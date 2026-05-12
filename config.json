@@ -1,0 +1,52 @@
+{
+  "id": "flink-course",
+  "title": "Apache Flink 2 Ultimate",
+  "description": "Ультимативный курс по Apache Flink 2.x — true streaming до железа: state internals, RocksDB+ForSt disaggregated state, Chandy-Lamport snapshots, Two-Phase Commit sinks, Materialized Tables, AI integration через ML_PREDICT и VECTOR_SEARCH.",
+  "author": "Lev Neganov",
+  "difficulty": "advanced",
+  "language": "ru",
+  "version": "1.0.0",
+  "modules": [
+    { "id": "00-course-intro", "title": "Введение в курс" },
+    { "id": "01-architecture", "title": "Архитектура Flink" },
+    { "id": "02-datastream-api", "title": "DataStream API" },
+    { "id": "03-state-management", "title": "State Management" },
+    { "id": "04-rocksdb-forst", "title": "RocksDB и ForSt backends" },
+    { "id": "05-time-watermarks", "title": "Time, Watermarks, Windows" },
+    { "id": "06-checkpointing-savepoints", "title": "Checkpointing и Savepoints" },
+    { "id": "07-exactly-once", "title": "Exactly-Once семантика" },
+    { "id": "08-table-sql", "title": "Table API и SQL" },
+    { "id": "09-cep", "title": "Complex Event Processing" },
+    { "id": "10-connectors-cdc", "title": "Connectors и Flink CDC" },
+    { "id": "11-formats-serialization", "title": "Форматы и сериализация" },
+    { "id": "12-pyflink", "title": "PyFlink" },
+    { "id": "13-deployment-k8s", "title": "Deployment и Kubernetes Operator" },
+    { "id": "14-state-evolution", "title": "State Evolution и Processor API" },
+    { "id": "15-performance-tuning", "title": "Performance tuning" },
+    { "id": "16-observability", "title": "Observability" },
+    { "id": "17-patterns-architecture", "title": "Patterns и архитектура" },
+    { "id": "18-capstone", "title": "Capstone проект" }
+  ],
+  "tags": [
+    "flink",
+    "stream-processing",
+    "stateful-streaming",
+    "exactly-once",
+    "rocksdb",
+    "kubernetes",
+    "data-engineering",
+    "cdc"
+  ],
+  "prerequisites": {
+    "courses": [
+      { "slug": "kafka-course", "level": "required" },
+      { "slug": "python-course", "level": "recommended" },
+      { "slug": "storage-formats", "level": "recommended" }
+    ],
+    "external": []
+  },
+  "estimatedHours": 80,
+  "pricing": {
+    "type": "free"
+  }
+}

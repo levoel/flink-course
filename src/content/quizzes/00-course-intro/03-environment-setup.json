@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "00-course-intro/03-environment-setup",
+  "moduleId": "00-course-intro",
+  "_meta": {
+    "idPrefix": "flink-m00-03",
+    "description": "Use IDs: flink-m00-03-q1, flink-m00-03-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m00-03-q1",
+      "type": "multiple-choice",
+      "question": "В нашем docker-compose у нас 2 TaskManager-а с numberOfTaskSlots=4 каждый. Сколько максимум параллельных subtasks может запускать кластер?",
+      "options": [
+        { "id": "a", "text": "2 — по числу TaskManager-ов" },
+        { "id": "b", "text": "4 — по числу slots на одном TaskManager" },
+        { "id": "c", "text": "8 — 2 TM × 4 slots каждый" },
+        { "id": "d", "text": "16 — Flink удваивает slots для HA" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Slots — это единица планирования. Общее число параллельных subtasks ограничено суммой slots по всем TaskManager-ам: 2 TM × 4 slots = 8 slots. Memory TaskManager-а делится поровну между slots (но не CPU — это soft isolation). Если parallelism job > 8 → ResourceManager либо запросит ещё TM (на K8s), либо job не запустится.",
+      "studyHint": "Повторите урок 03 — раздел 'Архитектура: что вы запустили'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-03-q2",
+      "type": "multiple-choice",
+      "question": "В Web UI на :8081 какая метрика — первый инструмент диагностики любой Flink job?",
+      "options": [
+        { "id": "a", "text": "Количество checkpoint-ов" },
+        { "id": "b", "text": "busyTimeMsPerSecond / idleTimeMsPerSecond / backPressuredTimeMsPerSecond для каждого оператора (backpressure visualization)" },
+        { "id": "c", "text": "Размер state в RocksDB" },
+        { "id": "d", "text": "Latency в миллисекундах от source до sink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Backpressure visualization — главный диагностический инструмент Flink с 1.13+. Каждый оператор имеет три метрики: busy (полезная работа), idle (нет данных), backpressured (downstream не успевает). Сумма ≈ 1000ms/sec. В UI цвета: красный=busy, синий=idle, чёрный=backpressured. Любая проблема производительности диагностируется через эти три метрики: если все операторы backpressured → проблема в sink, если один operator busy=1000ms → bottleneck в нём.",
+      "studyHint": "Повторите урок 03 — раздел 'Web UI: что смотреть'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m00-03-q3",
+      "type": "multiple-choice",
+      "question": "Какая команда останавливает job С созданием savepoint?",
+      "options": [
+        { "id": "a", "text": "flink cancel <jobid>" },
+        { "id": "b", "text": "flink stop --savepointPath file:///tmp/flink-savepoints <jobid>" },
+        { "id": "c", "text": "flink kill <jobid>" },
+        { "id": "d", "text": "flink restart <jobid>" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "`flink stop --savepointPath <path> <jobid>` останавливает job gracefully и создаёт savepoint. Это правильный способ для planned upgrade: stop with savepoint → modify code → run -s <savepoint> для restore. `flink cancel <jobid>` отменяет без savepoint — данные в state теряются (если только не было автоматического checkpoint). `flink kill` не существует, `flink restart` тоже.",
+      "studyHint": "Повторите урок 03 — раздел 'Базовый CLI'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m00-03-q4",
+      "type": "true-false",
+      "question": "Apache Kafka 3.7 в нашем setup работает в KRaft mode без ZooKeeper.",
+      "correctAnswer": true,
+      "explanation": "Apache Kafka с версии 3.3+ поддерживает KRaft (Kafka Raft) mode — встроенный consensus algorithm, заменяющий ZooKeeper. С 3.7 KRaft полностью production-ready, с 4.0 (план 2026) ZK поддержка будет удалена. KRaft упрощает deployment: один процесс kafka с двумя ролями (broker, controller) вместо отдельного ZooKeeper кластера. Для разработки и dev окружений это must.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

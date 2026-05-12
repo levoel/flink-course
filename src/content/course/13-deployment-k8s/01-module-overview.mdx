@@ -1,0 +1,105 @@
+---
+title: "Обзор модуля: Deployment и Kubernetes Operator"
+description: "Application vs Session mode, Flink Kubernetes Operator, Adaptive Scheduler + Autoscaler (FLIP-271/291)"
+order: 1
+difficulty: "advanced"
+estimatedTime: 16
+topics: ["Deployment", "Kubernetes", "Operator", "Adaptive Scheduler", "FLIP-271", "FLIP-291"]
+---
+
+# Deployment и Kubernetes Operator — обзор модуля (KILLER)
+
+Production Flink в 2026 году = Kubernetes + Flink Kubernetes Operator + Adaptive Scheduler. Этот модуль покрывает full stack: deployment modes, K8s operator CRDs, autoscaler, blue/green upgrades.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Application mode vs Session mode | Когда какой, per-job mode REMOVED в 2.x |
+| 03 | Native Kubernetes integration | flink kubernetes-application command |
+| 04 | **Flink Kubernetes Operator** | FlinkDeployment + FlinkSessionJob CRs |
+| 05 | HA: ZooKeeper vs K8s ConfigMaps | Leader election, checkpoint storage |
+| 06 | **Adaptive Scheduler + In-place rescaling (FLIP-271/291)** | Autoscaling без redeployment |
+| 07 | Blue/green deploys | Savepoint → upgrade → restore |
+| 08 | Multi-region setup | Disaster recovery, cross-region savepoints |
+
+## Application vs Session mode
+
+| Mode | Когда |
+|---|---|
+| **Application** | Один job = один cluster. Lifecycle совмещён. Production default |
+| **Session** | Shared cluster для multiple jobs. Dev / batch / ad-hoc |
+| ~~Per-job~~ | **Removed в 2.0** |
+
+## Flink Kubernetes Operator
+
+Official Apache project. Деплой через CRD:
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector
+spec:
+  image: flink:2.2.0-java17
+  flinkVersion: v2_2
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend.type: rocksdb
+    state.checkpoints.dir: s3://bucket/checkpoints
+    high-availability: kubernetes
+    jobmanager.scheduler: adaptive   # ← обязательно для autoscaling
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+  job:
+    jarURI: s3://artifacts/fraud-detector-1.0.jar
+    parallelism: 4
+    upgradeMode: savepoint
+```
+
+## Adaptive Scheduler + In-place rescaling (FLIP-291)
+
+Без Adaptive Scheduler: rescale = stop with savepoint → restart с новым parallelism → restore. Долго (минуты).
+
+С Adaptive Scheduler + FLIP-291 (Flink 1.18+):
+- Изменение `parallelism` через REST API → in-place rescale без savepoint
+- Autoscaler смотрит на metrics (busy time, backpressure) → automatic scaling
+- **Mandatory** для production elastic deployments
+
+```yaml
+flinkConfiguration:
+  jobmanager.scheduler: adaptive
+
+# Autoscaler config
+job.autoscaler.enabled: true
+job.autoscaler.target.utilization: 0.7
+job.autoscaler.scale.up.grace-period: 1min
+job.autoscaler.scale.down.interval: 1h
+```
+
+## Blue/green deploys
+
+```bash
+# 1. Trigger savepoint на current job
+kubectl patch flinkdeployment my-job --type merge -p '{
+  "spec": {"job": {"savepointTriggerNonce": 12345}}
+}'
+
+# 2. Update image
+kubectl patch flinkdeployment my-job --type merge -p '{
+  "spec": {"image": "flink:2.3.0-java17"}
+}'
+
+# Operator делает: stop with savepoint → start new job на новом image → restore from savepoint
+```
+
+## Killer takeaway
+
+В 2026 НЕ деплойте Flink без Kubernetes Operator и Adaptive Scheduler. Это like running Postgres without PgBouncer. Operator решает 90% operational complexity: HA, savepoint management, autoscaling, blue/green.

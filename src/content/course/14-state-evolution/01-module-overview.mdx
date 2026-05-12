@@ -1,0 +1,80 @@
+---
+title: "Обзор модуля: State Evolution"
+description: "State Processor API, savepoint formats, RocksDB→ForSt migration"
+order: 1
+difficulty: "advanced"
+estimatedTime: 12
+topics: ["State Processor API", "Savepoint", "Migration", "Schema Evolution"]
+---
+
+# State Evolution — обзор модуля
+
+Production Flink job живёт годами. За это время меняется: schema state, topology, backend, parallelism, version Flink. Этот модуль учит, как мигрировать state safely.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | State Processor API | Offline read/write state через DataStream batch API |
+| 03 | Schema evolution для POJO / Avro | Что Flink делает auto, что нельзя |
+| 04 | Savepoint formats — canonical vs native | Cross-backend migration |
+| 05 | maxParallelism changes | Невозможно direct — re-bootstrap через State Processor API |
+| 06 | Job upgrade strategy | UID-ing операторов, allowNonRestoredState |
+| 07 | **RocksDB → ForSt migration** | Critical для 2.x adopt |
+
+## State Processor API — superpower
+
+Read/write state offline:
+
+```java
+SavepointReader sp = SavepointReader.read(env, savepointPath);
+
+DataStream<KeyedState> keyed = sp.readKeyedState(
+    "fraud-detector-uid",
+    new ReaderFunction()
+);
+
+// Modify, filter, aggregate state
+
+SavepointWriter newSp = SavepointWriter.fromExistingSavepoint(savepointPath)
+    .removeOperator("old-uid")
+    .withOperator("new-uid", new BootstrapTransformation<>(...));
+
+newSp.write(newSavepointPath);
+```
+
+## Savepoint formats
+
+| Format | Speed | Cross-backend | When |
+|---|---|---|---|
+| **Native** (default 1.15+) | Fast | ❌ | Same backend, frequent updates |
+| **Canonical** | Slow | ✅ | Backend migration (RocksDB → ForSt) |
+
+```bash
+flink stop --savepoint-format canonical --savepointPath ... <jobid>
+```
+
+## UIDs — обязательно
+
+```java
+stream
+    .keyBy(...)
+    .process(new FraudDetector())
+    .uid("fraud-detector")    // ← MANDATORY для production
+    .name("Fraud Detection");
+```
+
+Без UID Flink не может сопоставить state из savepoint с оператором после изменения topology.
+
+## Migration playbook
+
+1. Stop job with **canonical** savepoint
+2. Update code / config
+3. Run new version с `flink run -s savepoint --allowNonRestoredState`
+4. Verify state correctly restored
+5. Monitor stability сутки → only then удалить старую savepoint
+
+## Killer takeaway
+
+**Канонический совет**: установите UID на каждый stateful operator + используйте canonical savepoints для cross-backend migrations + регулярно testing rollback. Это спасёт от disaster в production.

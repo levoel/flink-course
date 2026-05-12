@@ -1,0 +1,177 @@
+---
+title: "Обзор курса и дорожная карта"
+description: "19 модулей, целевая аудитория, killer demos, технологический стек"
+order: 2
+difficulty: "intermediate"
+estimatedTime: 12
+topics: ["Курс", "Roadmap", "Module overview"]
+---
+
+# Обзор курса и дорожная карта
+
+Этот курс — самое глубокое погружение в Apache Flink на русском языке. Цель — не «научиться писать stream job», а **понять, как Flink работает под капотом**: как Chandy-Lamport snapshots реализованы через ABS алгоритм, как RocksDB LSM-tree интегрирован с managed memory, как Two-Phase Commit обеспечивает exactly-once, как ForSt позволяет хранить state на S3 без потери latency.
+
+---
+
+## Целевая аудитория
+
+Курс рассчитан на инженеров, которые:
+
+- Знают Kafka на уровне «писал producer/consumer, понимают partitions и consumer groups»
+- Имеют опыт работы с Apache Spark (Structured Streaming желательно, но не обязательно)
+- Знают Java или Scala на уровне написания production-кода; Python для PyFlink модуля
+- Хотят строить low-latency stateful pipelines и понимать их fundamentals
+
+Если вы впервые видите streaming — рекомендуем сначала пройти kafka-course и spark-course с этой же платформы. Этот курс — продолжение, не первый шаг.
+
+---
+
+## Структура 19 модулей
+
+Курс построен в три волны:
+
+<DiagramContainer title="Дорожная карта курса" color="slate">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox label="00 — Введение" tooltip="Текущий модуль. Что такое Flink, обзор курса, environment setup.">Старт</DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Foundation" />
+    <FlowRow>
+      <DataBox label="01 — Архитектура" tooltip="JobManager (Dispatcher/RM/JobMaster), TaskManager, slots, graph transformation 4-уровневая.">Архитектура</DataBox>
+      <DataBox label="02 — DataStream API" tooltip="Classic API + DataStream V2 (FLIP-409), ProcessFunction, Async I/O, timers, side outputs.">DataStream</DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="★ Stateful core" />
+    <FlowRow>
+      <DataBox
+        label="03 — State Management"
+        tooltip="Operator vs Keyed state, key groups математика, Async State API V2 для ForSt."
+      >
+        State ★
+      </DataBox>
+      <DataBox
+        label="04 — RocksDB + ForSt"
+        tooltip="LSM internals, compaction, column families, disaggregated state на S3 через ForSt (Flink 2.0)."
+      >
+        RocksDB ★
+      </DataBox>
+      <DataBox label="05 — Time + Watermarks" tooltip="Event time, watermark generation, Watermark Alignment FLIP-217, windows, late events.">Time</DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="★ Fault tolerance" />
+    <FlowRow>
+      <DataBox
+        label="06 — Checkpointing"
+        tooltip="Chandy-Lamport / ABS, aligned vs unaligned, Generic Log-Based Incremental Checkpoints (DSTL), savepoints."
+      >
+        Checkpoints ★
+      </DataBox>
+      <DataBox
+        label="07 — Exactly-Once"
+        tooltip="Two-Phase Commit, SinkV2 API (FLIP-191), KafkaSink EOS, transaction.timeout pitfall."
+      >
+        EOS ★
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="SQL & Patterns" />
+    <FlowRow>
+      <DataBox
+        label="08 — Table API / SQL"
+        tooltip="Dynamic tables, temporal joins, Materialized Tables (FLIP-435), ML_PREDICT + VECTOR_SEARCH (2.2)."
+      >
+        SQL
+      </DataBox>
+      <DataBox label="09 — CEP" tooltip="Pattern API, MATCH_RECOGNIZE, NFA implementation, fraud detection.">CEP</DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Ecosystem" />
+    <FlowRow>
+      <DataBox
+        label="10 — Connectors + CDC"
+        tooltip="FLIP-27 sources, Hybrid Source FLIP-150, Iceberg/Paimon/Hudi, Flink CDC 3.6."
+      >
+        Connectors
+      </DataBox>
+      <DataBox label="11 — Formats" tooltip="TypeInformation, POJO/Avro/Protobuf, Kryo fallback (50% perf hit), schema evolution.">Forms</DataBox>
+      <DataBox label="12 — PyFlink" tooltip="Process vs Thread mode (PEMJA), Pandas UDFs, async functions (2.2).">PyFlink</DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Production" />
+    <FlowRow>
+      <DataBox
+        label="13 — Deployment + K8s"
+        tooltip="Flink Kubernetes Operator, Adaptive Scheduler + Autoscaler FLIP-271/291, blue/green."
+      >
+        Deploy ★
+      </DataBox>
+      <DataBox label="14 — State Evolution" tooltip="State Processor API, savepoint formats, RocksDB→ForSt migration.">Evolution</DataBox>
+      <DataBox label="15 — Tuning" tooltip="Memory model, backpressure anatomy, buffer debloating, GC tuning.">Tuning</DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox label="16 — Observability" tooltip="Web UI, OTel gRPC export, Runtime Data Sampling FLIP-570, Grafana templates.">Obs</DataBox>
+      <DataBox label="17 — Patterns" tooltip="Fraud detection, real-time joins, CDC pipelines, Flink Agents preview.">Patterns</DataBox>
+      <DataBox label="18 — Capstone" tooltip="E2E: Kafka → Flink (CDC+stateful) → Iceberg с EOS, autoscaling, chaos testing.">Финал</DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+**★ — killer-модули** с уникальной глубиной: ABS algorithm walkthrough с барьерами, RocksDB compaction live визуализация, ForSt с MinIO как S3 mock, two-phase commit survival test с `docker kill` посередине commit.
+
+---
+
+## Что вы получите
+
+К концу курса вы:
+
+1. **Разверните production HA-кластер Flink** на K8s через Kubernetes Operator с Adaptive Scheduler.
+2. **Спроектируете exactly-once pipeline**: Kafka → Flink stateful processing → Iceberg, end-to-end EOS гарантия.
+3. **Затюните RocksDB** для своего workload — compaction strategy, column families, managed memory.
+4. **Диагностируете backpressure** через busy/idle/backPressured метрики и Web UI визуализацию.
+5. **Мигрируете state** через State Processor API при изменении topology или backend.
+6. **Внедрите Flink CDC** для real-time replication из Postgres в lakehouse.
+7. **Аргументируете выбор Flink vs Spark Structured Streaming vs Kafka Streams vs RisingWave**.
+
+---
+
+## Формат уроков
+
+Каждый модуль состоит из 5-7 уроков:
+
+- **MDX-урок** — теория с диаграммами, кодом, callout-блоками. 20-40 минут чтения.
+- **Knowledge check** — короткая проверка ключевого понимания.
+- **Quiz** — 4 вопроса (multiple-choice + true/false), bloomLevel: conceptual / applied / analytical / evaluative.
+- **Module exam** — 6 вопросов, passing threshold 70%.
+- **Docker lab** — на ключевые модули: barrier propagation tracing, RocksDB compaction live, disaggregated state с MinIO.
+- **Glossary** + **Troubleshooting** — справочные ресурсы для модулей.
+
+---
+
+## Стек курса
+
+- **Apache Flink 2.2.x** (current stable, 2.0 как база)
+- **Java 17 / 21** — основной язык
+- **Python 3.11** — для PyFlink модуля
+- **Apache Kafka 3.7** — source/sink для большинства labs
+- **Apache Paimon** — lakehouse backend для Materialized Tables
+- **MinIO** — S3-compatible storage для disaggregated state labs
+- **Flink Kubernetes Operator** + **OrbStack/Kind** — для K8s deployment модуля
+- **Flink CDC 3.6** — для real-time replication модуля
+
+---
+
+## Что НЕ покрываем (legacy)
+
+Намеренно опускаем то, что removed/deprecated в 2.x:
+
+- **DataSet API** — removed в 2.0
+- **Scala API** — removed в 2.0
+- **SourceFunction / SinkFunction / SinkV1** — removed в 2.0
+- **Per-job mode** — removed в 2.0
+- **flink-conf.yaml** (legacy format) — заменён на standard YAML
+- **Stateful Functions** — sunsetted в 2026
+- **Queryable State** — deprecated с 1.18
+- **Reactive Mode** — заменён Adaptive Scheduler + Autoscaler
+
+---
+
+<KnowledgeCheck
+  question="Какие четыре модуля курса дают наибольшую глубину internals по сравнению с другими курсами по Flink на рынке?"
+  answer="Модули 03 (State Management — key groups, Async State API V2), 04 (RocksDB + ForSt — LSM internals, disaggregated state), 06 (Checkpointing & Savepoints — ABS, aligned vs unaligned, GIC/DSTL) и 07 (Exactly-Once — 2PC, SinkV2). Эти четыре модуля препарируют ядро Flink. Также killer-модулем является 13 (Deployment + K8s Operator) — с Adaptive Scheduler и FLIP-291 in-place rescaling, что критично для production autoscaling."
+/>

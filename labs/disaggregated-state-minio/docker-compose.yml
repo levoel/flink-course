@@ -1,0 +1,90 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    tty: true
+    stdin_open: true
+
+  jobmanager:
+    image: flink:2.2.0-java17
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend.type: forst
+        state.backend.forst.primary-dir: s3://forst-state/
+        state.backend.forst.local-dir: /tmp/forst-cache
+        state.checkpoints.dir: s3://checkpoints/
+        execution.checkpointing.interval: 60s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        s3.endpoint: http://minio:9000
+        s3.path-style-access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+        taskmanager.numberOfTaskSlots: 4
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  taskmanager-1:
+    image: flink:2.2.0-java17
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend.type: forst
+        state.backend.forst.primary-dir: s3://forst-state/
+        state.backend.forst.local-dir: /tmp/forst-cache
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 4096m
+        s3.endpoint: http://minio:9000
+        s3.path-style-access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+
+  taskmanager-2:
+    image: flink:2.2.0-java17
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend.type: forst
+        state.backend.forst.primary-dir: s3://forst-state/
+        state.backend.forst.local-dir: /tmp/forst-cache
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 4096m
+        s3.endpoint: http://minio:9000
+        s3.path-style-access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+
+volumes:
+  minio-data:

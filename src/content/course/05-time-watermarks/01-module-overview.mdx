@@ -1,0 +1,83 @@
+---
+title: "Обзор модуля: Time, Watermarks, Windows"
+description: "Event/processing time, Watermark Alignment FLIP-217, windows, late events side output"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Event Time", "Watermarks", "Windows", "FLIP-217"]
+---
+
+# Time, Watermarks, Windows — обзор модуля
+
+Time semantics — фундаментальное отличие true streaming от batch. Event time + watermarks делают результаты детерминистическими при reprocessing. Этот модуль учит правильно работать с временем — самая частая ошибка production Flink.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Three notions of time | Event / processing / ingestion |
+| 03 | WatermarkStrategy API | forBoundedOutOfOrderness, withIdleness, custom generator |
+| 04 | Watermark propagation | MIN(input watermarks), idle source pitfall |
+| 05 | **Watermark Alignment (FLIP-217, GA 1.18)** | multi-source coordination, 76x speedup для backlogged jobs |
+| 06 | Window types | Tumbling, sliding, session, global |
+| 07 | Triggers, evictors, allowed lateness | Side output для late events |
+| 08 | TVF Windows в Table API | TUMBLE, HOP, CUMULATE, SESSION |
+
+## Ключевые концепты
+
+### Three notions of time
+
+- **Event time** — embedded в record, основа для correct semantics
+- **Processing time** — wall clock TaskManager, быстро но недетерминированно
+- **Ingestion time** — присваивается при попадании в Flink (deprecated)
+
+### WatermarkStrategy
+
+```java
+WatermarkStrategy
+  .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))  // watermark = max_ts - 20s
+  .withTimestampAssigner((event, ts) -> event.getEventTime())
+  .withIdleness(Duration.ofMinutes(1));  // ← важно для idle partitions
+```
+
+### Watermark Alignment (FLIP-217)
+
+Решает проблему «один источник убежал, другой отстал»:
+
+```java
+.forBoundedOutOfOrderness(Duration.ofSeconds(20))
+.withWatermarkAlignment("group-1",
+    Duration.ofSeconds(20),  // max-drift
+    Duration.ofSeconds(1)    // update-interval
+);
+```
+
+SourceCoordinator паузит splits, чьи watermark > maxDesired. Без alignment — slow source держит watermark всего pipeline.
+
+### Window types
+
+| Window | State growth | Use case |
+|---|---|---|
+| Tumbling | Constant | Fixed-time aggregations |
+| Sliding | × by overlap ratio | Moving average, последние N минут |
+| Session | Per active session | User session analysis |
+| Global | Unbounded | Custom trigger logic |
+
+### Late events — обязательно side output
+
+```java
+DataStream<Event> mainStream = stream
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Duration.ofMinutes(2))
+    .sideOutputLateData(lateTag)  // ← production REQUIRED
+    .process(...);
+
+DataStream<Event> lateStream = mainStream.getSideOutput(lateTag);
+```
+
+Без `.sideOutputLateData` поздние события **silently dropped** — одна из самых частых производственных ошибок.
+
+## Killer takeaway
+
+**В production ВСЕГДА** настраивайте: `withIdleness` (для idle partitions), `allowedLateness` (для опоздавших), `sideOutputLateData` (capture late). Не настроили — теряете данные тихо.

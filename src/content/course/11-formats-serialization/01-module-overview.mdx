@@ -1,0 +1,79 @@
+---
+title: "Обзор модуля: Форматы и сериализация"
+description: "TypeInformation, POJO/Avro/Protobuf, Kryo fallback (50% perf hit), schema evolution"
+order: 1
+difficulty: "advanced"
+estimatedTime: 10
+topics: ["TypeInformation", "POJO", "Avro", "Protobuf", "Kryo"]
+---
+
+# Форматы и сериализация — обзор модуля
+
+Performance Flink сильно зависит от того, какой serializer выбран для типов. Default Kryo fallback может дать 50% perf hit. Этот модуль учит выбирать правильный format для каждого случая.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | TypeInformation system | Как Flink выводит types |
+| 03 | POJO requirements | no-arg ctor, getters/setters/public fields |
+| 04 | Tuple types | Tuple2, Tuple3, generics erasure pitfall |
+| 05 | Avro (Specific / Generic / Reflect) | Schema registry integration |
+| 06 | Protobuf, Thrift | Performance comparison |
+| 07 | Kryo fallback — 50% perf hit | Почему избегать, как fail-fast |
+| 08 | Schema evolution | TypeSerializerSnapshot, compatibility checking |
+
+## Serializer hierarchy
+
+```
+TypeInformation
+    ├── BasicTypeInfo (Long, String, Integer, ...)
+    ├── PojoTypeInfo (классы с POJO requirements)
+    ├── TupleTypeInfo (Tuple2, Tuple3...)
+    ├── RowTypeInfo (Row for SQL)
+    ├── AvroTypeInfo / ProtobufTypeInfo
+    └── GenericTypeInfo → Kryo fallback ← ИЗБЕГАТЬ
+```
+
+## POJO requirements
+
+```java
+public class Order {
+    public long id;             // public field OR
+    private String name;
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public Order() {}           // no-arg constructor MANDATORY
+}
+```
+
+Если хотя бы одно требование нарушено → `GenericTypeInfo` → Kryo. 50% perf hit.
+
+## Kryo fallback — fail-fast
+
+```yaml
+pipeline.generic-types: false
+```
+
+Это сразу fail при попытке использовать non-POJO/non-Avro/non-Protobuf class. Better than silently degrading to Kryo.
+
+## Performance hierarchy
+
+```
+Tuple (no generics)  ~100% baseline
+POJO                 ~95% (small overhead)
+Avro Specific        ~85%
+Protobuf             ~80%
+Avro Generic         ~75% (more reflection)
+Kryo                 ~50% ← ИЗБЕГАТЬ
+```
+
+## Schema evolution
+
+Изменение POJO с добавлением optional field — Flink делает automatic. Удаление required field — fail. Custom serializer через `TypeSerializerSnapshot` для control.
+
+## Killer takeaway
+
+В production **всегда** установите `pipeline.generic-types: false` — это fail-fast при Kryo fallback. И всегда explicit `.returns(TypeInformation)` после lambda, потому что generics erasure теряет type info.

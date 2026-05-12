@@ -1,0 +1,244 @@
+---
+title: "Что такое Apache Flink"
+description: "True streaming engine, философия stateful processing, отличия от micro-batch и от других streaming-систем"
+order: 1
+difficulty: "intermediate"
+estimatedTime: 20
+topics: ["Flink", "Stream Processing", "Stateful Streaming", "Архитектура"]
+---
+
+# Что такое Apache Flink
+
+Apache Flink — это **stateful streaming engine** для обработки бесконечных потоков данных с миллисекундной latency. Он решает класс задач, который не закрывают ни SQL-базы, ни batch-фреймворки, ни простые message brokers: непрерывная обработка событий с накапливаемым состоянием, exactly-once семантикой и поддержкой event time.
+
+Если Kafka — это распределённый commit log, то Flink — это вычислитель **над** commit log-ом, который читает поток событий, поддерживает state per key, реагирует на каждое событие и при сбое восстанавливается с точностью до записи.
+
+---
+
+## Stream vs Batch: фундаментальный сдвиг
+
+Большинство фреймворков обработки данных рождались как batch-системы и потом доращивались до streaming. Hadoop → Spark → Spark Streaming → Spark Structured Streaming — эволюция шла «от batch к stream через micro-batch». Flink родился иначе: с первого дня его модель — **stream first**, а batch рассматривается как частный случай stream-а с известными границами (`Boundedness.BOUNDED`).
+
+Это не просто архитектурная философия — это влияет на каждое инженерное решение:
+
+| Аспект | Micro-batch (Spark Structured Streaming) | True streaming (Flink) |
+|---|---|---|
+| Единица обработки | RDD/DataFrame, фиксированный batch interval | Каждая запись отдельно (через mailbox processor) |
+| Latency | 100мс — секунды | 1мс — сотни мкс |
+| State | Между batch-ами, через checkpoint | Per-key, continuous, hot in-memory + RocksDB на диске |
+| Event time | Поддерживается, но через batch granularity | Native, per-record |
+| Watermarks | Per-batch | Per-record, propagation через operator graph |
+| Exactly-once | Через idempotent sink или 2PC | 2PC через TwoPhaseCommitSinkFunction / SinkV2 |
+| Backpressure | Через batch scheduling | Native, credit-based flow control |
+
+В мае 2025 Spark выпустил **Real-Time Mode (RTM)** в 4.1 с millisecond latency — но даже эта фича по-прежнему построена на batch-абстракциях, и кейсы со сложным stateful processing продолжают мигрировать на Flink.
+
+<Callout type="note">
+True streaming не значит «лучше», а значит «по-другому». Если ваша задача — daily ETL над partition-ированной таблицей в S3, Spark batch остаётся выбором по умолчанию. True streaming оправдан там, где latency, per-record processing и stateful per-key операции — first-class требования.
+</Callout>
+
+---
+
+## Анатомия типичного Flink job
+
+Рассмотрим типичный fraud detection pipeline:
+
+<DiagramContainer title="Stateful streaming pipeline на Flink" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Kafka Source"
+        tooltip="KafkaSource с FLIP-27 API. Boundedness.CONTINUOUS_UNBOUNDED. Splits = Kafka partitions. SourceReader fetch'ит на каждом TaskManager-е, SplitEnumerator на JobManager распределяет splits."
+      >
+        transactions topic
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="forward partitioning" />
+    <FlowRow>
+      <DataBox
+        label="map / filter"
+        tooltip="Stateless преобразования. Operator chaining объединяет их в один task с предыдущим — никакой network shuffle, никакой сериализации. Один поток на parallel subtask."
+      >
+        parse + validate
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="keyBy(userId) → hash partitioning" />
+    <FlowRow>
+      <DataBox
+        label="KeyedProcessFunction"
+        tooltip="Здесь начинается stateful. keyBy перераспределяет записи по hash(userId) % maxParallelism. Каждый subtask владеет некоторыми key groups. State backend (RocksDB/ForSt) хранит ValueState/MapState per key."
+      >
+        per-user state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="watermark-aware" />
+    <FlowRow>
+      <DataBox
+        label="Tumbling Window"
+        tooltip="Window за 5 минут event time. Watermark говорит Flink, что события до момента T уже все пришли. Window emit-ит результат когда watermark пересёк границу окна. Allowed lateness конфигурирует side output для опоздавших."
+      >
+        5-min aggregation
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Kafka Sink EOS"
+        tooltip="KafkaSink с DeliveryGuarantee.EXACTLY_ONCE. Использует Kafka transactional API через Two-Phase Commit: preCommit на barrier, commit на notifyCheckpointComplete callback. transactional.id prefix позволяет recover после restart."
+      >
+        fraud_alerts topic
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Код:
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.enableCheckpointing(60_000); // checkpoint каждую минуту
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+
+KafkaSource<Transaction> source = KafkaSource.<Transaction>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("transactions")
+    .setGroupId("fraud-detector")
+    .setStartingOffsets(OffsetsInitializer.latest())
+    .setValueOnlyDeserializer(new TransactionDeserializer())
+    .build();
+
+env.fromSource(source, WatermarkStrategy
+        .<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+        .withTimestampAssigner((tx, ts) -> tx.getEventTime())
+        .withIdleness(Duration.ofMinutes(1)),
+    "kafka-source")
+    .filter(tx -> tx.getAmount() > 0)
+    .keyBy(Transaction::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .process(new FraudDetector())  // ← stateful, использует ValueState
+    .sinkTo(KafkaSink.<Alert>builder()
+        .setBootstrapServers("kafka:9092")
+        .setRecordSerializer(...)
+        .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+        .setTransactionalIdPrefix("fraud-detector-tx")
+        .setProperty("transaction.timeout.ms", "900000")
+        .build());
+
+env.execute("Fraud Detection");
+```
+
+Каждая строчка скрывает множество internals: credit-based flow control под `keyBy`, watermark propagation алгоритм, Chandy-Lamport snapshots под `enableCheckpointing`, two-phase commit под `EXACTLY_ONCE`. В курсе мы препарируем каждый из этих механизмов.
+
+---
+
+## Пять core features Flink
+
+1. **Stateful processing** — каждый оператор может держать состояние per key (ValueState, MapState, ListState, ReducingState, AggregatingState). Состояние переживает restart через checkpoints. В Flink 2.x — disaggregated state через ForSt backend позволяет хранить state на S3.
+
+2. **Exactly-once семантика** — гарантия «каждое событие повлияло на результат ровно один раз», даже при сбоях. Реализуется через Asynchronous Barrier Snapshotting (ABS) для внутреннего state + Two-Phase Commit для transactional sinks (Kafka, JDBC, Iceberg).
+
+3. **Event time + watermarks** — Flink обрабатывает события по их собственному времени (когда они произошли), а не по wall clock TaskManager-а. Watermark говорит «события до T уже все пришли», что позволяет окнам правильно эмитить результат. Watermark Alignment (FLIP-217) синхронизирует multi-source jobs.
+
+4. **Low latency at scale** — миллисекундная end-to-end latency на TBs of state и миллионах events/sec. Достигается через credit-based flow control в network stack, operator chaining, async checkpoints, native code (Tungsten-like для table API).
+
+5. **True streaming — batch как special case** — batch обрабатывается как bounded stream. Один и тот же DataStream API/Table API работает для streaming и batch. Hybrid Sources (FLIP-150) позволяют комбинировать backfill из S3 + live stream из Kafka в одной job.
+
+---
+
+## Flink 2.0 — cloud-native era
+
+В марте 2025 вышел **Flink 2.0** — первый major release за 8 лет (1.0 был в 2016). Это не просто инкремент — это фундаментальная переориентация на cloud-native архитектуру:
+
+- **Disaggregated State (FLIP-423)** — primary state теперь может жить на S3/HDFS/GCS, локальный диск только для cache. Checkpoint становится metadata-only operation. Recovery time не зависит от размера state.
+- **ForSt state backend** (FLIP-427) — «For Streaming» — LSM-tree поверх RocksDB, но с remote primary storage и async I/O.
+- **Async State API V2** (FLIP-424/425) — non-blocking state access с callbacks через mailbox executor.
+- **DataStream API V2** (FLIP-409) — переосмысление API после 9 лет накопленных решений.
+- **Materialized Tables** (FLIP-435 GA) — declarative streaming/batch с автоматическим pipeline.
+
+В декабре 2025 вышел **Flink 2.2** с AI-фичами:
+
+- **ML_PREDICT** (FLIP-526) — вызов ML моделей прямо из streaming SQL.
+- **VECTOR_SEARCH** (FLIP-540) — векторный поиск встроен в SQL.
+- **PyFlink async functions** — для high-latency external lookups.
+
+В марте 2026 появился **Flink Agents 0.2.1** — отдельный sub-project для event-driven AI agents на Flink runtime с поддержкой LLMs, tools, memory и MCP.
+
+Курс ориентирован на **Flink 2.2.x** как stable, с обзором 2.0 базы. Мы намеренно не учим legacy: DataSet API (removed), Scala API (removed), SourceFunction/SinkFunction (removed в 2.0).
+
+---
+
+## Когда Flink — правильный выбор, а когда — нет
+
+Flink — мощный инструмент, но избыточный для простых задач. Сравнение с альтернативами:
+
+| Use case | Flink | Альтернатива |
+|---|---|---|
+| Stateful event processing с EOS, миллионы events/sec | ✅ | — |
+| Real-time analytics с windowing на TBs state | ✅ | — |
+| CDC pipeline (Postgres → lakehouse) | ✅ (Flink CDC 3.6) | Debezium + Kafka Streams |
+| Stream-stream joins (interval, temporal) | ✅ | — |
+| Простой stateless transform Kafka → Kafka | Избыточно | Kafka Streams (library, без JVM cluster) |
+| Daily batch ETL S3 → Snowflake | Избыточно | Spark, dbt |
+| Workflow orchestration | ❌ | Airflow, Prefect |
+| Простая аналитика SQL над hot data | Избыточно | RisingWave, Materialize, ClickHouse |
+| Microservice durable execution | ❌ | Temporal |
+
+<Callout type="warning">
+Самая частая ошибка — выбрать Flink для stateless transform, который можно сделать на Kafka Streams library без отдельного кластера. Flink оправдан, когда state-heavy, complex windowing или high throughput с EOS. Если можно обойтись простой topology без state — используйте Kafka Streams или ksqlDB.
+</Callout>
+
+---
+
+## Где Flink в архитектуре
+
+Flink сидит между event source-ом (Kafka, Pulsar, Kinesis) и destination-ом (Kafka, lakehouse, OLAP DB):
+
+<DiagramContainer title="Flink в дата-архитектуре" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Sources"
+        tooltip="Kafka (наиболее частый), Pulsar, Kinesis. Также Flink CDC connectors для Postgres/MySQL/MongoDB binlog. HybridSource комбинирует bounded (S3 backfill) + unbounded (Kafka live)."
+      >
+        Kafka / CDC / S3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Flink streaming jobs"
+        tooltip="ETL, fraud detection, real-time aggregation, dim table joins, ML inference (ML_PREDICT с 2.2). Stateful, exactly-once, event-time."
+      >
+        Stateful processing
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Lakehouse sinks"
+        tooltip="Iceberg / Paimon / Hudi / Delta. SinkV2 + pre-commit topologies для compaction, post-commit для manifest publish."
+      >
+        Iceberg / Paimon
+      </DataBox>
+      <DataBox
+        label="OLAP / Search"
+        tooltip="ClickHouse для real-time analytics, Elasticsearch для full-text search, Druid/Pinot для time-series OLAP."
+      >
+        ClickHouse / ES
+      </DataBox>
+      <DataBox
+        label="Output Kafka"
+        tooltip="Часто Flink output → новый Kafka topic, который потребляется другими стримерами или microservices. Это классический Kappa Architecture pattern."
+      >
+        Kafka topic
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+<KnowledgeCheck
+  question="Что фундаментально отличает true streaming (Flink) от micro-batch streaming (Spark Structured Streaming)?"
+  answer="True streaming обрабатывает каждую запись отдельно через mailbox processor с миллисекундной latency, поддерживает per-record event time и watermarks, имеет native credit-based flow control. Micro-batch собирает записи в batch (RDD/DataFrame) и обрабатывает batch целиком — latency определяется batch interval (десятки-сотни миллисекунд минимум). Spark 4.1 RTM (Real-Time Mode) пытается достичь миллисекундной latency, но архитектурно остаётся batch-based. Различие критично для use cases с complex stateful per-key processing, EOS требованиями и event-time correctness."
+/>

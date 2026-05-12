@@ -1,0 +1,92 @@
+---
+title: "Обзор модуля: Performance tuning"
+description: "Memory model (FLIP-49), backpressure anatomy, buffer debloating, GC tuning"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Performance", "Memory Model", "Backpressure", "GC", "RocksDB Tuning"]
+---
+
+# Performance tuning — обзор модуля
+
+Tuning Flink — мульти-фронтовая задача: memory model, RocksDB, network buffers, GC, serialization. Этот модуль — systematic guide к диагностике bottleneck и tuning.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Memory Model (FLIP-49) | TaskManager memory layout: heap / managed / network / metaspace |
+| 03 | Backpressure anatomy | busy / idle / backPressured metrics, diagnosis flow |
+| 04 | Network buffer tuning | Credit-based flow control, buffer debloating |
+| 05 | RocksDB tuning deep | Predefined options vs custom, managed memory |
+| 06 | Parallelism strategy | Source/operator/sink, slot sharing groups |
+| 07 | GC tuning | G1 vs ZGC vs Shenandoah для low-pause streaming |
+| 08 | Operator chaining + slot sharing tuning | Когда disable chaining, когда split slot sharing |
+
+## Memory Model (FLIP-49)
+
+```
+Total Process Memory =
+  + Total Flink Memory
+    + JVM Heap
+      + Framework Heap (Flink internal)
+      + Task Heap (user code)
+    + Off-Heap (Direct + Native)
+      + Framework Off-Heap
+      + Task Off-Heap
+      + Network Memory (buffers)
+      + Managed Memory (RocksDB native, sort)
+  + JVM Metaspace
+  + JVM Overhead
+```
+
+Конфиг:
+```yaml
+taskmanager.memory.process.size: 8g
+taskmanager.memory.managed.fraction: 0.4  # 40% of Flink Memory → RocksDB
+taskmanager.memory.network.fraction: 0.1
+```
+
+## Backpressure diagnosis flow
+
+Из Web UI каждый operator имеет:
+- `busyTimeMsPerSecond` — полезная работа
+- `idleTimeMsPerSecond` — нет данных
+- `backPressuredTimeMsPerSecond` — downstream не успевает
+
+Сумма ≈ 1000ms/sec. Цвета: красный=busy, синий=idle, чёрный=backpressured.
+
+### Сценарии
+
+| Что видно | Bottleneck | Fix |
+|---|---|---|
+| Source idle, downstream busy | Source slow | Increase source parallelism, batch larger |
+| Source busy 1000ms | Source CPU-bound | Increase parallelism, faster format |
+| Middle operator busy | CPU-bound op | Increase parallelism там, optimize code |
+| All backPressured | Sink slow | Async I/O, batch larger, scale sink |
+| Backpressure ramps then drops | RocksDB compaction | Tune compaction, use changelog backend |
+
+## Buffer debloating (1.14+)
+
+```yaml
+taskmanager.network.memory.buffer-debloat.enabled: true
+```
+
+Динамически уменьшает буферы при backpressure → ускоряет alignment checkpoints. Critical для EOS workloads.
+
+## GC tuning для streaming
+
+| GC | Pause | Use case |
+|---|---|---|
+| G1 (default) | 10-200ms | General-purpose |
+| ZGC | < 10ms | Low-latency, large heap |
+| Shenandoah | < 10ms | Like ZGC, alternative |
+
+```yaml
+env.java.opts: "-XX:+UseZGC -XX:MaxGCPauseMillis=10"
+```
+
+## Killer takeaway
+
+**Первый инструмент** диагностики — busy/idle/backpressure metrics в Web UI. **Не** угадывайте — измеряйте. Tuning без data — это shotgun debugging.

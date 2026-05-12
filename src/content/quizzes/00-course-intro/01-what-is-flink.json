@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "00-course-intro/01-what-is-flink",
+  "moduleId": "00-course-intro",
+  "_meta": {
+    "idPrefix": "flink-m00-01",
+    "description": "Use IDs: flink-m00-01-q1, flink-m00-01-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m00-01-q1",
+      "type": "multiple-choice",
+      "question": "В чём фундаментальное отличие true streaming (Flink) от micro-batch streaming (Spark Structured Streaming)?",
+      "options": [
+        { "id": "a", "text": "Flink быстрее, потому что использует Java вместо Scala" },
+        { "id": "b", "text": "Flink обрабатывает каждую запись отдельно с миллисекундной latency, native event-time и watermarks; Spark Structured Streaming собирает batch и обрабатывает их целиком, latency определяется batch interval" },
+        { "id": "c", "text": "Никакой разницы — оба используют RDDs внутри" },
+        { "id": "d", "text": "Spark Structured Streaming поддерживает stateful processing, а Flink нет" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink — true streaming: обрабатывает каждую запись через mailbox processor с миллисекундной latency, native per-record event time, credit-based flow control. Spark Structured Streaming — micro-batch: даже Real-Time Mode (Spark 4.1+) остаётся batch-based архитектурно. Различие критично для stateful per-key processing, EOS, event-time correctness. Stateful processing — наоборот, главная сила Flink.",
+      "studyHint": "Повторите урок 01 — таблица 'Stream vs Batch'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-01-q2",
+      "type": "multiple-choice",
+      "question": "У вас задача: stateless transform — читать Kafka topic, парсить JSON, фильтровать по полю, писать в другой Kafka topic. Объём — 50k msg/s. Нужен ли Flink?",
+      "options": [
+        { "id": "a", "text": "Да — Flink единственный достаточно быстрый для 50k msg/s" },
+        { "id": "b", "text": "Нет — для stateless transform без state и сложных join-ов Kafka Streams (library, без JVM cluster) более простой выбор. Flink избыточен" },
+        { "id": "c", "text": "Да — без Flink невозможно гарантировать ordering" },
+        { "id": "d", "text": "Нет — задачу решает сам Kafka через ksqlDB CREATE TABLE" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Stateless transform Kafka → Kafka — это classic use case для Kafka Streams: библиотека (не отдельный кластер), запускается прямо в вашем приложении, имеет exactly-once через Kafka transactions. 50k msg/s — комфортный диапазон. Flink оправдан, когда есть stateful per-key processing, complex windowing, joins с внешними данными, или требуются гарантии EOS на heterogeneous sinks. Не используйте Flink, если можно обойтись Kafka Streams.",
+      "studyHint": "Повторите урок 01 — раздел 'Когда Flink — правильный выбор, а когда — нет'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m00-01-q3",
+      "type": "multiple-choice",
+      "question": "Что нового принёс Flink 2.0 (март 2025) — major release после 8 лет минорных?",
+      "options": [
+        { "id": "a", "text": "Поддержку SQL впервые" },
+        { "id": "b", "text": "Disaggregated State (FLIP-423), ForSt state backend, Async State API V2, DataStream V2; удаление DataSet API, Scala API, SourceFunction/SinkFunction" },
+        { "id": "c", "text": "Интеграцию с Hadoop YARN" },
+        { "id": "d", "text": "Поддержку Python через PyFlink впервые" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink 2.0 — cloud-native переориентация. Главные новшества: Disaggregated State (primary state на S3, локальный диск только cache), ForSt backend (LSM-tree с remote storage), Async State API V2 для non-blocking state access, DataStream V2 (FLIP-409). Удалены legacy API: DataSet (заменён unified DataStream + Boundedness), Scala API (Java-first), SourceFunction/SinkFunction (заменены FLIP-27 и FLIP-191). SQL был с 1.9, Python с 1.9, Hadoop YARN с самого начала.",
+      "studyHint": "Повторите урок 01 — раздел 'Flink 2.0 — cloud-native era'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-01-q4",
+      "type": "true-false",
+      "question": "Flink 2.2 (декабрь 2025) добавил ML_PREDICT и VECTOR_SEARCH функции в SQL — теперь можно вызывать LLM модели прямо из streaming queries.",
+      "correctAnswer": true,
+      "explanation": "Flink 2.2 — AI era. ML_PREDICT (FLIP-526) позволяет в SQL вызывать registered ML models (классификация, регрессия), VECTOR_SEARCH (FLIP-540) — векторный поиск по embeddings прямо в streaming SQL. Plus async functions в PyFlink для high-latency external lookups. Это disrupts pattern, где обычно ML inference делается через external service call с Async I/O — теперь можно как первоклассную SQL операцию. Также появился отдельный sub-project Flink Agents (0.2.1, март 2026) для event-driven AI agents.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

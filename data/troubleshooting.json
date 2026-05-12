@@ -1,0 +1,234 @@
+{
+  "categories": [
+    {
+      "id": "checkpoints",
+      "name": "Checkpoint issues",
+      "issues": [
+        {
+          "title": "Checkpoint timeout",
+          "symptoms": ["lastCheckpointDuration > execution.checkpointing.timeout", "Checkpoint failed alerts"],
+          "causes": [
+            "Backpressure → barrier alignment не успевает",
+            "Large state без incremental checkpoints",
+            "RocksDB compaction совпадает с checkpoint",
+            "Slow DFS (S3 throttling)"
+          ],
+          "fixes": [
+            "Enable unaligned checkpoints: execution.checkpointing.unaligned: true",
+            "Enable GIC: state.backend.changelog.enabled: true",
+            "Increase timeout: execution.checkpointing.timeout: 30min",
+            "Decrease interval to spread cost",
+            "Use Flink 2.0 file merging (FLIP-306)"
+          ]
+        },
+        {
+          "title": "Checkpoint size растёт unbounded",
+          "symptoms": ["Каждый checkpoint больше предыдущего", "DFS bandwidth wasted"],
+          "causes": [
+            "State без TTL — растёт без удаления",
+            "Sliding windows с большим range",
+            "Operator state накапливается (например, ListState без cleanup)"
+          ],
+          "fixes": [
+            "Set StateTTLConfig: NeverReturnExpired + cleanupFullSnapshot",
+            "Reduce window size или switch на session windows с gap",
+            "Manual cleanup в onTimer callback"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "backpressure",
+      "name": "Backpressure",
+      "issues": [
+        {
+          "title": "Backpressure cascade — slow sink kills pipeline",
+          "symptoms": ["В UI sink operator backPressured=1000ms", "Throughput drops"],
+          "causes": [
+            "External system slow (DB, ES, Kafka cluster overloaded)",
+            "Sink parallelism too low",
+            "Synchronous I/O в RichSinkFunction"
+          ],
+          "fixes": [
+            "Async I/O для external lookups",
+            "Increase sink parallelism",
+            "Batch larger в sink (через KafkaSink batch.size)",
+            "Switch на AsyncSink V2 с retry strategies",
+            "RateLimiter в source (FLIP-535, Flink 2.2)"
+          ]
+        },
+        {
+          "title": "All operators backpressured — entire pipeline stalled",
+          "symptoms": ["Watermark stuck", "Throughput → 0"],
+          "causes": [
+            "Sink down полностью",
+            "Network bandwidth saturated",
+            "Checkpoint stuck (next can't start)"
+          ],
+          "fixes": [
+            "Check external system status",
+            "Buffer debloating: taskmanager.network.memory.buffer-debloat.enabled: true",
+            "Network buffer tuning: increase numberOfBuffers"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "name": "State issues",
+      "issues": [
+        {
+          "title": "RocksDB OOM-Killed TaskManager",
+          "symptoms": ["Pod OOMKilled", "Status.JVM.Memory.Direct usage высокий"],
+          "causes": [
+            "Misconfigured managed memory",
+            "Custom RocksDBOptionsFactory без write buffer manager",
+            "Too many state primitives per slot",
+            "Large key sizes"
+          ],
+          "fixes": [
+            "Use PredefinedOptions (DEFAULT, SPINNING_DISK_OPTIMIZED, FLASH_SSD_OPTIMIZED)",
+            "Ensure WriteBufferManager enabled (default)",
+            "Increase taskmanager.memory.managed.fraction: 0.5",
+            "Isolate state-heavy ops в свой slot sharing group",
+            "Consider switch на ForSt — state на S3, локальный диск только cache"
+          ]
+        },
+        {
+          "title": "State growth unbounded",
+          "symptoms": ["state.size метрика растёт линейно", "Diskpressure on nodes"],
+          "causes": [
+            "keyBy on high-cardinality field (user_id × session_id × ...)",
+            "No TTL",
+            "Sliding windows с long range"
+          ],
+          "fixes": [
+            "StateTTLConfig с cleanup strategies",
+            "Аккуратные partitioning стратегии",
+            "Periodic state pruning через onTimer",
+            "Monitor state.size + state.numberOfKeys метрики"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "watermarks",
+      "name": "Watermark issues",
+      "issues": [
+        {
+          "title": "Watermark stuck (no progress)",
+          "symptoms": ["currentInputWatermark не движется", "Windows не fire"],
+          "causes": [
+            "Idle source partition без withIdleness",
+            "Watermark generator не emit-ит на data-pull source",
+            "Разные источники, drift apart без alignment",
+            "Late event с очень старым timestamp"
+          ],
+          "fixes": [
+            "WatermarkStrategy.withIdleness(Duration.ofMinutes(1))",
+            "Watermark alignment (FLIP-217) для multi-source",
+            "Periodic emission strategy для poll-based sources",
+            "Verify timestamp assigner correct"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "exactly-once",
+      "name": "Exactly-once issues",
+      "issues": [
+        {
+          "title": "Data loss с EOS — Kafka transaction.timeout.ms expired",
+          "symptoms": ["После restart часть данных потеряна", "Kafka logs: 'transaction timed out'"],
+          "causes": [
+            "Flink restart took longer than Kafka transaction.timeout.ms",
+            "Default 15min не хватило"
+          ],
+          "fixes": [
+            "Set transaction.timeout.ms = 1 hour в Kafka producer config",
+            "Set transaction.max.timeout.ms = 3600000 в Kafka broker",
+            "Сократить downtime через faster recovery (incremental checkpoints, local recovery)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "name": "Memory model",
+      "issues": [
+        {
+          "title": "TaskManager OOM despite memory budget",
+          "symptoms": ["Pod killed reason: OOMKilled", "Outside JVM heap"],
+          "causes": [
+            "RocksDB native memory > managed memory budget",
+            "Network buffers misconfigured",
+            "Direct memory leak"
+          ],
+          "fixes": [
+            "taskmanager.memory.managed.fraction: 0.5",
+            "Verify shared block cache enabled",
+            "Don't override RocksDBOptionsFactory without WriteBufferManager",
+            "Monitor taskmanager.Status.JVM.Memory.Direct.MemoryUsed"
+          ]
+        },
+        {
+          "title": "Network buffer exhaustion",
+          "symptoms": ["'Insufficient number of network buffers' error"],
+          "causes": [
+            "Too many channels (high parallelism × inputs)",
+            "buffers-per-channel слишком низкий"
+          ],
+          "fixes": [
+            "Tune taskmanager.network.fraction (default 0.1)",
+            "taskmanager.network.memory.min/max",
+            "Уменьшить buffers-per-channel"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "production",
+      "name": "Production pitfalls",
+      "issues": [
+        {
+          "title": "Kryo fallback — 50% perf hit",
+          "symptoms": ["pipeline.generic-types logged warnings", "TypeInformation falls back to GenericType"],
+          "causes": [
+            "Map с lambda → generics erasure",
+            "Custom class без POJO requirements",
+            "Tuple types в lambdas"
+          ],
+          "fixes": [
+            "pipeline.generic-types: false (fail-fast)",
+            "Always POJO requirements: no-arg ctor, public fields/getters/setters",
+            "Use explicit .returns(TypeInformation) после lambda",
+            "Avro / Protobuf для cross-job interop"
+          ]
+        },
+        {
+          "title": "Late events silently dropped",
+          "symptoms": ["Window output missing data", "User complaints about missing records"],
+          "causes": [
+            "No allowedLateness",
+            "No side output для late events"
+          ],
+          "fixes": [
+            "ALWAYS: .allowedLateness(Duration.ofMinutes(5))",
+            ".sideOutputLateData(lateTag) для capture",
+            "Alert on late event counter > threshold"
+          ]
+        },
+        {
+          "title": "savepoint не работает после change topology",
+          "symptoms": ["State not restored from savepoint"],
+          "causes": ["UIDs операторов не выставлены", "Topology поменялась так, что Flink не может match state"],
+          "fixes": [
+            "Always: stream.uid('descriptive-id') для каждого stateful operator",
+            "flink run -s savepoint --allowNonRestoredState",
+            "State Processor API для bootstrap state из batch"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "moduleId": "00-course-intro",
+  "title": "Module 00 Exam — Введение в курс",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m00-exam",
+    "description": "6-question integrated exam for Module 00"
+  },
+  "questions": [
+    {
+      "id": "flink-m00-exam-q1",
+      "type": "multiple-choice",
+      "question": "Какие пять core features делают Apache Flink уникальным среди streaming engines?",
+      "options": [
+        { "id": "a", "text": "Поддержка только SQL, integration with Hadoop, slot allocation, batch processing, REST API" },
+        { "id": "b", "text": "Stateful processing per key, exactly-once семантика, event time + watermarks, low latency at scale, true streaming (batch как special case)" },
+        { "id": "c", "text": "Высокая memory efficiency, file-based storage, JVM tuning, distributed tracing, K8s native" },
+        { "id": "d", "text": "Только high throughput и horizontal scaling" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Пять core features Flink: (1) stateful per-key processing с ValueState/MapState/ListState; (2) exactly-once через ABS + 2PC sinks; (3) event time + watermarks для correctness; (4) миллисекундная latency на TBs state; (5) true streaming с batch как Boundedness.BOUNDED special case. Это отличает Flink от Spark Structured Streaming (micro-batch), Kafka Streams (library, limited state), ksqlDB (Kafka-only).",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-exam-q2",
+      "type": "multiple-choice",
+      "question": "Use case: real-time fraud detection с 5-минутным sliding window per user, exactly-once гарантия на 100k tx/sec. Какой engine?",
+      "options": [
+        { "id": "a", "text": "Spark Structured Streaming в micro-batch mode" },
+        { "id": "b", "text": "Kafka Streams library" },
+        { "id": "c", "text": "Apache Flink — stateful, EOS, low latency, true streaming" },
+        { "id": "d", "text": "ksqlDB" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Classic Flink use case: per-user stateful (ValueState с историей транзакций), sliding window 5min (Flink native), 100k tx/sec (Flink хорошо масштабируется), exactly-once (2PC на Kafka sink). Spark SS может справиться, но micro-batch latency ≥ batch interval. Kafka Streams library ограничен в state size и не имеет sliding window нативно. ksqlDB не справится со 100k и stateful complexity.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m00-exam-q3",
+      "type": "multiple-choice",
+      "question": "Что значит 'disaggregated state' в Flink 2.0?",
+      "options": [
+        { "id": "a", "text": "State разнесён по нескольким TaskManager-ам без репликации" },
+        { "id": "b", "text": "Primary state хранится на distributed storage (S3/HDFS/GCS), локальный диск используется как cache. Recovery time не зависит от размера state. Реализуется ForSt state backend" },
+        { "id": "c", "text": "Это deprecated концепт из Flink 1.x" },
+        { "id": "d", "text": "Старое название RocksDB backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Disaggregated state (FLIP-423) — cloud-native подход: primary state на S3, локальный диск только cache. Checkpoint становится metadata-only operation, recovery time независим от размера state. ForSt backend (FLIP-427) реализует это поверх LSM-tree с async I/O. Это disruptive — раньше size of local disk ограничивал state size. VLDB 2025 paper показывает 75-120% throughput vs local RocksDB для I/O-heavy queries с 1GB cache.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m00-exam-q4",
+      "type": "multiple-choice",
+      "question": "Какое условие должно быть выполнено, чтобы Flink job мог работать в exactly-once режиме end-to-end?",
+      "options": [
+        { "id": "a", "text": "Только запустить env.enableCheckpointing()" },
+        { "id": "b", "text": "Source должен поддерживать replay по offset, internal exactly-once гарантируется ABS, sink должен быть transactional (Two-Phase Commit) или idempotent" },
+        { "id": "c", "text": "Использовать только Java, не Python" },
+        { "id": "d", "text": "Развернуть на Kubernetes" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "E2E exactly-once требует трёх компонентов: (1) replayable source (Kafka с offset, S3 с known position); (2) internal EOS через ABS алгоритм barriers; (3) transactional sink (TwoPhaseCommitSinkFunction или новый SinkV2 с Committer) — например KafkaSink с DeliveryGuarantee.EXACTLY_ONCE, или idempotent sink (uniqueness через primary key). Если хотя бы один компонент at-least-once → итог at-least-once.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m00-exam-q5",
+      "type": "multiple-choice",
+      "question": "Почему Flink можно назвать 'cloud-native' с 2.0?",
+      "options": [
+        { "id": "a", "text": "Он работает только в облаке" },
+        { "id": "b", "text": "Disaggregated state (state на S3, не локальный диск), Flink Kubernetes Operator (autoscaling FLIP-271, in-place rescaling FLIP-291), Application mode, native K8s integration, нет привязки к локальным дискам" },
+        { "id": "c", "text": "Только AWS-совместимость" },
+        { "id": "d", "text": "Использует cloud-native YAML synthesizer" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink 2.0 — cloud-native переориентация. Disaggregated state делает state portable между nodes (не tied к local disk). Flink Kubernetes Operator (official Apache project) с autoscaler и in-place rescaling делает elastic scaling возможным. Application mode (без shared Session cluster) — proper Kubernetes deployment модель. Это сравнимо с Snowflake / BigQuery подходом — compute и storage decoupled.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m00-exam-q6",
+      "type": "true-false",
+      "question": "Курс намеренно не покрывает DataSet API, Scala API, SourceFunction, SinkFunction и Stateful Functions — потому что эти технологии removed или sunsetted в Flink 2.x экосистеме.",
+      "correctAnswer": true,
+      "explanation": "Курс — 2.x-first. DataSet API removed в 2.0 (заменён unified DataStream с Boundedness). Scala API removed (Java-first философия). SourceFunction/SinkFunction/SinkV1 removed (FLIP-27 Source API + FLIP-191 SinkV2). Stateful Functions sunsetted в 2026 из-за неактивности. Учить legacy не имеет смысла — production deployments активно мигрируют на новые API. Также не покрываются Reactive Mode (заменён Adaptive Scheduler), Queryable State (deprecated), flink-conf.yaml format (заменён standard YAML config.yaml).",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

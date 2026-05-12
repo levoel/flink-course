@@ -1,0 +1,99 @@
+---
+title: "Обзор модуля: Patterns и архитектура"
+description: "Fraud detection, real-time joins, CDC pipelines, Flink Agents preview"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Patterns", "Architecture", "Fraud Detection", "CDC", "Flink Agents"]
+---
+
+# Patterns и архитектура — обзор модуля
+
+Знание API не делает architect. Этот модуль — реальные production patterns и architectural decisions. Закрываем взгляд на новое: **Flink Agents** sub-project (0.2.1, март 2026).
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Stateful microservice pattern | Event-sourcing + Flink, vs traditional CRUD |
+| 03 | Real-time dim joins | Broadcast vs lookup vs temporal join |
+| 04 | **CDC end-to-end pipeline** | Debezium → Kafka → Flink CDC → Iceberg |
+| 05 | Real-time recommendations | Feature store, async lookups, ML_PREDICT inline |
+| 06 | Anti-pattern: tiny state per huge key cardinality | TTL strategies, alternative architectures |
+| 07 | Lambda vs Kappa architecture | When each, Materialize/RisingWave hybrid |
+| 08 | **Flink Agents preview (0.2.1)** | Event-driven AI agents на Flink runtime, MCP integration |
+
+## Top patterns
+
+### 1. Fraud Detection (canonical Flink job)
+
+```java
+stream
+    .keyBy(Transaction::getUserId)
+    .process(new FraudDetector())  // ValueState с историей
+    .filter(alert -> alert.score > 0.7)
+    .sinkTo(KafkaSink.<Alert>builder()
+        .setDeliveryGuarantee(EXACTLY_ONCE)
+        .build());
+```
+
+Внутри `FraudDetector`:
+- `ValueState<History>` — последние N транзакций
+- `MapState<RuleId, Counter>` — нарушения правил
+- Event-time timers для clearing old data
+
+### 2. CDC pipeline
+
+```yaml
+# Flink CDC 3.6 pipeline.yaml
+source:
+  type: postgres
+sink:
+  type: paimon
+```
+
+Schema evolution propagates automatically.
+
+### 3. Real-time recommendations
+
+```sql
+SELECT user_id,
+    ML_PREDICT('recommender_model', user_features) AS recommendations
+FROM user_actions
+WHERE TIMESTAMPDIFF(SECOND, event_time, CURRENT_TIMESTAMP) < 60;
+```
+
+С Flink 2.2 ML_PREDICT делает LLM call прямо из SQL.
+
+## Flink Agents — новый sub-project (preview)
+
+Released October 2025 (0.1.0), March 2026 (0.2.1). FLIP-531.
+
+```python
+from flink_agents import Agent, Tool, Memory
+
+agent = Agent(
+    name="customer-support",
+    model="claude-opus-4-7",
+    tools=[
+        Tool.from_kafka_topic("orders"),
+        Tool.from_postgres("users"),
+    ],
+    memory=Memory.kafka_topic("conversations"),
+)
+
+agent.run_on_stream(input_stream="support_requests")
+```
+
+Event-driven AI agents с exactly-once guarantees для actions. Use case: автоматизация customer support, real-time decision making.
+
+## Killer takeaway
+
+В 2026 Flink становится не просто stream processor, а **stateful AI runtime**. Materialized Tables + ML_PREDICT + Flink Agents — это disrupts pattern «stream processing → external ML service». Сейчас inference запускается прямо в job.
+
+## Связи
+
+- **Модуль 03 (State)** — fraud detection patterns
+- **Модуль 07 (EOS)** — exactly-once для AI agent actions
+- **Модуль 10 (Connectors + CDC)** — pipeline architecture

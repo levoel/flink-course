@@ -1,0 +1,104 @@
+---
+title: "Обзор модуля: Table API и SQL"
+description: "Dynamic tables, temporal joins, Materialized Tables, ML_PREDICT + VECTOR_SEARCH (Flink 2.2)"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Table API", "SQL", "Materialized Tables", "ML_PREDICT", "VECTOR_SEARCH"]
+---
+
+# Table API и SQL — обзор модуля
+
+Table API/SQL — declarative layer Flink. SQL streaming pipelines дают высокую productivity для analysts и data engineers. Flink 2.0 принёс Materialized Tables (GA), 2.2 — AI functions (ML_PREDICT, VECTOR_SEARCH).
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Dynamic Tables theory | Stream-table duality, continuous queries |
+| 03 | DDL syntax | CREATE TABLE, time attributes, watermarks в DDL |
+| 04 | Joins | Regular, interval, temporal (FOR SYSTEM_TIME AS OF), lookup |
+| 05 | **Materialized Tables (FLIP-435)** | Declarative refresh, Paimon catalog |
+| 06 | **AI functions — ML_PREDICT, VECTOR_SEARCH (2.2)** | LLM calls из SQL |
+| 07 | Pattern Match (MATCH_RECOGNIZE) | CEP в SQL |
+| 08 | Hive integration | Catalog, query syntax |
+
+## Dynamic Tables
+
+Stream-table duality — base concept Flink SQL:
+- **Stream → Table**: changelog accumulation
+- **Table → Stream**: changelog emission
+
+```sql
+-- Continuous query на streaming source
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    order_time TIMESTAMP(3),
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'format' = 'avro-confluent',
+    ...
+);
+
+SELECT user_id, COUNT(*), AVG(amount)
+FROM orders
+GROUP BY user_id, TUMBLE(order_time, INTERVAL '5' MINUTE);
+```
+
+## Joins — четыре типа
+
+| Тип | When |
+|---|---|
+| **Regular join** | Stream × Stream, state grows unbounded — нужен idle state retention |
+| **Interval join** | На bounded time window: `b.t BETWEEN a.t - INTERVAL '1' HOUR AND a.t` |
+| **Temporal join** | `FOR SYSTEM_TIME AS OF` — версионированная dim table |
+| **Lookup join** | На каждый event lookup в external (DB/REST), Async I/O |
+
+## Materialized Tables (Flink 2.0 GA, FLIP-435)
+
+Declarative streaming с auto-refresh:
+
+```sql
+CREATE MATERIALIZED TABLE user_metrics
+FRESHNESS = INTERVAL '30' SECOND
+AS SELECT user_id,
+   COUNT(*) AS event_count,
+   AVG(amount) AS avg_amount
+FROM orders
+GROUP BY user_id;
+```
+
+Backend — **Apache Paimon** (streaming-first lakehouse). Flink создаёт refresh job в JobManager. ALTER → новый refresh job замещает.
+
+## AI functions (Flink 2.2)
+
+### ML_PREDICT (FLIP-526)
+
+```sql
+CREATE MODEL fraud_classifier
+WITH ('provider' = 'openai', 'model' = 'gpt-4');
+
+SELECT user_id,
+       ML_PREDICT('fraud_classifier', transaction) AS score
+FROM transactions;
+```
+
+### VECTOR_SEARCH (FLIP-540)
+
+```sql
+SELECT order_id, VECTOR_SEARCH(
+    'embeddings_index',
+    embedding_vector,
+    5  -- top-K
+) AS similar_orders
+FROM orders;
+```
+
+## Killer takeaway
+
+Для batch-aware analysts SQL — главный entrypoint в Flink. Materialized Tables + AI functions делают возможным написать ML inference pipeline в 10 строк SQL. Это disruptive.

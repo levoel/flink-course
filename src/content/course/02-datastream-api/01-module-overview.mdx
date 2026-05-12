@@ -1,0 +1,72 @@
+---
+title: "Обзор модуля: DataStream API"
+description: "Classic API + DataStream V2 (FLIP-409), ProcessFunction, Async I/O, timers, side outputs"
+order: 1
+difficulty: "advanced"
+estimatedTime: 12
+topics: ["DataStream API", "ProcessFunction", "Async I/O", "FLIP-409"]
+---
+
+# DataStream API — обзор модуля
+
+DataStream API — основной программный интерфейс Flink. В этом модуле препарируем classic API и preview DataStream V2 (FLIP-409, experimental в 2.0). Особое внимание — низкоуровневая ProcessFunction family и Async I/O.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | StreamExecutionEnvironment basics | sources, sinks, transformations |
+| 03 | ProcessFunction family | KeyedProcessFunction, BroadcastProcessFunction |
+| 04 | Timers — event-time и processing-time | onTimer callback, registerEventTimeTimer |
+| 05 | Side Outputs | OutputTag, .getSideOutput(), use cases |
+| 06 | Async I/O | unorderedWait, capacity, ORDERED vs UNORDERED |
+| 07 | DataStream API V2 (FLIP-409, preview) | Новые abstractions, миграция future |
+
+## Ключевые концепты
+
+### ProcessFunction — low-level API
+
+`KeyedProcessFunction` даёт доступ к: state, timers, side outputs. Это building block для всего stateful processing:
+
+```java
+public class FraudDetector
+        extends KeyedProcessFunction<Long, Tx, Alert> {
+
+    private ValueState<Long> lastTimeState;
+
+    public void open(Configuration c) {
+        lastTimeState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("lt", Long.class));
+    }
+
+    public void processElement(Tx tx, Context ctx, Collector<Alert> out) {
+        // access state, register timers
+        ctx.timerService().registerEventTimeTimer(tx.ts + 60_000);
+    }
+
+    public void onTimer(long ts, OnTimerContext ctx, Collector<Alert> out) {
+        // fires when watermark > ts
+    }
+}
+```
+
+### Async I/O для external lookups
+
+Для lookup в DB / REST / cache без блокировки thread:
+
+```java
+AsyncDataStream
+    .unorderedWait(stream, new AsyncDbLookup(), 1000, MILLISECONDS, 100)
+    .uid("async-lookup");
+```
+
+Capacity 100 = до 100 одновременных in-flight requests. `unorderedWait` сохраняет order среди ready callbacks, не waiting; `orderedWait` сохраняет full ordering но slower.
+
+### DataStream V2 (FLIP-409, experimental)
+
+Переосмысление API после 9 лет: новые building blocks (DataStream, ProcessFunction, Partitioning + extensions). Цель — чище и более composable. Не для production до 2.3-2.4.
+
+## Killer takeaway
+
+99% production Flink jobs можно написать на `KeyedProcessFunction` + timers + side outputs. Это **самый powerful** abstraction в API. Higher-level (windows, joins) — синтаксический сахар поверх ProcessFunction.

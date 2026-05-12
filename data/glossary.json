@@ -1,0 +1,238 @@
+{
+  "categories": [
+    {
+      "id": "flink-fundamentals",
+      "name": "Основы Flink",
+      "terms": [
+        {
+          "term": "True streaming",
+          "termEn": "True Streaming",
+          "definition": "Подход к stream processing, где каждая запись обрабатывается отдельно с миллисекундной latency (через mailbox processor). Противоположность micro-batch (Spark Structured Streaming), где записи группируются в batch. Flink — true streaming с первого дня.",
+          "example": "// Каждая запись обрабатывается независимо\nstream.keyBy(x -> x.userId)\n      .process(new ProcessFunction() {\n          // вызывается per-record\n          void processElement(Event e, Context ctx, Collector out) {...}\n      });",
+          "relatedLessons": [
+            { "title": "Что такое Apache Flink", "slug": "00-course-intro/01-what-is-flink" }
+          ]
+        },
+        {
+          "term": "JobManager",
+          "termEn": "JobManager",
+          "definition": "Координатор Flink кластера. Состоит из трёх внутренних компонентов: Dispatcher (REST API), ResourceManager (управление slots), JobMaster (per-job lifecycle). В HA setup JobManager-ов несколько с leader election через ZK или K8s ConfigMaps.",
+          "example": "# Web UI: localhost:8081\n# REST API: GET /jobs, POST /jars/upload, etc.\n# Из CLI:\nflink list           # → Dispatcher\nflink run jar        # → JobMaster создаётся",
+          "relatedLessons": [
+            { "title": "Архитектура", "slug": "01-architecture/01-jobmanager-components" }
+          ]
+        },
+        {
+          "term": "TaskManager",
+          "termEn": "TaskManager",
+          "definition": "Worker процесс Flink. JVM с N task slots. Memory делится поровну между slots (CPU нет — soft isolation). Hosting place для subtasks. В Adaptive Scheduler можно in-place rescale (FLIP-291).",
+          "example": "# taskmanager.numberOfTaskSlots: 4\n# taskmanager.memory.process.size: 4g\n# Память делится: framework + task heap + managed + network + JVM\n#               + metaspace + JVM overhead",
+          "relatedLessons": [
+            { "title": "TaskManager memory model", "slug": "15-performance-tuning/02-memory-model" }
+          ]
+        },
+        {
+          "term": "Task Slot",
+          "termEn": "Task Slot",
+          "definition": "Единица планирования в Flink. Каждый subtask занимает один slot. Memory TaskManager-а делится поровну между slots. Через slot sharing groups несколько операторов одной job могут жить в одном slot.",
+          "example": "// Default — все операторы в одной slot sharing group:\nstream.map(...).keyBy(...).window(...)\n      .slotSharingGroup('default')\n\n// Изолировать heavy state operator:\n.slotSharingGroup('heavy-state')",
+          "relatedLessons": [
+            { "title": "Slots and chaining", "slug": "01-architecture/04-slots-chaining" }
+          ]
+        },
+        {
+          "term": "Operator Chaining",
+          "termEn": "Operator Chaining",
+          "definition": "Оптимизация Flink: соседние операторы со совместимым parallelism и forward partitioning склеиваются в один task → одна нить, ноль сериализации, ноль network shuffle. Может ломать scaling — операторы внутри chain не масштабируются независимо.",
+          "example": "// По умолчанию map + filter chain'атся:\nstream.map(...).filter(...)\n\n// Disable chaining:\nstream.map(...).disableChaining()\n\n// Start new chain:\nstream.map(...).startNewChain()",
+          "relatedLessons": [
+            { "title": "Operator chaining", "slug": "01-architecture/04-slots-chaining" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "name": "State Management",
+      "terms": [
+        {
+          "term": "Keyed State",
+          "termEn": "Keyed State",
+          "definition": "State, доступный после keyBy(). Распределяется по key groups (hash(key) % maxParallelism). Каждый subtask владеет некоторыми key groups. Primitives: ValueState, ListState, MapState, ReducingState, AggregatingState.",
+          "example": "public class FraudDetector extends KeyedProcessFunction<Long, Tx, Alert> {\n    private ValueState<Long> lastTimeState;\n    \n    public void open(Configuration c) {\n        lastTimeState = getRuntimeContext().getState(\n            new ValueStateDescriptor<>('last-time', Long.class));\n    }\n}",
+          "relatedLessons": [
+            { "title": "Keyed state", "slug": "03-state-management/02-keyed-state" }
+          ]
+        },
+        {
+          "term": "Key Group",
+          "termEn": "Key Group",
+          "definition": "Внутренний механизм rescaling. hash(key) % maxParallelism определяет key group. Количество key groups = maxParallelism (immutable!). При parallelism N: каждый subtask владеет maxParallelism/N key groups. Default maxParallelism: 128 при parallelism ≤128, иначе round-up степень 2.",
+          "example": "// Setting maxParallelism is CRITICAL!\nenv.setMaxParallelism(256);  // immutable после старта\n\n// Если parallelism=4, maxParallelism=256:\n// subtask 0: kg 0-63, subtask 1: 64-127, ...\n// При rescale до 8: каждый subtask получит 32 kg",
+          "relatedLessons": [
+            { "title": "Key groups math", "slug": "03-state-management/03-key-groups" }
+          ]
+        },
+        {
+          "term": "RocksDB state backend",
+          "termEn": "EmbeddedRocksDBStateBackend",
+          "definition": "Workhorse state backend Flink. LSM-tree на local disk через JNI. Поддерживает state в TBs (size of local disk). Read/write 5-10x медленнее heap (через serialization). Каждый state primitive = отдельная Column Family.",
+          "example": "state.backend.type: rocksdb\nstate.checkpoints.dir: s3://my-bucket/checkpoints\nstate.backend.incremental: true   # incremental snapshots\nstate.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED",
+          "relatedLessons": [
+            { "title": "RocksDB internals", "slug": "04-rocksdb-forst/01-lsm-internals" }
+          ]
+        },
+        {
+          "term": "ForSt",
+          "termEn": "ForSt State Backend (Flink 2.0)",
+          "definition": "'For Streaming' — новый state backend Flink 2.0 (FLIP-427). LSM-tree, но SST файлы primary живут на S3/HDFS/GCS, локальный диск только cache. Async I/O. Disaggregated state — recovery time не зависит от размера state.",
+          "example": "state.backend.type: forst\nstate.backend.forst.primary-dir: s3://my-bucket/forst-state\nstate.backend.forst.local-dir: /tmp/forst-cache\n# REQUIRES Async State API V2!",
+          "relatedLessons": [
+            { "title": "ForSt deep", "slug": "04-rocksdb-forst/05-forst-disaggregated" }
+          ]
+        },
+        {
+          "term": "Async State API V2",
+          "termEn": "Async State API V2 (Flink 2.0)",
+          "definition": "Новый non-blocking state access API (FLIP-424/425). Asynchronous Execution Controller (AEC) разделяет record processing от state access. Обязателен для ForSt — синхронный API через ForSt деградирует до sync DFS access (катастрофа по latency).",
+          "example": "// Old (sync):\nLong v = state.value();\n\n// New (async):\nstate.asyncValue().thenAccept(v -> {\n    if (v == null) state.asyncUpdate(1);\n    else state.asyncUpdate(v + 1);\n});",
+          "relatedLessons": [
+            { "title": "Async State API", "slug": "03-state-management/05-async-state-v2" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "time-watermarks",
+      "name": "Time & Watermarks",
+      "terms": [
+        {
+          "term": "Event Time",
+          "termEn": "Event Time",
+          "definition": "Время, когда событие произошло в источнике (embedded в record). Противоположность processing time (wall clock TaskManager-а). Event time — основа для correct semantics при reprocessing и backfill.",
+          "example": "WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))\n    .withTimestampAssigner((e, ts) -> e.getEventTime())  // ← event time\n    .withIdleness(Duration.ofMinutes(1));",
+          "relatedLessons": [
+            { "title": "Event time", "slug": "05-time-watermarks/01-time-notions" }
+          ]
+        },
+        {
+          "term": "Watermark",
+          "termEn": "Watermark",
+          "definition": "Метка прогресса event time в потоке. Watermark = T значит «все события с timestamp ≤ T уже пришли». Используется для window emission, allowed lateness, side outputs для late events.",
+          "example": "// Bounded out-of-orderness — самая частая стратегия\n.forBoundedOutOfOrderness(Duration.ofSeconds(20))\n// watermark = maxObservedTs - 20s\n\n// Идемпотентно для idle partitions:\n.withIdleness(Duration.ofMinutes(1))",
+          "relatedLessons": [
+            { "title": "Watermarks", "slug": "05-time-watermarks/02-watermark-generation" }
+          ]
+        },
+        {
+          "term": "Watermark Alignment",
+          "termEn": "Watermark Alignment (FLIP-217)",
+          "definition": "Координация watermark между sources (одна быстрая, другая медленная). Без alignment одна source может убежать по event time, и watermark всего pipeline застрянет на медленной. Alignment паузит fast sources.",
+          "example": ".forBoundedOutOfOrderness(Duration.ofSeconds(20))\n.withWatermarkAlignment(\n    'multi-source-group',\n    Duration.ofSeconds(20),  // max-allowed-drift\n    Duration.ofSeconds(1)    // update-interval\n);",
+          "relatedLessons": [
+            { "title": "Watermark alignment", "slug": "05-time-watermarks/04-watermark-alignment" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "checkpoints",
+      "name": "Checkpoints & Savepoints",
+      "terms": [
+        {
+          "term": "Checkpoint",
+          "termEn": "Checkpoint",
+          "definition": "Распределённый snapshot всего job state, координируется CheckpointCoordinator на JobManager. Реализован через ABS (Asynchronous Barrier Snapshotting) — адаптация Chandy-Lamport. Срабатывает периодически.",
+          "example": "execution.checkpointing.interval: 60s\nexecution.checkpointing.mode: EXACTLY_ONCE\nexecution.checkpointing.timeout: 10min\nexecution.checkpointing.max-concurrent-checkpoints: 1",
+          "relatedLessons": [
+            { "title": "Checkpointing", "slug": "06-checkpointing-savepoints/01-abs-algorithm" }
+          ]
+        },
+        {
+          "term": "Savepoint",
+          "termEn": "Savepoint",
+          "definition": "Manual snapshot для planned upgrade. Canonical format (unified, портабельный) или native (1.15+). Owned by user — не удаляется автоматически. Используется при migration: stop with savepoint → modify code → run -s savepoint.",
+          "example": "# Stop with savepoint:\nflink stop --savepointPath s3://bucket/savepoints <jobid>\n\n# Restore:\nflink run -s s3://bucket/savepoints/<savepoint> jar.jar\n\n# Canonical (cross-backend) vs Native (fast):\nflink stop --savepoint-format canonical ...",
+          "relatedLessons": [
+            { "title": "Savepoints", "slug": "06-checkpointing-savepoints/05-savepoints" }
+          ]
+        },
+        {
+          "term": "Aligned vs Unaligned Checkpoints",
+          "termEn": "Aligned / Unaligned Checkpoints",
+          "definition": "Aligned — оператор блокирует канал A после получения barrier, ждёт barrier на всех каналах, потом snapshot. Под backpressure alignment долгий. Unaligned (FLIP-76, 1.11+) — barrier обгоняет in-flight записи, in-flight persistится как ChannelState.",
+          "example": "execution.checkpointing.unaligned: true\nexecution.checkpointing.aligned-checkpoint-timeout: 30s\n# Start aligned, escalate to unaligned при alignment > 30s",
+          "relatedLessons": [
+            { "title": "Aligned vs Unaligned", "slug": "06-checkpointing-savepoints/03-aligned-unaligned" }
+          ]
+        },
+        {
+          "term": "GIC / DSTL",
+          "termEn": "Generic Log-Based Incremental Checkpoints",
+          "definition": "Changelog state backend (FLIP-158, 1.15+ MVP). Каждый state mutation дубль-пишется: в underlying backend (RocksDB) и в DSTL (Durable Short-term Log) на DFS. Checkpoint = flush DSTL → ms. Materialization периодическая.",
+          "example": "state.backend.changelog.enabled: true\nstate.backend.changelog.storage: filesystem\ndstl.dfs.base-path: s3://my-bucket/dstl\nstate.backend.changelog.periodic-materialize.interval: 10min",
+          "relatedLessons": [
+            { "title": "GIC / DSTL", "slug": "06-checkpointing-savepoints/04-changelog-state" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "exactly-once",
+      "name": "Exactly-Once",
+      "terms": [
+        {
+          "term": "Two-Phase Commit",
+          "termEn": "Two-Phase Commit (2PC)",
+          "definition": "Протокол для transactional sinks: (1) beginTransaction → write → preCommit на barrier (flush НЕ commit, txn в state); (2) notifyCheckpointComplete → commit. Recovery: read pending txn из state → recoverAndCommit.",
+          "example": "KafkaSink.<String>builder()\n    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)\n    .setTransactionalIdPrefix('my-app')\n    .setProperty('transaction.timeout.ms', '900000')  // 15min — больше чем downtime\n    .build();",
+          "relatedLessons": [
+            { "title": "Two-Phase Commit", "slug": "07-exactly-once/02-two-phase-commit" }
+          ]
+        },
+        {
+          "term": "SinkV2 API",
+          "termEn": "Sink V2 API (FLIP-191)",
+          "definition": "Modern sink API: Sink factory создаёт SinkWriter (emit Committables на barrier) и Committer (actual commit). SupportsPreCommitTopology — для compaction между Writer и Committer. SupportsPostCommitTopology — для Iceberg manifest publish.",
+          "example": "public class MySink implements Sink<Event>, SupportsPreCommitTopology<...> {\n    public SinkWriter<Event> createWriter(InitContext ctx) {...}\n    public Committer<MyCommittable> createCommitter() {...}\n    public DataStream<MyCommittable> addPreCommitTopology(stream) {...}\n}",
+          "relatedLessons": [
+            { "title": "SinkV2", "slug": "07-exactly-once/04-sinkv2-anatomy" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "modern-features",
+      "name": "Modern features (2.x)",
+      "terms": [
+        {
+          "term": "Materialized Tables",
+          "termEn": "Materialized Tables (FLIP-435)",
+          "definition": "Declarative streaming в Flink 2.0 GA. CREATE MATERIALIZED TABLE с FRESHNESS interval → Flink сам создаёт refresh job в JobManager. Backend — Apache Paimon. Заменяет манипуляции с CDC + INSERT INTO.",
+          "example": "CREATE MATERIALIZED TABLE user_metrics\nFRESHNESS = INTERVAL '30' SECOND\nAS SELECT user_id, COUNT(*) AS event_count\nFROM events GROUP BY user_id;",
+          "relatedLessons": [
+            { "title": "Materialized Tables", "slug": "08-table-sql/04-materialized-tables" }
+          ]
+        },
+        {
+          "term": "ML_PREDICT",
+          "termEn": "ML_PREDICT (FLIP-526)",
+          "definition": "Flink 2.2 — SQL function для inference ML моделей. CREATE MODEL зарегистрировать модель, потом ML_PREDICT(model_name, features) в SELECT. Работает с registered TensorFlow, ONNX, OpenAI endpoints.",
+          "example": "CREATE MODEL fraud_classifier\nWITH ('provider' = 'openai', 'model' = 'gpt-4');\n\nSELECT user_id, ML_PREDICT('fraud_classifier', transaction) AS score\nFROM transactions;",
+          "relatedLessons": [
+            { "title": "AI in SQL", "slug": "08-table-sql/06-ai-functions" }
+          ]
+        },
+        {
+          "term": "Flink Kubernetes Operator",
+          "termEn": "Flink Kubernetes Operator",
+          "definition": "Official Apache project для управления Flink jobs на K8s через CRDs (FlinkDeployment, FlinkSessionJob). Поддерживает Autoscaler (FLIP-271) и In-place rescaling (FLIP-291) через Adaptive Scheduler.",
+          "example": "apiVersion: flink.apache.org/v1beta1\nkind: FlinkDeployment\nspec:\n  image: flink:2.2.0-java17\n  flinkConfiguration:\n    jobmanager.scheduler: adaptive\n  jobManager: { resource: { memory: 2048m } }\n  taskManager: { resource: { memory: 4096m } }",
+          "relatedLessons": [
+            { "title": "K8s Operator", "slug": "13-deployment-k8s/03-k8s-operator" }
+          ]
+        }
+      ]
+    }
+  ]
+}

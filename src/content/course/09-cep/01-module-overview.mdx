@@ -1,0 +1,63 @@
+---
+title: "Обзор модуля: CEP (Complex Event Processing)"
+description: "Pattern API, MATCH_RECOGNIZE, NFA implementation, fraud detection"
+order: 1
+difficulty: "advanced"
+estimatedTime: 10
+topics: ["CEP", "Pattern", "MATCH_RECOGNIZE", "Fraud Detection"]
+---
+
+# CEP — обзор модуля
+
+Complex Event Processing — поиск patterns в streams of events. Flink имеет два API: DataStream Pattern API и SQL MATCH_RECOGNIZE. Use cases — fraud detection, anomaly detection, login attacks, IoT alarms.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Pattern API basics | begin, next, within, where |
+| 03 | Quantifiers и contiguity | times, oneOrMore, optional, followedBy, followedByAny |
+| 04 | MATCH_RECOGNIZE в SQL | Стандарт SQL:2016 |
+| 05 | NFA implementation | Как Flink эффективно матчит |
+| 06 | Time semantics в CEP | Event time vs processing time, AFTER MATCH SKIP |
+| 07 | Real-world examples | Fraud, login anomaly, IoT alarm cascade |
+
+## Pattern API
+
+```java
+Pattern<Event, ?> pattern = Pattern.<Event>begin("first")
+    .where(event -> event.getType().equals("LOGIN_FAIL"))
+    .times(3)
+    .within(Duration.ofMinutes(1));
+
+PatternStream<Event> ps = CEP.pattern(stream.keyBy(Event::getUserId), pattern);
+
+DataStream<Alert> alerts = ps.select(matches -> {
+    List<Event> fails = matches.get("first");
+    return new Alert("Brute force on " + fails.get(0).getUserId());
+});
+```
+
+## MATCH_RECOGNIZE в SQL
+
+```sql
+SELECT *
+FROM ticker
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY rowtime
+    MEASURES
+        START_ROW.rowtime AS start_time,
+        LAST(PRICE_DOWN.price) AS bottom_price,
+        LAST(PRICE_UP.price) AS top_price
+    PATTERN (START_ROW PRICE_DOWN+ PRICE_UP+)
+    DEFINE
+        PRICE_DOWN AS price < PREV(price),
+        PRICE_UP   AS price > PREV(price)
+);
+```
+
+## Killer takeaway
+
+Для простых patterns (sequence of N events) — Pattern API быстрее писать. Для аналитики и declarative — MATCH_RECOGNIZE. Когда complexity растёт — переходить на custom KeyedProcessFunction со state machine, это даёт maximum control.

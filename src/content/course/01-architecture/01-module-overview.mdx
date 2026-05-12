@@ -1,0 +1,66 @@
+---
+title: "Обзор модуля: Архитектура Flink"
+description: "JobManager (Dispatcher/RM/JobMaster), TaskManager, slots, graph transformation 4-уровневая"
+order: 1
+difficulty: "advanced"
+estimatedTime: 12
+topics: ["Architecture", "JobManager", "TaskManager", "Slots"]
+---
+
+# Архитектура Flink — обзор модуля
+
+Модуль 01 — карта местности Flink. Если в модуле 00 мы смотрели "что такое Flink", здесь препарируем внутренности: JobManager на три компонента (Dispatcher/RM/JobMaster), TaskManager memory model, graph transformation от StreamGraph до Physical execution, operator chaining и slot sharing groups.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | JobManager components | Dispatcher (REST), ResourceManager (slots), JobMaster (job lifecycle) |
+| 03 | TaskManager и slots | Memory model basics, slot — единица планирования |
+| 04 | Graph transformation | StreamGraph → JobGraph → ExecutionGraph → Physical |
+| 05 | Operator chaining и slot sharing | Когда blocked scaling, .disableChaining(), .slotSharingGroup() |
+| 06 | Application vs Session mode | Когда какой, lifecycle differences |
+| 07 | Job submission lifecycle | REST submit → Dispatcher → JobMaster → deploy step by step |
+
+## Ключевые концепты
+
+### JobManager — три компонента
+
+- **Dispatcher** — REST API, принимает job submissions, стартует JobMaster per job
+- **ResourceManager** — один на cluster, управляет slots, на K8s native общается с K8s API
+- **JobMaster** — один на job, отвечает за life cycle, держит ExecutionGraph
+
+### Graph transformation
+
+```
+StreamGraph (API calls)
+  ↓ operator chaining optimization
+JobGraph (tasks с chained operators)
+  ↓ parallelism expansion
+ExecutionGraph (N ExecutionVertex per task)
+  ↓ slot allocation
+Physical execution (deployed на slots)
+```
+
+### Slot Sharing Groups
+
+By default все операторы job в slot-sharing-group `"default"`. Это позволяет N параллельных копий полного pipeline-а уместиться в N slots. Изолировать state-heavy operator:
+
+```java
+stream.keyBy(...).process(heavyOp).slotSharingGroup("heavy-state");
+```
+
+### Operator Chaining
+
+Соседние операторы со совместимым parallelism и forward partitioning склеиваются в один task → одна нить, ноль сериализации. Но ломает independent scaling — disable если operators имеют разные resource needs.
+
+## Killer takeaway
+
+Slot — не CPU и не memory. Slot — это **единица планирования**. CPU shared (soft isolation), memory разделена поровну между slots. Это фундаментальное отличие от Spark executor model.
+
+## Связи
+
+- **Модуль 03 (State)** — slot sharing groups для изоляции state-heavy
+- **Модуль 13 (Deployment)** — Application vs Session mode на K8s
+- **Модуль 15 (Tuning)** — memory model deep dive

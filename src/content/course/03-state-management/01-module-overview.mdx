@@ -1,0 +1,79 @@
+---
+title: "Обзор модуля: State Management"
+description: "Operator vs Keyed state, key groups математика, Async State API V2"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["State", "Keyed State", "Key Groups", "Async State API"]
+---
+
+# State Management — обзор модуля (KILLER)
+
+State — то, что делает Flink уникальным. Без state Flink был бы просто message router. С state и exactly-once гарантиями — это distributed event processor с продвинутыми семантиками. Этот модуль препарирует state до key groups математики и async access API V2 (обязательной для ForSt в Flink 2.x).
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Operator state vs Keyed state | Когда какой, ListState/UnionListState/BroadcastState |
+| 03 | Keyed state primitives | ValueState, ListState, MapState, ReducingState, AggregatingState |
+| 04 | Key Groups математика | hash(key) % maxParallelism, rescaling, immutable maxParallelism |
+| 05 | State TTL | NeverReturnExpired, cleanup strategies |
+| 06 | **Async State API V2 (Flink 2.0)** | FLIP-424/425, AEC, callback model |
+| 07 | State Schema Evolution overview | Что Flink делает auto, что нельзя |
+
+## Ключевые концепты
+
+### Operator state vs Keyed state
+
+| Тип | Доступен | Use case |
+|---|---|---|
+| **Operator state** | Per parallel operator instance | Kafka source offsets, broadcast configs |
+| **Keyed state** | После `keyBy()`, per key | 99% stateful processing |
+
+### Keyed state primitives
+
+```java
+private ValueState<Long>          counter;       // single value per key
+private ListState<Event>          history;       // append-only list
+private MapState<String, Long>    countByType;   // hash map
+private ReducingState<Long>       sum;           // value + reduce function
+private AggregatingState<Tx, Avg> avg;           // accumulate IN, output OUT
+```
+
+### Key Groups математика
+
+```
+hash(key) % maxParallelism → key group
+key group / (maxParallelism / parallelism) → owning subtask
+```
+
+**Critical**: `maxParallelism` — immutable после старта. Default: 128 при parallelism ≤ 128, иначе round-up power of 2.
+
+При rescaling parallelism 4 → 8:
+- Каждый subtask владел 32 key groups
+- Теперь владеет 16
+- State key groups «переезжают» между subtasks
+- Если maxParallelism недостаточен — нельзя scale-up без State Processor API rebootstrapping
+
+### Async State API V2 (Flink 2.0)
+
+Новый non-blocking API (FLIP-424/425):
+
+```java
+// Old sync (blocking):
+Long v = state.value();
+state.update(v + 1);
+
+// New async (non-blocking via AEC):
+state.asyncValue().thenAccept(v -> {
+    state.asyncUpdate(v == null ? 1 : v + 1);
+});
+```
+
+**Async Execution Controller (AEC)** разделяет record processing от state access. Это обязательно для ForSt (state на S3) — sync через ForSt деградирует до sync DFS access = катастрофа по latency.
+
+## Killer takeaway
+
+`maxParallelism` — самая важная конфигурация Flink job. Установите её явно и щедро (например 1024) при первом запуске. Изменить её после старта = full re-bootstrapping через State Processor API. Это одна из главных production-проблем при scaling.

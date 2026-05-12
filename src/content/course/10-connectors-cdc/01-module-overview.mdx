@@ -1,0 +1,92 @@
+---
+title: "Обзор модуля: Connectors и Flink CDC"
+description: "FLIP-27 sources, Hybrid Source (FLIP-150), Iceberg/Paimon sinks, Flink CDC 3.6"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Connectors", "Flink CDC", "Hybrid Source", "Iceberg", "Paimon"]
+---
+
+# Connectors и Flink CDC — обзор модуля
+
+Connectors — главный интерфейс Flink с внешним миром. Этот модуль покрывает unified Source API (FLIP-27), Hybrid Source (combine batch + stream), modern Sink V2 для lakehouse, и отдельный sub-project **Flink CDC** для real-time DB replication.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | FLIP-27 Source API | Source factory, SplitEnumerator, SourceReader |
+| 03 | Kafka source/sink (FLIP-27 era) | KafkaSource, KafkaSink, dynamic partitions |
+| 04 | File systems (FileSource, FileSink) | Bulk vs record-wise, bucketing |
+| 05 | **Hybrid Source (FLIP-150)** | Backfill из S3 → live Kafka, switch policy |
+| 06 | Lakehouse sinks (Iceberg / Paimon / Hudi) | Pre-commit compaction, post-commit manifest |
+| 07 | JDBC source/sink, lookup joins | Async via Async I/O |
+| 08 | **Flink CDC 3.6** | Pipeline + Transform + Schema Evolution, AI integration |
+
+## FLIP-27 Source API
+
+Unified batch/streaming:
+```java
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("orders")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setBoundedness(Boundedness.CONTINUOUS_UNBOUNDED)  // или BOUNDED для batch
+    .build();
+```
+
+- `Source` — factory создаёт `SplitEnumerator` (JM) и `SourceReader` (TM)
+- `SplitEnumerator` распределяет splits → `SourceReader` fetch-ит данные
+- `SourceCoordinator` для watermark alignment, recovery
+
+## Hybrid Source (FLIP-150)
+
+Combine bounded + unbounded в одной job:
+
+```java
+HybridSource<String> source = HybridSource.builder(
+    FileSource.forRecordStreamFormat(format, Path.of("s3://bucket/historical/")).build()
+).addSource(
+    KafkaSource.<String>builder()...build()
+).build();
+```
+
+Use case: backfill 6 months истории из S3, потом switch на live Kafka stream — одна job.
+
+## Lakehouse sinks anatomy
+
+**Iceberg sink** через SinkV2:
+1. **SinkWriter** — пишет parquet files в S3
+2. **Pre-commit topology** — compaction мелких файлов
+3. **Committer** — commit data files + write Iceberg manifest
+4. **Post-commit topology** — publish manifest, update Hive metastore
+
+## Flink CDC 3.6
+
+Real-time replication из baz, sub-project с 3.1:
+
+```yaml
+# pipeline.yaml
+source:
+  type: postgres
+  hostname: db.example.com
+  port: 5432
+  username: cdc
+  password: ${PG_PASSWORD}
+  database: production
+
+transform:
+  - source-table: orders
+    projection: \\*, _id AS id, transform_amount(amount)
+
+sink:
+  type: paimon
+  warehouse: s3://lakehouse/paimon/
+```
+
+Поддерживает: Postgres, MySQL, MongoDB → Iceberg, Paimon, Hudi, Delta. С 3.3 — **AI Model Integration** (OpenAI embedding/chat в transform expressions).
+
+## Killer takeaway
+
+Для real-time replication из transactional DB в lakehouse Flink CDC 3.x — лучший choice 2026 года. Pipeline YAML без писания Java/SQL. С schema evolution propagation.

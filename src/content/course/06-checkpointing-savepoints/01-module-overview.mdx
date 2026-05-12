@@ -1,0 +1,85 @@
+---
+title: "Обзор модуля: Checkpointing и Savepoints"
+description: "Chandy-Lamport / ABS, aligned vs unaligned, GIC/DSTL, savepoint formats"
+order: 1
+difficulty: "advanced"
+estimatedTime: 18
+topics: ["Checkpointing", "Savepoints", "ABS", "Chandy-Lamport", "FLIP-76", "FLIP-158"]
+---
+
+# Checkpointing и Savepoints — обзор модуля (KILLER)
+
+Checkpointing — механизм fault tolerance Flink. Без checkpoints Flink был бы at-most-once stream processor. С ABS алгоритмом (Asynchronous Barrier Snapshotting) и transactional sinks Flink — exactly-once на TBs of state с миллисекундной recovery. Этот модуль — самый алгоритмически глубокий в курсе.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | **ABS algorithm walkthrough** | Chandy-Lamport адаптация, barriers, sync vs async phase |
+| 03 | Aligned vs Unaligned (FLIP-76) | Когда какой, in-flight ChannelState persistence |
+| 04 | Incremental Checkpoints | SharedStateRegistry, SST file sharing |
+| 05 | **GIC / DSTL (FLIP-158)** | Changelog State Backend, materialization cycle |
+| 06 | Savepoints — canonical vs native | Cross-backend migration, restore modes |
+| 07 | Restart strategies | fixed-delay, failure-rate, exponential-delay |
+| 08 | File Merging (FLIP-306, Flink 1.20) | Меньше DFS файлов в больших checkpoints |
+
+## ABS Algorithm — главный алгоритм
+
+1. CheckpointCoordinator инжектит **CheckpointBarrier(N)** во все sources
+2. Barrier течёт по DAG как обычная запись (flush немедленно)
+3. Source: snapshot state → forward barrier
+4. Operator с N input channels:
+   - Получил barrier на A → блокирует A, буферизирует
+   - Продолжает читать B, C, ... пока не получит barrier на всех
+   - **Alignment** complete → snapshot → forward barrier → unblock
+5. Sink: barrier на всех → snapshot → ack JM
+6. Все acks → checkpoint complete → callback `notifyCheckpointComplete`
+
+### Sync vs Async phases
+
+- **Sync phase** (barrier пришёл) — immutable snapshot создаётся (COW / RocksDB native snapshot — hardlinks на SST файлы)
+- **Async phase** — фактическая загрузка в DFS (processing продолжается!)
+
+## Aligned vs Unaligned
+
+| Aspect | Aligned | Unaligned (FLIP-76, 1.11+) |
+|---|---|---|
+| Под backpressure | Долгое alignment | Barrier обгоняет in-flight |
+| Snapshot size | Без in-flight | + ChannelState (in-flight buffers) |
+| Recovery cost | Дешёвая | Дороже (replay channel state) |
+| Best for | Низкая backpressure | Высокая backpressure |
+
+**Hybrid (1.14+)**: `execution.checkpointing.unaligned: true` + `aligned-checkpoint-timeout: 30s` — start aligned, escalate to unaligned если alignment > timeout.
+
+## Generic Log-Based Incremental Checkpoints (FLIP-158)
+
+**Проблема**: даже async + incremental, время checkpoint зависит от RocksDB flush cycle. Нестабильное.
+
+**Решение** — **Changelog State Backend** + **DSTL**:
+- Каждый state mutation дубль-пишется: в RocksDB + в DSTL (append-only log на DFS)
+- DSTL flush на checkpoint → ms (маленький append)
+- **Materialization** — periodic (default 10min): RocksDB snapshot → DFS → DSTL truncate
+
+```yaml
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+dstl.dfs.base-path: s3://my-bucket/dstl
+state.backend.changelog.periodic-materialize.interval: 10min
+```
+
+**Что даёт**: checkpoint interval seconds на TB-scale state, stable e2e latency для EOS sinks (Kafka transactions короче).
+
+## Savepoints vs Checkpoints
+
+| | Checkpoint | Savepoint |
+|---|---|---|
+| Trigger | Auto, periodic | Manual |
+| Format | Native | Canonical OR Native (1.15+) |
+| Purpose | Fault tolerance | Planned upgrade |
+| Lifecycle | Owned by Flink | Owned by user |
+| Backend switch | ❌ | ✅ (canonical) |
+
+## Killer takeaway
+
+Включайте **`state.backend.changelog.enabled: true`** для любой job с state > 10GB. Это решает production-essential проблему: stable checkpoint latency. Особенно критично для EOS sinks — короткие Kafka transactions выигрывают.

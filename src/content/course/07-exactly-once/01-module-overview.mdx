@@ -1,0 +1,98 @@
+---
+title: "Обзор модуля: Exactly-Once семантика"
+description: "Two-Phase Commit, SinkV2 API (FLIP-191), KafkaSink EOS, transaction.timeout pitfall"
+order: 1
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Exactly-Once", "Two-Phase Commit", "SinkV2", "FLIP-191"]
+---
+
+# Exactly-Once — обзор модуля (KILLER)
+
+Exactly-once семантика — главная гарантия Flink. Реализуется через ABS для internal state + Two-Phase Commit для transactional sinks. Этот модуль детально разбирает 2PC protocol, новый SinkV2 API и production pitfalls (особенно Kafka transaction.timeout.ms).
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | E2E EOS layers | Source replayable + internal ABS + transactional sink |
+| 03 | **Two-Phase Commit Protocol** | beginTransaction → preCommit → commit, recovery |
+| 04 | **SinkV2 API (FLIP-191)** | Sink/SinkWriter/Committer, pre-/post-commit topologies |
+| 05 | KafkaSink с EOS | transactional.id prefix, transaction.timeout pitfall |
+| 06 | File sinks с EOS | FileSink, bucketing, rolling policies |
+| 07 | Iceberg/Paimon sinks anatomy | Pre-commit (compaction) + post-commit (manifest) |
+| 08 | Survival test lab | docker kill во время commit, verify zero duplicates |
+
+## E2E exactly-once = 3 слоя
+
+1. **Replayable source** (Kafka offsets, S3 file paths) — можно перечитать
+2. **Internal EOS** через ABS — gerantee no record processed twice in state
+3. **Transactional sink** через 2PC — gerantee no duplicate written
+
+Если хотя бы один слой at-least-once → итог at-least-once.
+
+## Two-Phase Commit Protocol
+
+```
+Phase 1 (Prepare):
+  beginTransaction(N)   ← на barrier(N)
+  for each record: write to open txn
+  preCommit()           ← flush НО не commit; txnId в state
+
+Phase 2 (Commit):
+  notifyCheckpointComplete(N)  ← scheduler говорит "checkpoint N committed everywhere"
+  commit()                       ← finalize txn
+
+Recovery:
+  read pending txns из state → recoverAndCommit()
+```
+
+## Critical pitfall: Kafka transaction.timeout
+
+**Сценарий**: Flink restart занимает 30 минут. Kafka transaction.timeout.ms = 15 min (default). Когда Flink восстанавливается, Kafka уже abort-ил pending транзакции → **data loss с EOS**.
+
+**Fix**:
+```java
+KafkaSink.<String>builder()
+    .setProperty("transaction.timeout.ms", "3600000")   // 1 hour
+    // также: на broker: transaction.max.timeout.ms = 3600000
+```
+
+## SinkV2 API (FLIP-191) — современный contract
+
+Вместо deprecated TwoPhaseCommitSinkFunction:
+
+```java
+public interface Sink<InputT> {
+    SinkWriter<InputT> createWriter(InitContext context);
+}
+
+public interface TwoPhaseCommittingSink<InputT, CommT> extends Sink<InputT> {
+    Committer<CommT> createCommitter();
+}
+
+// Pre-commit topology (compaction между Writer и Committer):
+public interface SupportsPreCommitTopology<...> {
+    DataStream<...> addPreCommitTopology(DataStream<...> stream);
+}
+
+// Post-commit (Iceberg manifest, Hive metastore):
+public interface SupportsPostCommitTopology<...> {
+    void addPostCommitTopology(DataStream<...> stream);
+}
+```
+
+### Iceberg sink использует обе topologies
+
+- **Pre-commit**: small file compaction (объединить мелкие файлы)
+- **Commit**: записать data files
+- **Post-commit**: publish manifest, update Hive metastore
+
+## Killer takeaway
+
+Если у вас EOS на Kafka и downtime > 15 минут — теряете данные. **ВСЕГДА** установите `transaction.timeout.ms` ≥ предполагаемое max downtime + safety margin. Production setting обычно 1 hour.
+
+## Killer demo
+
+**Lab — EOS Survival Test**: KafkaSink с EXACTLY_ONCE, consumer считает duplicates. Chaos: `docker kill TaskManager` во время commit, между preCommit и commit, во время barrier alignment. Verify zero duplicates.

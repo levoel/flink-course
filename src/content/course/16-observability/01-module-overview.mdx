@@ -1,0 +1,68 @@
+---
+title: "Обзор модуля: Observability"
+description: "Web UI deep, OTel gRPC export, Runtime Data Sampling (FLIP-570), Grafana templates"
+order: 1
+difficulty: "advanced"
+estimatedTime: 12
+topics: ["Observability", "OpenTelemetry", "Prometheus", "Grafana", "FLIP-570"]
+---
+
+# Observability — обзор модуля
+
+Production Flink требует deep observability. Этот модуль — practical guide: Web UI deep dive, metrics system, distributed tracing с OTel (1.20+ для checkpoints, 2.3 gRPC export), Grafana dashboards.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Flink Web UI deep | Backpressure visualization, watermarks, checkpoints history |
+| 03 | Metrics system | Counter / Gauge / Meter / Histogram |
+| 04 | Prometheus integration | metrics.reporter.prom.*, pull vs push |
+| 05 | OpenTelemetry (1.20+, gRPC export 2.3) | Traces для checkpoints/jobs |
+| 06 | **Runtime Data Sampling (FLIP-570)** | Live sampling в Web UI для debug |
+| 07 | Logging best practices | No per-record logging, structured JSON |
+| 08 | Grafana templates — top 12 charts | Checkpoint p95, busy/idle ratio, state size, late events |
+
+## Top 12 metrics для production dashboard
+
+1. `lastCheckpointDuration` p50/p95/p99 — stability indicator
+2. `lastCheckpointSize` — state growth trend
+3. `numberOfFailedCheckpoints` (counter) — alert > 0
+4. `currentInputWatermark` per operator — stuck watermark detection
+5. `numLateRecordsDropped` (если без side output)
+6. `Status.JVM.GarbageCollector.G1Young.Time` — GC pressure
+7. `Status.JVM.Memory.Direct.MemoryUsed` — off-heap budget
+8. `taskmanager.Status.Network.AvailableMemorySegments` — network buffer health
+9. `busyTimeMsPerSecond` per operator
+10. `backPressuredTimeMsPerSecond` per operator
+11. `numRecordsInPerSecond` / `numRecordsOutPerSecond` — throughput
+12. RocksDB compaction count + duration
+
+## OpenTelemetry в Flink 2.3
+
+gRPC export (FLIP-???):
+
+```yaml
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OtelReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector:4317
+metrics.reporter.otel.protocol: grpc
+traces.reporter.otel.endpoint: http://otel-collector:4317
+```
+
+Distributed traces показывают full lifecycle checkpoint: barrier insertion → propagation → ack → notify complete. Critical для debugging slow checkpoints.
+
+## Alerting playbook
+
+| Metric | Alert | Severity |
+|---|---|---|
+| `lastCheckpointDuration` > timeout/2 | Warning | Medium |
+| `numberOfFailedCheckpoints` > 0 (5min window) | Alert | High |
+| `currentInputWatermark` lag > 5min | Alert | High |
+| `numLateRecordsDropped` > 0 | Alert | Medium |
+| `backPressuredTimeMsPerSecond` > 800 (sustained 20s) | Alert | High |
+| TaskManager OOMKilled | Alert | Critical |
+
+## Killer takeaway
+
+**Backpressure visualization в Web UI** — главный диагностический инструмент. Изучите его до автоматизма. 80% production issues видны через busy/idle/backpressure pattern в первую минуту анализа.

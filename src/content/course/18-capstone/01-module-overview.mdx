@@ -1,0 +1,91 @@
+---
+title: "Обзор модуля: Capstone проект"
+description: "End-to-end: Kafka → Flink (CDC+stateful) → Iceberg с EOS, autoscaling, chaos testing"
+order: 1
+difficulty: "advanced"
+estimatedTime: 20
+topics: ["Capstone", "End-to-End", "Production", "Chaos Testing"]
+---
+
+# Capstone — финальный проект
+
+Интегральный проект, объединяющий все killer-темы курса в реальный production pipeline. Real-time observability platform с full stack: CDC, stateful processing, exactly-once, K8s autoscaling, chaos testing.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Capstone — design phase | Architecture, requirements, technology choices |
+| 03 | Capstone — implementation: source layer | Flink CDC из Postgres |
+| 04 | Capstone — implementation: stateful layer | Aggregations, joins, watermarks |
+| 05 | Capstone — implementation: sink layer | Iceberg sink с EOS |
+| 06 | Capstone — deployment | K8s operator, autoscaler, HA |
+| 07 | Capstone — observability | OTel metrics + traces, Grafana, alerting |
+| 08 | Capstone — chaos testing | Kill TM, JM, network partition, broker down |
+| 09 | Capstone — production readiness checklist | Final review |
+
+## Capstone architecture
+
+```
+Postgres (OLTP)
+    ↓ Debezium binlog
+Kafka (orders, customers, products topics)
+    ↓ Flink CDC 3.6
+        ├──→ Flink stateful job
+        │       (per-user aggregations,
+        │        temporal joins,
+        │        watermark alignment)
+        ↓
+    Iceberg (lakehouse, EOS sink)
+    ↓
+    ClickHouse (real-time OLAP)
+    ↓
+    Grafana dashboards
+```
+
+## Что демонстрируется в Capstone
+
+- ✅ **State Management** (M3) — ValueState, MapState, TTL
+- ✅ **RocksDB + ForSt** (M4) — disaggregated state на S3
+- ✅ **Watermark Alignment** (M5) — multi-source coordination
+- ✅ **Generic Log Incremental Checkpoints** (M6) — stable checkpoint latency
+- ✅ **Two-Phase Commit** (M7) — exactly-once на Iceberg sink
+- ✅ **Materialized Tables** (M8) — aggregated metrics для dashboards
+- ✅ **Flink CDC 3.6** (M10) — source pipeline
+- ✅ **Flink Kubernetes Operator + Adaptive Scheduler** (M13)
+- ✅ **State Processor API** (M14) — для bootstrap state
+- ✅ **OpenTelemetry tracing** (M16) — production observability
+
+## Chaos testing checklist
+
+- [ ] `docker kill TaskManager` → job рестартует с savepoint, no data loss
+- [ ] `docker kill JobManager` → leader election, new JM pickups
+- [ ] Network partition Kafka ↔ Flink → backpressure handled
+- [ ] Kafka broker down → consumer reassign partitions
+- [ ] Postgres source down → CDC pipeline graceful pause
+- [ ] S3/Iceberg slow → unaligned checkpoints kick in
+- [ ] OOM kill TaskManager → adaptive scheduler reschedules
+
+## Production readiness checklist
+
+- [ ] Все stateful operators имеют UID
+- [ ] Watermark alignment configured если multi-source
+- [ ] Side output для late events
+- [ ] Allowed lateness reasonable
+- [ ] State TTL configured
+- [ ] Changelog state backend enabled
+- [ ] Unaligned checkpoint timeout configured
+- [ ] Transaction timeout >= max downtime
+- [ ] Adaptive scheduler enabled
+- [ ] Autoscaler thresholds tuned
+- [ ] Grafana dashboard + alerts
+- [ ] Savepoint test recovery procedure documented
+- [ ] Disaster recovery runbook
+
+## Что дальше
+
+Курс закончен. Дальнейшее изучение:
+- **Flink Forward conference** — annual conference, talks на YouTube
+- **Apache Flink Slack** — community Q&A
+- **Дальнейшие шаги** — Apache Paimon (streaming lakehouse), RisingWave (streaming SQL DB), Materialize (compute view) для расширения видения

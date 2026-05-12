@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "00-course-intro/02-course-overview",
+  "moduleId": "00-course-intro",
+  "_meta": {
+    "idPrefix": "flink-m00-02",
+    "description": "Use IDs: flink-m00-02-q1, flink-m00-02-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m00-02-q1",
+      "type": "multiple-choice",
+      "question": "Какие четыре модуля курса наиболее уникальны по сравнению с другими курсами по Flink?",
+      "options": [
+        { "id": "a", "text": "Модули 00 (Intro), 01 (Architecture), 02 (DataStream), 11 (Formats)" },
+        { "id": "b", "text": "Модули 03 (State), 04 (RocksDB+ForSt), 06 (Checkpointing), 07 (Exactly-Once)" },
+        { "id": "c", "text": "Модули 09 (CEP), 10 (Connectors), 15 (Tuning), 16 (Observability)" },
+        { "id": "d", "text": "Модули 12 (PyFlink), 17 (Patterns), 18 (Capstone)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Модули 03 (State Management — key groups, Async State API V2), 04 (RocksDB + ForSt — LSM internals, disaggregated state), 06 (Checkpointing — ABS algorithm, aligned vs unaligned, GIC) и 07 (Exactly-Once — 2PC, SinkV2) препарируют ядро Flink. Эти модули вместе составляют killer-материал курса, которого редко встретишь в публичных курсах. Также killer-модулем является 13 (Deployment + K8s Operator) с Adaptive Scheduler и in-place rescaling.",
+      "studyHint": "Повторите урок 02 — диаграмма 'Дорожная карта курса'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-02-q2",
+      "type": "multiple-choice",
+      "question": "Курс ориентирован на Flink 2.x. Что из перечисленного НАМЕРЕННО НЕ покрывается в курсе?",
+      "options": [
+        { "id": "a", "text": "DataStream API и Table API / SQL" },
+        { "id": "b", "text": "DataSet API, Scala API, SourceFunction/SinkFunction (всё removed в 2.0), Stateful Functions (sunsetted), Queryable State (deprecated)" },
+        { "id": "c", "text": "RocksDB state backend и checkpointing" },
+        { "id": "d", "text": "Apache Kafka как источник данных" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Курс — 2.x-first и намеренно не учит legacy: DataSet API (removed в 2.0 — заменён unified DataStream), Scala API (removed — Java-first), SourceFunction/SinkFunction/SinkV1 (removed — теперь FLIP-27 Source API и FLIP-191 SinkV2), Stateful Functions (sunsetted в 2026 из-за неактивности), Queryable State (deprecated с 1.18). Reactive Mode также не покрывается — заменён Adaptive Scheduler. Всё остальное — основа курса.",
+      "studyHint": "Повторите урок 02 — раздел 'Что НЕ покрываем (legacy)'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m00-02-q3",
+      "type": "multiple-choice",
+      "question": "Какой language stack используется в курсе?",
+      "options": [
+        { "id": "a", "text": "Только Scala — нативный язык Flink" },
+        { "id": "b", "text": "Java 17/21 как основной + Python 3.11 для PyFlink модуля" },
+        { "id": "c", "text": "Только Python через PyFlink" },
+        { "id": "d", "text": "Kotlin и Go" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "С Flink 2.0 Scala API удалён — поэтому курс использует Java 17/21 (минимум 11, рекомендуется 17). Для PyFlink модуля (12) используется Python 3.11 с DataStream API в Python, Table API и UDFs (process vs thread mode, Pandas vectorized). Также Apache Paimon, MinIO, Flink CDC, Flink K8s Operator — экосистема.",
+      "studyHint": "Повторите урок 02 — раздел 'Стек курса'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m00-02-q4",
+      "type": "true-false",
+      "question": "Курс предполагает базовое знание Kafka, опыт работы с Apache Spark, Java или Scala на production-уровне и знание основ распределённых систем.",
+      "correctAnswer": true,
+      "explanation": "Курс — продвинутый. Без понимания Kafka (partitions, consumer groups, offsets) трудно следить за source/sink архитектурой Flink. Опыт Spark Structured Streaming помогает сравнивать философию micro-batch vs true streaming. Java на production-уровне нужен для всех labs кроме PyFlink модуля. Распределённые системы (CAP, consensus, partitioning) — для понимания HA, JobManager failover, checkpointing семантики. Рекомендуется сначала пройти kafka-course и spark-course с этой же платформы.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

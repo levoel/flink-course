@@ -1,0 +1,90 @@
+---
+title: "Обзор модуля: RocksDB и ForSt backends"
+description: "LSM internals, column families, leveled vs universal compaction, ForSt disaggregated state"
+order: 1
+difficulty: "advanced"
+estimatedTime: 16
+topics: ["RocksDB", "ForSt", "LSM", "Disaggregated State", "FLIP-427"]
+---
+
+# RocksDB и ForSt — обзор модуля (KILLER)
+
+RocksDB — workhorse state backend Flink. ForSt (Flink 2.0) — революция: тот же LSM-tree, но primary storage на S3, локальный диск только cache. Этот модуль — самый глубокий в курсе, потому что RocksDB tuning часто = разница между production и failure.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | LSM-tree fundamentals | MemTable → SSTable, levels, compaction |
+| 03 | Column families в Flink | Каждый state primitive = отдельная CF |
+| 04 | Compaction strategies | Leveled vs Universal — write/read amplification trade-offs |
+| 05 | PredefinedOptions | DEFAULT / SPINNING_DISK / FLASH_SSD, custom factory |
+| 06 | Managed memory integration | WriteBufferManager, shared block cache, gotchas |
+| 07 | Incremental Checkpointing | SharedStateRegistry, SST file sharing, reference counting |
+| 08 | **ForSt — disaggregated state (FLIP-427)** | Primary storage S3, async I/O, recovery independent of state size |
+
+## RocksDB mechanics
+
+```
+Writes:
+  Record → serialize → WriteBatch → MemTable (skiplist, in-memory)
+  MemTable full → flush to L0 SSTable on disk
+
+Reads:
+  MemTable → Immutable MemTable → Block Cache
+       → Bloom filter → L0 → L1 → L2 → ... (SSTable lookup)
+```
+
+### Compaction styles
+
+- **Leveled** (default) — non-overlapping levels, минимизирует read amplification, выше write amplification
+- **Universal** — больше overlap, меньше write amplification, выше read
+
+### Column Families per state primitive
+
+```
+ValueState<Long>     → CF "valueState"
+MapState<K, V>       → CF "mapState"
+ListState<E>         → CF "listState"
+```
+
+У каждой CF свой MemTable, свои SST файлы. Shared: WriteBufferManager, Block Cache.
+
+## Managed Memory integration
+
+Flink выделяет RocksDB managed memory off-heap (часть Task Slot memory). **Gotcha**: если override RocksDBOptionsFactory без WriteBufferManager — managed memory не помогает → OOM-killer на TaskManager.
+
+```yaml
+taskmanager.memory.managed.fraction: 0.4   # 40% of Flink Memory → RocksDB
+state.backend.rocksdb.memory.managed: true # shared budget между slots
+```
+
+## ForSt — Flink 2.0 disaggregated state
+
+**Архитектура**:
+- LSM-tree поверх RocksDB
+- SST файлы primary на **S3/HDFS/GCS**
+- Локальный диск = cache only
+- Async I/O
+
+```yaml
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://my-bucket/forst-state
+state.backend.forst.local-dir: /tmp/forst-cache
+```
+
+**Преимущества**:
+- State size unlimited (S3 cost-effective)
+- Recovery time **independent of state size** (не нужно download terabytes)
+- Cloud-native — natural fit с K8s ephemeral storage
+
+**Требования**:
+- Async State API V2 (sync API → деградирует до sync DFS = катастрофа)
+- Sufficient cache size — иначе latency взлетит
+
+VLDB 2025 paper показывает: ForSt + 1GB cache даёт 75-120% throughput vs local RocksDB для I/O-heavy queries при state size 1.2-4.8GB.
+
+## Killer demo
+
+**Lab — Disaggregated State с MinIO**: запустить MinIO container (S3 mock), настроить ForSt на него, измерить cache hit vs miss latency, recovery test (kill TaskManager, scale to different parallelism, observe recovery time).

@@ -1,0 +1,77 @@
+---
+title: "Обзор модуля: PyFlink"
+description: "Process vs Thread mode (PEMJA), Pandas UDFs (Arrow), async functions (2.2)"
+order: 1
+difficulty: "advanced"
+estimatedTime: 12
+topics: ["PyFlink", "Python", "PEMJA", "Pandas UDFs"]
+---
+
+# PyFlink — обзор модуля
+
+PyFlink даёт Python API для DataStream и Table. Использовать когда команда строго Python (ML инженеры), но понимать perf trade-offs vs JVM. Этот модуль — practical guide к PyFlink с perf hierarchy.
+
+## Уроки модуля
+
+| # | Урок | Что внутри |
+|---|---|---|
+| 01 | **Обзор модуля** | Текущий урок |
+| 02 | Setup, environment, packaging | venv, requirements, archive |
+| 03 | DataStream API в Python | Ограниченный subset, growing |
+| 04 | Table API в Python | First-class support, parity с Java |
+| 05 | Python UDF — process mode | Beam Portability, IPC overhead |
+| 06 | Python UDF — thread mode (1.15+, PEMJA) | JVM-thread execution, faster |
+| 07 | Pandas UDFs (vectorized via Arrow) | Order of magnitude faster |
+| 08 | **Async functions в PyFlink (2.2+)** | Для high-latency external lookups |
+
+## PyFlink performance hierarchy
+
+```
+Native Flink Java         100% baseline
+Python Thread mode         70-90% (PEMJA, JVM-thread)
+Python Process mode         30-50% (Beam Portability, IPC)
+Python Process + custom deps  20-40%
+Pandas UDF (vectorized)   90-95% (Arrow zero-copy, batch)
+```
+
+## Pandas UDFs — game changer
+
+Vectorized via Apache Arrow:
+
+```python
+from pyflink.table.udf import udf
+import pandas as pd
+
+@udf(input_types=[DataTypes.DOUBLE()], result_type=DataTypes.DOUBLE())
+def double_value(v):
+    return v * 2  # row-by-row, slow
+
+@udf(input_types=[DataTypes.DOUBLE()], result_type=DataTypes.DOUBLE(),
+     func_type='pandas')   # ← VECTORIZED
+def double_pandas(v: pd.Series) -> pd.Series:
+    return v * 2  # batch операция, 10-50x быстрее
+```
+
+## Async functions (Flink 2.2)
+
+Для external service calls (LLM, embedding APIs):
+
+```python
+@async_udf(input_types=[DataTypes.STRING()], result_type=DataTypes.STRING())
+async def llm_call(text: str) -> str:
+    response = await openai.ChatCompletion.acreate(
+        model="gpt-4", messages=[...]
+    )
+    return response.choices[0].message.content
+```
+
+## Когда НЕ использовать PyFlink
+
+- Stateful keyed jobs с complex state primitives — лучше Java
+- Latency-critical (< 50ms) — IPC overhead dominates
+- High throughput (> 100k rec/s per slot) — Java native parsing
+- Custom serializer / format work — Java API богаче
+
+## Killer takeaway
+
+Если ваша job всё равно ML-inference heavy — PyFlink с Pandas UDFs или async functions может быть быстрее, чем Java + Async I/O к external Python service. Embedded execution убирает network hop.
