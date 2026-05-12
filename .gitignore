@@ -1,0 +1,34 @@
+# Maven / Gradle
+target/
+build/
+*.class
+*.jar
+*.war
+.gradle/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Python (PyFlink)
+__pycache__/
+*.py[cod]
+.venv
+venv/
+env/
+
+# Flink runtime
+flink-*.tar.gz
+flink-conf-backup.yaml
+log/
+tmp/
+*.out
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
