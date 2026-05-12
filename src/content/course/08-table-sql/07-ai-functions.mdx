@@ -35,6 +35,63 @@ FROM transactions;
 
 ---
 
+## ML_PREDICT pipeline — от CREATE MODEL до inline inference
+
+<DiagramContainer title="ML_PREDICT execution — CREATE MODEL → registered → invoked в SELECT" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. CREATE MODEL — DDL registration"
+        tooltip="CREATE MODEL name INPUT (...) OUTPUT (...) WITH (provider, endpoint, api_key, rate.limit.rpm, batch.size, cache.enabled). Provider определяет protocol: openai/anthropic для LLM API, http для custom REST, onnx/tensorflow для embedded inference. Model metadata stored в catalog."
+      >
+        catalog entry с inference config
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="model registered" />
+    <FlowRow>
+      <DataBox
+        label="2. ML_PREDICT(MODEL, fields) в SELECT"
+        tooltip="LATERAL TABLE(ML_PREDICT(MODEL fraud_scorer, t.amount, t.location)) — table function expansion. Per input row, model inference produces output row(s). Альтернативная функциональная форма ML_PREDICT('model_name', fields) возвращает ROW value."
+      >
+        SQL invokes inference
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Async I/O dispatch" />
+    <FlowRow>
+      <DataBox
+        label="3. Provider request с batching"
+        tooltip="Flink буферизует до batch.size records, отправляет batch request к provider (HTTP POST для OpenAI/Claude/custom REST, или local call для ONNX). Built-in rate limiting (rpm/tpm) matches API tier. Retry с exponential backoff на 429/5xx."
+      >
+        batch HTTP request / local ONNX
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="response received" />
+    <FlowRow>
+      <DataBox
+        label="4. Response parsing + cache"
+        tooltip="Provider response parsed по OUTPUT schema. LLM JSON → structured ROW. LRU cache (cache.enabled=true) — identical inputs serve from memory. Massive savings для repetitive content (FAQs, common queries)."
+      >
+        ROW output + cache populate
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="callback on mailbox" />
+    <FlowRow>
+      <DataBox
+        label="5. Output emitted в downstream"
+        tooltip="Result row joined в SELECT output. Downstream operators (filter, materialize, sink) видят prediction как regular column. Можно cascade ML_PREDICT с VECTOR_SEARCH для RAG patterns: embed query → search vectors → enrich → predict."
+      >
+        enriched stream
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+<Callout type="warning">
+ML_PREDICT (Flink 2.2+) — синхронный LLM call в SQL может убить throughput. OpenAI GPT-4 latency 1-5s → max 20-50 inferences/sec per worker. Prefer batch.size + cache.enabled, или cheap embedded ONNX модель для pre-filter, дорогой LLM только для low-confidence fallback (10-20% volume).
+</Callout>
+
+---
+
 ## CREATE MODEL — register inference endpoint
 
 ```sql
@@ -451,6 +508,10 @@ WITH ('api_key' = 'sk-real-key-12345')
 DDL stored в catalog. Anyone с catalog access sees key.
 
 **Fix**: env var interpolation `${OPENAI_API_KEY}` (Flink reads from TM env). Or secrets manager integration.
+
+<Callout type="tip">
+Cost-aware design для production ML pipelines: two-stage classification — cheap embedded ONNX (DistilBERT) handles 80-90% high-confidence, expensive LLM fallback только для low-confidence (10-20%). Plus cache.enabled=true для repetitive content. Это снижает stocks 100× vs naive «ML_PREDICT every event».
+</Callout>
 
 ### 3. Rate limit ignored → 429 storm
 

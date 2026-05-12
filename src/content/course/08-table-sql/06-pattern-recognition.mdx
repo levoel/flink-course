@@ -13,6 +13,67 @@ MATCH_RECOGNIZE — стандартный SQL:2016 syntax для row pattern ma
 
 Пример практический: detect head-and-shoulders pattern в stock prices, detect 3 failed login attempts followed by success (suspicious), detect customer journey patterns (browse → cart → checkout → abandon).
 
+<Callout type="note">
+MATCH_RECOGNIZE — SQL:2016 standard, более портабельный чем Pattern API (Flink CEP). Analysts могут писать decларативно, decision engines читают как обычный SQL. Performance comparable с CEP API; choose based on team skills и output requirements.
+</Callout>
+
+---
+
+## Execution model — PATTERN / MEASURES / DEFINE flow
+
+<DiagramContainer title="MATCH_RECOGNIZE — как Flink выполняет pattern matching" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. PARTITION BY key"
+        tooltip="Каждое уникальное значение ключа имеет own state machine. Per-partition independent matching. High cardinality PARTITION BY (millions users) = millions state machines, memory overhead. Reduce cardinality if possible (region вместо user)."
+      >
+        per-key state machine
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ORDER BY event_time" />
+    <FlowRow>
+      <DataBox
+        label="2. Pattern NFA construction"
+        tooltip="PATTERN (A B+ C) транслируется в non-deterministic finite automaton (NFA) с состояниями для каждой row variable. Quantifiers (+, *, {n}) — расширяют состояния. На каждое incoming событие NFA advance, проверяя DEFINE predicates."
+      >
+        NFA states от PATTERN clause
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="event arrives, NFA processes" />
+    <FlowRow>
+      <DataBox
+        label="3. DEFINE predicate evaluation"
+        tooltip="Каждое DEFINE — SQL predicate на row variable. RUNNING semantics (default) — predicate evaluates с running sum/count. LAST(var.col, N) — N-я последняя value matched. PREV — absolute row before. Predicates running во время matching."
+      >
+        evaluate per row vs current state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="match found или partial accumulating" />
+    <FlowRow>
+      <DataBox
+        label="4. WITHIN time bound check"
+        tooltip="WITHIN INTERVAL 'n' UNIT — pattern должен завершиться в n единиц от first row. Без WITHIN — state unbounded если pattern not terminating. ВСЕГДА add WITHIN в production. Bound state proportional к event rate × interval."
+      >
+        WITHIN bounds state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="match complete (or expired)" />
+    <FlowRow>
+      <DataBox
+        label="5. MEASURES emission + AFTER MATCH SKIP"
+        tooltip="MEASURES вычисляет output columns: FIRST/LAST/COUNT/SUM по variables. AFTER MATCH SKIP определяет где начинается следующий match: PAST LAST ROW (non-overlapping), TO NEXT ROW (overlapping), TO FIRST/LAST var. ONE ROW per match или ALL ROWS (debug)."
+      >
+        emit row + advance position
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+<Callout type="warning">
+Без `WITHIN INTERVAL 'n' UNIT` state растёт **unbounded** если pattern никогда не завершается. ВСЕГДА добавлять WITHIN в production. Greedy quantifiers (UP+) с rare termination — еще одна ловушка; non-greedy `UP+?` или explicit WITHIN required.
+</Callout>
+
 ---
 
 ## Базовый синтаксис

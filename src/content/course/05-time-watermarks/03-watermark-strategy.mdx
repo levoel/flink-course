@@ -232,6 +232,10 @@ Event(ts=180) arrives на idle source at T4
 pipeline.auto-watermark-interval: 200ms   # как часто periodic emit
 ```
 
+<Callout type="warning">
+Без `withIdleness` одна idle Kafka partition держит watermark всего pipeline на `Long.MIN_VALUE` — окна не закрываются, выглядит как stuck job. Это единственная самая частая production-проблема с watermarks. Для multi-partition source — must-have, не optional.
+</Callout>
+
 ---
 
 ## Custom WatermarkGenerator: punctuated vs periodic
@@ -343,6 +347,10 @@ env.fromSource(source, strategy, "kafka")
 env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka")
    .assignTimestampsAndWatermarks(strategy)
 ```
+
+<Callout type="tip">
+Всегда передавайте `WatermarkStrategy` внутрь `fromSource()` — это включает per-partition watermarks (каждая Kafka partition имеет свой WatermarkGenerator). После source через `.assignTimestampsAndWatermarks()` — теряете per-partition semantics, одна fast partition может «съесть» watermark всего subtask.
+</Callout>
 
 ---
 

@@ -19,6 +19,10 @@ Chaos scenarios:
 5. Network partition между JobManager и TaskManager.
 6. Slow `transaction.timeout.ms` — induce data loss intentionally.
 
+<Callout type="tip">
+EOS chaos test golden rule: kill TM между preCommit и commit — это самый коварный window. Verify zero duplicates + zero missing с consumer `isolation.level=read_committed`. Repeat scenario 100×, expect 100% pass для всех scenarios A-E.
+</Callout>
+
 ---
 
 ## docker-compose stack
@@ -221,6 +225,10 @@ public class DuplicateVerifier {
 ```
 
 **Critical**: `isolation.level=read_committed`. Без этого consumer видит aborted transactions — невозможно отделить EOS violation от транзитного состояния.
+
+<Callout type="warning">
+Самая частая ошибка верификации EOS: consumer без `isolation.level=read_committed` видит aborted transactions как regular records → false positive «duplicates». Это объясняет 90% «EOS failures» в chaos tests. Всегда документировать downstream consumers: `read_committed` обязателен для EOS pipelines.
+</Callout>
 
 ---
 

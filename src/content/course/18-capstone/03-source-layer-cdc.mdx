@@ -13,6 +13,64 @@ topics: ["Implementation", "Flink CDC", "Postgres", "Schema Evolution", "Snapsho
 
 Mы используем **Flink CDC 3.6 directly** (без intermediate Kafka), как обосновано в design phase. Pipeline declarative YAML, под капотом Flink DataStream graph с EOS sink.
 
+<DiagramContainer title="CDC pipeline architecture: Postgres → Flink CDC → Paimon" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Postgres primary"
+        tooltip="OLTP write path. wal_level=logical generates LSN log entries for every INSERT/UPDATE/DELETE. REPLICA IDENTITY DEFAULT for PK-keyed tables, FULL for transition tracking. Application unaware of CDC."
+      >
+        WAL log (logical replication)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="streaming replication к replica" />
+    <FlowRow>
+      <DataBox
+        label="Postgres read replica"
+        tooltip="Hot standby with same WAL. Flink CDC reads from replica, NOT primary — avoids OLTP throughput impact. Replication slot 'flink_cdc' anchored here, retains WAL until consumed. max_slot_wal_keep_size 100GB safety bound."
+      >
+        replication slot 'flink_cdc'
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="pgoutput decoder → DataChangeEvent stream" />
+    <FlowRow>
+      <DataBox
+        label="Flink CDC source (FLIP-27)"
+        tooltip="Phase 1: chunked parallel snapshot of existing rows (scan.incremental.snapshot.enabled). Phase 2: switch to continuous WAL streaming via pgoutput plugin. Splits = tables. Each subtask gets table-level work. Watermarks generated on commit boundaries."
+      >
+        Snapshot phase → Continuous WAL phase
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="transform: schema-aware projection / filter" />
+    <FlowRow>
+      <DataBox
+        label="Transform layer"
+        tooltip="YAML transform expressions: projection (column selection, renames), filter (WHERE clause), primary-keys override. Per-table. Applied before sink. Schema changes propagate through transform automatically."
+      >
+        SQL-style projection/filter
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="route table → sink table mapping" />
+    <FlowRow>
+      <DataBox
+        label="Route layer"
+        tooltip="ecommerce.public.orders → lakehouse.raw.orders. Wildcard support for shard consolidation (customers_* → customers). Multiple sink catalogs possible (hot data → Paimon, archive → Iceberg)."
+      >
+        source-table → sink-table mapping
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="exactly-once commit per checkpoint" />
+    <FlowRow>
+      <DataBox
+        label="Paimon sink (lakehouse.raw.*)"
+        tooltip="LSM-tree table format. Bucket by primary key. Changelog producer 'lookup' provides full change events для downstream readers. Schema evolution auto-applied (ALTER TABLE on DDL). Atomic snapshot per checkpoint."
+      >
+        Paimon snapshot per checkpoint (EOS)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ---
 
 ## Step 1: Postgres preparation

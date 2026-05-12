@@ -79,6 +79,10 @@ Backfill 30 дней Kafka events на 5000 subtasks:
 
 FLIP-217 benchmark: 76x speedup на 5000 subtask cluster — потому что без alignment координация через MIN watermark делалась через single coordination point.
 
+<Callout type="note">
+Watermark Alignment не заменяет `withIdleness` — они complementary. Idleness обрабатывает «нет данных вообще» (markIdle → exclude from MIN), alignment обрабатывает «есть данные, но разный темп event time» (pause fast splits). Production стек: сначала `withIdleness`, потом `withWatermarkAlignment`.
+</Callout>
+
 ---
 
 ## Архитектура FLIP-217
@@ -319,6 +323,10 @@ payments.withWatermarkAlignment("ecommerce", ...);
 maxDrift меньше чем outOfOrderness → невозможное условие. Один source с WM = T, второй WM = T - 60s (он outOfOrderness апсетит). Coordinator pause-ит fast, но даже без events fast стоит, его WM не двигается — потому что forBoundedOutOfOrderness тривиально WM = max_ts - 60s. **Stall**.
 
 Правило: `maxAllowedDrift >= outOfOrderness * 2`.
+
+<Callout type="warning">
+FLIP-217 GA с Flink 1.18. На 1.17 и ниже behaviour может быть unstable — особенно interaction с idle sources исправлен только в 1.19+. Если у вас older version и multi-source с heavy backfill — upgrade или test на staging особенно тщательно перед production rollout.
+</Callout>
 
 ### 3. Idle source с alignment — sneaky bug
 

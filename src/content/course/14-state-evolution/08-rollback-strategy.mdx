@@ -40,6 +40,63 @@ spec:
 
 ---
 
+## Rollback procedure timeline
+
+<DiagramContainer title="Rollback procedure timeline: detect → decide → execute → validate" color="rose">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="T=0: Deploy v1.43 (green)"
+        tooltip="Operator triggers savepoint on blue (v1.42), creates SP_PRE_UPGRADE in S3. Cancels blue, starts green from that savepoint. State preserved 1:1 between versions."
+      >
+        SP_PRE_UPGRADE created + green starts
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="T+0 — T+1h: monitoring window" />
+    <FlowRow>
+      <DataBox
+        label="T+15min: Initial metrics OK"
+        tooltip="First checkpoints complete. Throughput matches blue baseline. Alerts quiet. Engineer monitors dashboard."
+      >
+        Checkpoint success rate normal
+      </DataBox>
+      <DataBox
+        label="T+30min: Degradation visible"
+        tooltip="Checkpoint failures rising, RocksDB exceptions in logs, error rate climbing. Some categories of bugs only surface under realistic state size + traffic."
+      >
+        Alerts begin firing
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="T+45min: decision point" />
+    <FlowRow>
+      <DataBox
+        label="T+1h: Rollback decision"
+        tooltip="Severity P1/P2 confirmed. Root cause not 1-hour fix. Decision: execute runbook. Notify #flink-incidents. Bump transactional.id.prefix if EOS sink (avoid 2PC conflict with v1.43 transactions)."
+      >
+        Trigger rollback runbook
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="T+1h — T+1h25min: execution" />
+    <FlowRow>
+      <DataBox
+        label="T+1h10: kubectl patch к v1.42 + SP_PRE_UPGRADE"
+        tooltip="kubectl patch flinkdeployment с image=v1.42.0 + initialSavepointPath=SP_PRE_UPGRADE. Operator cancels green, updates JM Deployment, submits job."
+      >
+        Job restart on old image + old savepoint
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="recovery validation" />
+    <FlowRow>
+      <DataBox
+        label="T+1h25: Validation"
+        tooltip="Job RUNNING on v1.42.0. First 2 checkpoints success. Error rate back to baseline. Output rate matches pre-upgrade. Mark incident resolved. RTO = ~25 minutes from decision to recovery."
+      >
+        Metrics normalized, RTO ~25min
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Rollback workflow
 
 ### Scenario: post-deploy degradation

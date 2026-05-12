@@ -173,6 +173,55 @@ Histogram queries:
 
 ## MetricGroup hierarchy
 
+<DiagramContainer title="MetricGroup hierarchy: Job → Task → Operator → Subtask" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager scope"
+        tooltip="Top-level metrics for the whole job: numRunningJobs, lastCheckpointDuration, lastCheckpointSize, numberOfFailedCheckpoints, restoreTime. One value per job, не per subtask."
+      >
+        jobmanager.&lt;job_id&gt;.&lt;metric&gt;
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="job split into tasks" />
+    <FlowRow>
+      <DataBox
+        label="TaskManager scope"
+        tooltip="Per-TM metrics: JVM heap/direct memory, GC time/count, CPU load, threads. Status_JVM_* and Status_Network_* live here. One series per TaskManager."
+      >
+        taskmanager.&lt;tm_id&gt;.Status_JVM_*
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="TM runs tasks of jobs" />
+    <FlowRow>
+      <DataBox
+        label="Task scope"
+        tooltip="Per-task (chained operators) metrics: alignmentDurationMs, lastCheckpointAsyncDuration, buffersInUseCount, buffersOutPoolUsage. One series per (job, task, subtask)."
+      >
+        taskmanager.&lt;tm&gt;.&lt;job&gt;.&lt;task&gt;.&lt;subtask&gt;
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="task contains operators" />
+    <FlowRow>
+      <DataBox
+        label="Operator scope (finest)"
+        tooltip="Per-operator metrics: numRecordsIn/Out, busy/idle/backPressuredTimeMsPerSecond, currentInputWatermark, numLateRecordsDropped. User metrics via getRuntimeContext().getMetricGroup() live here. Highest cardinality."
+      >
+        ...&lt;operator_name&gt;.&lt;metric&gt;
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="user code adds sub-groups" />
+    <FlowRow>
+      <DataBox
+        label="User sub-groups"
+        tooltip="getMetricGroup().addGroup('business').addGroup('category', 'fraud').counter('alerts') — structured labels. Each addGroup appends to scope path → in Prometheus becomes labels. Useful for filtering 'sum by (category)'."
+      >
+        addGroup('business').counter('alerts')
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 Метрики организованы в **MetricGroup** иерархию:
 
 ```

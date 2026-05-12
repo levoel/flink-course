@@ -84,6 +84,10 @@ $FLINK_HOME/bin/flink run \
 
 **Single YAML deploys full DB → lakehouse pipeline with schema evolution.**
 
+<Callout type="tip">
+Flink CDC 3.6 — **YAML pipeline вместо boilerplate Debezium + Kafka Connect setup**. Один файл декларативно описывает source → transform → route → sink, schema evolution auto-propagated, no Java code. Это убивает traditional 3-tier (Debezium → Kafka → Spark/Flink) для lakehouse ingestion: один Flink job делает всё.
+</Callout>
+
 ---
 
 ## Architecture: pipeline → DataStream

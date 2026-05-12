@@ -13,6 +13,10 @@ Dynamic Tables — central abstraction Flink SQL. Понимание этой м
 
 Stream-table duality — концепция изначально из Kafka Streams (Confluent), но Flink её формализует через unified Table API/SQL — same syntax для batch и streaming, same execution model для bounded и unbounded sources.
 
+<Callout type="note">
+Dynamic Table — это logical concept, не физическое хранение. Physical storage появляется только когда materializing через `Materialized Table` (FLIP-435) на Paimon backend, либо при INSERT INTO в обычный sink.
+</Callout>
+
 ---
 
 ## Stream → Table: changelog accumulation
@@ -263,6 +267,10 @@ GROUP BY user_id, HOP(event_time, INTERVAL '1' MINUTE, INTERVAL '1' HOUR);
 ```
 
 Window-based aggregations имеют natural cleanup: state released после watermark passes window_end + allowed_lateness.
+
+<Callout type="warning">
+Regular GROUP BY без window растёт **unbounded** — state TBs eventually, RocksDB OOM. Нужен либо `table.exec.state.ttl=24h` (idle state retention), либо window-based aggregation. Это #1 production gotcha SQL pipelines.
+</Callout>
 
 ---
 

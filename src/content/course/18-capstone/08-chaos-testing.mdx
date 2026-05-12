@@ -13,6 +13,61 @@ Phase 6: chaos testing. Production-grade pipeline должен survive failures.
 
 Chaos engineering — это не «break stuff for fun». Это **structured testing of failure modes** в staging environment, с pre-defined expected behaviors, prior to production exposure.
 
+<DiagramContainer title="Chaos test scenarios matrix" color="rose">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Compute failures (Flink-side)"
+        tooltip="Kill TaskManager (subtask failure, recovery from checkpoint). Kill JobManager leader (HA failover via ZooKeeper/K8s lease, RTO < 30s). OOM kill TaskManager (memory budget violation, restart loop check)."
+      >
+        Kill TM / Kill JM / OOM kill
+      </DataBox>
+      <DataBox
+        label="Network failures"
+        tooltip="Network partition Flink ↔ Kafka (toxiproxy 30s drop, verify reconnect + offset resume). Slow network Flink ↔ S3 (latency injection 2-5s, verify backpressure handling, not crash)."
+      >
+        Partition Kafka / Slow S3
+      </DataBox>
+      <DataBox
+        label="External system failures"
+        tooltip="Kafka broker down (3-broker cluster, kill 1 — verify producer reconnects, no message loss with acks=all). Postgres replication slot exceeded (max_slot_wal_keep_size hit — verify alert fires before disk full). ClickHouse sink unavailable (sink backpressure, no exception loop)."
+      >
+        Kafka / Postgres / sink down
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="for each scenario: 3 verification axes" />
+    <FlowRow>
+      <DataBox
+        label="1. Data integrity (zero loss)"
+        tooltip="Reconciliation script: source_count = sink_count + late_events_count. Run every 5min during chaos + 1h after. Any discrepancy = EOS violation = redesign needed. Production rule: EOS or it didn't happen."
+      >
+        source = sink + late (per minute)
+      </DataBox>
+      <DataBox
+        label="2. RTO (recovery time)"
+        tooltip="Time from failure injection to job RUNNING + processing at baseline throughput. SLO: TM kill < 2min, JM failover < 30s, broker down < 60s reconnect. Measure with Prometheus job_uptime + numRestarts increase."
+      >
+        Measured RTO vs SLO
+      </DataBox>
+      <DataBox
+        label="3. Side effects (no cascade)"
+        tooltip="Downstream consumers see no duplicate messages (EOS sinks). Alerts fire as expected (no alert fatigue from chaos). Recovery doesn't trigger secondary failures (e.g. checkpoint storm after burst). Observability captures all events."
+      >
+        Downstream OK + alerts correct
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="quarterly schedule" />
+    <FlowRow>
+      <DataBox
+        label="Schedule: Monthly drill"
+        tooltip="Week 1: planning, hypothesis updates. Week 2: run scenarios in staging. Week 3: review results, fix gaps (alert thresholds, runbook updates, code fixes). Week 4: integrate into runbooks, train new on-call. Continuous chaos in non-prod a la Netflix optional."
+      >
+        Plan → Run → Review → Integrate
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ---
 
 ## Test environment setup

@@ -1,0 +1,106 @@
+{
+  "title": "RocksDB Live Compaction",
+  "uid": "rocksdb-live",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {"from": "now-15m", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "title": "Estimated num keys",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_estimate_num_keys",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "SST files total size",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_total_sst_files_size",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Running compactions",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_num_running_compactions",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Block cache hit rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(flink_taskmanager_job_task_operator_rocksdb_block_cache_hit[1m]) / (rate(flink_taskmanager_job_task_operator_rocksdb_block_cache_hit[1m]) + rate(flink_taskmanager_job_task_operator_rocksdb_block_cache_miss[1m]))",
+          "legendFormat": "{{task_name}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Write stopped (1=yes)",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_is_write_stopped",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Estimate pending compaction bytes",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_estimate_pending_compaction_bytes",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Memtable size all",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 22},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_size_all_mem_tables",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Actual delayed write rate",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 22},
+      "targets": [
+        {
+          "expr": "flink_taskmanager_job_task_operator_rocksdb_actual_delayed_write_rate",
+          "legendFormat": "{{task_name}}/{{subtask_index}}"
+        }
+      ]
+    }
+  ]
+}

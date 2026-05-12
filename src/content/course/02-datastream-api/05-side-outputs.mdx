@@ -107,6 +107,51 @@ DataStream<ErrorRecord> errorStream = mainStream.getSideOutput(errorTag);
 
 ---
 
+## Side output mechanics
+
+<DiagramContainer title="Side output mechanics: main flow + tagged outputs" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="ProcessFunction processElement(in, ctx, out)"
+        tooltip="Single entry point per record. ctx exposes both main collector (out.collect) и side output API (ctx.output(tag, value)). One traversal — no extra deserialization or shuffle for splits."
+      >
+        Record arrives
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="route by business logic" />
+    <FlowRow>
+      <DataBox
+        label="out.collect(value) — main output"
+        tooltip="Default downstream stream. Same type as ProcessFunction declared output (Collector&lt;Output&gt;). Goes к whatever .process(...) chained next. Most records flow here."
+      >
+        Main stream → next operator
+      </DataBox>
+      <DataBox
+        label="ctx.output(lateTag, value) — late events"
+        tooltip="OutputTag&lt;LateEvent&gt; lateTag = new OutputTag&lt;LateEvent&gt;('late') {}. Anonymous subclass required for type inference. Different type allowed than main output. Retrieved через stream.getSideOutput(lateTag)."
+      >
+        Side: late events stream
+      </DataBox>
+      <DataBox
+        label="ctx.output(errorTag, value) — DLQ"
+        tooltip="Dead Letter Queue pattern. Parse errors, validation failures, schema mismatch — emit к errorTag, sink to error Kafka topic. Type-safe (DLQRecord), independent parallelism."
+      >
+        Side: error DLQ stream
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="retrieved by tag" />
+    <FlowRow>
+      <DataBox
+        label="mainStream.getSideOutput(tag)"
+        tooltip="Returns DataStream&lt;T&gt; matching the tag's type parameter. Each side output is independent — can have own sink, parallelism, watermark handling. Watermarks propagate identically to main."
+      >
+        Independent DataStream per tag
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Use Case 1: Late event capture
 
 Самый частый — capture late events из windowed aggregation:

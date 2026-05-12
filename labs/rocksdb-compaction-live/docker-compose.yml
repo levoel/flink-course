@@ -1,0 +1,124 @@
+# Flink 2.2 + RocksDB state backend + MinIO checkpoints + Prometheus/Grafana
+# Variant: ROCKSDB_OPTIONS=DEFAULT (по умолчанию) или FLASH_SSD_OPTIMIZED
+
+x-flink-common: &flink-common
+  image: flink:2.2.0-java17
+  environment: &flink-env
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: jobmanager
+      state.backend.type: rocksdb
+      state.backend.incremental: true
+      state.backend.rocksdb.predefined-options: ${ROCKSDB_OPTIONS:-DEFAULT}
+      state.backend.rocksdb.metrics.actual-delayed-write-rate: true
+      state.backend.rocksdb.metrics.background-errors: true
+      state.backend.rocksdb.metrics.block-cache-capacity: true
+      state.backend.rocksdb.metrics.block-cache-hit: true
+      state.backend.rocksdb.metrics.block-cache-miss: true
+      state.backend.rocksdb.metrics.column-family-as-variable: true
+      state.backend.rocksdb.metrics.compaction-pending: true
+      state.backend.rocksdb.metrics.cur-size-active-mem-table: true
+      state.backend.rocksdb.metrics.cur-size-all-mem-tables: true
+      state.backend.rocksdb.metrics.estimate-live-data-size: true
+      state.backend.rocksdb.metrics.estimate-num-keys: true
+      state.backend.rocksdb.metrics.estimate-pending-compaction-bytes: true
+      state.backend.rocksdb.metrics.is-write-stopped: true
+      state.backend.rocksdb.metrics.mem-table-flush-pending: true
+      state.backend.rocksdb.metrics.num-immutable-mem-table: true
+      state.backend.rocksdb.metrics.num-running-compactions: true
+      state.backend.rocksdb.metrics.num-running-flushes: true
+      state.backend.rocksdb.metrics.num-snapshots: true
+      state.backend.rocksdb.metrics.size-all-mem-tables: true
+      state.backend.rocksdb.metrics.total-sst-files-size: true
+      state.checkpoints.dir: s3://checkpoints/
+      execution.checkpointing.interval: 30s
+      execution.checkpointing.mode: EXACTLY_ONCE
+      s3.endpoint: http://minio:9000
+      s3.path-style-access: true
+      s3.access-key: minioadmin
+      s3.secret-key: minioadmin
+      taskmanager.numberOfTaskSlots: 4
+      taskmanager.memory.process.size: 4096m
+      parallelism.default: 4
+      # Prometheus reporter
+      metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+      metrics.reporter.prom.port: 9249
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    tty: true
+    stdin_open: true
+
+  jobmanager:
+    <<: *flink-common
+    ports:
+      - "8081:8081"
+      - "9249:9249"  # prometheus metrics
+    command: jobmanager
+    volumes:
+      - ./jobs:/jobs:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  taskmanager-1:
+    <<: *flink-common
+    command: taskmanager
+    ports:
+      - "9251:9249"
+    depends_on:
+      - jobmanager
+
+  taskmanager-2:
+    <<: *flink-common
+    command: taskmanager
+    ports:
+      - "9252:9249"
+    depends_on:
+      - jobmanager
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - jobmanager
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  minio-data:

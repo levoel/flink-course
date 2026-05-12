@@ -301,6 +301,57 @@ Variables: `$namespace`, `$job_name`, `$operator_name`, `$tm_id`. Filterable vie
 
 ---
 
+## Alerting tiers: P0 → P3
+
+<DiagramContainer title="Alerting tiers: P0 → P3 routing playbook" color="rose">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="P0 — Critical (page on-call)"
+        tooltip="User-facing impact OR proven data loss risk. Job stopped, persistent checkpoint failures (>2 in 10min), OOMKilled TaskManager. Expected frequency < 5/month. Wakes engineer at 3am. Must have runbook + clear remediation."
+      >
+        PagerDuty → on-call phone
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="serious but not immediate user impact" />
+    <FlowRow>
+      <DataBox
+        label="P1 — High (Slack mention)"
+        tooltip="Sustained issue (5-10+ min), risk of escalation but not yet impacting users. Backpressure sustained, watermark stuck > 10min, checkpoint duration P95 > 5min. Expected 1-3/week. Notify during business hours, response within 1h."
+      >
+        #flink-alerts-high (@oncall mention)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trend / capacity issue" />
+    <FlowRow>
+      <DataBox
+        label="P2 — Medium (digest)"
+        tooltip="Trend issues for capacity planning. State growth faster than usual, GC time elevated, throughput downward trend, RocksDB compaction backlog. Daily/weekly digest. No interrupt — review during regular ops review."
+      >
+        Slack digest / email daily summary
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="observability artifact, no action" />
+    <FlowRow>
+      <DataBox
+        label="P3 — Info (Slack channel)"
+        tooltip="Observability marker. Heap > 80% for 30min (watch trend), throughput drop 30% vs baseline (may be expected upstream pattern). No notification — passively observable in Slack channel."
+      >
+        #flink-observability (no notification)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="route through Alertmanager" />
+    <FlowRow>
+      <DataBox
+        label="Alertmanager inhibition + grouping"
+        tooltip="Inhibition rule: CheckpointFailing P0 suppresses Backpressure P1 (likely same root cause). Group by job_name → one alert per job, not per subtask. group_wait 30s for P0, 5m for P1. Reduces alert volume 50-70%."
+      >
+        Inhibition / grouping / silencing
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Alerting playbook
 
 Alerts categorized по severity:

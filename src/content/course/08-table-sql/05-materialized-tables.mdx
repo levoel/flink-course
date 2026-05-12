@@ -13,6 +13,10 @@ Materialized Tables — flagship feature Flink 2.0 GA (FLIP-435). Это declara
 
 Это disruptive feature: workflow становится «declare what you want», вместо «manage how to compute». Comparable с dbt модель в batch ETL — но native real-time.
 
+<Callout type="note">
+Materialized Tables (FLIP-435) — GA в Flink 2.0. Backend = Apache Paimon (streaming-first lakehouse). Refresh job auto-spawned, state управляется через checkpoints, ALTER SET FRESHNESS делает stop-with-savepoint + restart с тем же state.
+</Callout>
+
 ---
 
 ## Concept — что это значит
@@ -458,6 +462,10 @@ ALTER MATERIALIZED TABLE m SUSPEND;
 Refresh job stopped, table reads return stale data. Consumers don't know.
 
 **Fix**: monitor `MaterializedTable.lastRefreshTimestamp` metric, alert if stale > 2 × freshness.
+
+<Callout type="warning">
+Materialized Tables — refresh job lifecycle отдельно от main job. SUSPEND без RESUME → stale data, consumers не знают. Monitor `lastRefreshTimestamp`, alert if stale > 2 × FRESHNESS. ALTER SET FRESHNESS меняет refresh strategy, в edge case (batch ↔ streaming mode switch) state не переносится.
+</Callout>
 
 ### 4. ALTER FRESHNESS не сохраняет state в edge cases
 

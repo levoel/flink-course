@@ -13,6 +13,10 @@ Late events — события, прибывшие с timestamp меньше cur
 
 Этот урок — production-grade discussion: что такое late events, как настроить allowedLateness, обязательное использование side output, monitoring и alerts.
 
+<Callout type="warning">
+ВСЕГДА вызывайте `.sideOutputLateData(tag)` для production windowed pipelines — иначе late events silently dropped (только `numLateRecordsDropped` метрика, никаких errors). Это #1 причина reconciliation mismatch между Flink real-time и batch source-of-truth.
+</Callout>
+
 ---
 
 ## Что такое late event
@@ -294,6 +298,10 @@ FraudAlert alert = new FraudAlert(userId, windowStart, score, fireVersion);
 ```
 
 Downstream knows initial vs update. Choose based on requirements.
+
+<Callout type="tip">
+Re-fire после late event эмитит second result для того же window. Downstream sink ДОЛЖЕН быть idempotent: compacted Kafka topic (key = `window_start + entity_id`), ClickHouse ReplacingMergeTree, Postgres ON CONFLICT, или Iceberg upsert. Append-only sink без version поля → дубли в downstream.
+</Callout>
 
 ---
 

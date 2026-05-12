@@ -129,7 +129,62 @@ Compact: 10 bytes для 13 bytes Avro equivalent (Avro encodes both fields more
 
 ---
 
-## Schema evolution в Protobuf
+## Schema evolution scenarios
+
+<DiagramContainer title="Protobuf schema evolution: scenarios per change type" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Initial schema: tags 1,2,3"
+        tooltip="message UserEvent { int64 user_id = 1; string event_type = 2; int64 timestamp_ms = 3; }. Old binary records written to Kafka, sitting in topic + savepoint state."
+      >
+        Producer schema v1
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="developer modifies .proto" />
+    <FlowRow>
+      <DataBox
+        label="ADD: new tag 5 (skip 4)"
+        tooltip="string user_agent = 5. Wire format encodes by tag number — old readers see unknown tag 5, skip it. New readers get '' (default) for old records. SAFE. Skip 4 if reserved or possibly used."
+      >
+        ADD new field → SAFE
+      </DataBox>
+      <DataBox
+        label="REMOVE: reserved 3 + reserved name"
+        tooltip="reserved 3; reserved 'timestamp_ms'; — prevents future devs from reusing tag 3 для different type. Without reserved, reusing tag = catastrophic data corruption (old records misinterpreted). SAFE only with reservation."
+      >
+        REMOVE with reservation → SAFE
+      </DataBox>
+      <DataBox
+        label="REUSE tag number"
+        tooltip="message v2: int64 timestamp_ms = 3 deleted, then string session_id = 3 added. Old data in topic contains int64 at tag 3, new readers interpret as string → garbage. CATASTROPHIC."
+      >
+        REUSE tag → DATA CORRUPTION
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="more scenarios" />
+    <FlowRow>
+      <DataBox
+        label="RENAME field name"
+        tooltip="message v2: int64 user_id = 1 → int64 customer_id = 1. Wire format encodes by tag number only — name is metadata. SAFE on wire level. But: downstream code generated from .proto sees customer_id() accessor."
+      >
+        RENAME name → SAFE (tag stable)
+      </DataBox>
+      <DataBox
+        label="TYPE change int32 → int64"
+        tooltip="Same tag, type widened. Wire backward compatible (int32 fits in int64 varint encoding). Positive values OK. Negative numbers different encoding — careful. int↔string NEVER compatible."
+      >
+        WIDEN int → varint compat
+      </DataBox>
+      <DataBox
+        label="proto2 required → optional"
+        tooltip="proto2 only — proto3 removed required entirely. Changing required → optional breaks old readers expecting required field. proto3 default — all optional, no required at all."
+      >
+        proto2 required→optional → BREAKS
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
 
 Protobuf evolution rules:
 

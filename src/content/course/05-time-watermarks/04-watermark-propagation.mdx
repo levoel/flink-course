@@ -133,6 +133,10 @@ MIN(active only) = MIN(1000, 1100, 980) = **980** → watermark двигаетс
 
 Production правило: **всегда** комбинация `.withIdleness()` + `.allowedLateness()` + `.sideOutputLateData()` для critical pipelines.
 
+<Callout type="warning">
+Resurrection idle source — silent data loss. Idle partition «просыпается» через 30 минут, события приходят с timestamp в прошлом, watermark уже ушёл вперёд → события late → без `sideOutputLateData` они silently dropped. Production: idleness + lateness + side output — это triplet, не выбор.
+</Callout>
+
 ---
 
 ## Multi-input operators: union, connect, join
@@ -239,6 +243,10 @@ keyBy(userId):
 ```
 
 Это означает: даже если один key всегда идёт в downstream subtask 3, watermark от source проходит через все downstream subtasks.
+
+<Callout type="note">
+Watermark — это distributed consensus («все согласились, что времена до T прошли»), не keyed value. Поэтому broadcast независимо от partitioning стратегии. Для диагностики stuck watermark идите сверху вниз по DAG в Web UI — первый operator с `currentInputWatermark = Long.MIN_VALUE` укажет на проблемный upstream.
+</Callout>
 
 ### Forward / hash / rebalance — все одинаково для WM
 

@@ -262,6 +262,10 @@ state.backend.local-recovery: true
 - Только если TM не died (rescheduled to same physical node)
 - Disk usage doubles (RocksDB live + local recovery copies)
 
+<Callout type="tip">
+Recovery time зависит от ПОЛНОГО размера state (нужны все SSTs из manifest), не от incremental diff. Если recovery time критичен — комбинируйте `state.backend.local-recovery: true` + Adaptive Scheduler с STICKY allocation: TM рестартует на том же node → читает SSTs с локального NVMe вместо S3 → recovery minutes → seconds.
+</Callout>
+
 ---
 
 ## Comparison: full vs incremental
@@ -311,6 +315,10 @@ Upload SSTs requires network. На 1TB state, 60s interval, 5% diff = 50GB diff,
 При changing key groups (rescaling от parallelism 100 к 200), SSTs reshuffle между subtasks. After rescale **all SSTs are new** — incremental benefit lost для first checkpoint после rescale.
 
 **Mitigation**: meh — это inherent при rescaling, нет workaround. Just expect spike в bandwidth.
+
+<Callout type="warning">
+После rescale (parallelism 100 → 200) все SSTs reshuffle по новым key groups → incremental benefit временно lost, первые несколько checkpoint фактически full. Если rescale частый (autoscaling) — включайте GIC: DSTL log не зависит от SST layout, checkpoint остаётся stable. Production правило: rescale + heavy compaction + EOS = enable GIC.
+</Callout>
 
 ### 6. Сравнение incremental + GIC
 

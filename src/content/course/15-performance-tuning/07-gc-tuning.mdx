@@ -132,6 +132,75 @@ env.java.opts.taskmanager: >
 
 ---
 
+## G1 vs ZGC vs Shenandoah — pause comparison
+
+<DiagramContainer title="G1 vs ZGC vs Shenandoah: pause time profile" color="slate">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="G1GC (default Java 17+)"
+        tooltip="Region-based, concurrent mark + incremental copy. MaxGCPauseMillis soft target (default 200ms). Pauses 10-200ms typical for streaming workloads. Stable up to 32GB heap, degrades larger. Production-default for moderate latency."
+      >
+        Pauses: 10-200ms (soft target)
+      </DataBox>
+      <DataBox
+        label="ZGC (generational, Java 21 GA)"
+        tooltip="Colored pointers + load barriers. Concurrent EVERYTHING except trivial root scan. Pauses sub-millisecond regardless of heap size — 8GB or 16TB same pause. Higher CPU overhead (~10-15%). Best для P99 latency SLO."
+      >
+        Pauses: &lt; 1ms (regardless of heap)
+      </DataBox>
+      <DataBox
+        label="Shenandoah (generational, Red Hat)"
+        tooltip="Brooks pointers + read barriers. Concurrent compaction. Pauses &lt; 10ms typical. Lower CPU overhead than ZGC. Production-ready since Java 17. Alternative to ZGC, more mature for some workloads."
+      >
+        Pauses: &lt; 10ms (concurrent compact)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="throughput trade-off" />
+    <FlowRow>
+      <DataBox
+        label="G1: highest throughput"
+        tooltip="Most efficient for raw events/sec. STW pauses don't kill throughput average — just cause spikes. Best for batch-like streaming workloads where occasional 100ms hiccup OK."
+      >
+        Throughput: 100% baseline
+      </DataBox>
+      <DataBox
+        label="ZGC: 10-15% throughput overhead"
+        tooltip="Load barriers on every reference read cost CPU. Trade throughput for predictable latency. For most streaming jobs OK — pipeline latency dominates over CPU efficiency."
+      >
+        Throughput: 85-90% of G1
+      </DataBox>
+      <DataBox
+        label="Shenandoah: 10% overhead"
+        tooltip="Read barriers similar to ZGC. Slightly less throughput penalty than ZGC depending на workload. Generational variant reduces overhead further (young gen barriers cheaper)."
+      >
+        Throughput: ~90% of G1
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="heap size sweet spot" />
+    <FlowRow>
+      <DataBox
+        label="G1: 4GB — 32GB"
+        tooltip="Below 4GB G1 overhead не оправдан (Serial GC simpler). Above 32GB degrades — humongous objects break region allocator, mark phase grows. Switch к ZGC at 32GB+."
+      >
+        Optimal: 4-32GB
+      </DataBox>
+      <DataBox
+        label="ZGC: 8GB — 16TB"
+        tooltip="Lower bound 8GB — colored pointers + load barriers overhead не оправдан меньше. Upper bound 16TB — no practical limit, ZGC designed для huge heaps (cloud TaskManagers с 256GB+)."
+      >
+        Optimal: 8GB - 16TB
+      </DataBox>
+      <DataBox
+        label="Shenandoah: 4GB — 1TB"
+        tooltip="Similar to ZGC but lower upper bound (1TB practical). Mature on smaller heaps than ZGC. Default in Red Hat OpenJDK builds."
+      >
+        Optimal: 4GB - 1TB
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## GC выбор: decision tree
 
 ```

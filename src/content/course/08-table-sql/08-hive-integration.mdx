@@ -13,6 +13,67 @@ Hive — historic data warehouse standard. У многих organizations existin
 
 Use case: migrate batch Hive workloads на streaming в Flink incrementally без discard existing investment.
 
+<Callout type="note">
+HiveCatalog — bridge между legacy Hive ecosystem (HMS, UDFs, HiveQL) и modern Flink streaming. Для **greenfield** deployments — лучше Iceberg/Paimon с REST catalog (Polaris, Apache Iceberg REST). Hive integration оправдана только при существующей инфраструктуре.
+</Callout>
+
+---
+
+## HiveCatalog setup и query path
+
+<DiagramContainer title="HiveCatalog — setup и query execution flow" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. CREATE CATALOG hive WITH ('type'='hive', ...)"
+        tooltip="Flink загружает hive-site.xml из hive-conf-dir. Reads hive.metastore.uris (thrift://host:9083), hive.metastore.warehouse.dir (HDFS/S3). Connect к HMS через Thrift RPC. Catalog registered с named identifier."
+      >
+        hive-site.xml + HMS Thrift connection
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="USE CATALOG hive_legacy" />
+    <FlowRow>
+      <DataBox
+        label="2. Hive Metastore — metadata source"
+        tooltip="HMS = central Postgres/MySQL хранилище table definitions, partition lists, schemas, UDF registrations. Flink читает metadata через Thrift API. Каждый DESCRIBE/SELECT — RPC call. Метаданные кешируются (table.catalog.hive.metadata-cache.expire-after-write)."
+      >
+        Postgres backend + Thrift RPC
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="SHOW TABLES / SELECT * FROM ..." />
+    <FlowRow>
+      <DataBox
+        label="3. Query planning — federated"
+        tooltip="Cross-catalog queries поддерживаются: SELECT FROM hive.db.legacy JOIN iceberg.lakehouse.modern. Flink optimizer planning across catalogs. Partition pruning — push WHERE predicate в HMS partition listing API для efficient scan."
+      >
+        Flink planner reads HMS metadata
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="streaming source через partition watch" />
+    <FlowRow>
+      <DataBox
+        label="4. Streaming read — partition monitoring"
+        tooltip="OPTIONS('streaming-source.enable'='true', 'monitor-interval'='1min') — Flink poll-ит HMS каждую минуту, видит новые partitions. Каждая new partition → trigger downstream processing. Useful для batch ETL → streaming bridge."
+      >
+        poll HMS for new partitions
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="data file read" />
+    <FlowRow>
+      <DataBox
+        label="5. Hive UDFs invocation"
+        tooltip="ADD JAR '/path/udf.jar' + CREATE TEMPORARY FUNCTION fn AS 'com.company.UDF'. Hive UDF class loaded в Flink TaskManager classpath. Audit thread-safety обязательно — Hive UDFs assumed sequential, Flink runs parallel. Most stateless UDFs safe."
+      >
+        Hive UDFs executed parallel
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+<Callout type="warning">
+Hive UDFs не всегда thread-safe — assumed sequential execution в Hive, Flink runs параллельно по subtasks. Non-thread-safe UDFs (shared mutable state, static counters) crash. Audit весь UDF JAR library перед deploy. HMS version mismatch (Hive 2.x vs 3.x) = `Required field 'client_protocol' is unset` — match `flink-sql-connector-hive-*` version с реальной HMS.
+</Callout>
+
 ---
 
 ## Зачем интегрироваться с Hive
@@ -267,6 +328,10 @@ One query reads Hive legacy table в streaming, applies Hive UDF, joins Iceberg 
 4. **No legacy** — Hive overhead unjustified.
 
 Modern stack: Iceberg + REST catalog (Polaris/Apache Iceberg REST) + Paimon for streaming tables.
+
+<Callout type="tip">
+Incremental migration pattern: HiveCatalog как bridge — читать legacy Hive в streaming mode, писать в Iceberg/Paimon. Cross-catalog joins работают transparently: `FROM hive_legacy.warehouse.events JOIN iceberg.lakehouse.users`. Через 6-12 месяцев dual-write phase — postcutover Hive можно decommission.
+</Callout>
 
 ---
 

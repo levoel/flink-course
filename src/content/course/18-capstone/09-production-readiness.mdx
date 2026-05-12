@@ -17,6 +17,82 @@ Production readiness — не one-time milestone. Это continuous responsibili
 
 ## Checklist категории
 
+<DiagramContainer title="9-category production readiness checklist" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. Code quality"
+        tooltip="All stateful operators have explicit .uid('name'). Operator names .name(...) for Web UI. Idempotent committers. Error handling with side outputs (DLQ). No per-record logging. POJO/Avro for state (no Kryo fallback)."
+      >
+        UIDs / names / idempotency
+      </DataBox>
+      <DataBox
+        label="2. State management"
+        tooltip="State TTL configured for unbounded state (sessions, caches). State sizing capacity-planned (max 100GB per TM с RocksDB). Schema evolution rules followed. State Processor API migration job documented for any breaking change. Backend choice (RocksDB/ForSt/HashMap) justified."
+      >
+        TTL / sizing / recovery
+      </DataBox>
+      <DataBox
+        label="3. EOS verification"
+        tooltip="Kafka sink: EXACTLY_ONCE + transactional.id.prefix unique. transaction.timeout.ms > max checkpoint duration. Iceberg/Paimon sink: SinkV2 with proper commit/rollback. Reconciliation script comparing source vs sink counts running continuously. Late events captured (sideOutputLateData)."
+      >
+        EOS sinks / reconciliation
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="deployment layer" />
+    <FlowRow>
+      <DataBox
+        label="4. Deployment"
+        tooltip="K8s Operator (FlinkDeployment CR). HA via ZooKeeper or K8s lease. JM replicas=2. Autoscaler configured (FlinkAutoscaler). upgradeMode: savepoint. allowNonRestoredState: false default. Resource requests/limits sized from staging tests."
+      >
+        K8s / HA / autoscaling
+      </DataBox>
+      <DataBox
+        label="5. Observability"
+        tooltip="Prometheus scraping all TMs/JMs. Grafana dashboards (fleet + per-job + incident). Alerts tiered P0-P3 with runbook links. Logs aggregated к Loki/ES, structured JSON. OTel traces sampled. SLO definitions documented с burn rate alerts."
+      >
+        Metrics / alerts / dashboards
+      </DataBox>
+      <DataBox
+        label="6. Performance"
+        tooltip="Latency SLO: P99 < X ms documented. Throughput SLO: events/sec sustained. Stress-tested 2x expected peak load в staging. Backpressure rare under normal load. GC time < 5% CPU sustained. Checkpoint duration < 50% interval."
+      >
+        Latency / throughput SLO
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ops layer" />
+    <FlowRow>
+      <DataBox
+        label="7. Security"
+        tooltip="Secrets via K8s secrets or Vault (no env var plaintext). NetworkPolicy restricting TM ↔ Postgres/Kafka access. TLS на all external connections. mTLS within cluster (optional). IAM роли для S3 (no static keys). Audit log access enabled."
+      >
+        Secrets / TLS / authz
+      </DataBox>
+      <DataBox
+        label="8. Disaster Recovery"
+        tooltip="Savepoint retention tiered (hourly 7d / upgrades 30d / weekly 90d / monthly 1y). Quarterly DR drill executed in last 90 days. Rollback runbook tested. Cross-region savepoint replication if multi-region SLO. Documented RTO/RPO targets."
+      >
+        Runbooks / savepoint retention
+      </DataBox>
+      <DataBox
+        label="9. Operational readiness"
+        tooltip="On-call rotation defined в PagerDuty. Escalation policy documented. Runbooks accessible from each alert (annotation URL). Recent on-call training (last 6 months). Post-mortem template ready. Sign-off from each role before launch."
+      >
+        On-call / escalation / training
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="sign-off gate" />
+    <FlowRow>
+      <DataBox
+        label="Pre-launch sign-offs"
+        tooltip="Each category requires explicit sign-off from designated role: Eng lead (1, 2, 6), Platform engineer (4, 5), SRE (8, 9), Security (7), Data quality engineer (3). All boxes checked, all sign-offs recorded — only then production rollout approved."
+      >
+        Role-based approval per category
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 1. **Code quality** — UIDs, watermarks, idempotency, error handling.
 2. **State management** — TTL, sizing, recovery.
 3. **EOS verification** — sink configs, reconciliation.

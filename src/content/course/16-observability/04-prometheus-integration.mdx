@@ -13,6 +13,54 @@ Prometheus — de-facto стандарт metrics для Kubernetes окруже�
 
 ---
 
+## End-to-end metrics flow
+
+<DiagramContainer title="Flink → PrometheusReporter → Prometheus → Grafana" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink TaskManager / JobManager"
+        tooltip="Generates metrics in-process: built-in (numRecordsIn, checkpoint duration, JVM heap) + user metrics through getRuntimeContext().getMetricGroup(). Held in MetricRegistry."
+      >
+        MetricRegistry (Counter / Gauge / Meter / Histogram)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="PrometheusReporter exposes HTTP endpoint" />
+    <FlowRow>
+      <DataBox
+        label="PrometheusReporter (in-JVM)"
+        tooltip="metrics.reporter.prom.factory.class: PrometheusReporterFactory. Opens HTTP server on port 9249 inside each TM/JM. Renders MetricRegistry as Prometheus text format on /metrics request. Pull-based — no outbound network."
+      >
+        Port 9249 → /metrics endpoint (text format)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Prometheus pulls every 15s" />
+    <FlowRow>
+      <DataBox
+        label="Prometheus server"
+        tooltip="Service discovery via Kubernetes (kubernetes_sd_configs role: pod). Discovers TMs/JMs through annotations prometheus.io/scrape=true, port=9249. Scrapes endpoint, stores in TSDB. Evaluates recording/alerting rules."
+      >
+        Scrape + TSDB + Alertmanager rules
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="PromQL queries" />
+    <FlowRow>
+      <DataBox
+        label="Grafana"
+        tooltip="Prometheus datasource. PromQL queries — rate(numRecordsIn[5m]), histogram_quantile(0.99, ...). Dashboards organized: overview / health / pipeline / business / dependencies. Variable templating by namespace/job/operator."
+      >
+        Dashboards + alerting visualization
+      </DataBox>
+      <DataBox
+        label="Alertmanager"
+        tooltip="Routes firing alerts из Prometheus rules. Tiers: P0 (PagerDuty) for job stopped/checkpoint fail, P1 (Slack) for backpressure/watermark stuck, P2 (email) for GC time, state growth. Silencing/grouping/deduplication."
+      >
+        PagerDuty / Slack routing
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## PrometheusReporter (pull-based)
 
 Default для long-running streaming jobs. Flink exposes metrics на HTTP endpoint, Prometheus периодически scrapes.

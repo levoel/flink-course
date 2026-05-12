@@ -256,6 +256,10 @@ config.setAlignedCheckpointTimeout(Duration.ofSeconds(30));   // hybrid
 - **Production по умолчанию** — start aligned, escalate под backpressure
 - Best of both worlds — cheap recovery normally, bounded duration под stress
 
+<Callout type="tip">
+Aligned-checkpoint-timeout — это «защитник от long-running alignment»: start aligned (cheap recovery), если alignment затянулся > timeout — autoматический escalate к unaligned для этого checkpoint. Production default 30s — sweet spot между cost of unaligned recovery и предотвращением Kafka transaction expiration под backpressure spike.
+</Callout>
+
 ---
 
 ## Real production scenario
@@ -333,6 +337,10 @@ taskmanager.network.memory.buffer-debloat.target: 1s
 ```
 
 Buffer debloating dynamically adjusts buffer sizes — keeps amount of in-flight data к target processing time (e.g., 1s). Это minimizes ChannelState size с unaligned. **Must-have** при unaligned production.
+
+<Callout type="warning">
+Включили unaligned без buffer debloating? Под extreme backpressure InputBuffer накапливают GB-TB данных, ChannelState раздувает snapshot до неподъёмного размера. Async upload растёт, checkpoint timeout, обратный эффект. Buffer debloating (`taskmanager.network.memory.buffer-debloat.enabled: true`) — обязательная пара к unaligned.
+</Callout>
 
 ### 7. Snapshot includes upstream output buffers too
 

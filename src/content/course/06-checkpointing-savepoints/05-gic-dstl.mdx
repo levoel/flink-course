@@ -319,6 +319,10 @@ EOS Kafka pipeline with strict transaction.timeout.ms:
 
 Shorter Kafka transactions → меньше memory in brokers, faster recovery, fewer stale transactions.
 
+<Callout type="note">
+GIC не заменяет incremental — он сидит поверх него. Default Flink 2.x stack: ChangelogStateBackend (GIC) wraps RocksDB (incremental). DSTL обрабатывает frequent checkpoints (стабильные миллисекунды), incremental оптимизирует periodic materialization (раз в 10 минут). Это complementary, не альтернативы.
+</Callout>
+
 ---
 
 ## Real production scenario
@@ -398,6 +402,10 @@ S3 limits per-prefix throughput. Putting DSTL и checkpoints на same prefix м
 Если DSTL DFS partly unavailable (S3 region outage), recovery fails. State за last materialization (up to 10 min) lost.
 
 **Mitigation**: shorter materialization interval (5 min reduces window), multi-region DSTL replication.
+
+<Callout type="warning">
+GIC дубль-пишет каждую state mutation в DSTL на DFS — это постоянная DFS bandwidth (не только на checkpoint). На 100K mutations/sec это ~20MB/s sustained writes + S3 PUT requests. Положите DSTL и checkpoint storage на разные S3 prefix-ы (limit per-prefix throughput) и проверьте cost — на high-mutation workloads request count может вырасти существенно.
+</Callout>
 
 ### 5. Stop-with-savepoint после GIC enabled
 

@@ -79,6 +79,54 @@ Optimized для NVMe: смolaller SSTs (parallel compaction), more background j
 
 ---
 
+## DEFAULT / SPINNING_DISK / FLASH_SSD comparison
+
+<DiagramContainer title="PredefinedOptions: DEFAULT vs SPINNING_DISK vs FLASH_SSD" color="slate">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="DEFAULT — conservative"
+        tooltip="WriteBuffer 64MB × 2. Snappy compression. Leveled compaction. Works everywhere, optimized nowhere. Used когда workload unknown — dev/testing default."
+      >
+        WriteBuffer 64MB × 2, Snappy, Leveled
+      </DataBox>
+      <DataBox
+        label="SPINNING_DISK_OPTIMIZED — HDD"
+        tooltip="WriteBuffer 128MB × 4 (absorb HDD seeks). SST target 256MB (fewer files → fewer random seeks). max_bytes_for_level_base 1GB. WA higher but HDD has no endurance limit. For legacy HDD deployments."
+      >
+        WriteBuffer 128MB × 4, SST 256MB
+      </DataBox>
+      <DataBox
+        label="FLASH_SSD_OPTIMIZED — NVMe"
+        tooltip="WriteBuffer 64MB × 4. LZ4 compression (faster than snappy on SSD I/O). SST target 64MB (parallel compaction). max_open_files -1 (SSD random access OK). 4 background jobs. PRODUCTION default."
+      >
+        WriteBuffer 64MB × 4, LZ4, SST 64MB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trade-offs" />
+    <FlowRow>
+      <DataBox
+        label="Write throughput"
+        tooltip="FLASH_SSD highest — parallel compaction on smaller SSTs, fast LZ4 compression. SPINNING limited by HDD seek time despite larger buffers. DEFAULT moderate."
+      >
+        FLASH &gt; DEFAULT &gt; SPINNING
+      </DataBox>
+      <DataBox
+        label="Read latency"
+        tooltip="FLASH_SSD lowest — small SSTs fit in block cache better, LZ4 decompress fast. SPINNING worst due to HDD seek dominance even with larger files. DEFAULT moderate."
+      >
+        FLASH &lt; DEFAULT &lt; SPINNING
+      </DataBox>
+      <DataBox
+        label="Compaction cost"
+        tooltip="SPINNING least frequent compactions (larger SSTs, fewer files). FLASH most frequent (smaller SSTs) but parallel + fast disk = OK. DEFAULT in between."
+      >
+        SPINNING: rare; FLASH: frequent+parallel
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Какой выбрать
 
 | Hardware / Workload | Recommended |

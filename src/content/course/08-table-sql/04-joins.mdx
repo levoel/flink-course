@@ -60,6 +60,10 @@ Decision tree:
 - Stream × Slowly Changing Dim (in Flink) → temporal join
 - Stream × External system → lookup join
 
+<Callout type="warning">
+Regular joins state растёт **unbounded** — нужен idle state retention через `SET 'table.exec.state.ttl' = '24h'`. Без TTL state TB-size eventually, RocksDB OOM, restart cycles. Production monitoring обязателен.
+</Callout>
+
 ---
 
 ## Regular join — unbounded state
@@ -284,6 +288,10 @@ Per subtask:
 ```
 
 FULL good для small dim tables (1M rows). PARTIAL — для large tables с high hit rate.
+
+<Callout type="tip">
+Для enrichment streams с versioned dim (currency rates, user profiles via CDC) — **temporal joins** через `FOR SYSTEM_TIME AS OF event_time`. Это деterministic при replay (rate at order_time, не current rate) — критично для accounting correctness и compliance.
+</Callout>
 
 ---
 

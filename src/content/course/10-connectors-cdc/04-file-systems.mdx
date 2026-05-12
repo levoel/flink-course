@@ -215,6 +215,10 @@ Combines time + size + inactivity. Used для record formats (CSV, JSON) где
 
 **Note для record format:** S3 не supports append → каждая запись `re-uploads` whole file via multipart upload coordination. Это handled via Multi-Part Upload (MPU) — parts uploaded incrementally, finalized on rolling.
 
+<Callout type="warning">
+FileSink rolling policy зависит от формата: **bulk (Parquet/ORC)** — ОБЯЗАТЕЛЬНО `OnCheckpointRollingPolicy`, потому что Parquet footer пишется только на close (mid-checkpoint roll = invalid file). **Record-wise (CSV/JSON)** — `DefaultRollingPolicy` с time + size + inactivity. Перепутать = либо broken Parquet, либо checkpoint-bound file commit latency для CSV.
+</Callout>
+
 ---
 
 ## Compression

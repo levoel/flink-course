@@ -192,6 +192,10 @@ CUMULATE (24h max, 1-min step): 1 window in state per key (reset every 24h)
 
 **1440x state reduction**.
 
+<Callout type="tip">
+Любая метрика «X за последние N часов с обновлением каждую минуту» (orders today, revenue this hour, active users this week) — это CUMULATE, не HOP. Если в коде встретили `SlidingEventTimeWindows.of(Time.hours(24), Time.minutes(1))` — переписывайте на `CUMULATE` либо custom state, иначе state blow-up неизбежен.
+</Callout>
+
 ### Use case: cumulative metrics
 
 Real-time dashboard «orders today», «revenue this hour», «active users this month» — все CUMULATE patterns:
@@ -312,6 +316,10 @@ CREATE TABLE orders (
 ```
 
 `WATERMARK FOR event_time AS event_time - INTERVAL '20' SECONDS` эквивалентно `forBoundedOutOfOrderness(Duration.ofSeconds(20))` в DataStream API.
+
+<Callout type="note">
+TVF Windows require `WATERMARK FOR ... AS ...` в `CREATE TABLE` — без него TVF выдаёт ошибку на этапе плана. В отличие от DataStream API, где WatermarkStrategy опционален, в SQL это hard requirement. Idle source в SQL configured через `scan.watermark.idle-timeout` (per-table hint) или `table.exec.source.idle-timeout` (global).
+</Callout>
 
 ### Idle source в SQL
 

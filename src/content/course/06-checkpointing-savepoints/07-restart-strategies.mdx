@@ -184,6 +184,55 @@ When task в region R fails:
 
 Real production: 2-10x recovery speedup typically.
 
+<DiagramContainer title="Failover region: scope restart при task failure" color="rose">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Source A"
+        tooltip="Kafka source pipeline 1. Forward edge к Map A — same region. Independent от Source B."
+      >
+        Region 1: source
+      </DataBox>
+      <DataBox
+        label="Source B"
+        tooltip="Kafka source pipeline 2. Forward к Map B → hash к KeyBy. После hash — это уже Region 2 downstream."
+      >
+        Region 1 → Region 2 boundary
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="forward (Region 1) | hash → новая Region 2" />
+    <FlowRow>
+      <DataBox
+        label="Map A → Sink A (Region 1)"
+        tooltip="Pipeline 1 — pipelined region: Source A → Map A → Sink A. Forward edges, no shuffle. Failure любого operator в Region 1 restart-ит только Region 1."
+      >
+        Pipelined region 1
+      </DataBox>
+      <DataBox
+        label="KeyBy → Process → Sink B (Region 2)"
+        tooltip="Pipeline 2 — другая pipelined region. Хеш-shuffle отделяет от Source B. Region 2 фейлится — Region 1 продолжает работать без disruption, Source B блокирует upstream до recovery Region 2."
+      >
+        Pipelined region 2
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="task в Region 2 dies (e.g., OOM)" />
+    <FlowRow>
+      <DataBox
+        label="Full failover: restart ALL"
+        tooltip="Legacy default. Один OOM в любом operator → restart всего job. Все 500GB state restored, все sources replay from checkpoint. Downtime 5 min независимо от scope failure."
+      >
+        Все regions restart
+      </DataBox>
+      <DataBox
+        label="Region failover: только Region 2"
+        tooltip="Default с 1.10+. Restart только Region 2 subtasks (~50% операторов). Region 1 продолжает работу — fraud detection не interrupted. Recovery 1-2 min вместо 5."
+      >
+        Region 1 untouched
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ---
 
 ## Recovery time breakdown
@@ -232,6 +281,10 @@ state.backend.local-recovery: true
 ```
 
 20x speedup для same-node recovery — типичный scenario при transient TM failure (OOM kill, restart).
+
+<Callout type="tip">
+Region failover (default с Flink 1.10+) даёт 2-10x speedup recovery vs full restart всего job — restart только pipelined region вокруг failed task, остальные regions продолжают работу. Combine с `state.backend.local-recovery: true` и Adaptive Scheduler STICKY allocation — для transient TM failures recovery от minutes к seconds.
+</Callout>
 
 ---
 
@@ -306,6 +359,10 @@ Job recovery time = 20min (downloads 2TB state)
 ```
 
 **Mitigation**: increase `transaction.timeout.ms` к expected max recovery time × 2.
+
+<Callout type="warning">
+Kafka `transaction.timeout.ms` < recovery time = at-least-once вместо EOS. После crash восстановление 2TB state занимает 20 минут, а transaction expires через 15 минут → in-flight transactions abort, duplicates на restart. Production rule: `transaction.timeout.ms >= 2 × expected_max_recovery_time` + monitor recovery duration в Prometheus.
+</Callout>
 
 ### 4. Region failover requires no global state
 

@@ -104,6 +104,10 @@ Green's `initTransactions()` для `fraud-v1-0-0` increment epoch. Broker inval
 
 После cutover Blue остановить, Green продолжает. Pending Blue transactions abort по timeout.
 
+<Callout type="warning">
+`transactional.id` prefix MUST be unique per deployment. Blue/green collision = zombie producer fencing = silently dropped commits в running pipeline. При rolling deploy через `kubectl rollout` без savepoint/cleanup новые pods запускаются с теми же prefix параллельно со старыми — data loss.
+</Callout>
+
 ---
 
 ## Mechanics — что происходит во время checkpoint
@@ -197,6 +201,10 @@ KafkaSink.<T>builder()
 ```
 
 **Recommendation**: 1 hour (3600000ms) для production. Это покрывает 99% recovery scenarios.
+
+<Callout type="warning">
+`transaction.timeout.ms` PITFALL: default Kafka client = 60 seconds. Production Flink job требует значительно больше. Slow restart (K8s pod scheduling, S3 checkpoint download, JVM warmup) > timeout = broker auto-aborts prepared txn = **data loss с EOS**. Всегда задавать 1 hour и broker `transaction.max.timeout.ms=3600000`.
+</Callout>
 
 ### Broker-side limit
 

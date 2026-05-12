@@ -183,6 +183,57 @@ SavepointWriter.fromExistingSavepoint(env, oldPath, backend)
 
 ---
 
+## Job upgrade workflow: savepoint → modify → restore
+
+<DiagramContainer title="Job upgrade workflow: savepoint → modify → restore" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. Production blue running v1.42"
+        tooltip="Current production job with all stateful operators UID-ed. Daily auto-savepoints to S3. Job processes live traffic with current state shape."
+      >
+        v1.42 + state schema X
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trigger savepoint (native default)" />
+    <FlowRow>
+      <DataBox
+        label="2. Stop with savepoint"
+        tooltip="flink stop --savepointPath s3://... <jobid>. Job drains in-flight records, writes savepoint to DFS, exits cleanly. State preserved with operator UIDs as identity keys."
+      >
+        savepoint sp-pre-v143/ written к S3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="optional: State Processor API migration" />
+    <FlowRow>
+      <DataBox
+        label="3. Modify savepoint (if breaking change)"
+        tooltip="Use State Processor API to rewrite savepoint: removeOperator() for removed UIDs, transform() for schema changes, addOperator() for renamed UIDs. Produces NEW savepoint with updated UIDs/state shape. Required canonical format."
+      >
+        SavepointWriter → sp-migrated/
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="deploy new code, restore from savepoint" />
+    <FlowRow>
+      <DataBox
+        label="4. Start v1.43 with restored state"
+        tooltip="flink run -s s3://.../sp-migrated/ --restoreMode NO_CLAIM new.jar. Operators load state via UID matching. allowNonRestoredState=true required if orphan UIDs exist. New stateful operators начинают с empty state."
+      >
+        v1.43 restored from savepoint
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rollback path preserved" />
+    <FlowRow>
+      <DataBox
+        label="5. Validate + retain prior savepoint"
+        tooltip="Monitor metrics first hour: state size growth normal, no exception logs, output rate matches blue. Keep sp-pre-v143/ for emergency rollback (7-30 day retention). Rollback = flink run -s sp-pre-v143/ v1.42.jar."
+      >
+        Keep sp-pre-v143/ for rollback window
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Blue/green testing на staging
 
 **Critical rule**: каждое breaking change tested на staging savepoint перед production deploy.

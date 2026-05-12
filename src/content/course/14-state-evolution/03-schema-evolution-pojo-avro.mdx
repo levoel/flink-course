@@ -98,6 +98,60 @@ public class UserState {
 }
 ```
 
+### POJO evolution compatibility flow
+
+<DiagramContainer title="POJO evolution: compatibility check на restore" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Savepoint contains old state"
+        tooltip="Savepoint persists not only data but also PojoSerializer snapshot — class FQN + field names/types/order. Это metadata used for compatibility check на restore."
+      >
+        PojoSerializerSnapshot (old fields)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="restore from savepoint" />
+    <FlowRow>
+      <DataBox
+        label="Flink loads new code"
+        tooltip="New version code defines updated POJO class. Flink scans current class — extracts field names/types в new PojoSerializer."
+      >
+        New PojoSerializer (current fields)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="compare old vs new" />
+    <FlowRow>
+      <DataBox
+        label="Field-by-field reconciliation"
+        tooltip="Flink matches fields by name (NOT position). Common fields → same type required (or promotable). New fields → use default null/0. Removed fields → silently dropped on read. Renamed fields = remove + add (data lost)."
+      >
+        match by name → diff old/new
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="result" />
+    <FlowRow>
+      <DataBox
+        label="COMPATIBLE_AS_IS"
+        tooltip="No differences detected. Existing data deserialized с current serializer без migration."
+      >
+        Same fields → reuse
+      </DataBox>
+      <DataBox
+        label="COMPATIBLE_AFTER_MIGRATION"
+        tooltip="Added/removed nullable fields, или promotable type changes. Flink reads с old serializer, writes с new — automatic in-place migration."
+      >
+        Add/remove/promote → migrate
+      </DataBox>
+      <DataBox
+        label="INCOMPATIBLE"
+        tooltip="Rename, non-promotable type change, structural changes. Flink throws StateMigrationException — restore fails. Need State Processor API migration."
+      >
+        Rename/type → FAIL
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ### Inspecting POJO compatibility
 
 Flink при restore проверяет compatibility и выбрасывает clear exception если incompatible:

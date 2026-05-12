@@ -260,6 +260,67 @@ logger.myapp.level = INFO
 
 ## Log aggregation pipelines
 
+<DiagramContainer title="Log pipeline: log4j2 async appender → ship → ELK / Loki" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Application code"
+        tooltip="LOG.atWarn().addKeyValue('user_id', e.getUserId()).log(). MDC for context propagation. NEVER per-record in hot path. Sampled + error + lifecycle only."
+      >
+        slf4j API (structured fields)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="dispatched через log4j2 router" />
+    <FlowRow>
+      <DataBox
+        label="log4j2 Async appender"
+        tooltip="appender.async.type=Async wraps JsonFile appender. Off-loads disk IO к dedicated thread, doesn't block mailbox. Bounded queue (4096) — drops on overflow, never blocks producer thread."
+      >
+        Async wrapper (bounded queue 4096)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="JSON formatted, written к file" />
+    <FlowRow>
+      <DataBox
+        label="JsonTemplateLayout → rolling file"
+        tooltip="JsonTemplateLayout с LogstashJsonEventLayoutV1.json. SizeBasedTriggeringPolicy (100MB), max 5 files. Local file /flink/logs/taskmanager.log on emptyDir (NOT tmpfs)."
+      >
+        /flink/logs/*.log (rolling 100MB × 5)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="sidecar tails files in real-time" />
+    <FlowRow>
+      <DataBox
+        label="Promtail / Fluentd / OTel Collector"
+        tooltip="DaemonSet sidecar tails /flink/logs/*.log on every node. Parses JSON, attaches K8s labels (pod, namespace, job). Multiline-handles stack traces. Ships batch к backend через push API."
+      >
+        Tail + JSON parse + K8s labels
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ship via push API" />
+    <FlowRow>
+      <DataBox
+        label="Loki (cheap, label-based)"
+        tooltip="Index labels only, full text in S3-compatible storage. ~5-10x cheaper than ES. Grafana Explore for queries: {job='flink', level='ERROR'}. Best for moderate query volume + long retention."
+      >
+        Object storage + label index
+      </DataBox>
+      <DataBox
+        label="Elasticsearch (full-text search)"
+        tooltip="Full-text indexed. Powerful queries (checkpoint_id:123 AND duration_ms:>60000), Kibana visualizations. Expensive at scale. Use ILM policies for hot/warm/cold tiering."
+      >
+        Inverted index + Kibana UI
+      </DataBox>
+      <DataBox
+        label="S3 archive (compliance)"
+        tooltip="Long-term retention (1-7 years). S3 Glacier for compliance/audit. Athena queryable on JSON-LD format. Cheap (~$0.004/GB/month Glacier Deep)."
+      >
+        S3 Glacier (1-7 years)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 Logs в файлах TaskManager — useless для search и retention. Production aggregation:
 
 ### Option 1: Fluentd → Elasticsearch + Kibana

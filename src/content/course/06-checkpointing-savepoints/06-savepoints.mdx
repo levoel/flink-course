@@ -131,6 +131,49 @@ s3://bucket/savepoints/savepoint-abc-001/
 | Daily operational savepoint | Native |
 | Disaster recovery | Both — native primary, canonical backup |
 
+<DiagramContainer title="Native vs Canonical: create и restore flow" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Running job (RocksDB state)"
+        tooltip="Job runs с RocksDB backend. State в виде SST файлов на local NVMe (+ shared в S3 для incremental checkpoints). На stop-with-savepoint triggers savepoint creation в выбранном формате."
+      >
+        State в SST формате
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="stop-with-savepoint" />
+    <FlowRow>
+      <DataBox
+        label="Native format"
+        tooltip="Same path как checkpoint: RocksDB native snapshot (hardlinks), upload SST файлов как есть. Fast — 5-10x быстрее canonical. Tied к current backend (RocksDB) и Flink version. Default с 1.15+."
+      >
+        Fast (same as checkpoint)
+      </DataBox>
+      <DataBox
+        label="Canonical format"
+        tooltip="Backend-agnostic serialization: каждый state primitive (ValueState, MapState, ListState) сериализуется в portable format. 2-5x bigger size, 3-10x slower create/restore. Required для backend switch и version migration."
+      >
+        Slow, portable
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="restore — flink run -s" />
+    <FlowRow>
+      <DataBox
+        label="Native → same backend"
+        tooltip="Restore только в same Flink version и same backend. RocksDB native savepoint нельзя open в ForSt — формат внутренний. Same backend = fast restore (download SSTs, open RocksDB)."
+      >
+        RocksDB → RocksDB only
+      </DataBox>
+      <DataBox
+        label="Canonical → any backend"
+        tooltip="Reads portable format, deserializes в state structures, materializes в target backend (RocksDB ИЛИ ForSt). Это позволяет RocksDB → ForSt migration без полной перестройки state через source replay."
+      >
+        RocksDB → ForSt (or vice versa)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ---
 
 ## Restore: flink run -s
@@ -221,6 +264,10 @@ Flink reads canonical savepoint, creates ForSt-native state из portable format
 - Restore time также slower (deserialization)
 - Use only когда нужен backend switch — не для daily operations
 - Migration one-way obvious — после ForSt switch, going back требует another canonical savepoint
+
+<Callout type="warning">
+Без explicit `.uid()` на каждом stateful operator savepoint restore сломается при минимальных изменениях topology — Flink auto-генерирует UID на основе позиции в DAG, добавление одного `.filter()` сдвинет все downstream UIDs. `--allowNonRestoredState` маскирует проблему: state silently lost, job стартует с пустым state. Production rule: CI check на наличие `.uid()` для всех stateful operators.
+</Callout>
 
 ---
 
@@ -369,6 +416,10 @@ stream.keyBy(...).uid("kb-user").process(new MyFunc()).uid("my-func").sinkTo(s).
 Without explicit `.uid()` — auto-generated based на operator position. Adding/removing operators changes UIDs of everything downstream. Savepoint restore fails.
 
 **Production rule**: every stateful operator MUST have explicit `.uid()`. CI check для this.
+
+<Callout type="note">
+Canonical format mandatory для cross-backend migration (RocksDB → ForSt) и cross-version (Flink 1.18 → 2.x). Native в 10x быстрее, но привязан к current Flink version + backend. Production стратегия: native для повседневных savepoints (daily backup, rolling deploy в той же версии), canonical для миграций (раз в год) и long-term archival backup.
+</Callout>
 
 ### 2. Schema evolution + savepoints
 

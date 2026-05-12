@@ -573,6 +573,10 @@ public void testEndToEnd() throws Exception {
 
 ### 1. Idempotent committer — critical
 
+<Callout type="warning">
+**Idempotent committer = #1 production bug source в custom SinkV2**. На recovery Flink re-calls `commit()` для уже committed Committables. Non-idempotent committer throws → infinite retry loop. Always catch `AlreadyCommittedException` and treat as success.
+</Callout>
+
 Committer может called multiple times для same committable (recovery). Must be **idempotent**:
 
 ```java

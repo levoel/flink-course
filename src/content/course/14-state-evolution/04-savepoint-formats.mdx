@@ -102,6 +102,55 @@ spec:
 
 ## Comparison
 
+<DiagramContainer title="Native vs Canonical: format comparison" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Native savepoint"
+        tooltip="Same binary format as checkpoints. RocksDB native = SST file references (incremental). ForSt native = LSM segments on S3. HashMap native = serialized in-memory data. Fast write (no reserialization)."
+      >
+        Backend-specific binary (RocksDB SST / ForSt segments)
+      </DataBox>
+      <DataBox
+        label="Canonical savepoint"
+        tooltip="Universal Flink format. State fully reserialized field-by-field via TypeSerializer. Backend-agnostic — RocksDB savepoint can be restored on ForSt or HashMap. Required для State Processor API."
+      >
+        Universal Flink binary (cross-backend)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="restore decision" />
+    <FlowRow>
+      <DataBox
+        label="Same backend, same/minor version"
+        tooltip="Native works perfectly. 3-5x faster than canonical. Can be incremental. Use для daily blue/green, hourly auto-savepoints, patch upgrades (2.2.0 → 2.2.1)."
+      >
+        Native → fast restore
+      </DataBox>
+      <DataBox
+        label="Cross-backend OR major upgrade"
+        tooltip="Native fails for cross-backend (RocksDB → ForSt). Canonical required. Slower but portable. Use для backend migration, major version upgrade (1.20 → 2.2), State Processor API."
+      >
+        Canonical → portable restore
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="speed/size trade-off" />
+    <FlowRow>
+      <DataBox
+        label="1TB state: native ~5-10 min"
+        tooltip="Native incremental — only SST file references written. Negligible reserialization."
+      >
+        Native: incremental, fast
+      </DataBox>
+      <DataBox
+        label="1TB state: canonical ~30-60 min"
+        tooltip="Canonical reserializes whole state field-by-field. Always full snapshot, no incremental. 5-10x slower than native."
+      >
+        Canonical: full reserialize
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 | Aspect | Native | Canonical |
 |---|---|---|
 | Speed | 3-5x faster | Slower (full reserialize) |

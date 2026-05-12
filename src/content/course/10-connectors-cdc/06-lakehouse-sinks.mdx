@@ -13,6 +13,10 @@ Lakehouse — это convergence data warehouse (ACID, schema, query) с data la
 
 Этот урок разбирает: anatomy lakehouse sinks через SinkV2 (pre-commit topology для small file compaction, post-commit для manifest publish), ecosystem comparison, choice criteria.
 
+<Callout type="note">
+Все четыре lakehouse sinks (Iceberg / Paimon / Hudi / Delta) используют одну архитектуру: **SinkV2 + pre-commit topology (compaction)** + **post-commit topology (manifest/metastore publish)**. Понимание этого pattern переносится между форматами — отличаются только metadata layer и manifest format.
+</Callout>
+
 ---
 
 ## SinkV2 advanced: pre-commit и post-commit topologies

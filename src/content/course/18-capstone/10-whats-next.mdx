@@ -155,7 +155,83 @@ Managed services tradeoffs: less ops burden, less flexibility, vendor lock-in.
 
 ---
 
-## Career paths
+## Career paths in streaming
+
+<DiagramContainer title="Career paths from this course → senior+ specialization" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Middle-Senior Streaming Engineer (where you are)"
+        tooltip="Capable of designing, implementing, deploying, operating, debugging production Flink jobs. ~$120-180k US, lower in EU. Foundation for any specialization below."
+      >
+        Course graduate: 2-5 years experience
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="specialize по interest + market demand" />
+    <FlowRow>
+      <DataBox
+        label="Senior Streaming Engineer"
+        tooltip="Deep Flink + ecosystem expertise. Lead production deployments. Mentor team. Contribute back (bug fixes, FLIPs). Conference talks. 3-5 years post-course. $180-250k US."
+      >
+        Path: depth in Flink internals
+      </DataBox>
+      <DataBox
+        label="Streaming Architect"
+        tooltip="Design data architectures, evaluate technologies, set org-wide patterns. Cross-team influence. Business communication. Often hands-off coding. Path: senior engineer + architecture exposure. $220-300k US."
+      >
+        Path: breadth + business
+      </DataBox>
+      <DataBox
+        label="Platform Engineer (Streaming)"
+        tooltip="Build internal Flink-as-a-Platform: multi-tenant clusters, self-service onboarding, autoscaling, observability. K8s + Flink + DevOps fusion. High demand in big tech. $200-280k US."
+      >
+        Path: K8s + Flink + DevOps
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="alternative tracks" />
+    <FlowRow>
+      <DataBox
+        label="Flink Committer / Apache Member"
+        tooltip="Open source contribution. Meaningful PRs, mailing list participation, FLIP authorship, eventual nomination by existing committers. Often part of day job (Ververica, Alibaba, AWS, Confluent). Career-defining credential."
+      >
+        Path: OSS contribution
+      </DataBox>
+      <DataBox
+        label="Data Engineer (Streaming)"
+        tooltip="End-to-end pipelines: Flink + Kafka + Iceberg/Paimon + dbt + Snowflake/Redshift. Data engineering background + streaming depth. Mix batch + streaming work. $150-220k US."
+      >
+        Path: data engineering hybrid
+      </DataBox>
+      <DataBox
+        label="ML Platform Engineer (Streaming + AI)"
+        tooltip="Emerging area. Real-time ML inference, feature stores, agent platforms. Flink + ML/AI fusion. Flink Agents, Paimon vector tables, real-time embeddings. High growth area. $200-350k US in 2026+."
+      >
+        Path: streaming + ML/AI
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="adjacent ecosystem (broader)" />
+    <FlowRow>
+      <DataBox
+        label="Apache Paimon expert"
+        tooltip="Deep dive в LSM-tree lakehouse format. Compaction tuning, CDC integration. High demand с adoption growth 2025-2026."
+      >
+        Lakehouse depth
+      </DataBox>
+      <DataBox
+        label="Multi-engine (Flink + RisingWave + Materialize)"
+        tooltip="Breadth across streaming engines. Each имеет niche: Flink (general-purpose), RisingWave (incremental SQL), Materialize (timely dataflow). Senior architects often know multiple."
+      >
+        Streaming engine generalist
+      </DataBox>
+      <DataBox
+        label="Cloud-specific (AWS MSK / GCP Dataflow / Azure)"
+        tooltip="Managed Flink offerings: AWS Kinesis Data Analytics, GCP Dataflow (Beam), Confluent Cloud Flink. Cloud-specific tuning, networking, IAM. Often part of senior platform role."
+      >
+        Cloud specialization
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
 
 ### Senior Streaming Engineer
 

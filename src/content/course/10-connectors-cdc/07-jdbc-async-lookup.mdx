@@ -188,6 +188,10 @@ LEFT JOIN users_dim FOR SYSTEM_TIME AS OF o.proctime AS u
 
 Each event blocks operator thread на duration JDBC query. Если query 20ms — max throughput per subtask = 50 events/sec. Unacceptable для production.
 
+<Callout type="warning">
+Sync JDBC lookup даёт ~50 records/sec per subtask (limited by query latency). Для любого production workload **MUST use Async I/O** через `RichAsyncFunction`. Sync lookup blocks operator main thread = no event processing, no checkpoint barrier handling → checkpoint timeout → job restart loop.
+</Callout>
+
 ### Async lookup via Async I/O
 
 <DiagramContainer title="Async I/O: pipeline lookups concurrently" color="blue">

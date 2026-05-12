@@ -13,6 +13,10 @@ SinkV2 — современный API для приёмников в Flink, за
 
 Ключевая идея SinkV2 — `Committer` — это **отдельный operator** в Flink graph, не часть SinkWriter. Это позволяет повторно использовать committer для retry, балансировать commit load и встраивать compaction/aggregation между write и commit.
 
+<Callout type="note">
+SinkV2 (FLIP-191) — современный API. `TwoPhaseCommitSinkFunction` deprecated в 1.x и **removed в 2.0**. Если мигрируете legacy job — переписывать обязательно.
+</Callout>
+
 ---
 
 ## Архитектура SinkV2
@@ -224,6 +228,10 @@ public interface SupportsPostCommitTopology<CommittableT>
 - **Iceberg manifest publish** — после commit data files в Iceberg metadata layer, нужно publish manifest list и update catalog.
 - **Hive metastore update** — register new partition.
 - **Broadcast notification** — пользовательский telegram bot «new data dropped».
+
+<Callout type="warning">
+PostCommitTopology **не EOS**. Если post-commit operator падает после успешного commit — на restart Flink заново вызовет post-commit для уже committed транзакций. Side effects дублируются. Iceberg manifest publish идемпотентен (UUID), telegram notification — нет.
+</Callout>
 
 ```java
 @Override

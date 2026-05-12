@@ -253,6 +253,10 @@ Symptoms:
 - S3 throttling observed
 - Long bucket listings
 
+<Callout type="tip">
+File merging (FLIP-306) — must-have для installations с 1000+ subtasks или sub-minute checkpoints. Снижает количество файлов 50-100x, устраняет S3 PUT throttling, ускоряет listing, режет request costs на порядок. Если видите 503 SlowDown или checkpoint duration 8+ минут на больших cluster — это primary fix перед всеми остальными оптимизациями.
+</Callout>
+
 ### Maybe skip if:
 - Small parallelism (< 50)
 - Large state per subtask already (files naturally > 32MB)
@@ -280,6 +284,10 @@ state.backend.changelog.enabled: true      # GIC
 state.checkpoints.file-merging.enabled: true   # FLIP-306
 state.backend.local-recovery: true             # local cache
 ```
+
+<Callout type="note">
+File merging оптимизирует количество физических файлов, но manifest всё равно содержит все StateHandles (теперь с offset+length вместо path). Manifest size proportional к state primitives count, не к file count — на jobs с тысячами state объектов manifest всё ещё может быть large. Для cleanup отслеживайте `max-space-amplification` (default 2.0) — допустимый overhead до forced rewrite merged файлов.
+</Callout>
 
 ---
 

@@ -223,6 +223,10 @@ stream.sinkTo(sink);
 
 Flink uses pattern `{prefix}-{subtask}-{checkpointId}` для transactional.id. На recovery Flink lists transactions matching prefix, aborts orphaned, resumes valid. **Prefix must be unique per job** — если две jobs use same prefix, они interfere → data loss / corruption.
 
+<Callout type="warning">
+Kafka `transactional.id` PITFALL: должен быть **уникальный per job**. Blue/green deployment с одинаковым prefix = zombie fencing — Kafka aborts «старого» producer-а, новый job получает aborted transactions, possible data loss. Encode environment в prefix: `prod-fraud-v2-tx`, `staging-fraud-v2-tx`. При major redeploy bump version suffix.
+</Callout>
+
 ---
 
 ## SinkWriter, Committer, GlobalCommitter в SinkV2

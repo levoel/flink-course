@@ -31,6 +31,54 @@ POJO (Plain Old Java Object) — preferred serialization path для user-define
 
 ---
 
+## TypeInformation extraction flow
+
+<DiagramContainer title="TypeInformation extraction: how Flink decides POJO vs Kryo" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="env.fromElements / map / state — type T encountered"
+        tooltip="TypeExtractor invoked from DataStream API, StateDescriptor, etc. Goal: produce TypeInformation&lt;T&gt; used for serializer selection. Cached per JobGraph compilation."
+      >
+        TypeExtractor.getForClass(T.class)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="check basic types first" />
+    <FlowRow>
+      <DataBox
+        label="Is T primitive / String / boxed / Date?"
+        tooltip="BasicTypeInfo handles Long, Integer, Double, Boolean, String, Date, Void, BigInteger, BigDecimal. Most efficient serializer — direct binary write."
+      >
+        BasicTypeInfo → fast path
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="not basic — try POJO" />
+    <FlowRow>
+      <DataBox
+        label="POJO detection rules"
+        tooltip="1) Class public (or static nested). 2) Public no-arg constructor exists. 3) For each non-static field: public OR has matching getter/setter by name convention. 4) All field types recursively are basic/POJO/known. 5) No unresolved generic params."
+      >
+        Check all 5 POJO rules
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rules outcome" />
+    <FlowRow>
+      <DataBox
+        label="ALL rules pass → PojoTypeInfo"
+        tooltip="PojoSerializer used. ~95% perf of Tuple. Supports schema evolution (add/remove nullable fields). Field-by-field binary writes. Compatible с Table API. Production-grade."
+      >
+        PojoSerializer (fast, evolvable)
+      </DataBox>
+      <DataBox
+        label="ANY rule fails → GenericTypeInfo"
+        tooltip="Fallback to Kryo. Default behavior — NO WARNING (silent perf hit). 50% slower than POJO, NO schema evolution support. Common causes: missing no-arg ctor (Lombok @AllArgsConstructor only), final fields, getter/setter name mismatch, Instant/LocalDateTime fields (need explicit type info)."
+      >
+        Kryo (slow, no evolution)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
 ## Канонический POJO
 
 ```java

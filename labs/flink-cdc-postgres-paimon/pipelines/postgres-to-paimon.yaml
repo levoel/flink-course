@@ -1,0 +1,43 @@
+# Flink CDC 3.6 pipeline: Postgres logical replication → Apache Paimon (S3 на MinIO).
+#
+# Submit: docker compose exec flink-cdc-submitter \
+#     bash -c 'cd /opt/flink-cdc-3.6.0 && ./bin/flink-cdc.sh /pipelines/postgres-to-paimon.yaml'
+
+source:
+  type: postgres
+  hostname: postgres
+  port: 5432
+  username: cdc
+  password: cdc
+  database-name: cdcdb
+  schema-name: public
+  tables: public.orders, public.customers
+  slot.name: flink_slot
+  decoding.plugin.name: pgoutput
+  publication.name: cdc_pub
+  scan.incremental.snapshot.enabled: true
+  scan.incremental.snapshot.chunk.size: 8192
+  scan.startup.mode: initial
+
+sink:
+  type: paimon
+  catalog.properties.metastore: filesystem
+  catalog.properties.warehouse: s3://paimon-warehouse/
+  catalog.properties.s3.endpoint: http://minio:9000
+  catalog.properties.s3.access-key: minioadmin
+  catalog.properties.s3.secret-key: minioadmin
+  catalog.properties.s3.path.style.access: "true"
+  table.properties.bucket: "2"
+  table.properties.changelog-producer: "input"
+
+pipeline:
+  name: pg-to-paimon
+  parallelism: 2
+  schema.change.behavior: evolve
+
+# Optional: route specific tables to different sinks (например, sharding)
+route:
+  - source-table: public.orders
+    sink-table: cdcdb.orders
+  - source-table: public.customers
+    sink-table: cdcdb.customers

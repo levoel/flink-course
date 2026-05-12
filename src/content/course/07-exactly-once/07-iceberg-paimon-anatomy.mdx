@@ -13,6 +13,10 @@ Iceberg и Paimon — два главных streaming-friendly lakehouse фор�
 
 Apache Iceberg (proven в Netflix, Apple) и Apache Paimon (рождён в Flink community, optimized для streaming) имеют разные internals, но **same SinkV2 wiring**.
 
+<Callout type="tip">
+Iceberg/Paimon sinks ОБЯЗАТЕЛЬНО используют `TwoPhaseCommittingSink` + `SupportsPostCommitTopology`. Post-commit для manifest publish / catalog update. Pre-commit для small file compaction — без неё manifest entries growth = query planning latency растёт линейно.
+</Callout>
+
 ---
 
 ## Архитектура — общая для Iceberg и Paimon
@@ -331,6 +335,10 @@ Paimon филесистем catalog работает в standalone setups (singl
 Если установить committer parallelism к 8, multiple subtasks parallelly call `table.newAppend().commit()` → catalog CAS conflicts → most retry, slow throughput.
 
 **Fix**: committer parallelism = 1. Iceberg/Paimon defaults to это.
+
+<Callout type="warning">
+Committer parallelism MUST = 1 для Iceberg/Paimon. Multiple subtasks parallelly call `table.newAppend().commit()` → catalog CAS conflicts → 99% retry, throughput cratters. Если задавали parallelism > 1 manually — откатить.
+</Callout>
 
 ### 2. Без pre-commit compaction → millions of small files
 

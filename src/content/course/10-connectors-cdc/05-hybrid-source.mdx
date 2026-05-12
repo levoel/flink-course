@@ -47,6 +47,10 @@ env.fromSource(source, watermarkStrategy, "hybrid")
 
 **Один pipeline.** State (per-user baseline) populated during historical phase. Smoothly transitions к live phase когда historical exhausted. Same DataStream, same operator state, same exactly-once.
 
+<Callout type="tip">
+Hybrid Source (FLIP-150) — modern Kappa architecture **в одном бинаре**: backfill из S3 → smooth switch на live Kafka, без external orchestration (Spark batch + handoff). Same code, single job, exactly-once preserved across switch. Это убивает Lambda architecture для большинства use cases.
+</Callout>
+
 ---
 
 ## Architecture: HybridSource как FLIP-27 Source

@@ -235,6 +235,10 @@ public void triggerCheckpointSync(CheckpointBarrier barrier) {
 
 Sync phase обычно **< 100ms** даже для TB state. Это why Flink scalable.
 
+<Callout type="tip">
+RocksDB native snapshot — O(1) hardlinks на immutable SST файлы, никакого copy данных. Это причина, почему sync phase миллисекунды даже на TB state. На heap state backend CopyOnWriteStateMap требует shadow copy всего map-а на момент snapshot → OOM на больших state. Production: RocksDB/ForSt, не heap.
+</Callout>
+
 ### Step 6: Async upload + forward barrier
 
 После sync phase — две вещи в parallel:
@@ -299,6 +303,10 @@ public void notifyCheckpointComplete(long checkpointId) {
 ```
 
 Это **Two-Phase Commit** — урок 03 модуля 07.
+
+<Callout type="warning">
+`notifyCheckpointComplete` — критический колбек для 2PC sinks (Kafka, JDBC, Iceberg). Если sink died после checkpoint complete, но до `notifyCheckpointComplete` — на recovery Flink восстановит state от этого checkpoint, но `notifyCheckpointComplete` для этого ID уже НЕ вызовется. Sink должен в `open()` читать pending transactions из state и `recoverAndCommit()` для всех с `epoch <= recoveredCheckpoint`.
+</Callout>
 
 ---
 

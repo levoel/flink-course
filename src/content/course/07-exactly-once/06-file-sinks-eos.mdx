@@ -13,6 +13,10 @@ FileSink — modern (FLIP-191) приёмник для file-based outputs: S3, H
 
 В отличие от KafkaSink с native transactions, FileSink реализует EOS через **transactional rename**: pending файлы существуют физически, но для query engine «не существуют» до commit. Это похоже на pattern Iceberg/Hudi commits.
 
+<Callout type="note">
+FileSink (FLIP-191) — modern API на SinkV2. Старый `StreamingFileSink` deprecated. EOS гарантия зависит от **atomic rename** в filesystem: HDFS/Linux/GCS/Azure — native, S3 — через Multipart Upload.
+</Callout>
+
 ---
 
 ## File lifecycle — три состояния
@@ -332,6 +336,10 @@ public class FileSinkWithCompaction<T> extends FileSink<T>
 ```
 
 **3. Iceberg/Paimon** — у них рassive compaction в catalog layer. Streaming sink пишет small files, асинхронные `rewrite_files` jobs compact.
+
+<Callout type="tip">
+Pre-commit topology обязательна для production data lake sinks: FileSink/Iceberg/Paimon. Используй `SupportsPreCommitTopology` + window aggregation для merge 10×64MB → 1×256MB до Committer. Это снижает file count в 10× и query latency engine (Trino, Spark) — в разы.
+</Callout>
 
 ---
 

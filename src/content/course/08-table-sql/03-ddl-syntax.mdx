@@ -15,6 +15,63 @@ Mastering DDL — это путь к declarative streaming. SQL pipelines ста
 
 ---
 
+## Anatomy CREATE TABLE — какие части за что отвечают
+
+<DiagramContainer title="CREATE TABLE flow — schema + time attributes + watermark + PK" color="indigo">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. Column list — schema"
+        tooltip="Регулярные столбцы (с типами), computed columns (column AS expression), metadata columns (METADATA FROM 'partition'/'offset'/'timestamp'/'headers'). Computed columns синтезируются runtime, не stored. Metadata VIRTUAL = read-only, не emit на sink."
+      >
+        regular + computed + METADATA
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Schema готов" />
+    <FlowRow>
+      <DataBox
+        label="2. Time attribute"
+        tooltip="PROCTIME() — non-deterministic, wall clock TM. TIMESTAMP(3)/TIMESTAMP_LTZ(3) с WATERMARK — event time, deterministic при replay. Computed column через TO_TIMESTAMP_LTZ(epoch_ms, 3) для конверсии Unix epoch."
+      >
+        PROCTIME() или event_time
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="time attribute marked" />
+    <FlowRow>
+      <DataBox
+        label="3. WATERMARK FOR col AS col - INTERVAL"
+        tooltip="Декларация: для column col вычислить watermark = max(col) - delay. Determines deadline для late events. Out-of-orderness measurement P99 + 50% safety margin = typical 5-30 seconds. Без watermark — windowed aggregations не emit results."
+      >
+        watermark = max(col) - 5s
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="event-time semantics ready" />
+    <FlowRow>
+      <DataBox
+        label="4. PRIMARY KEY (col) NOT ENFORCED"
+        tooltip="Metadata для planner и connectors. NOT ENFORCED = Flink не валидирует uniqueness. Required для upsert-kafka, JDBC sink с upsert, CDC sources. Влияет на partitioning при sink (по PK hash). Composite PK supported."
+      >
+        PK metadata для upsert
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="DDL ready" />
+    <FlowRow>
+      <DataBox
+        label="5. WITH ('connector' = ...) + PARTITIONED BY"
+        tooltip="Connector-specific properties: kafka/upsert-kafka/jdbc/filesystem/iceberg/paimon/*-cdc. PARTITIONED BY — для filesystem/Hive Hive-style partitioning (region=us/date=2026-05-12/). Query engines partition-prune по WHERE clause."
+      >
+        connector + partitioning
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+<Callout type="warning">
+WATERMARK too aggressive = lost late events. Production: измерить P99 out-of-orderness на real stream, set watermark = P99 + 50% safety margin (типично 5-30s). Слишком маленький `INTERVAL '1' SECOND` → out-of-order > 1s events dropped silently (без `ignore-parse-errors=true`).
+</Callout>
+
+---
+
 ## Basic CREATE TABLE
 
 ```sql
@@ -355,6 +412,10 @@ JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
 ```
 
 `update_time` + PK + watermark — задаёт versioned table.
+
+<Callout type="tip">
+Temporal joins (`FOR SYSTEM_TIME AS OF`) — единственно корректный способ enrichment с versioned dim tables (currency rates, product catalog, user profile snapshots). Каждый order видит rate at order_time, не current — deterministic при replay, корректно для accounting.
+</Callout>
 
 ### Pattern: CDC source
 
