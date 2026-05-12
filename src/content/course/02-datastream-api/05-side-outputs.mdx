@@ -132,7 +132,7 @@ lateEvents.sinkTo(lateEventsKafka);
 lateEvents.map(tx -> {
     Metrics.lateEventCounter.inc();
     return tx;
-}).addSink(...);
+}).sinkTo(...);  // SinkV2 API (FLIP-191)
 ```
 
 Без side output для late events они просто **silently dropped** — это самый частый source of data loss в Flink jobs. Production rule: **ALWAYS добавляйте side output для late events** + alert если count > threshold.

@@ -200,7 +200,7 @@ public class FraudDetectionJob {
         lateStream
             .windowAll(TumblingProcessingTimeWindows.of(Time.minutes(1)))
             .aggregate(new CountAgg())
-            .addSink(new MetricsSink("late.transactions.per.minute"));
+            .sinkTo(new MetricsSink("late.transactions.per.minute"));  // SinkV2
 
         env.execute("Fraud Detection");
     }

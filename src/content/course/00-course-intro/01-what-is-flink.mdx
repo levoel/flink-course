@@ -28,7 +28,7 @@ Apache Flink — это **stateful streaming engine** для обработки 
 | State | Между batch-ами, через checkpoint | Per-key, continuous, hot in-memory + RocksDB на диске |
 | Event time | Поддерживается, но через batch granularity | Native, per-record |
 | Watermarks | Per-batch | Per-record, propagation через operator graph |
-| Exactly-once | Через idempotent sink или 2PC | 2PC через TwoPhaseCommitSinkFunction / SinkV2 |
+| Exactly-once | Через idempotent sink или 2PC | 2PC через SinkV2 (FLIP-191) / TwoPhaseCommittingSink |
 | Backpressure | Через batch scheduling | Native, credit-based flow control |
 
 В мае 2025 Spark выпустил **Real-Time Mode (RTM)** в 4.1 с millisecond latency — но даже эта фича по-прежнему построена на batch-абстракциях, и кейсы со сложным stateful processing продолжают мигрировать на Flink.

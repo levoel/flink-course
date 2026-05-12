@@ -201,7 +201,7 @@ K8s ConfigMap содержит leader info + JobGraph pointers, persistent stora
 
 При старте каждый JobManager pod пытается стать лидером:
 
-1. **ZK**: запись в ephemeral znode `/leader/dispatcher` с lock. Кто первый — тот лидер. При смерти ephemeral znode исчезает, kикdaster кто-то другой триггерит resubscribe и захватывает lock.
+1. **ZK**: запись в ephemeral znode `/leader/dispatcher` с lock. Кто первый — тот лидер. При смерти владельца ephemeral znode исчезает, и кто-то другой триггерит resubscribe и захватывает lock.
 2. **K8s**: каждый pod пытается update ConfigMap с annotation `leader=<pod-id>` через optimistic lock. Lease (renew раз в N секунд) гарантирует, что dead pod не блокирует election.
 
 Leader election происходит отдельно для каждого сервиса: Dispatcher leader, ResourceManager leader, per-JobMaster leader. Обычно они на одном pod-е, но логически независимы.

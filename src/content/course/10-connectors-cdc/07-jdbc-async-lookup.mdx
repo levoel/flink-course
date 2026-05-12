@@ -65,28 +65,29 @@ JDBC source — query-and-finish. Не tail-ит changes. Для real-time DB re
 ## JDBC sink — streaming inserts
 
 ```java
-SinkFunction<Order> jdbcSink = JdbcSink.sink(
-    "INSERT INTO orders_history (order_id, user_id, amount, ts) VALUES (?, ?, ?, ?)",
-    (statement, order) -> {
-        statement.setLong(1, order.getId());
-        statement.setLong(2, order.getUserId());
-        statement.setBigDecimal(3, order.getAmount());
-        statement.setTimestamp(4, new Timestamp(order.getEventTime()));
-    },
-    JdbcExecutionOptions.builder()
+// Modern JDBC Sink через SinkV2 builder API (Flink 2.x)
+JdbcSink<Order> jdbcSink = JdbcSink.<Order>builder()
+    .withQueryStatement(
+        "INSERT INTO orders_history (order_id, user_id, amount, ts) VALUES (?, ?, ?, ?)",
+        (statement, order) -> {
+            statement.setLong(1, order.getId());
+            statement.setLong(2, order.getUserId());
+            statement.setBigDecimal(3, order.getAmount());
+            statement.setTimestamp(4, new Timestamp(order.getEventTime()));
+        })
+    .withExecutionOptions(JdbcExecutionOptions.builder()
         .withBatchSize(5000)
         .withBatchIntervalMs(200)
         .withMaxRetries(5)
-        .build(),
-    new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+        .build())
+    .buildAtLeastOnce(new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
         .withUrl("jdbc:postgresql://db:5432/production")
         .withDriverName("org.postgresql.Driver")
         .withUsername("writer")
         .withPassword("secret")
-        .build()
-);
+        .build());
 
-stream.addSink(jdbcSink);
+stream.sinkTo(jdbcSink);   // SinkV2: sinkTo(), not legacy addSink()
 ```
 
 ### Batching critical для throughput

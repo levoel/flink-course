@@ -308,16 +308,27 @@ Downtime: ~few seconds (stop + start).
 State Processor API позволяет создать savepoint **offline** from batch job:
 
 ```java
-// Generate savepoint из external data
-SavepointMetadata savepoint = SavepointMetadata.forNewBatchEnvironment(env)
-    .withConfiguration(...);
+// Generate savepoint из external data — State Processor API (Flink 2.x)
+// State Processor API в 2.x использует DataStream batch (bounded), не legacy DataSet API
 
-ExistingSavepoint existing = Savepoint.load(env, savepoint, savepointPath);
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
-DataSet<Account> accounts = env.fromCollection(loadAccountsFromDB());
-existing.writeKeyedState("account-state", accounts, ...);
+// Загружаем bootstrap данные из BoundedSource (FLIP-27)
+DataStream<Account> accounts = env.fromCollection(loadAccountsFromDB());
 
-Savepoint.write(savepoint, "s3://bucket/bootstrap-savepoint/");
+// Bootstrap новый savepoint
+SavepointWriter
+    .newSavepoint(env, new EmbeddedRocksDBStateBackend(), 128)
+    .withOperator(
+        OperatorIdentifier.forUid("account-state"),
+        OperatorTransformation
+            .bootstrapWith(accounts)
+            .keyBy(Account::getId)
+            .transform(new AccountStateBootstrapFunction()))
+    .write("s3://bucket/bootstrap-savepoint/");
+
+env.execute("Bootstrap savepoint");
 
 // Затем restore нормально:
 // flink run -s s3://bucket/bootstrap-savepoint/ stream-job.jar

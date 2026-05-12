@@ -11,7 +11,7 @@ topics: ["Flink Agents", "AI Agents", "LLM", "FLIP-531", "MCP", "Future"]
 
 В октябре 2025 вышел **Flink Agents 0.1.0** — preview release новой Apache Flink sub-project. В марте 2026 — 0.2.1 stable preview. Это FLIP-531 — попытка ответить на вопрос: «AI agents работают на event streams. Stream processing engine с EOS, durability, state — это естественная runtime для агентов. Почему мы строим agents на ad-hoc Python orchestration, когда есть Flink?».
 
-Flink Agents — это **event-driven AI agents с stream processing seman tics**: каждое incoming event triggers agent invocation, agent имеет durable memory через Flink state, может вызывать tools (Kafka, DB, HTTP), exactly-once гарантирует, что side effects не выполняются дважды. Combined с MCP (Model Context Protocol) и mainstream LLM providers, это даёт production-grade infrastructure для AI applications.
+Flink Agents — это **event-driven AI agents с stream processing semantics**: каждое incoming event triggers agent invocation, agent имеет durable memory через Flink state, может вызывать tools (Kafka, DB, HTTP), exactly-once гарантирует, что side effects не выполняются дважды. Combined с MCP (Model Context Protocol) и mainstream LLM providers, это даёт production-grade infrastructure для AI applications.
 
 Этот урок — `★ FUTURE`. Мы разберём архитектуру, primitives, и где этот sub-project размещается в Flink ecosystem.
 

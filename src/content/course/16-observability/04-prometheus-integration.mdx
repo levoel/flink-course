@@ -51,7 +51,7 @@ JobManager также exposes metrics на своём порту (default 9249 �
 metrics.reporter.prom.port: 9249-9259
 ```
 
-Каждый TM picks first available port. Прометheus scrape config должен охватывать range.
+Каждый TM picks first available port. Prometheus scrape config должен охватывать range.
 
 ---
 
@@ -401,7 +401,7 @@ PushGateway сохраняет metrics forever (если `deleteOnShutdown: fals
 curl -X DELETE http://pushgateway:9091/metrics/job/old-job-name
 ```
 
-Или TTL через прометheus garbage collection script.
+Или TTL через Prometheus garbage collection script.
 
 ### Gotcha 6: Metric name conflicts в multi-tenant
 

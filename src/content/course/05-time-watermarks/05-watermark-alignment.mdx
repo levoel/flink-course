@@ -11,7 +11,7 @@ topics: ["Watermark Alignment", "FLIP-217", "SourceCoordinator", "Multi-source",
 
 Watermark Alignment (FLIP-217) — одна из самых важных feature, добавленных в Flink за последние 5 лет. Она решает фундаментальную проблему multi-source jobs: **один источник убегает по event time, другой отстаёт, и watermark всего pipeline зависит от медленного**. До FLIP-217 это было причиной OOM, drift в gigabytes state и невозможности правильного backfill.
 
-GA в Flink 1.18, продолжает совершенствоваться. На 5000 subtasks benchmark показывает **76x speedup** vs alignment без FLIP-217. Этот урок — детальный разбор алгоритма, configuration и production гoтча.
+GA в Flink 1.18, продолжает совершенствоваться. На 5000 subtasks benchmark показывает **76x speedup** vs alignment без FLIP-217. Этот урок — детальный разбор алгоритма, configuration и production gotcha.
 
 ---
 

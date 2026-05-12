@@ -170,7 +170,7 @@ public class AsyncDimLookup extends RichAsyncFunction<Transaction, EnrichedTx> {
 - External store уже существует и имеет low latency.
 
 **Когда НЕ применять:**
-- External DB down → backpressure caskадирует на весь pipeline. Critical dependency.
+- External DB down → backpressure каскадирует на весь pipeline. Critical dependency.
 - Need historical versions для time-travel queries — lookup всегда current.
 
 <Callout type="note">
@@ -183,7 +183,7 @@ Lookup join — это **eventual consistency** между fact и dim. Если
 
 Концепция: dim — это **versioned table**, каждое значение помнит свою валидность (rowtime). Join производится по **historical version dim на event time fact-а**.
 
-Это решение проблемы reprocessing. Представьте: вы запускаете job 1 января для replay транзакций с 1 ноября. Цена продукта изменилась 15 ноября. Lookup join даст current price (как на 1 января — neправильно). Temporal join даст historical price (как на event time каждой транзакции).
+Это решение проблемы reprocessing. Представьте: вы запускаете job 1 января для replay транзакций с 1 ноября. Цена продукта изменилась 15 ноября. Lookup join даст current price (как на 1 января — неправильно). Temporal join даст historical price (как на event time каждой транзакции).
 
 ```sql
 -- Versioned table: products с PRIMARY KEY и rowtime
@@ -274,7 +274,7 @@ ON o.product_id = p.product_id;
 | Список стран ISO (~250 stable) | Broadcast | Tiny, rarely updated |
 | Product catalog 1M items, real-time prices, replay required | Temporal | Historical correctness |
 | User profile 500M users, current value OK | Lookup (Async I/O + cache) | Too big для broadcast |
-| Feature flags (~1000), updates secunды | Broadcast | Tiny, real-time delivery |
+| Feature flags (~1000), updates секунды | Broadcast | Tiny, real-time delivery |
 | Fraud rules ~10k, updates rare | Broadcast | Manageable, no replay concerns |
 | Currency rates 200 pairs, replay financial calcs | Temporal | Historical exchange rate critical |
 | User session state 100M, lookup current | Lookup (Redis) | Too big, current OK |
