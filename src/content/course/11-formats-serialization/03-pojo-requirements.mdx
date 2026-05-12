@@ -1,0 +1,433 @@
+---
+title: "POJO requirements: правила, которые нельзя нарушать"
+description: "Public no-arg constructor, public fields ИЛИ getters/setters, supported field types. Anti-patterns. Validation через TypeExtractor."
+order: 3
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["POJO", "PojoTypeInfo", "PojoSerializer", "TypeExtractor"]
+---
+
+# POJO requirements: правила, которые нельзя нарушать
+
+POJO (Plain Old Java Object) — preferred serialization path для user-defined types в Flink. Правильный POJO даёт ~95% производительности голого Tuple, поддерживает schema evolution (добавление nullable полей) и работает прозрачно с Table API. Нарушение хотя бы одного requirement — и Flink молча падает на `GenericTypeInfo<T>` с Kryo serializer (50% perf hit, см. урок 07).
+
+Эти правила выглядят простыми, но в production codebases каждый второй класс нарушает хотя бы одно. В этом уроке — exhaustive разбор каждого условия, anti-patterns с примерами из реальных проектов и validation techniques для CI.
+
+---
+
+## Правила POJO в Flink — exhaustive list
+
+Класс `T` распознаётся как POJO **тогда и только тогда**, когда:
+
+1. **Класс public** (или `static` nested public).
+2. **Имеет public no-arg constructor** (`public T() {}`).
+3. **Для каждого non-static, non-transient field** выполнено **хотя бы одно**:
+   - field имеет модификатор `public` (и не `final`, потому что Flink должен уметь set);
+   - класс имеет `public` getter (`getX()` или `isX()` для boolean) и setter (`setX()`) с соответствующими сигнатурами.
+4. **Все non-transient field types** распознаются Flink — это либо BasicTypeInfo, либо POJO рекурсивно, либо array, Map, List, Set из flink-aware элементов.
+5. **Класс не generic с unresolved параметрами** — `class Box<T>` без `extends Box<ConcreteType>` не POJO.
+
+Любое нарушение → `GenericTypeInfo` → Kryo. Без warning по default. Это самый коварный bug в Flink.
+
+---
+
+## Канонический POJO
+
+```java
+public class Transaction {
+
+    public long txId;              // public field — OK
+
+    private String userId;
+    private double amount;
+    private Instant eventTime;      // ← внимание: Instant — не POJO!
+    private TxStatus status;        // enum — OK (BasicTypeInfo)
+
+    public Transaction() {}         // ← no-arg ctor ОБЯЗАТЕЛЬНО
+
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+
+    public double getAmount() { return amount; }
+    public void setAmount(double amount) { this.amount = amount; }
+
+    public Instant getEventTime() { return eventTime; }
+    public void setEventTime(Instant eventTime) { this.eventTime = eventTime; }
+
+    public TxStatus getStatus() { return status; }
+    public void setStatus(TxStatus status) { this.status = status; }
+}
+```
+
+Проверим:
+
+```java
+TypeInformation<Transaction> info = TypeExtractor.getForClass(Transaction.class);
+System.out.println(info);
+// PojoType<Transaction>(
+//   amount: Double,
+//   eventTime: GenericType<java.time.Instant>,   ← Kryo!
+//   status: EnumType<TxStatus>,
+//   txId: Long,
+//   userId: String
+// )
+```
+
+Видим: класс распознан как POJO, **но один field `eventTime` — Kryo**. Это частая ловушка: класс-обёртка POJO, но внутри есть non-POJO field. Решение далее.
+
+---
+
+## Anti-pattern 1: отсутствие no-arg constructor
+
+```java
+public class Order {
+    public long id;
+    public String customer;
+
+    public Order(long id, String customer) {  // только parametrised ctor
+        this.id = id;
+        this.customer = customer;
+    }
+}
+
+// → GenericTypeInfo → Kryo
+// (Lombok @AllArgsConstructor без @NoArgsConstructor — частый источник)
+```
+
+Lombok-пользователи особенно подвержены:
+
+```java
+@Data                           // generates getters/setters
+@AllArgsConstructor             // generates (long, String) ctor
+// @NoArgsConstructor missing! 
+public class Order {
+    private long id;
+    private String customer;
+}
+// → НЕ POJO → Kryo
+```
+
+Правильно:
+
+```java
+@Data
+@NoArgsConstructor              // ← обязательно
+@AllArgsConstructor
+public class Order {
+    private long id;
+    private String customer;
+}
+```
+
+---
+
+## Anti-pattern 2: final fields
+
+```java
+public class Immutable {
+    public final long id;          // final → set невозможен → не POJO
+    public final String name;
+
+    public Immutable() { id = 0; name = ""; }  // даже с ctor — final не пишется
+    public Immutable(long id, String name) { this.id = id; this.name = name; }
+}
+```
+
+Immutability patterns конфликтуют с Flink POJO requirements. Flink использует reflection `Field.set(obj, value)` — финальные поля не set'ятся (UnsupportedOperationException, или раньше silently игнорировалось).
+
+Решение — либо принять mutability для streaming records (Flink-style), либо использовать Java records (1.18+):
+
+```java
+public record TransactionRec(long txId, String userId, double amount) {}
+// Flink 1.18+ распознаёт records как POJO-equivalent через RecordSerializer
+```
+
+Records — recommended path для immutable data в современной Flink. Все accessor-методы (`txId()`, `userId()`) генерируются compiler-ом, и Flink использует canonical constructor для deserialization.
+
+---
+
+## Anti-pattern 3: getter/setter naming не совпадает
+
+```java
+public class Mismatch {
+    private String customerName;
+
+    public Mismatch() {}
+    public String getName() { return customerName; }   // ← getName, не getCustomerName
+    public void setName(String name) { this.customerName = name; }
+}
+```
+
+Flink ищет getter/setter **по имени field**: `customerName` → `getCustomerName`/`setCustomerName` (`isCustomerName` для boolean). Если field называется `customerName`, а getter `getName` — Flink **не свяжет** их. Field считается inaccessible → класс не POJO.
+
+Правила:
+
+| Field name | Expected getter | Expected setter |
+|---|---|---|
+| `name` | `getName()` | `setName(...)` |
+| `customerName` | `getCustomerName()` | `setCustomerName(...)` |
+| `isActive` (boolean) | `isActive()` или `getIsActive()` | `setActive(...)` или `setIsActive(...)` |
+| `active` (boolean) | `isActive()` или `getActive()` | `setActive(...)` |
+
+Lombok соблюдает это правило, manual code часто нет.
+
+---
+
+## Anti-pattern 4: inner non-static class
+
+```java
+public class Outer {
+    public static class GoodNested {  // OK — static
+        public long id;
+        public GoodNested() {}
+    }
+
+    public class BadInner {           // НЕ static → синтетический this$0 reference на Outer
+        public long id;
+        public BadInner() {}
+    }
+}
+```
+
+Inner non-static class имеет implicit `this$0` reference на enclosing instance. Это не serializable как plain POJO — Flink видит `Outer this$0` field и пытается сериализовать enclosing → infinite recursion / non-Serializable error.
+
+Правило: **anonymous и inner non-static classes — никогда не POJO**. Всегда выносите наружу или делайте `static`.
+
+```java
+// Тоже BadInner pattern
+DataStream<MyType> stream = input.map(new MapFunction<>() {
+    @Override
+    public Tuple2<String, MyType> map(String value) {
+        // anonymous class имеет implicit ref на enclosing
+        return Tuple2.of(value, new MyType());
+    }
+});
+// MyType если nested non-static — кошмар. Сделайте static class.
+```
+
+---
+
+## Anti-pattern 5: nested non-POJO types
+
+```java
+public class Event {
+    public long id;
+    public Instant timestamp;        // ← Instant не POJO
+    public Map<String, Object> metadata;  // ← value Object → ?
+
+    public Event() {}
+}
+```
+
+Класс Event сам POJO (no-arg ctor, public fields), **но** его field `timestamp: Instant` не POJO. Что происходит:
+
+```
+PojoTypeInfo<Event>
+  id: Long                       ← BasicTypeInfo, fast
+  timestamp: GenericType<Instant> ← Kryo!
+  metadata: ?                    ← Map<String,Object> → GenericType (Object value)
+```
+
+Класс распознан как POJO, но **per-field serializer для `timestamp` и `metadata` — Kryo**. Это самый коварный случай: throughput для типа Event не 100% и не 50%, а зависит от того, какие fields hot — Long fast, Instant slow.
+
+### Решения
+
+**1. Замена типов на flink-friendly:**
+
+```java
+public class Event {
+    public long id;
+    public long timestampMs;       // ← long вместо Instant
+    public Map<String, String> metadata;  // ← String вместо Object
+    public Event() {}
+}
+// Все fields → BasicTypeInfo + MapTypeInfo, full POJO performance
+```
+
+**2. Custom TypeInformation для Instant через `@TypeInfo`:**
+
+```java
+@TypeInfo(InstantTypeInfoFactory.class)
+public class Wrapper {
+    public Instant ts;
+    public Wrapper() {}
+}
+
+public class InstantTypeInfoFactory extends TypeInfoFactory<Instant> {
+    @Override
+    public TypeInformation<Instant> createTypeInfo(
+        Type t, Map<String, TypeInformation<?>> genericParams) {
+        return new InstantTypeInfo();
+    }
+}
+```
+
+**3. Avro Specific** — если schema хочется share:
+
+```java
+@AvroGenerated
+public class EventAvro extends SpecificRecordBase { ... }
+// → AvroTypeInfo, не Kryo, schema evolution support
+```
+
+---
+
+## Anti-pattern 6: enum с custom fields
+
+```java
+public enum TxStatus {
+    PENDING("P", 1),
+    COMPLETED("C", 2),
+    FAILED("F", 3);
+
+    private final String code;
+    private final int order;
+
+    TxStatus(String code, int order) {
+        this.code = code;
+        this.order = order;
+    }
+}
+```
+
+В Flink enum распознаётся как `EnumTypeInfo` — сериализуется через `EnumSerializer` (int ordinal). Custom fields (`code`, `order`) **не сериализуются**. На deserialize Flink читает ordinal и делает `TxStatus.values()[ordinal]` — fields доступны как usual в enum constants.
+
+**Это нормально**, но имеет implication для schema evolution: если порядок enum constants меняется (`PENDING=0`, `COMPLETED=1` → swap), state становится corrupted. Best practice — никогда не reorder enum, только append.
+
+---
+
+## Detailed: PojoSerializer внутренности
+
+```java
+public final class PojoSerializer<T> extends TypeSerializer<T> {
+    private final Class<T> clazz;
+    private final Field[] fields;                  // отсортированы по имени
+    private final TypeSerializer<Object>[] serializers;  // per-field
+    private final ExecutionConfig executionConfig;
+
+    @Override
+    public void serialize(T value, DataOutputView target) throws IOException {
+        for (int i = 0; i < fields.length; i++) {
+            Object fieldValue = fields[i].get(value);     // reflection
+            if (fieldValue == null) {
+                target.writeBoolean(true);                 // null marker
+            } else {
+                target.writeBoolean(false);
+                serializers[i].serialize(fieldValue, target);  // delegated
+            }
+        }
+    }
+
+    @Override
+    public T deserialize(DataInputView source) throws IOException {
+        T instance = clazz.getDeclaredConstructor().newInstance();  // no-arg ctor
+        for (int i = 0; i < fields.length; i++) {
+            boolean isNull = source.readBoolean();
+            if (!isNull) {
+                Object fieldValue = serializers[i].deserialize(source);
+                fields[i].set(instance, fieldValue);                // reflection set
+            }
+        }
+        return instance;
+    }
+}
+```
+
+Ключевые моменты:
+
+- **Field order — sorted by name**, не declaration order. Это критично для schema evolution: один и тот же field на разных versions всегда в одинаковой позиции.
+- **Reflection overhead** — `Field.get()` и `Field.set()` ~5x медленнее direct access. С Java 9+ через `VarHandle` / `MethodHandle` можно ускорить, но Flink держит compatibility с Java 8.
+- **Per-field null marker** (1 byte) — позволяет nullable fields, обязательно для evolution (новое поле = nullable).
+
+---
+
+## Validation: проверка POJO в CI
+
+Подход 1 — статический lint:
+
+```java
+// Тест: убедиться что все @State POJO класс
+public class PojoValidationTest {
+    @Test
+    public void allPojosAreValid() {
+        Reflections reflections = new Reflections("com.myproject.events");
+        Set<Class<?>> classes = reflections.getTypesAnnotatedWith(StreamEvent.class);
+
+        for (Class<?> clazz : classes) {
+            TypeInformation<?> info = TypeExtractor.getForClass(clazz);
+            assertThat(info)
+                .as("Class %s must be PojoTypeInfo, got %s", clazz, info)
+                .isInstanceOf(PojoTypeInfo.class);
+        }
+    }
+}
+```
+
+Подход 2 — runtime fail-fast (production):
+
+```java
+// В application bootstrap
+env.getConfig().disableGenericTypes();
+// Любая попытка использовать non-POJO в pipeline → IllegalArgumentException
+```
+
+Подход 3 — recursive walk:
+
+```java
+static void assertNoKryoFields(TypeInformation<?> info, String path) {
+    if (info instanceof GenericTypeInfo<?>) {
+        throw new AssertionError("Kryo fallback at " + path + ": " + info);
+    }
+    if (info instanceof PojoTypeInfo<?> pojo) {
+        for (int i = 0; i < pojo.getArity(); i++) {
+            assertNoKryoFields(pojo.getTypeAt(i), path + "." + pojo.getFieldNames()[i]);
+        }
+    }
+}
+```
+
+---
+
+## Production gotchas
+
+- **Lombok `@Data` без `@NoArgsConstructor`** — самый частый случай Kryo fallback в Lombok-based projects. Используйте `@Data @NoArgsConstructor @AllArgsConstructor`.
+- **`@Builder`** alone — не добавляет no-arg ctor. Combine с `@NoArgsConstructor`.
+- **Kotlin data class** — нужно добавить `@JvmOverloads constructor()` или secondary constructor для no-arg. Лучше использовать regular class.
+- **Bean Validation annotations (`@NotNull`, `@Size`)** — Flink игнорирует, валидация не работает в hot path.
+- **`@JsonProperty` на field** — никакого эффекта на Flink POJO detection. Jackson и Flink — независимые миры.
+- **Generic POJO** — `class Wrapper<T>` без bound — Flink не может сериализовать T. Используйте конкретные subclasses или `@TypeInfo`.
+- **Field с `transient` modifier** — игнорируется serializer. Полезно для derived/cache fields, но осторожно: после deserialize transient field = default value.
+- **`@Tolerate` Lombok** — может позволить добавить no-arg constructor рядом с `@AllArgsConstructor`, но проще использовать `@NoArgsConstructor`.
+- **Records с reference types** — `record Event(long id, Instant ts)` — `ts: Instant` остаётся проблемным, как и в обычном POJO.
+- **Sealed interfaces (Java 17+)** — для discriminated union (`sealed interface Event permits ClickEvent, ViewEvent`) Flink не знает sub-types. Используйте Avro union или flat POJO с type field.
+
+<Callout type="warning">
+Production-grade рекомендация: создайте abstract base class `StreamEventBase` с обязательным `public T() {}`, все ваши event types inherit от него. Документируйте в Code Review checklist: "no-arg ctor + all fields public/getters/setters + no Instant/BigDecimal без custom TypeInfo".
+</Callout>
+
+<Callout type="tip">
+Альтернатива POJO — Avro Specific (codegen). Если у вас уже есть `.avsc` schemas — используйте их. Avro Specific = ~85% perf vs ~95% POJO, но получаете schema evolution из коробки, schema registry integration, cross-language compatibility. Trade-off зависит от того, важнее ли вам performance или governance.
+</Callout>
+
+---
+
+## Best practices summary
+
+| Practice | Why |
+|---|---|
+| Always `@NoArgsConstructor` + `@AllArgsConstructor` (Lombok) | No silent Kryo fallback |
+| Replace `Instant` with `long epochMillis` в hot path | BasicTypeInfo fast, no Kryo |
+| Replace `BigDecimal` carefully — есть BasicTypeInfo, но slow | Use `long cents` для money |
+| Avoid `Optional<T>` fields | Nullable fields with `null` is faster |
+| Use `Map<String, String>` not `Map<String, Object>` | Object value → Kryo |
+| Sealed types — use Avro union или flat with discriminator | POJO не handles polymorphism |
+| `pipeline.generic-types: false` в production config | Fail-fast при regression |
+| CI test: all event types are PojoTypeInfo | Detect breaks early |
+| Records (Java 17+) preferred over class с getters | Immutable, less code, supported 1.18+ |
+
+---
+
+<KnowledgeCheck
+  question="Команда добавила новый event type `class FraudAlert` с Lombok `@Data @Builder`. Job в production показывает 40% throughput regression на этом стриме. Опишите root cause analysis, конкретные шаги diagnosis, и fix."
+  answer="**Root cause hypothesis**: Lombok `@Data` генерирует getters/setters, но `@Builder` не генерирует no-arg constructor. Без `@NoArgsConstructor` Lombok-class не имеет `public FraudAlert()` → Flink TypeExtractor falls back to GenericTypeInfo → Kryo serializer. **Diagnosis steps**: (1) Локально запустить `TypeInformation<FraudAlert> info = TypeExtractor.getForClass(FraudAlert.class); System.out.println(info);` — увидеть либо `GenericType<FraudAlert>`, либо PojoType с GenericType fields. (2) В production логах Flink JobManager — поискать `Class ... must be public and have a no-arg constructor to be analyzed as a POJO type. Falling back to GenericType` (это WARN-уровень, часто проскальзывает в noise). (3) `env.getConfig().disableGenericTypes()` в staging — pipeline сразу fails с `IllegalArgumentException`, указывая на конкретный класс. (4) `javap -p FraudAlert.class` — посмотреть какие constructors сгенерировал Lombok. Если только `<init>(Long, String, ...)` от `@Builder`, no-arg ctor отсутствует. (5) Decompile сгенерированный bytecode через IntelliJ → подтвердить. **Fix**: добавить `@NoArgsConstructor` к Lombok annotations: `@Data @Builder @NoArgsConstructor @AllArgsConstructor` (последний нужен потому, что `@NoArgsConstructor` удаляет `@Builder`-generated ctor, надо явно вернуть). Перезапустить job. Throughput восстанавливается. **Дополнительный fix для предотвращения**: (a) добавить в bootstrap `env.getConfig().disableGenericTypes()` — теперь любой regression на этой почве fails в CI integration tests; (b) добавить unit test `PojoValidationTest`, который через reflection находит все `@StreamEvent`-annotated classes и assert-ит `instanceof PojoTypeInfo`; (c) добавить в team coding standards правило: Lombok `@Data` всегда вместе с `@NoArgsConstructor + @AllArgsConstructor`. **Дополнительная проверка polynomial fields**: если в FraudAlert есть field `Instant detectedAt`, после fix он останется Kryo внутри POJO — replace на `long detectedAtMs` или зарегистрировать custom TypeInfo. Throughput может улучшиться ещё на 10-15%."
+/>

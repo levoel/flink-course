@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/04-cdc-end-to-end",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-04",
+    "description": "Quiz for CDC end-to-end pipeline"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-04-q1",
+      "type": "multiple-choice",
+      "question": "Flink CDC 3.6 YAML pipeline под капотом — что это за конструкции?",
+      "options": [
+        { "id": "a", "text": "Это просто Flink SQL переименованный" },
+        { "id": "b", "text": "Declarative DSL поверх Flink. Builds full DataStream graph: FLIP-27 source (snapshot + streaming reader), transform operators (SQL expressions), route operator, SchemaOperator с coordination для propagation, sink с EOS через 2PC. YAML — facade, под ним нормальная Flink job" },
+        { "id": "c", "text": "Это alternative engine, не Flink" },
+        { "id": "d", "text": "Это batch-only API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink CDC 3.x — declarative pipeline framework поверх стандартного Flink. YAML описывает source/transform/route/sink, под капотом builds DataStream graph с: (1) CDC source — FLIP-27 architecture с parallel snapshot splits по PK ranges + streaming reader из replication slot; (2) transform operators применяют SQL-like projections/filters per DataChangeEvent; (3) SchemaOperator coordinator на JobManager propagate-ит schema events; (4) sink с EOS (Paimon/Iceberg 2PC). Скрывает 90% boilerplate (раньше требовалось 500+ строк Java).",
+      "studyHint": "Повторите урок 04 — раздел 'Часть 3: Flink CDC 3.6 YAML pipeline'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-04-q2",
+      "type": "multiple-choice",
+      "question": "Schema evolution с `schema.change.behavior: evolve` — что произойдёт при ALTER TABLE DROP COLUMN в Postgres?",
+      "options": [
+        { "id": "a", "text": "Pipeline fail с error" },
+        { "id": "b", "text": "Auto-apply: source detect SchemaChangeEvent, SchemaOperator propagate-ит downstream, sink выполняет ALTER TABLE DROP COLUMN на lakehouse. Новый snapshot Paimon без column. Downstream queries SELECT dropped_column сломаются. Это powerful но dangerous — для production prod рекомендован `try-evolve` + alerting" },
+        { "id": "c", "text": "Schema evolution не работает в Flink CDC" },
+        { "id": "d", "text": "Применяется только к sink, source игнорируется" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "`evolve` mode применяет destructive changes automatically. DROP COLUMN на live lakehouse — критическое. Recovery: time-travel Paimon к previous snapshot, ROLLBACK TO SNAPSHOT, restore Postgres column из backup. Production prevention: (1) `try-evolve` с alerting на DROP/RENAME/incompatible; (2) Postgres DDL governance — ALTER требует approval; (3) lakehouse retention min 30 days для recovery window; (4) downstream queries должны handle missing columns gracefully (COALESCE).",
+      "studyHint": "Повторите урок 04 — раздел 'Schema evolution propagation'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-04-q3",
+      "type": "multiple-choice",
+      "question": "Postgres replication slot fill-up — что это и почему опасно?",
+      "options": [
+        { "id": "a", "text": "Просто warning, можно игнорировать" },
+        { "id": "b", "text": "Если consumer (Flink CDC) down, WAL накапливается в Postgres и не truncate-ится — Postgres держит WAL до confirmed_flush_lsn от slot. Disk переполняется → Postgres crash. Mitigations: monitor pg_replication_slots.confirmed_flush_lsn, alerting при growth > X GB, max_slot_wal_keep_size для bound. Drop unused slots immediately" },
+        { "id": "c", "text": "Это нормальное поведение" },
+        { "id": "d", "text": "Решается перезапуском Postgres" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical Postgres CDC gotcha. Replication slot — это persistent reservation. Postgres гарантирует, что WAL не truncate-ится до confirmed_flush_lsn от slot. Если Flink CDC down 48 часов, slot не advance, WAL накапливается. На high-traffic OLTP это GB/час. Production guards: (1) `max_slot_wal_keep_size` bounds growth (drop slot если exceeded); (2) alerting на slot lag > X GB; (3) monitoring pg_replication_slots view; (4) immediate drop slot если Flink CDC permanently removed.",
+      "studyHint": "Повторите урок 04 — Production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-04-q4",
+      "type": "true-false",
+      "question": "В Flink CDC 3.x source phase 'initial' parallel snapshot создаёт нагрузку на production Postgres — это normal и не требует mitigations.",
+      "correctAnswer": false,
+      "explanation": "Production OLTP databases чувствительны к heavy reads. Parallel splits для snapshot phase загружают Postgres — SELECT * FROM table parallel. На production это бьёт по latency приложения. Mitigations обязательны: (1) запустить initial snapshot ночью; (2) использовать read replica для snapshot; (3) снизить `scan.snapshot.fetch.size`; (4) меньший parallelism source во время snapshot; (5) `scan.incremental.snapshot.enabled: true` — lock-free algorithm. Never assume snapshot 'не повредит' production.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

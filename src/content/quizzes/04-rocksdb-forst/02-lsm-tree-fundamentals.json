@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/02-lsm-tree-fundamentals",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-02",
+    "description": "Quiz for LSM-tree fundamentals lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-02-q1",
+      "type": "multiple-choice",
+      "question": "Опишите write path в LSM-tree (RocksDB).",
+      "options": [
+        { "id": "a", "text": "Write блокирует thread пока запись на диск, затем index update" },
+        { "id": "b", "text": "Write → optional WAL append → MemTable skiplist (in-memory) → когда MemTable full → immutable copy → flush в background к L0 SSTable. Никаких random disk I/O на write path" },
+        { "id": "c", "text": "Write пишет напрямую в random location SST" },
+        { "id": "d", "text": "Write обновляет B-tree pages на диске" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "LSM-tree write — almost free операция. Запись append в memory skiplist (O(log n)), optional WAL append (Flink disables WAL потому что checkpoint обеспечивает durability). Когда MemTable достигает write_buffer_size (default 64MB) — становится immutable, background thread flushes к L0 SST. Никаких random disk I/O. Это why LSM делает 5-10x faster writes чем B-tree. L0 SST overlapping (могут пересекаться по keys между файлами). Compaction позже merges L0→L1+.",
+      "studyHint": "Повторите урок — секция Write path",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m04-02-q2",
+      "type": "multiple-choice",
+      "question": "Что такое 'write/read/space amplification triangle' в LSM?",
+      "options": [
+        { "id": "a", "text": "Это название Apache project" },
+        { "id": "b", "text": "Three fundamental tradeoffs LSM: Write Amp = disk bytes / user bytes, Read Amp = disk reads per user read, Space Amp = disk space / live data. Pick two. Leveled compaction = low SA + low RA + high WA. Universal = low WA + higher SA" },
+        { "id": "c", "text": "Метрики, которые Flink автоматически tunes" },
+        { "id": "d", "text": "Конфигурационные параметры RocksDB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это foundational LSM concept. Triangle of trade-offs: невозможно minimize все три одновременно. Leveled compaction: WA 50-70x (high), RA 1-2 (low), SA 1.1-1.5 (low). Universal: WA 10-15x (low), RA higher (variable), SA 1.5-2 (higher). FIFO: zero compaction, no RA/WA cost но best-effort correctness. Understanding triangle = key для choosing compaction strategy. Default leveled — лучший balance для most Flink workloads (read-heavy с stable latency).",
+      "studyHint": "Повторите урок — секция Triangle",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-02-q3",
+      "type": "multiple-choice",
+      "question": "Production issue: L0 SST count = 30, growing, writes полностью stopped. Read P99 deteriorating. Что происходит и как fix?",
+      "options": [
+        { "id": "a", "text": "Disk full — добавить storage" },
+        { "id": "b", "text": "Write stall: flush rate > compaction rate. После level0_slowdown_writes_trigger (default 20) RocksDB throttles writes, после level0_stop_writes_trigger (default 36) — stops. Fix: больше compaction threads (thread.num: 8), увеличить max_bytes_for_level_base, проверить SSD I/O" },
+        { "id": "c", "text": "Restart job" },
+        { "id": "d", "text": "Increase MemTable size" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic write stall. Symptoms: L0 SST accumulate потому что compaction can't keep up. level0_slowdown_writes_trigger (default 20) — RocksDB artificially throttles writes. level0_stop_writes_trigger (default 36) — STOPS writes пока compaction catches up. Read perf degrades потому что 30 overlapping L0 SST = check all 30 per GET (bloom helps но not eliminate). Fix эскалация: (1) state.backend.rocksdb.thread.num: 8 — больше parallel compactions; (2) increase max_bytes_for_level_base — fewer L1 cascades; (3) verify SSD I/O not saturated; (4) consider universal compaction для write-heavy; (5) PredefinedOptions.FLASH_SSD_OPTIMIZED для sane SSD defaults.",
+      "studyHint": "Повторите урок — Production gotchas",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-02-q4",
+      "type": "true-false",
+      "question": "DELETE в LSM-tree это physical removal от disk operation, immediate.",
+      "correctAnswer": false,
+      "explanation": "False. DELETE в LSM = append tombstone (marker) — same cost как PUT. Original key+value остаётся в SST до compaction. Read должен check tombstone — если найден, return null. Physical removal происходит только когда compaction rewrites SST без обоих (original + tombstone). Implications: (1) state.clear() heavy workloads накапливают tombstones; (2) space временно doubles; (3) read latency может degrade с tombstone density; (4) Universal compaction merges less frequently — tombstones linger longer. Это why TTL cleanup compact filter работает только во время compaction.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

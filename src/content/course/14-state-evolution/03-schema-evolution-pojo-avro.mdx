@@ -1,0 +1,397 @@
+---
+title: "Schema evolution для POJO и Avro"
+order: 3
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Schema Evolution", "POJO", "Avro", "Backwards Compatibility", "Custom Serializer"]
+---
+
+# Schema evolution для POJO и Avro
+
+State в production эволюционирует: добавляются поля, меняются типы, удаляются устаревшие. **Schema evolution** — это процесс update state class так, чтобы existing state в savepoint оставался readable. Flink поддерживает automatic schema evolution для двух форматов: **POJO** (Plain Old Java Object) и **Avro**. Для остальных форматов (Kryo, generic Java serialization) **schema evolution не работает** — это критический gotcha.
+
+В этом уроке: что Flink делает автоматически, что НЕ делает (и где обрыв), какие правила evolution в POJO и Avro, escape hatch — custom TypeSerializer, миграция через State Processor API когда автоматики недостаточно.
+
+---
+
+## Зачем нужна evolution
+
+Production job stateful год. State class:
+
+```java
+public class UserState {
+    private String userId;
+    private long txCount;
+}
+```
+
+Бизнес: «давайте трекать last seen timestamp». Code:
+
+```java
+public class UserState {
+    private String userId;
+    private long txCount;
+    private Instant lastSeenAt;   // ← new field
+}
+```
+
+Что произойдёт при rolling upgrade?
+
+**Если evolution NOT supported** — restore from savepoint **FAILS** с deserialization exception. Need manual State Processor API migration (см. урок 14.2).
+
+**Если evolution supported** — Flink reads old state (без `lastSeenAt`), считает поле = null (default value), seamlessly handles. Все works.
+
+Это огромная разница в production. Schema evolution support — критический фактор стабильности.
+
+---
+
+## POJO evolution: что Flink делает
+
+POJO — Java class который Flink распознаёт по rules:
+- Public class (не nested non-static)
+- Public no-arg constructor
+- Все non-static fields либо public, либо имеют public getter/setter
+
+Flink использует **PojoSerializer** который сериализует POJO field-by-field. Schema evolution для POJO **встроена**:
+
+| Operation | Supported? | Comment |
+|---|---|---|
+| **Добавить nullable field** | Yes | Old state читается с new=null. Optional<T> или wrapper types работают |
+| **Удалить field** | Yes | Old state с field — value silently dropped |
+| **Переименовать field** | No | Flink matches по name — переименование = remove + add. Old data lost |
+| **Изменить тип field** | No (limited) | Поддерживается только subset (long ↔ int), most cases FAIL |
+| **Изменить field в Class hierarchy** | No | Изменение supertype = breaks |
+| **Изменить class name** | No | Class identified by FQN |
+
+### POJO evolution rules — детальнее
+
+```java
+// Старая версия
+public class UserState {
+    public String userId;
+    public long txCount;
+}
+
+// Новая версия — добавление nullable field — OK
+public class UserState {
+    public String userId;
+    public long txCount;
+    public Instant lastSeenAt;   // OK — default null
+}
+
+// Новая версия — удаление field — OK
+public class UserState {
+    public String userId;
+    // txCount удалён — OK, old data ignored
+}
+
+// Новая версия — rename — FAIL
+public class UserState {
+    public String customerId;    // был userId — Flink не знает что rename
+    public long txCount;
+}
+
+// Новая версия — type change long → String — FAIL
+public class UserState {
+    public String userId;
+    public String txCount;       // был long — incompatible
+}
+```
+
+### Inspecting POJO compatibility
+
+Flink при restore проверяет compatibility и выбрасывает clear exception если incompatible:
+
+```text
+Caused by: org.apache.flink.util.StateMigrationException:
+The new key serializer must be compatible.
+
+Old serializer: PojoSerializer{class=com.example.UserState}
+New serializer: PojoSerializer{class=com.example.UserState}
+
+Fields in old:  userId, txCount
+Fields in new:  customerId, txCount
+
+Field 'userId' removed, field 'customerId' added — cannot reconcile.
+```
+
+Иногда полезно сделать **dry-run check** на staging savepoint перед production upgrade.
+
+---
+
+## Avro evolution: industry-standard
+
+Avro — schema-based serialization format с **named field evolution**. Каждый field имеет name + type. Evolution rules detailed в Avro spec.
+
+Flink использует **AvroSerializer** для Avro types. Evolution — automatically через Avro Resolver, который comparingt writer schema (в savepoint) и reader schema (current code).
+
+### Avro evolution rules
+
+| Operation | Supported? |
+|---|---|
+| **Добавить field с default value** | Yes |
+| **Удалить field с default value** | Yes |
+| **Переименовать field через aliases** | Yes (via Avro aliases) |
+| **Изменить тип на promoted type** (int → long, float → double) | Yes |
+| **Изменить тип non-promoted** | No |
+| **Изменить required ↔ optional** | Yes (с default) |
+
+```json
+// Старая schema
+{
+  "type": "record",
+  "name": "UserState",
+  "fields": [
+    {"name": "userId", "type": "string"},
+    {"name": "txCount", "type": "long"}
+  ]
+}
+
+// Новая schema — add optional field
+{
+  "type": "record",
+  "name": "UserState",
+  "fields": [
+    {"name": "userId", "type": "string"},
+    {"name": "txCount", "type": "long"},
+    {"name": "lastSeenAt", "type": ["null", "long"], "default": null}
+  ]
+}
+
+// Новая schema — rename через alias
+{
+  "type": "record",
+  "name": "UserState",
+  "fields": [
+    {"name": "customerId", "type": "string", "aliases": ["userId"]},
+    {"name": "txCount", "type": "long"}
+  ]
+}
+```
+
+Avro более flexible чем POJO — aliases для renames, promoted types, explicit defaults. Для production где state evolution critical, **Avro recommended over POJO**.
+
+### Использование Avro в Flink
+
+Через Avro generated classes или `GenericRecord`:
+
+```java
+// Approach 1: Avro-generated (compile-time schema)
+public class UserStateProcessor extends KeyedProcessFunction<String, Event, Alert> {
+
+    private transient ValueState<UserState> state;  // Avro generated
+
+    @Override
+    public void open(Configuration parameters) {
+        state = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("user-state", UserState.class)
+        );
+    }
+    // ... process method
+}
+
+// Approach 2: GenericRecord (runtime schema)
+private transient ValueState<GenericRecord> state;
+
+state = getRuntimeContext().getState(
+    new ValueStateDescriptor<>(
+        "user-state",
+        new GenericRecordAvroTypeInfo(SCHEMA)
+    )
+);
+```
+
+Approach 1 (generated) — type-safe, easier evolution через regenerate classes. Approach 2 (generic) — schema-flexible runtime, для сценариев где schema dynamic.
+
+---
+
+## Kryo и Java serialization: schema evolution NOT supported
+
+Kryo — fallback serializer когда тип не POJO, не Avro, не primitive. Schema evolution **NOT supported**:
+
+```java
+public class CustomComplexState implements Serializable {   // Java serialization fallback
+    private final Map<String, List<NestedClass>> data;
+    // ...
+}
+```
+
+Flink использует Kryo (default) или Java serialization для таких types. **Любое изменение class structure → state restore FAILS**. Это огромная gotcha.
+
+### Detection: проверьте serializers
+
+Flink logs показывают какие serializers используются:
+
+```text
+INFO  - Using KryoSerializer for type 'com.example.CustomComplexState'
+WARN  - You are using Kryo for serialization. Avoid это for production state —
+        schema evolution is NOT supported. Convert to POJO или Avro.
+```
+
+Always проверяйте startup logs на use Kryo для state types. Если видите — refactor к POJO/Avro.
+
+---
+
+## Custom TypeSerializer: escape hatch
+
+Если default POJO/Avro/Kryo не подходят, можно implement custom `TypeSerializer<T>` с full control over evolution:
+
+```java
+public class CustomStateSerializer extends TypeSerializer<MyState> {
+
+    private static final int VERSION = 2;   // schema version
+
+    @Override
+    public TypeSerializerSnapshot<MyState> snapshotConfiguration() {
+        return new CustomStateSerializerSnapshot(VERSION);
+    }
+
+    @Override
+    public void serialize(MyState value, DataOutputView target) throws IOException {
+        target.writeInt(VERSION);
+        target.writeUTF(value.userId);
+        target.writeLong(value.txCount);
+        if (value.lastSeenAt != null) {
+            target.writeBoolean(true);
+            target.writeLong(value.lastSeenAt.toEpochMilli());
+        } else {
+            target.writeBoolean(false);
+        }
+    }
+
+    @Override
+    public MyState deserialize(DataInputView source) throws IOException {
+        int version = source.readInt();
+        String userId = source.readUTF();
+        long txCount = source.readLong();
+        Instant lastSeenAt = null;
+
+        if (version >= 2) {
+            // V2+ может иметь lastSeenAt
+            boolean hasLastSeen = source.readBoolean();
+            if (hasLastSeen) {
+                lastSeenAt = Instant.ofEpochMilli(source.readLong());
+            }
+        }
+        // V1 не имел lastSeenAt — оставляем null
+
+        return new MyState(userId, txCount, lastSeenAt);
+    }
+
+    // ... другие methods
+}
+```
+
+Custom serializer — это work, но даёт **полный контроль over evolution**. Используется для high-stakes state классов или сложных evolution scenarios (e.g., struct migration с custom logic).
+
+---
+
+## Когда automatic evolution не работает: workflow
+
+```text
+1. Detect incompatible change в code review
+2. Plan migration: что меняется, какой default value, есть ли data loss?
+3. Trigger canonical savepoint на старой version
+4. Run State Processor API migration job:
+   a. Read old state с old schema
+   b. Transform to new schema (manual logic)
+   c. Write new savepoint
+5. Deploy new code restoring from new savepoint
+6. Validate sampling: некоторые keys читаются correctly
+7. Monitor сутки stability → only then удалить старый savepoint
+```
+
+См. урок 14.2 для деталей State Processor API.
+
+---
+
+## Comparison
+
+| Aspect | POJO | Avro | Kryo | Custom Serializer |
+|---|---|---|---|---|
+| Setup effort | Low (class в Java) | Medium (schema file) | Zero (default) | High (write serializer) |
+| Schema evolution | Add/remove nullable | Add/remove с defaults, aliases, promoted types | NONE | Full control |
+| Speed | Fast | Fast | Slow (~3x) | Variable |
+| Production for state? | Yes | Best | NO | Edge cases |
+| Schema registry integration | No | Yes (Confluent SR) | No | Manual |
+| Cross-language | Java-only | Yes (Python, Go, etc) | Java-mostly | Manual |
+
+---
+
+## Production gotchas
+
+- **Default serializer = Kryo для unknown types** — easy to fall into. Always log serializers at startup. Если custom class не POJO compliant → Kryo → no evolution.
+- **POJO non-public fields без getters** — Flink тихо falls back to Kryo. Symptom: schema evolution suddenly не работает. Fix: make fields public или add getters/setters.
+- **Constructor-based POJO + final fields** — Flink не может создать instance. → Kryo fallback. Use no-arg constructor + setters.
+- **Nested non-POJO types** — даже если outer class POJO, если inner type Kryo, выгрузка fails on evolution.
+- **Avro schema registry** — production Avro обычно с Confluent Schema Registry. State Processor API доступ к registry должен быть configured.
+- **Field renames в POJO** — physically impossible. Workaround: keep old field, deprecate, удалить в next major version. Или State Processor API migration.
+- **Type changes long ↔ int** — supported в Avro promoted types, NOT в POJO. POJO type change = always migration.
+- **Generic types `List<String>`** — Flink type extraction обычно работает, но edge cases (nested generics, wildcards) могут drop в Kryo.
+
+<Callout type="warning">
+**Detect Kryo usage перед production**. На startup проверяйте logs:
+```
+WARN org.apache.flink.api.java.typeutils.TypeExtractor - Class ... cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance.
+```
+Это значит «schema evolution не работает для этого state». В production такое state — bomb.
+</Callout>
+
+<Callout type="tip">
+В 2026 production best practice: **Avro для state с schema registry**. Это позволяет: centralized schema management, evolution rules enforcement, cross-language compatibility (Java Flink + Python consumers ML pipeline), explicit defaults для всех new fields. Setup effort окупается через год.
+</Callout>
+
+---
+
+## Practical example: добавление поля к UserState
+
+State был:
+
+```java
+public class UserState {
+    public String userId;
+    public long txCount;
+}
+```
+
+Хотим добавить `Instant lastSeenAt`. Approaches:
+
+**POJO approach (simple):**
+
+```java
+// Просто добавьте поле как nullable
+public class UserState {
+    public String userId;
+    public long txCount;
+    public Instant lastSeenAt;   // null для old state, set в new code
+}
+```
+
+Restore старого savepoint — works. lastSeenAt null для existing users, set при первой following event.
+
+**Avro approach (with default):**
+
+```json
+{
+  "type": "record",
+  "name": "UserState",
+  "fields": [
+    {"name": "userId", "type": "string"},
+    {"name": "txCount", "type": "long"},
+    {"name": "lastSeenAt", "type": ["null", "long"], "default": null}
+  ]
+}
+```
+
+Same result, more explicit.
+
+**Custom default (NOT null):**
+
+Если хотим `lastSeenAt = Instant.EPOCH` (не null), automatic evolution не подойдёт — нужно State Processor API migration.
+
+---
+
+<KnowledgeCheck
+  question="Production job stateful state `Map<UserId, Set<TransactionId>>`. UserId и TransactionId — custom typed classes. Через год хотим добавить field в TransactionId. Restore from savepoint после code change FAILS с deserialization error. Что произошло и как фиксить?"
+  answer="Diagnosis: проверьте startup logs предыдущего deploy на использование serializer. Custom typed classes (UserId, TransactionId) скорее всего fall back to **Kryo** — потому что они не POJO (вероятно immutable с final fields и constructor-based, что breaks PojoSerializer rules) и не Avro. Kryo **не поддерживает schema evolution** — любое изменение class structure breaks deserialization. Fixes (в порядке предпочтения): (1) **Refactor к POJO** — public no-arg constructor + setters или public fields. Schema evolution then works for nullable fields. Some teams выбирают immutable POJOs с factory methods и getters только — Flink type extractor it accepts. (2) **Migrate к Avro** — define schema с aliases support, generate classes. Best для long-term production. (3) **Custom TypeSerializer** — full control, but high effort. (4) **State Processor API migration** — read old state с old class, write new savepoint с new class. Best as one-time when automatic не работает. Pre-deploy prevention: всегда checking startup logs на 'cannot be used as a POJO type' warnings. Это signal что class falls к Kryo — bomb waiting to explode при evolution. Лучше discover проблему в dev, не production.",
+/>

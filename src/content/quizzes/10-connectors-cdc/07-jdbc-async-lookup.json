@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/07-jdbc-async-lookup",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-07",
+    "description": "Quiz для JDBC и Async lookup"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-07-q1",
+      "type": "multiple-choice",
+      "question": "Почему sync JDBC lookup в high-throughput Flink job — bad idea?",
+      "options": [
+        { "id": "a", "text": "JDBC не работает в Flink" },
+        { "id": "b", "text": "Sync lookup blocks operator main thread на duration JDBC query (10-100ms typical). Throughput limited 1/latency = ~50 events/sec per subtask. Plus blocks checkpoint barrier processing → timeout → job restart. Production solution: Async I/O — RichAsyncFunction с connection pool, capacity-bounded in-flight queries, throughput ~5000 events/sec per subtask" },
+        { "id": "c", "text": "JDBC sync только для Postgres" },
+        { "id": "d", "text": "Это actually fastest approach" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator main thread в Flink also processes mailbox events (checkpoint barriers, watermarks, control). Sync JDBC blocks этот thread на JDBC query duration — 10-100ms each. Throughput per subtask = 1/latency = 10-100 events/sec. С 1000 events/sec workload — need 10-100 subtasks для linear scaling. Plus blocks checkpoint processing → если query > checkpoint interval, checkpoint times out → job restart. Production must Async I/O: AsyncDataStream.orderedWait (или unorderedWait) с RichAsyncFunction, HikariCP connection pool, capacity 100 in-flight, timeout 1-5s. Throughput 5000+ events/sec per subtask. Это standard pattern для enrichment в production.",
+      "studyHint": "Повторите урок — секция Sync vs async lookup",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m10-07-q2",
+      "type": "multiple-choice",
+      "question": "Production: Async I/O JDBC lookup, 100k events/sec required. Какая архитектура?",
+      "options": [
+        { "id": "a", "text": "Single subtask с capacity 100000" },
+        { "id": "b", "text": "Multi-layer: (1) Async I/O с RichAsyncFunction + HikariCP pool (20 connections per subtask), capacity 100 in-flight, timeout 1s. (2) Lookup cache PARTIAL LRU с 100k rows, TTL 15min — 80-95% cache hit rate, miss queries через async к DB. (3) Connection pooling — total = parallelism × 20, требует DB max_connections адекватно (Postgres 500+ или PgBouncer). (4) Parallelism scale linear — 8 subtasks × ~5k events/sec (с cache) = 40k. Bump до 16-20 для 100k. (5) Иначе: stream rate change events через Flink CDC, broadcast к stream, обновлять keyed state — eliminate JDBC lookups для hot users" },
+        { "id": "c", "text": "Sync lookup с увеличенным timeout" },
+        { "id": "d", "text": "Заменить Postgres на Redis" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production architecture для high-throughput enrichment requires multiple optimizations stacked. Layer 1 Async I/O: pipelined concurrent queries (capacity 100), aggressive timeout. Layer 2 Cache: PARTIAL LRU+TTL — Pareto distribution active users means 80-95% cache hit (<1ms), miss async to DB. Critical multiplier — без cache 5k/sec per subtask, с cache 50k/sec. Layer 3 Pool: HikariCP, sized по DB limit; PgBouncer middleware для multiplexing. Layer 4 Architectural: если cache invalidation too coarse — stream user updates via Flink CDC, broadcast к main stream, maintain keyed state — eliminates JDBC lookups entirely для hot users. Это standard pattern fraud detection / personalization architectures.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-07-q3",
+      "type": "multiple-choice",
+      "question": "Что значит ordered vs unordered в AsyncDataStream и какие trade-offs?",
+      "options": [
+        { "id": "a", "text": "Ordered только для batch mode" },
+        { "id": "b", "text": "Ordered: preserves stream order — если lookup для event 2 completes раньше event 1, buffered until 1 done. Latency slight overhead, throughput slightly lower. Unordered: emits as completed — higher throughput, lower latency, но downstream получает events в order completion. Choose unordered if downstream tolerant (aggregations, sinks с PK), ordered для time-sensitive sequential processing" },
+        { "id": "c", "text": "Они идентичны functionally" },
+        { "id": "d", "text": "Ordered deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "AsyncDataStream.orderedWait vs unorderedWait. Ordered: maintains FIFO order — slow lookup для event 1 blocks emission events 2,3,... done first. Buffer until 1 completes. Trade-off: ordering preserved, slight throughput cost. Unordered: emits as completed — event 5 may exit before event 1 if its lookup fast. Higher throughput, lower per-event latency, но stream order changed. Production choice: ordered для downstream operators requiring event order (CEP, time-windowed aggregations); unordered для aggregations (commutative ops), sinks с PK (Iceberg upsert), or where downstream re-orders.",
+      "studyHint": "Повторите урок — секция Ordered vs unordered",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m10-07-q4",
+      "type": "true-false",
+      "question": "JDBC sink с PRIMARY KEY defined использует UPSERT semantics (INSERT ... ON CONFLICT DO UPDATE), что обеспечивает idempotent writes — exactly-once без необходимости XA transactions.",
+      "correctAnswer": true,
+      "explanation": "Правда. JDBC sink с PRIMARY KEY auto-generates UPSERT statement (PostgreSQL: INSERT ... ON CONFLICT (pk) DO UPDATE SET ..., MySQL: INSERT ... ON DUPLICATE KEY UPDATE). Это idempotent — re-applying same record produces same final state. Поэтому при Flink checkpoint replay (на recovery) duplicate writes не cause inconsistency. Это alternative к XA transactions: XA (XADataSource via JdbcSink.exactlyOnceSink) использует 2PC через XA protocol — overhead 5-10x latency. UPSERT через PK natural idempotent — strict improvement для most use cases. Production rule: prefer idempotent UPSERT когда possible (almost always для streaming sinks), use XA только для append-only без natural PK.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

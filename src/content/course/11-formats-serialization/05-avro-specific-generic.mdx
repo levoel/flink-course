@@ -1,0 +1,401 @@
+---
+title: "Avro: Specific, Generic, Reflect"
+description: "Avro SpecificRecord (codegen) vs GenericRecord vs Reflect (reflection-based). Schema Registry integration. Schema evolution properties."
+order: 5
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Avro", "Schema Registry", "AvroSerializer", "Schema Evolution"]
+---
+
+# Avro: Specific, Generic, Reflect
+
+Apache Avro — индустриальный стандарт для structured streaming data. Schema-first дизайн, compact binary encoding, явная schema evolution с backward/forward/full compatibility — всё это делает Avro выбором по умолчанию для production streaming pipelines в финтехе, ретейле, AdTech. Confluent Schema Registry — de-facto стандарт для Kafka.
+
+Flink имеет first-class Avro integration через `flink-avro` модуль с тремя режимами работы: **Specific** (codegen, типизированные классы), **Generic** (GenericRecord — universal data carrier) и **Reflect** (reflection-based маппинг POJO ↔ Avro). У каждого свой trade-off speed vs flexibility. В этом уроке — exhaustive разбор всех трёх, integration с Schema Registry и schema evolution properties.
+
+---
+
+## Три режима Avro в Flink
+
+<DiagramContainer title="Avro modes в Flink" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Specific"
+        tooltip="Avro Maven/Gradle plugin генерирует Java classes из .avsc schemas. Класс extends SpecificRecordBase, типизированные getters/setters. Compile-time type safety. Используется AvroSerializer с pre-baked schema. ~85% perf vs POJO."
+      >
+        SpecificRecord (codegen)
+      </DataBox>
+      <DataBox
+        label="Generic"
+        tooltip="GenericRecord — wrapper над Schema + Object[]. Поля по name lookup: record.get('userId'). Универсальный, runtime-flexible. Используется когда schema динамическая (multi-tenant, schema discovery). ~75% perf."
+      >
+        GenericRecord
+      </DataBox>
+      <DataBox
+        label="Reflect"
+        tooltip="AvroSerializer создаёт Avro schema из POJO через reflection. Не требует .avsc файлов. Гибрид POJO + Avro evolution. Reflection overhead на open(). ~80% perf. Less commonly used."
+      >
+        Reflect (POJO → Avro)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+| Mode | Schema source | Speed | Use case |
+|---|---|---|---|
+| Specific | `.avsc` → codegen | ~85% baseline | Известный stable schema, production |
+| Generic | runtime Schema | ~75% baseline | Schema discovery, dynamic routing, schema-less generic processing |
+| Reflect | reflection из POJO | ~80% baseline | Существующие POJO, хочется Avro evolution без переписывания |
+
+---
+
+## Mode 1: Avro Specific (codegen)
+
+Подход: разработчик пишет `.avsc` (или `.avdl`) schema, Avro Maven/Gradle plugin генерирует Java class, который extends `SpecificRecordBase`.
+
+### Schema (.avsc)
+
+```json
+{
+  "namespace": "com.example.events",
+  "type": "record",
+  "name": "UserEvent",
+  "fields": [
+    {"name": "userId", "type": "long"},
+    {"name": "eventType", "type": {
+      "type": "enum",
+      "name": "EventType",
+      "symbols": ["CLICK", "VIEW", "PURCHASE"]
+    }},
+    {"name": "timestamp", "type": {
+      "type": "long",
+      "logicalType": "timestamp-millis"
+    }},
+    {"name": "properties", "type": ["null", {
+      "type": "map",
+      "values": "string"
+    }], "default": null}
+  ]
+}
+```
+
+### Maven setup
+
+```xml
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-avro</artifactId>
+    <version>2.2.0</version>
+</dependency>
+
+<plugin>
+    <groupId>org.apache.avro</groupId>
+    <artifactId>avro-maven-plugin</artifactId>
+    <version>1.11.3</version>
+    <executions>
+        <execution>
+            <phase>generate-sources</phase>
+            <goals><goal>schema</goal></goals>
+            <configuration>
+                <sourceDirectory>${project.basedir}/src/main/avro</sourceDirectory>
+                <outputDirectory>${project.basedir}/target/generated-sources/avro</outputDirectory>
+                <stringType>String</stringType>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+После `mvn compile` появится `UserEvent.java` — типизированный POJO-like class. В Flink:
+
+```java
+// TypeExtractor видит SpecificRecord → AvroTypeInfo, не Kryo
+DataStream<UserEvent> events = env.fromSource(
+    KafkaSource.<UserEvent>builder()
+        .setBootstrapServers("kafka:9092")
+        .setTopics("user-events")
+        .setValueOnlyDeserializer(
+            ConfluentRegistryAvroDeserializationSchema.forSpecific(
+                UserEvent.class,
+                "http://schema-registry:8081"))
+        .build(),
+    WatermarkStrategy.<UserEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+        .withTimestampAssigner((event, ts) -> event.getTimestamp()),
+    "user-events-avro");
+
+events
+    .filter(e -> e.getEventType() == EventType.PURCHASE)
+    .keyBy(UserEvent::getUserId)
+    .process(new PurchaseHandler());
+```
+
+`AvroSerializer<UserEvent>` использует pre-baked schema из generated class — нет runtime schema lookup для каждой записи.
+
+---
+
+## Mode 2: Avro Generic (GenericRecord)
+
+Используется когда schema **не известна на compile time** или нужна максимальная flexibility: schema discovery, multi-tenant routing, transformations поверх unknown record types.
+
+```java
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.flink.formats.avro.typeutils.GenericRecordAvroTypeInfo;
+
+// Schema загружаем явно (например из Schema Registry или из file)
+Schema schema = new Schema.Parser().parse(new File("user-event.avsc"));
+
+DataStream<GenericRecord> events = env.fromSource(
+    KafkaSource.<GenericRecord>builder()
+        .setBootstrapServers("kafka:9092")
+        .setTopics("user-events")
+        .setValueOnlyDeserializer(
+            ConfluentRegistryAvroDeserializationSchema.forGeneric(
+                schema,
+                "http://schema-registry:8081"))
+        .build(),
+    WatermarkStrategy.noWatermarks(),
+    "events-generic")
+    .returns(new GenericRecordAvroTypeInfo(schema));  // ОБЯЗАТЕЛЬНО — иначе Kryo
+
+events
+    .filter(r -> r.get("eventType").toString().equals("PURCHASE"))
+    .keyBy(r -> r.get("userId"))
+    .process(new GenericRecordHandler());
+```
+
+Ключевые отличия от Specific:
+
+- **`.returns(new GenericRecordAvroTypeInfo(schema))`** обязательно — без этого Flink не знает, какой `Schema` использовать для `GenericRecord` runtime fields. По default `GenericRecord` стал бы Kryo.
+- **Field access по имени** (`record.get("userId")`) возвращает `Object` — нужен cast или `.toString()` для `CharSequence` (Avro String — `Utf8` или `String`).
+- **Schema travel вместе с records** — каждый GenericRecord знает свою schema через `.getSchema()`.
+
+### Когда Generic — правильный выбор
+
+- **Multi-tenant pipeline** — обрабатываете events разных tenants с разными schemas, dispatch по `event.get("tenantId")`.
+- **Schema discovery** — schema приходит из Schema Registry runtime, codegen impossible.
+- **Generic transformations** — например, masking PII fields by name pattern без знания concrete schema.
+- **Schema migration tooling** — utility jobs, которые переписывают данные между forms.
+
+### Cost
+
+- Field access по имени — `Map.get` overhead (~30ns vs ~3ns для direct field).
+- Avro String возвращается как `Utf8` (Avro-specific class). Конверсия `Utf8.toString()` копирует bytes → string.
+- Throughput ~25% ниже чем Specific. Для очень hot paths имеет значение.
+
+---
+
+## Mode 3: Avro Reflect (reflection-based)
+
+Avro Reflect — гибрид: ваш класс остаётся обычным Java POJO, но **Flink использует `AvroSerializer` с reflection-generated schema** для serialization.
+
+```java
+import org.apache.flink.formats.avro.typeutils.AvroTypeInfo;
+
+public class Transaction {
+    public long txId;
+    public String userId;
+    public double amount;
+    public Transaction() {}
+}
+
+// Manually attach AvroTypeInfo (вместо PojoTypeInfo)
+DataStream<Transaction> stream = ...
+    .returns(new AvroTypeInfo<>(Transaction.class));
+```
+
+Внутри:
+
+1. `AvroTypeInfo` через `ReflectData` Avro library генерирует Avro `Schema` из reflection over Transaction.
+2. `AvroSerializer<Transaction>` использует эту schema для serialize/deserialize.
+3. Schema evolution работает через standard Avro rules — нативный POJO с Avro evolution.
+
+### Когда Reflect полезен
+
+- У вас уже есть **legacy POJO codebase**, переписывать в Specific .avsc — много работы.
+- Хочется schema evolution на POJO без manual `TypeSerializerSnapshot` (см. урок 08).
+- Не нужен Schema Registry interop — schema живёт inside JAR.
+
+### Limitations
+
+- Schema, generated reflection, иногда не совпадает с manual .avsc (например, primitive long → Avro `long`, но nullable Long → Avro `["null", "long"]`).
+- Cross-language interop затруднён — schema generated от Java reflection ≠ "canonical" schema для других languages.
+- Performance ниже Specific (~5-10%) из-за reflection cost в hot path.
+
+---
+
+## Schema Registry integration
+
+Confluent Schema Registry — most common pattern для Kafka. Flink integration через `flink-avro-confluent-registry`:
+
+```xml
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-avro-confluent-registry</artifactId>
+    <version>2.2.0</version>
+</dependency>
+```
+
+### Specific + Confluent Registry
+
+```java
+KafkaSource<UserEvent> source = KafkaSource.<UserEvent>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("user-events")
+    .setValueOnlyDeserializer(
+        ConfluentRegistryAvroDeserializationSchema.forSpecific(
+            UserEvent.class,
+            "http://schema-registry:8081",
+            Map.of(
+                "schema.registry.basic.auth.user.info", "user:pass",
+                "specific.avro.reader", true,
+                "max.cached.schemas", 1000
+            )))
+    .build();
+```
+
+`ConfluentRegistryAvroDeserializationSchema` делает:
+
+1. Reads первые 5 bytes магической последовательности (`0x00` + schema ID).
+2. По schema ID запрашивает Schema Registry (cached).
+3. Использует Avro Specific reader для deserialize в `UserEvent`.
+
+### Sink с Registry
+
+```java
+KafkaSink<UserEvent> sink = KafkaSink.<UserEvent>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(KafkaRecordSerializationSchema.<UserEvent>builder()
+        .setTopic("processed-events")
+        .setValueSerializationSchema(
+            ConfluentRegistryAvroSerializationSchema.forSpecific(
+                UserEvent.class,
+                "processed-events-value",     // subject в registry
+                "http://schema-registry:8081"))
+        .build())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("processed-events-tx")
+    .build();
+```
+
+При sink Flink:
+
+1. Registers schema (по subject name) в Registry on first record.
+2. Receives schema ID.
+3. Wraps каждую record как `[magic byte 0x00][schema ID 4 bytes][Avro binary]`.
+
+---
+
+## Schema evolution в Avro
+
+Avro поддерживает три типа compatibility:
+
+| Compatibility | Можно изменить | Нельзя |
+|---|---|---|
+| **Backward** | Add optional field, remove field, change default | Add required field, remove default |
+| **Forward** | Add required field, remove optional | Remove required, change type |
+| **Full** | Backward AND forward | Анything that breaks either |
+
+В Schema Registry compatibility mode настраивается per-subject.
+
+### Add optional field (backward compatible)
+
+```diff
+ {
+   "type": "record",
+   "name": "UserEvent",
+   "fields": [
+     {"name": "userId", "type": "long"},
+-    {"name": "eventType", "type": "string"}
++    {"name": "eventType", "type": "string"},
++    {"name": "userAgent", "type": ["null", "string"], "default": null}
+   ]
+ }
+```
+
+Старые records без `userAgent` deserialize-ятся с `null`. Новые consumers handle this gracefully.
+
+### Rename field — НЕ совместимо
+
+```diff
+-    {"name": "userId", "type": "long"}
++    {"name": "user_id", "type": "long"}
+```
+
+Avro сравнивает schemas by **field name + position + type**. Rename = `userId` removed + `user_id` added. Это breaks backward compatibility.
+
+**Workaround**: использовать Avro `aliases`:
+
+```json
+{"name": "user_id", "type": "long", "aliases": ["userId"]}
+```
+
+Reader будет искать `user_id` (или alias `userId` для backward).
+
+### Change type — обычно НЕ совместимо
+
+`int → long` — backward compatible (long fits int values).
+`long → int` — НЕ compatible (int может не хватить bits).
+`string → bytes` — НЕ compatible.
+
+---
+
+## Performance microbench
+
+10M records, 500-byte average size:
+
+```
+Avro Specific           23M rec/sec  (codegen, pre-baked schema)
+Avro Reflect            21M rec/sec  (reflection over POJO)
+Avro Generic            19M rec/sec  (GenericRecord field-by-name access)
+JSON (Jackson)          12M rec/sec  (text parsing overhead)
+Kryo                    10M rec/sec
+POJO Flink              28M rec/sec  (baseline)
+```
+
+Avro Specific достигает 80-85% от POJO. Generic ~70%. JSON значительно хуже.
+
+---
+
+## Production gotchas
+
+- **`.returns(new GenericRecordAvroTypeInfo(schema))` забыт** — silent Kryo fallback. Самая частая ошибка с Generic mode.
+- **`specific.avro.reader: false`** в SerDe properties — deserializer возвращает GenericRecord даже если SpecificRecord класс есть. Job упадёт на cast.
+- **Avro String type — `Utf8`** — не Java String. Сравнения через `.equals(otherString)` могут возвращать false. Используйте `record.get(field).toString()` для safety.
+- **Mutable shared instance в Avro Specific** — некоторые Avro versions reuse instance в reader. После collect в Flink record может быть modified next iteration. Defensive copy: `new UserEvent(orig)` или конверсия в Flink POJO.
+- **Schema Registry credentials** — basic auth обязателен в production. Без него anyone может poison registry.
+- **Schema cache size** — `max.cached.schemas: 1000` default может быть мало для multi-tenant. Increase для high cardinality subjects.
+- **Compatibility mode wrong** — если subject в Registry имеет `NONE` compatibility, любой schema change accepted. Это recipe for production breakage. Production: всегда `BACKWARD` или `FULL`.
+- **Avro Logical Types** — `timestamp-millis`, `decimal` — некоторые Flink versions не deserialize-ят их properly, остаётся как `long` или `byte[]`. Test explicitly.
+- **`AvroSerializer` snapshot compatibility** — после `pipeline.generic-types: false` upgrade Flink версии, проверьте что AvroSerializer snapshot reloads correctly. State migration через State Processor API если нужно.
+- **Iceberg/Paimon sinks** — конвертируют Avro в Parquet/ORC. Поддержка `bytes`, `fixed`, `decimal` — варьируется. Проверьте specific sink documentation.
+
+<Callout type="warning">
+В production ВСЕГДА используйте Schema Registry с `BACKWARD` compatibility mode минимум. Иначе один careless schema commit может убить production consumers с deserialization errors, и rollback Avro schemas из Registry — сложная операция.
+</Callout>
+
+<Callout type="tip">
+Decision tree: схема stable, production-critical → **Avro Specific** + Schema Registry. Schema dynamic / multi-tenant → **Avro Generic**. Существующий POJO codebase, хочется evolution → **Avro Reflect** (compromise). Никогда не выбирайте Avro если schema внутри одного job и не пересекает boundary — там POJO/Tuple быстрее без overhead.
+</Callout>
+
+---
+
+## Comparison summary
+
+| Aspect | Specific | Generic | Reflect |
+|---|---|---|---|
+| Schema source | `.avsc` codegen | Runtime Schema | Reflection over POJO |
+| Type safety | Compile-time | Runtime cast | Compile-time |
+| Performance | ~85% | ~75% | ~80% |
+| Schema evolution | Yes (Avro rules) | Yes | Yes (Avro rules) |
+| Schema Registry | Native | Native | Less direct |
+| Cross-language interop | Yes (.avsc canonical) | Yes | Partial (Java-flavored) |
+| Use case | Production typed | Dynamic/discovery | Legacy POJO migration |
+
+---
+
+<KnowledgeCheck
+  question="Production pipeline читает Kafka topic с Avro events через Schema Registry. Через 3 месяца другая команда добавила новое required field `paymentMethod: string` в schema без default. Что произойдёт с running Flink consumers, и какие compatibility rules в Schema Registry предотвратили бы это?"
+  answer="**Что произойдёт**: Schema Registry с **NONE** compatibility mode accept-ит новый schema (что и был дефект). Old Flink consumers, которые имели старую schema generated в JAR-е (либо через Specific codegen, либо через GenericRecord с pinned schema), при чтении нового record с `paymentMethod` field будут пытаться deserialize. Avro reader использует writer schema (новая) + reader schema (старая) — это называется schema resolution. Если new field has default, Avro fills с default для reader. Если **default отсутствует** (required field), это **catastrophic deserialization error**: `org.apache.avro.AvroTypeException: missing required field 'paymentMethod'` либо `Found ..., expecting ...`. Consumer падает на каждом новом message → pipeline stops → backpressure через consumer group lag → downstream sinks idle. Recovery: либо rollback schema в registry (часто impossible, новые messages уже produced), либо emergency redeploy всех consumers с обновлённой schema. **Schema Registry rules для prevention**: (1) **BACKWARD compatibility (рекомендуется default)** — new schema может быть прочитан старыми consumers. New field MUST have default value, либо MUST be nullable (`['null', 'string']`). Schema Registry reject-ит commit без default. (2) **FULL compatibility** — даже строже: backward AND forward. Used когда producers и consumers могут эволюционировать независимо. (3) **BACKWARD_TRANSITIVE / FULL_TRANSITIVE** — compatibility check против ВСЕХ previous versions, не только latest. Critical если у вас есть consumers на разных versions schema. **Fix для текущей ситуации**: (a) В Schema Registry сделать `PUT /config/<subject>` `{compatibility: 'BACKWARD'}`. (b) Re-add `paymentMethod` с default `null` или `''`. (c) Если необходимо required → создать новый subject `events-v2`, parallel migration. (d) Audit team coding practices: schema change PR must go through registry validation step in CI — commit hook делает dry-run schema register с compatibility check. **Архитектурная рекомендация**: Никогда не использовать `NONE` compatibility в production. Минимум `BACKWARD`. Для shared topics с many consumers — `BACKWARD_TRANSITIVE` или `FULL_TRANSITIVE`."
+/>

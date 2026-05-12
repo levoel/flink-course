@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/06-async-state-api-v2",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-06",
+    "description": "Quiz for Async State API V2 lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-06-q1",
+      "type": "multiple-choice",
+      "question": "Что такое AEC (Asynchronous Execution Controller) и какую проблему он решает?",
+      "options": [
+        { "id": "a", "text": "Это deprecated компонент из Flink 1.x" },
+        { "id": "b", "text": "AEC — оркестратор non-blocking state access (FLIP-424/425). Mailbox thread submits state requests в AEC, продолжает работать. AEC tracks per-key ordering, manages concurrent I/O в worker pool, callbacks возвращаются на mailbox" },
+        { "id": "c", "text": "Это синоним RocksDB block cache" },
+        { "id": "d", "text": "Конфигурационный flag для timing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "AEC — Asynchronous Execution Controller, новый компонент Flink 2.x (FLIP-424/425). Решает проблему блокирующего state access: до async API любой state.value() блокировал mailbox thread. С AEC mailbox делегирует state requests, продолжает обрабатывать next events. AEC поддерживает RequestBuffer per key (per-key ordering сохраняется), ParallelismController (limits concurrent in-flight), CompletionScheduler (callbacks на mailbox thread). Это критично для ForSt: S3 GET = 50-100ms, sync API делает throughput ~20 events/sec, async — 30k events/sec.",
+      "studyHint": "Повторите урок — Архитектура AEC",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-06-q2",
+      "type": "multiple-choice",
+      "question": "Right code для read-modify-write в async API V2?",
+      "options": [
+        { "id": "a", "text": "Long v = state.asyncValue().get(); state.update(v+1);" },
+        { "id": "b", "text": "state.asyncValue().thenAccept(v -> { state.asyncUpdate(v == null ? 1L : v + 1); });" },
+        { "id": "c", "text": "CompletableFuture<Long> f = state.asyncValue(); f.thenApply(...).join();" },
+        { "id": "d", "text": "state.value(); state.update(...);" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Правильный async pattern: state.asyncValue() возвращает StateFuture<T>. thenAccept(callback) — terminal операция, callback выполняется когда state ready, на mailbox thread. Внутри callback используйте asyncUpdate (не update!). Mailbox продолжает обрабатывать next records без блокировки. Опции a/c смешивают async/sync (.get/.join blocking) — ломают non-blocking semantics. Опция d — sync, что для ForSt = катастрофа.",
+      "studyHint": "Повторите урок — API сравнение sync vs async",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-06-q3",
+      "type": "multiple-choice",
+      "question": "Почему ForSt backend ОБЯЗАТЕЛЬНО требует Async State API V2?",
+      "options": [
+        { "id": "a", "text": "Это технический whim авторов" },
+        { "id": "b", "text": "ForSt хранит primary state на S3. Cache miss = S3 GET = 50-100ms. Sync state.value() блокирует mailbox на эту latency → throughput падает до 20 events/sec. С async API mailbox продолжает работу, AEC параллелит I/O → 30k+ events/sec" },
+        { "id": "c", "text": "Async API быстрее на small state, sync — на big" },
+        { "id": "d", "text": "Это для backward compatibility" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt = primary state на S3, локальный диск только cache. Cache miss = 50-100ms S3 GET. Sync API блокирует single-threaded mailbox subtask-а на это время. Numerical: 30% cache miss × 10k events/sec × 100ms = 300 секунд блокировки/секунду wall clock — невозможно. Async API делегирует state I/O в AEC worker pool (8 threads), mailbox продолжает работать. Apache benchmarks: ForSt+sync = 200 events/sec, ForSt+async = 30k events/sec — 150x разница. Без async API ForSt unusable.",
+      "studyHint": "Повторите урок — секция ForSt + Async",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-06-q4",
+      "type": "true-false",
+      "question": "Side effects (out.collect) должны быть внутри callback (thenAccept), не до asyncValue().",
+      "correctAnswer": true,
+      "explanation": "True. Если emit out.collect(new Result(value)) до state.asyncValue() complete, output не отражает state. Правильный pattern: state.asyncValue().thenAccept(v -> out.collect(new Result(e, v))) — emit когда state ready. Иначе будет mismatch между state и output, что нарушает correctness. Особенно critical для accumulator state, threshold checks, и любых stateful business rules.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

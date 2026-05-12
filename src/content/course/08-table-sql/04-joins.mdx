@@ -1,0 +1,487 @@
+---
+title: "Joins — regular, interval, temporal, lookup"
+description: "Regular joins (unbounded state, idle retention), interval joins (BETWEEN), temporal joins (FOR SYSTEM_TIME AS OF), lookup joins (Async I/O)"
+order: 4
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["SQL Joins", "Interval Join", "Temporal Join", "Lookup Join", "State Retention"]
+---
+
+# Joins — regular, interval, temporal, lookup
+
+Joins в streaming SQL — где архитектурные решения встречаются с фундаментальными limitations stream processing. Regular join требует unbounded state. Interval join — bounded by time window. Temporal join — для slowly changing dimensions с versioning. Lookup join — external system queries через Async I/O. Каждый тип имеет свой semantics, performance characteristics и production gotchas. Этот урок препарирует все четыре типа: когда какой использовать и какие state implications.
+
+Mastery joins — это разница между «running query that eventually OOMs» и production-ready pipelines на TBs state.
+
+---
+
+## Обзор — четыре типа joins
+
+<DiagramContainer title="Stream joins — четыре типа" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Regular join"
+        tooltip="SELECT ... FROM A JOIN B ON A.id = B.id. Не bounded во времени. Каждая запись A может match любую запись B (когда-либо seen). State хранит всё A + B по join keys. Растёт unbounded — нужен TTL."
+      >
+        Stream × Stream unbounded
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Interval join"
+        tooltip="ON A.id = B.id AND A.t BETWEEN B.t - INTERVAL '1' HOUR AND B.t. Bounded by time. State освобождается после watermark + max interval. Used для correlated events within window."
+      >
+        Stream × Stream within window
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Temporal join"
+        tooltip="FOR SYSTEM_TIME AS OF event_time — join с versioned table в момент event_time. Used для enrichment: orders → currency_rate at order_time, transactions → user_profile snapshot at tx_time."
+      >
+        Stream × Versioned Table
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Lookup join"
+        tooltip="LEFT JOIN lookup_table FOR SYSTEM_TIME AS OF PROCTIME() — query external system (DB, REST) на каждый event. Реализован через Async I/O — non-blocking parallel lookups. Caching support."
+      >
+        Stream × External system
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Decision tree:
+- Stream × Stream + no time bound → regular join (с TTL!)
+- Stream × Stream + time correlation → interval join
+- Stream × Slowly Changing Dim (in Flink) → temporal join
+- Stream × External system → lookup join
+
+---
+
+## Regular join — unbounded state
+
+Simplest form:
+
+```sql
+SELECT
+    o.order_id,
+    o.amount,
+    p.payment_id,
+    p.status
+FROM orders AS o
+JOIN payments AS p ON o.order_id = p.order_id;
+```
+
+Behavior:
+- На каждое order: store в state, look для payment с тем же order_id, emit matches.
+- На каждое payment: store в state, look для order с тем же order_id, emit matches.
+- Order может прийти ДО payment или ПОСЛЕ — оба сохраняются до match.
+
+State growth:
+- Каждая входящая row store-ится по join key.
+- Без cleanup — state растёт linearly с unique join keys (orders + payments forever).
+
+### Idle state retention
+
+```sql
+SET 'table.exec.state.ttl' = '24h';
+```
+
+Это global для job — state TTL для всех stateful operators. После 24h без access к state entry — entry expired, удалён.
+
+Production reality:
+- TTL 1 hour — slim pipeline для dashboards, short-lived.
+- TTL 24-48 hours — typical для most pipelines (matching events within day).
+- TTL 7+ days — слишком долгое hold; consider denormalized source instead.
+
+### Outer join
+
+```sql
+SELECT o.order_id, p.status
+FROM orders AS o
+LEFT JOIN payments AS p ON o.order_id = p.order_id;
+```
+
+Side effect: LEFT JOIN emit-ит row даже если payment не пришёл. Это **retract stream** — потом, когда payment arrives, нужно retract null row и emit с actual payment. Sink должен support retract.
+
+---
+
+## Interval join — bounded by time
+
+Bounded state через time predicate в join condition:
+
+```sql
+SELECT
+    o.order_id,
+    p.payment_id,
+    o.amount,
+    p.status
+FROM orders AS o
+JOIN payments AS p
+  ON o.order_id = p.order_id
+  AND p.payment_time BETWEEN o.order_time AND o.order_time + INTERVAL '1' HOUR;
+```
+
+Semantics: payment должен прийти в течение 1 hour после order. После 1 hour — order expired, no match emit. Cannot retroactively match.
+
+### State management
+
+State per side:
+- `state(orders)` — orders waiting for payment, max age = current watermark - 0
+- `state(payments)` — payments waiting for order, max age = current watermark - 1 hour
+
+State released:
+- Orders older than current watermark (already-emitted matches или missed).
+- Payments older than (current_watermark - 1 hour).
+
+Это **bounded state** — proportional к event rate × interval, не к total events.
+
+### Variations
+
+```sql
+-- Symmetric: payment в любую сторону от order
+AND p.payment_time BETWEEN o.order_time - INTERVAL '30' MIN
+                        AND o.order_time + INTERVAL '30' MIN
+
+-- Strict ordering: payment AFTER order
+AND p.payment_time > o.order_time
+AND p.payment_time <= o.order_time + INTERVAL '1' HOUR
+
+-- Combine
+AND p.payment_time >= o.order_time
+AND p.payment_time < o.order_time + INTERVAL '1' HOUR
+```
+
+Cannot use `=` only — needs BETWEEN or directional ranges.
+
+---
+
+## Temporal join — versioned dim table
+
+For enrichment с slowly changing dimension (SCD): join stream event с dim table snapshot **в момент event_time**.
+
+### Versioned table — DDL
+
+```sql
+CREATE TABLE currency_rates (
+    currency STRING,
+    rate DECIMAL(10, 4),
+    update_time TIMESTAMP(3),
+    PRIMARY KEY (currency) NOT ENFORCED,
+    WATERMARK FOR update_time AS update_time
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'currency_rates',
+    ...
+);
+```
+
+Three required pieces:
+1. `PRIMARY KEY` — identity per version.
+2. `update_time` column — versioning timestamp.
+3. `WATERMARK FOR update_time AS update_time` — defines version time.
+
+Result — versioned table: для each (currency, time) есть deterministic rate.
+
+### Query
+
+```sql
+SELECT
+    o.order_id,
+    o.amount,
+    o.currency,
+    r.rate,
+    o.amount * r.rate AS amount_usd
+FROM orders AS o
+JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
+  ON o.currency = r.currency;
+```
+
+Semantics: для order с `order_time = T`, find currency_rates row с PK matching `o.currency` AND `update_time <= T` AND no newer rate `update_time'` с `T' <= T`. Это «latest rate at-or-before order time».
+
+Output is **deterministic per replay** — same orders с same order_times always produce same enrichment. Это foundational для correctness.
+
+### Use cases
+
+- **Currency conversion** — orders + historical rates.
+- **Product catalog** — orders + product snapshots (name, price evolving).
+- **User profile** — transactions + user attributes evolving (KYC level, segment).
+- **Loyalty tier** — purchases + customer tier at purchase time.
+
+### State
+
+State retains versions необходимые для open events:
+- All versions newer than oldest waiting event watermark.
+- Older versions can be cleanup (no event ever can query them).
+
+Lower state than regular join — bounded by max event lag (typically minutes-hours).
+
+---
+
+## Lookup join — external system
+
+Query external DB или REST API per event:
+
+### DDL
+
+```sql
+CREATE TABLE user_profile (
+    user_id STRING,
+    name STRING,
+    segment STRING,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://postgres:5432/mydb',
+    'table-name' = 'user_profile',
+    'lookup.cache' = 'PARTIAL',
+    'lookup.partial-cache.max-rows' = '10000',
+    'lookup.partial-cache.expire-after-write' = '10min',
+    'lookup.max-retries' = '3'
+);
+```
+
+`lookup.cache=PARTIAL` enables in-memory LRU cache. Avoids hitting external DB на каждое event.
+
+### Query
+
+```sql
+SELECT
+    o.order_id,
+    o.amount,
+    u.name,
+    u.segment
+FROM orders AS o
+LEFT JOIN user_profile FOR SYSTEM_TIME AS OF o.proc_time AS u
+  ON o.user_id = u.user_id;
+```
+
+Note `FOR SYSTEM_TIME AS OF o.proc_time` — proctime, не event_time. Lookup join always processing time semantics: looks up current state of external system. Cannot do «historical lookup».
+
+### Async I/O under the hood
+
+Lookup join uses **Async I/O** под капотом — non-blocking parallel external requests:
+
+```
+Per subtask:
+  - Pending queue (max 100 concurrent requests)
+  - For each incoming event: async lookup, callback emits result
+  - Mailbox executor handles results in order
+```
+
+10x-100x faster than synchronous JDBC calls.
+
+### Cache strategies
+
+```sql
+'lookup.cache' = 'NONE'   -- no cache, hit DB каждый раз
+'lookup.cache' = 'PARTIAL' -- LRU cache (most recent N entries)
+'lookup.cache' = 'FULL'    -- preload entire table в memory
+```
+
+FULL good для small dim tables (1M rows). PARTIAL — для large tables с high hit rate.
+
+---
+
+## Comparison table
+
+| Join type | State growth | Bounded by | Use case | Time semantics |
+|---|---|---|---|---|
+| **Regular** | unbounded (need TTL) | TTL | match streams forever | both event/proc |
+| **Interval** | bounded by interval × rate | watermark - max_interval | correlated within window | event time |
+| **Temporal** | bounded by event lag | watermark | enrich с versioned dim | event time |
+| **Lookup** | cache (bounded) | cache size | enrich с external | proc time |
+
+---
+
+## Когда какой использовать — decision tree
+
+<DiagramContainer title="Join selection decision tree" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Both sides streaming?"
+        tooltip="Если оба источника — streams (Kafka, CDC), это stream × stream join — regular или interval."
+      >
+        Stream × Stream → regular/interval
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Time correlation?"
+        tooltip="Если matching events должны быть within time window — interval join. Если 'whenever they match' — regular join с TTL."
+      >
+        Time bound? → interval, else regular
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="One side dim table in Flink?"
+        tooltip="Dim table — versioned, evolving slowly. Если в Flink (CDC source, materialized table) — temporal join. Если в external DB — lookup join."
+      >
+        Dim in Flink → temporal, external → lookup
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Need historical lookup?"
+        tooltip="Если query 'rate at order time' (historical), нужен temporal join с event time. Если 'current state' — lookup join с processing time."
+      >
+        Historical → temporal, current → lookup
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Performance comparison — same enrichment use case
+
+Scenario: orders stream + user_profile data (1M rows).
+
+| Approach | Latency P99 | State | Throughput | When use |
+|---|---|---|---|---|
+| Regular join (CDC source + TTL) | 5ms | 1M rows | 100k/s | balanced |
+| Temporal join (CDC source) | 5ms | 1M rows | 100k/s | versioned, deterministic |
+| Lookup join (external Postgres, cache=NONE) | 100ms | ~0 | 5k/s | small footprint, slow |
+| Lookup join (external, cache=PARTIAL 10k) | 10ms | 10k rows | 50k/s | balanced cache |
+| Lookup join (cache=FULL) | 5ms | 1M rows | 100k/s | small static dim |
+| Broadcast join (manual в DataStream) | 5ms | 1M × parallelism | 100k/s | small dim, high parallel |
+
+Lookup join trade-offs: lower state (only cache), но network round-trip latency. Suitable когда dim не fit в Flink state, или external system already managing dim updates.
+
+---
+
+## Production gotchas
+
+### 1. Regular join без TTL → OOM
+
+```sql
+SELECT * FROM a JOIN b ON a.id = b.id;
+-- No idle state retention set
+```
+
+After days running, state TBs, RocksDB OOM, job restart cycles.
+
+**Fix**: `SET 'table.exec.state.ttl' = '24h'` minimum. Production monitoring on state size growth.
+
+### 2. Interval join too narrow
+
+```sql
+JOIN payments ON o.id = p.order_id
+  AND p.t BETWEEN o.t AND o.t + INTERVAL '1' SECOND
+```
+
+If P99 payment latency = 30 seconds, миллиарды missed matches.
+
+**Fix**: measure actual latency distribution, set interval = P99 × 2.
+
+### 3. Temporal join без watermark on dim
+
+```sql
+CREATE TABLE rates (
+    currency STRING,
+    rate DECIMAL,
+    update_time TIMESTAMP(3),
+    PRIMARY KEY (currency) NOT ENFORCED
+    -- ❌ no WATERMARK
+) WITH (...);
+```
+
+Without watermark, temporal join can't determine versions — uses processing time (non-deterministic при replay).
+
+**Fix**: ВСЕГДА add `WATERMARK FOR update_time AS update_time` (or with -INTERVAL).
+
+### 4. Lookup join без cache → external system overload
+
+```sql
+LEFT JOIN user_profile FOR SYSTEM_TIME AS OF proc_time AS u
+  ON o.user_id = u.user_id
+-- DDL без 'lookup.cache' setting (default = NONE)
+```
+
+100k events/sec → 100k DB queries/sec → DB falls over.
+
+**Fix**: `'lookup.cache' = 'PARTIAL'`, set sane max-rows и expire-after-write.
+
+### 5. Idle state retention applies to ALL joins
+
+```sql
+SET 'table.exec.state.ttl' = '1h';
+
+SELECT * FROM orders JOIN payments ON ...  -- TTL 1h
+SELECT user_id, COUNT(*) FROM events GROUP BY user_id  -- ALSO TTL 1h, counts reset
+```
+
+Global setting affects unrelated stateful operators — может ломать correctness aggregations.
+
+**Fix**: set TTL per operator (Flink 2.x supports hints) или architect для consistency.
+
+### 6. Temporal join lookup ahead of dim watermark
+
+```
+Order event at t=100, watermark на dim table = t=80
+```
+
+Flink can't safely emit join — newer dim version might come (newer rate). Order **buffered** до dim watermark catches up.
+
+**Fix**: ensure dim updates fast или smooth event lag.
+
+### 7. Lookup join async I/O queue full → backpressure
+
+Default async I/O queue capacity = 100. If external system slow (200ms/query) и event rate high → queue fills, backpressure cascades.
+
+**Fix**: `'lookup.async.output-mode' = 'allow-unordered'` + tune queue. Consider switching to dim table в Flink state via CDC.
+
+### 8. Composite PK temporal join
+
+```sql
+PRIMARY KEY (region, currency) NOT ENFORCED
+```
+
+Temporal join должен match all PK columns:
+```sql
+JOIN rates FOR SYSTEM_TIME AS OF o.t AS r
+  ON o.region = r.region AND o.currency = r.currency
+```
+
+Missing one → planning error.
+
+---
+
+## Cheat sheet
+
+```
+Regular join:
+    SELECT ... FROM a JOIN b ON a.id = b.id
+    State: unbounded → SET 'table.exec.state.ttl'='24h'
+
+Interval join:
+    SELECT ... FROM a JOIN b
+      ON a.id = b.id
+      AND b.t BETWEEN a.t - INTERVAL '1' HOUR AND a.t
+    State: bounded by max interval
+
+Temporal join:
+    SELECT ... FROM s JOIN versioned_dim FOR SYSTEM_TIME AS OF s.event_time
+      ON s.id = versioned_dim.id
+    Requirements: PK + WATERMARK on dim
+    State: bounded by event lag
+
+Lookup join:
+    SELECT ... FROM s LEFT JOIN ext_dim FOR SYSTEM_TIME AS OF s.proc_time
+      ON s.id = ext_dim.id
+    Async I/O, cache configurable
+    State: cache only
+```
+
+---
+
+<KnowledgeCheck
+  question="Use case: orders Kafka stream (100k events/sec) needs enrichment с user_profile (10M users в Postgres, updated через CDC). Currency conversion с historical rates (10K currencies). Какие joins use для каждого enrichment и почему?"
+  answer="**User profile enrichment — temporal join с CDC source in Flink, NOT lookup join**. Создать `user_profile_cdc` table с Postgres CDC connector: `'connector' = 'postgres-cdc'` + PRIMARY KEY (user_id) NOT ENFORCED. Add WATERMARK FOR update_time AS update_time. Это streams Postgres binlog/WAL в Flink — каждое UPSERT/DELETE captured. Query: `SELECT o.*, u.name, u.segment FROM orders o JOIN user_profile_cdc FOR SYSTEM_TIME AS OF o.event_time AS u ON o.user_id = u.user_id`. Pros: (a) deterministic historical lookup — каждое order видит user_profile snapshot **at order_time**, не current state; (b) 100k events/sec achievable — no external DB calls; (c) state bounded ~10M user rows + recent versions, ~5-10GB total in RocksDB; (d) handles updates correctly — order на t=100 видит profile version active at t=100, не version at t=150. Lookup join alternative: 100k events/sec × Postgres query latency ~5ms × parallelism 16 → max 3.2k events/sec — too slow without cache, и cache doesn't have historical versions. **Currency rates — temporal join с Kafka source**. DDL: `CREATE TABLE currency_rates (...) WITH ('connector' = 'kafka', ...) PRIMARY KEY (currency) NOT ENFORCED WATERMARK FOR update_time AS update_time`. Query: `SELECT ..., o.amount * r.rate AS amount_usd FROM orders o JOIN currency_rates FOR SYSTEM_TIME AS OF o.event_time AS r ON o.currency = r.currency`. 10K currencies tiny state — каждая currency имеет несколько versions per day, total <10MB. Deterministic conversion: order's USD amount computed using rate at order_time. Critical для accounting correctness — не использовать current rate для historical orders. **Alternative — lookup join — НЕ подходит для обоих** потому что: (a) requires historical version retrieval which JDBC/REST lookup не supports; (b) высокая throughput overwhelms Postgres; (c) for currency, rates updated frequently и cache invalidation сложная. **Production gotchas**: (1) ensure ALL three sources have WATERMARK declarations matching out-of-orderness; (2) если user_profile CDC slow или Postgres replication lag — temporal join blocks pending events; mitigation — consume CDC topic с separate Flink job to compute up-to-date snapshot, downstream pipeline consumes that; (3) state size monitoring — alert at 80% disk; (4) test recovery — restart and verify deterministic enrichment for same events. **State estimate**: 10M users × ~1KB avg = ~10GB + 10K currencies × 100 versions × ~100B = 100MB. Total ~10GB — manageable for RocksDB на NVMe SSD."
+/>

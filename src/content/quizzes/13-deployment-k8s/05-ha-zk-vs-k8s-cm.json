@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/05-ha-zk-vs-k8s-cm",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-05",
+    "description": "Quiz for HA ZooKeeper vs Kubernetes ConfigMaps lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-05-q1",
+      "type": "multiple-choice",
+      "question": "Что хранится в HA метаданных (ConfigMaps или ZK znodes)?",
+      "options": [
+        { "id": "a", "text": "Полное state job-а — все ValueState/MapState содержимое" },
+        { "id": "b", "text": "JobGraph (или pointer), completed checkpoint pointer, leader election state, checkpoint counter — metadata only. Actual state data в DFS (S3/HDFS)" },
+        { "id": "c", "text": "Kafka offsets" },
+        { "id": "d", "text": "Метрики Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "HA метаданные = pointers + coordination data, не сами state data. ConfigMap содержит: JobGraph (или reference на blob в DFS если >1MB), latest completed checkpoint path, checkpoint counter, dispatcher submitted jobs registry, leader election state. Actual state (RocksDB SST files, ForSt blobs) хранится в DFS — state.checkpoints.dir. Это два разных storage path: high-availability.storageDir (метаданные) и state.checkpoints.dir (данные).",
+      "studyHint": "Повторите урок — Что должно 'выживать' при JM crash + Checkpoint storage relationship",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-05-q2",
+      "type": "multiple-choice",
+      "question": "JM pod рестартанулся (OOM killed). 90s pod RUNNING, но job в CREATED 5 минут → FAILED. Что вероятно случилось?",
+      "options": [
+        { "id": "a", "text": "Pod просто медленно стартует" },
+        { "id": "b", "text": "Либо HA не был включён (новый JM не знает о prior job, submit fresh из main()), либо HA storage недоступен / corrupt / JobGraph blob lost. Также jobManager.replicas: 1 = no warm standby" },
+        { "id": "c", "text": "Image registry медленный" },
+        { "id": "d", "text": "Network policy блокирует TM ↔ JM" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Симптом 'CREATED 5min → FAILED' указывает на recovery problem. Если HA не включён — fresh start, для stateful = катастрофа, FAILED скорее всего потому что main() ожидал external state. Если HA включён — JM пытается прочитать JobGraph + checkpoint pointer из HA storage. Possible failures: storageDir недоступен (S3 permission rotation), last checkpoint corrupt/удалён, ConfigMaps повреждены, JobGraph blob недоступен. Также `replicas: 1` = no warm standby → 90s downtime. Fix: jobManager.replicas: 2 + restart-strategy + monitoring checkpoint failures.",
+      "studyHint": "Повторите урок — Production gotchas + KnowledgeCheck",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-05-q3",
+      "type": "multiple-choice",
+      "question": "Production setup на Kubernetes в 2026. Какой HA выбрать?",
+      "options": [
+        { "id": "a", "text": "ZooKeeper-based — battle-tested" },
+        { "id": "b", "text": "Kubernetes ConfigMap-based — no external dependency, cloud-native, default в 2.x для K8s deployments" },
+        { "id": "c", "text": "etcd-based" },
+        { "id": "d", "text": "Никакой не нужен — K8s сам делает failover" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "K8s ConfigMap-based HA — production default 2026. Преимущества: (1) no external dependency — K8s API уже есть; (2) cloud-native — leverage K8s RBAC, watch streams; (3) simpler ops — нет ZK ensemble для patching/backup; (4) GitOps-friendly. ZK HA имеет смысл только для bare-metal Flink (вне K8s) или legacy infrastructure с уже работающим ZK. Без HA = SPOF, JM crash = data loss / downtime.",
+      "studyHint": "Повторите урок — Когда выбирать что",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-05-q4",
+      "type": "true-false",
+      "question": "В K8s ConfigMap-based HA leader election происходит через atomic update K8s ConfigMap (или Lease) с optimistic concurrency control (resourceVersion CAS).",
+      "correctAnswer": true,
+      "explanation": "True. K8s leader election leverages K8s API atomic operations. JM пытается захватить leadership через annotation update на ConfigMap (или Lease object): atomic compare-and-swap с resourceVersion. Если успех — lease на 15-30s, renew каждые 5s. Если CAS conflict — кто-то другой стал leader, retry. Lease expire (no renew 30s) → standby take over. Это та же модель, что K8s controllers используют для leader election.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

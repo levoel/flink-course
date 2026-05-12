@@ -1,0 +1,403 @@
+---
+title: "Flink Agents 0.2.1 — event-driven AI agents на Flink runtime (preview)"
+description: "Flink Agents — новая sub-project (March 2026, FLIP-531). Event-driven AI agents с streaming runtime, LLMs, memory, tools, MCP integration. Architecture, primitives, use cases: customer support automation, real-time decisions."
+order: 9
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Flink Agents", "AI Agents", "LLM", "FLIP-531", "MCP", "Future"]
+---
+
+# Flink Agents 0.2.1 — event-driven AI agents на Flink runtime (preview)
+
+В октябре 2025 вышел **Flink Agents 0.1.0** — preview release новой Apache Flink sub-project. В марте 2026 — 0.2.1 stable preview. Это FLIP-531 — попытка ответить на вопрос: «AI agents работают на event streams. Stream processing engine с EOS, durability, state — это естественная runtime для агентов. Почему мы строим agents на ad-hoc Python orchestration, когда есть Flink?».
+
+Flink Agents — это **event-driven AI agents с stream processing seman tics**: каждое incoming event triggers agent invocation, agent имеет durable memory через Flink state, может вызывать tools (Kafka, DB, HTTP), exactly-once гарантирует, что side effects не выполняются дважды. Combined с MCP (Model Context Protocol) и mainstream LLM providers, это даёт production-grade infrastructure для AI applications.
+
+Этот урок — `★ FUTURE`. Мы разберём архитектуру, primitives, и где этот sub-project размещается в Flink ecosystem.
+
+---
+
+## Зачем нужна отдельная sub-project
+
+Текущий ML support в Flink 2.2 — это **ML_PREDICT** (single inference call) + **VECTOR_SEARCH**. Это inference layer. Agents — другой уровень abstraction:
+
+| Aspect | ML_PREDICT (Flink 2.2) | Flink Agents (preview) |
+|---|---|---|
+| Granularity | Single function call | Multi-step reasoning + actions |
+| State | Stateless inference | Stateful conversation/memory |
+| Tools | No | Yes (Kafka, DB, HTTP, MCP) |
+| Multi-turn | No | Yes |
+| Tools side-effects | N/A | EOS guarantees |
+| Use case | Score event | Auto-handle customer complaint |
+| Equivalent в Python world | One OpenAI API call | LangChain/LangGraph agent |
+
+Agents — это extending Flink в **agent runtime** territory. Streaming engine с durability + state + EOS — идеальный fit для long-running, multi-step AI workflows.
+
+---
+
+## Архитектура Flink Agents
+
+<DiagramContainer title="Flink Agents — event-driven agent runtime" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Input event"
+        tooltip="Kafka topic с user requests / customer complaints / IoT alerts / etc. Каждое event triggers agent invocation."
+      >
+        support_request topic
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="keyBy(conversationId)" />
+    <FlowRow>
+      <DataBox
+        label="Agent operator"
+        tooltip="Special Flink operator (extends KeyedProcessFunction). On event: reconstruct context из state memory, call LLM, parse tool calls, execute tools, update memory, emit response."
+      >
+        AgentProcessFunction
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="LLM API call (async)" />
+    <FlowRow>
+      <DataBox
+        label="LLM provider"
+        tooltip="OpenAI / Anthropic / Bedrock / self-hosted. Через standardized client interface. Streaming response поддерживается."
+      >
+        Claude / GPT / Gemini
+      </DataBox>
+      <DataBox
+        label="Tool calls"
+        tooltip="Tools — это side effects: Kafka publish, DB write, HTTP call. Each через MCP server или native connector. EOS через Flink 2PC."
+      >
+        Tools (MCP / native)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="response" />
+    <FlowRow>
+      <DataBox
+        label="Memory (Flink state)"
+        tooltip="ValueState<Conversation> per conversationId. Стандартный Flink state. Checkpointed, restorable. Optional materialized в Kafka topic для query."
+      >
+        Memory state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="emit" />
+    <FlowRow>
+      <DataBox
+        label="Output stream"
+        tooltip="Agent response → Kafka topic. Consumed by frontend, notification service, downstream agents."
+      >
+        agent_responses topic
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Primitives
+
+### `Agent` — main entity
+
+```python
+from flink_agents import Agent, Tool, Memory, OpenAIProvider
+
+agent = Agent(
+    name="customer-support",
+    provider=OpenAIProvider(
+        model="gpt-4-turbo",
+        api_key="${OPENAI_API_KEY}"
+    ),
+    system_prompt="""You are a customer support agent for ACME Corp.
+        Always be polite. Use tools to look up customer information.
+        Escalate to human if uncertain.""",
+    tools=[
+        Tool.from_postgres(
+            name="lookup_customer",
+            description="Look up customer by ID",
+            connection_url="jdbc:postgresql://prod-db/customers",
+            query_template="SELECT * FROM customers WHERE id = :customer_id"
+        ),
+        Tool.from_kafka_topic(
+            name="create_ticket",
+            description="Create support ticket",
+            topic="support_tickets",
+            schema=TicketSchema
+        ),
+        Tool.from_http(
+            name="check_order_status",
+            description="Check order status from internal API",
+            endpoint="https://internal-api/orders/{order_id}",
+            method="GET"
+        ),
+    ],
+    memory=Memory.flink_state(
+        max_history_turns=10,
+        compress_after=20  # auto-summarize old turns
+    )
+)
+```
+
+### `Memory` — stateful conversation context
+
+```python
+# Несколько backend opcj:
+Memory.flink_state(...)         # ValueState в Flink, recoverable
+Memory.kafka_topic(...)          # Kafka compacted topic для cross-job sharing
+Memory.external(redis_url=...)   # Redis / Cassandra для distributed
+```
+
+Memory автоматически compress-ит старые turns через summarization (LLM call) для bounded context size. Это решает problem context window overflow в long conversations.
+
+### `Tool` — actions с EOS
+
+```python
+# Tool factory functions:
+Tool.from_kafka_topic(...)       # Publish to Kafka, EOS через 2PC
+Tool.from_database(...)          # JDBC/MongoDB queries
+Tool.from_http(...)              # REST APIs
+Tool.from_mcp(...)               # MCP server tools
+Tool.from_python(...)            # Custom Python function
+
+# Custom:
+@flink_agents.tool
+def my_custom_tool(param: str) -> str:
+    """Does X."""
+    return result
+```
+
+Critical aspect — tools **EOS-aware**. Если agent делает Kafka publish + ему ack-уируют, но crashes до checkpoint complete, tool **NOT re-executed** on restart. Это reuses Flink's 2PC infrastructure.
+
+### `MCP Tool` — interop с MCP servers
+
+```python
+from flink_agents import MCPTool
+
+# MCP server (например, filesystem / github / shopify) подключается:
+github_tools = MCPTool.from_server(
+    server_url="mcp://github-mcp-server:8000",
+    auth_token="${GITHUB_TOKEN}"
+)
+
+agent = Agent(
+    ...,
+    tools=[*github_tools, ...]   # auto-imported все tools server-а
+)
+```
+
+MCP (Model Context Protocol, открыт Anthropic 2024) — стандарт для tool/resource discovery в LLM apps. Flink Agents имеет first-class MCP client integration.
+
+---
+
+## Run на stream
+
+```python
+# Subscribe agent к stream of events
+agent.run_on_stream(
+    input_stream=KafkaSource(
+        topics="support_requests",
+        format="avro"
+    ),
+    output_stream=KafkaSink(
+        topic="agent_responses",
+        delivery_guarantee="exactly_once"
+    ),
+    key_by="conversation_id",     # routing по conversation
+    parallelism=8
+)
+```
+
+Under the hood:
+- Flink graph: KafkaSource → keyBy(conversationId) → AgentProcessFunction → KafkaSink (EOS).
+- AgentProcessFunction: ValueState<Conversation> for memory, async LLM calls, async tool calls.
+- Checkpoint coordination ensures EOS for tool side effects.
+
+---
+
+## Multi-agent orchestration
+
+Сложные workflows — несколько agents:
+
+```python
+# Triage agent — routes к specialist
+triage = Agent(name="triage", model="gpt-4-turbo", tools=[
+    Tool.classify(categories=["billing", "technical", "complaint"])
+])
+
+# Specialists
+billing = Agent(name="billing-agent", model="gpt-4-turbo", tools=[...])
+technical = Agent(name="technical-agent", model="gpt-4-turbo", tools=[...])
+
+# Pipeline
+input_stream
+    .agent(triage)
+    .branch_on(lambda response: response.category, {
+        "billing": billing,
+        "technical": technical,
+        "complaint": escalate_to_human
+    })
+    .sink_to(KafkaSink("resolved"))
+```
+
+Multi-agent chains — это normal Flink DAG, агенты — это операторы. Flink optimizer / chaining применяется как обычно.
+
+---
+
+## Use cases
+
+### 1. Customer support automation
+
+```python
+# 24/7 первая линия поддержки
+support_agent = Agent(
+    name="acme-support-l1",
+    provider=AnthropicProvider(model="claude-opus-4-7"),
+    system_prompt="""You are ACME's L1 customer support.
+        - Greet customers, ask for order ID.
+        - Look up info, answer simple questions.
+        - For complex issues, create ticket + escalate.""",
+    tools=[
+        lookup_customer, lookup_order, check_shipping,
+        create_ticket, refund_request
+    ],
+    memory=Memory.flink_state(max_history_turns=20)
+)
+
+support_agent.run_on_stream(
+    input_stream=KafkaSource(topics="user-messages"),
+    output_stream=KafkaSink(topic="agent-replies", delivery_guarantee="exactly_once"),
+    key_by="conversation_id"
+)
+```
+
+Real-world data: large e-commerce companies (Klarna, Bolt) уже использовали LLM-based L1 support через ad-hoc Python. Flink Agents даёт production runtime — EOS, durable state, K8s scaling.
+
+### 2. Real-time decision automation
+
+```python
+# Auto-approve/decline loan applications
+loan_agent = Agent(
+    name="loan-decision",
+    provider=BedrockProvider(model="claude-3.5"),
+    system_prompt="""Evaluate loan applications. Use tools to check credit,
+        employment, history. Auto-approve if score > 0.85, decline if < 0.3,
+        escalate human otherwise.""",
+    tools=[
+        check_credit_bureau, verify_employment, check_history,
+        emit_decision  # Kafka publish для downstream processing
+    ]
+)
+
+loan_agent.run_on_stream(
+    input_stream=KafkaSource(topics="loan-applications"),
+    output_stream=KafkaSink(topic="loan-decisions", delivery_guarantee="exactly_once")
+)
+```
+
+Critical: EOS гарантирует, что один application = одно decision, никаких double-approvals от retries.
+
+### 3. IoT alert handling
+
+```python
+iot_agent = Agent(
+    name="device-monitor",
+    provider=OpenAIProvider(model="gpt-4"),
+    system_prompt="Diagnose device anomalies. Suggest mitigation.",
+    tools=[
+        query_metrics, query_logs, check_similar_devices,
+        page_oncall, schedule_maintenance
+    ],
+    memory=Memory.flink_state()
+)
+
+iot_agent.run_on_stream(
+    input_stream=KafkaSource(topics="device-alerts"),
+    output_stream=KafkaSink(topic="diagnosis"),
+    key_by="device_id"
+)
+```
+
+Per-device conversation — agent помнит historical alerts, suggests escalation pattern.
+
+---
+
+## Сравнение: Flink Agents vs Python-based agent frameworks
+
+| Aspect | LangChain/LangGraph (Python) | Flink Agents |
+|---|---|---|
+| Runtime | Python process | Flink cluster |
+| State persistence | Manual (Redis/DB) | Built-in (Flink state) |
+| Recovery после crash | Manual | Automatic (checkpoint restore) |
+| Scaling | Manual (worker pool) | Built-in (parallelism, autoscaler) |
+| EOS for tools | Manual idempotency | Built-in (2PC) |
+| Event-driven | Через external trigger | Native (Kafka source) |
+| Observability | Custom | Built-in (Flink metrics + OTel) |
+| Mature | Yes (2 года production) | Preview (0.2.1, March 2026) |
+| Python ecosystem | Full | PyFlink + agent SDK |
+
+**Where Flink Agents wins**: production-grade infrastructure (EOS, recovery, scaling, observability). **Where LangChain wins**: maturity, community, rapid iteration.
+
+В 2026 — Flink Agents preview, не production-ready для most companies. Через 1-2 года expected mature.
+
+<Callout type="note">
+Flink Agents — это не replacement для LangChain, а **production runtime для production-grade AI agents**. Используйте LangChain/LangGraph для prototyping и dev. Когда нужно scale на миллионы events/day с EOS, durability, K8s autoscaling — порт на Flink Agents.
+</Callout>
+
+---
+
+## EOS semantics для tool calls
+
+Самая важная (и tricky) часть — EOS для side effects.
+
+```python
+# Tool: publish to Kafka topic 'orders'
+publish_order = Tool.from_kafka_topic(
+    name="publish_order",
+    topic="orders",
+    schema=OrderSchema
+)
+
+# Agent invocation:
+# 1. LLM call decides: publish_order(...)
+# 2. Tool execution — write to Kafka transactional
+# 3. checkpoint — 2PC commits Kafka transaction
+# 4. memory updated со tool result
+```
+
+Если crash после step 2 но до step 3 (transaction prepared, not committed): on restart, transaction recovered, replays correctly, no duplicate.
+
+Если crash до step 2: agent re-invokes from previous checkpoint, LLM call repeated (might decide differently — non-deterministic), but no side effect leaked.
+
+**Tradeoff**: tools must support transactional semantics (Kafka — да; arbitrary HTTP — нет). Non-transactional tools — at-least-once, requires app-level idempotency.
+
+---
+
+## Production gotchas (preview-specific)
+
+- **Preview status — production at own risk**. 0.2.1 имеет breaking API changes between versions. Не использовать для critical workloads без careful tracking.
+- **PyFlink dependency** — agents Python-first. JVM-only Java agents — на roadmap, не GA.
+- **LLM cost monitoring критичен** — каждый event = LLM call. На 1k events/sec gpt-4 = $X/sec. Кост budget + circuit breakers must.
+- **Long conversations memory bloat** — без compression Memory size linearly grows. `compress_after` обязателен.
+- **Tool latency** — каждый tool call в loop reasoning. Slow tool = slow agent. Sub-second tools recommended.
+- **Non-deterministic replays** — LLM output не deterministic. Replay из savepoint может dare different path. EOS still holds для tools, но conversation may diverge.
+- **MCP server availability** — external MCP tools — external dependency, retry/circuit breaker logic must.
+- **State size** — memory per conversation бывает MBs (long history). На millions concurrent conversations это TBs. Plan для ForSt backend.
+- **Checkpoint duration** — LLM async calls in-flight на checkpoint могут блокировать. Tune `taskmanager.network.memory.buffer-debloat.target`.
+
+<Callout type="warning">
+Самая частая ошибка в Flink Agents preview adoption — **using preview features в production critical path без backup plan**. Roadmap для GA — Q4 2026 / Q1 2027. До этого — prototype, internal tooling, non-critical use cases. Mission-critical AI agents — пока на LangChain/LangGraph + production-grade fallback.
+</Callout>
+
+---
+
+## Roadmap (как видна в FLIP-531 и community discussion)
+
+- **0.2.x (Q2 2026)** — preview, breaking changes возможны. Customer support / internal automation use cases.
+- **0.3.x (Q3 2026)** — Java agent API, structured outputs, better multi-agent orchestration.
+- **1.0 GA (Q4 2026 / Q1 2027)** — production-ready, stable API, full observability integration.
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: large e-commerce company хочет automate 80% L1 customer support через AI agent. Volume: 100k conversations/day, average 5 turns each. Должно интегрироваться с Postgres (customers), Kafka (events), Stripe (refunds). Latency budget 3 secs per response. Архитектурный выбор: (1) LangGraph в Python; (2) Flink Agents preview; (3) hybrid. Какие trade-offs и что выбрать в 2026?"
+  answer="Анализ scale + requirements: 100k conversations × 5 turns = 500k LLM calls/day = ~6 events/sec average, peak ~60 events/sec. Memory: 100k concurrent conversations × ~50KB context = 5GB state — manageable. Tool calls: ~3 per turn × 500k = 1.5M tool calls/day (mix DB queries, Kafka publish, Stripe API). EOS critical для Stripe refunds (никаких double-charges). Latency 3s — strict. Choice analysis: (a) **LangGraph + Python** — pros: mature (2024 production-tested), команда вероятно already familiar, fast iteration, established patterns; cons: manual scaling (workers + queue), manual EOS for tools (custom idempotency через request_id), manual state persistence (Redis + recovery code), no built-in event-driven (нужен Kafka consumer + worker pool), observability custom. Production но боль. (b) **Flink Agents preview** — pros: built-in EOS (Stripe refund safety из коробки!), built-in state persistence + recovery, K8s autoscaling, native Kafka source/sink, observability metrics; cons: preview status (API breaking changes), 0.2.x — may be unstable, team learning curve PyFlink + agents, community небольшая, debugging tools immature. (c) **Hybrid — RECOMMENDED**: deploy current production на LangGraph (mature, известная), но **start parallel pilot на Flink Agents** для специфичных subset (например, simple FAQ routing — low risk, high volume). Через 6-12 months evaluate если Flink Agents 0.3+ mature enough для full migration. Финальный план: **2026 → LangGraph production**, **Flink Agents pilot для one workflow** (например, order status lookup which has clear pattern), **2027 → full migration if Flink Agents GA stable**. Don't bet entire L1 support на preview tech. But also не lose 2 years — start learning curve now. Lesson: emerging tech adoption needs deliberate pilot strategy, не «all-in» либо «not at all»."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/06-parallelism-strategy",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-06",
+    "description": "Quiz for parallelism strategy lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-06-q1",
+      "type": "multiple-choice",
+      "question": "Почему setMaxParallelism нужно set заранее с большим запасом и какие последствия default ~128?",
+      "options": [
+        { "id": "a", "text": "Это просто оптимизация" },
+        { "id": "b", "text": "maxParallelism определяет ceiling — нельзя увеличить parallelism выше него. Меняется ТОЛЬКО через savepoint + restart (full state re-shuffle через key groups). Default ~128 → нельзя rescale за 128 subtasks. Для production set 1024 или 4096 заранее. Меняется в production = downtime + риск" },
+        { "id": "c", "text": "Влияет на throughput" },
+        { "id": "d", "text": "Optional параметр" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "maxParallelism — это hard ceiling, определяет количество key groups (по умолчанию 128 для small jobs). Hash(key) % maxParallelism → key group → subtask. Меняется только через savepoint + restart, потому что key group → subtask mapping rebuilt. Для large state это часы downtime. Set заранее с запасом — 1024 для большинства, 4096 для future scale. Caveat: чрезмерно высокий maxParallelism = больше granularity, но overhead в state organization (key group metadata).",
+      "studyHint": "Повторите урок — keyBy и data skew, max parallelism",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-06-q2",
+      "type": "multiple-choice",
+      "question": "Когда split slot sharing groups и какие trade-offs?",
+      "options": [
+        { "id": "a", "text": "Всегда используйте дефолт" },
+        { "id": "b", "text": "Split когда: state-heavy operator (большой RocksDB) нужно изолировать managed memory; ML inference operator (large heap usage); sync external API call (long blocking — не блокирует sibling subtasks). Trade-off: больше slots требуется, less efficient packing. Default sharing efficient для homogeneous lightweight transforms" },
+        { "id": "c", "text": "Только для performance" },
+        { "id": "d", "text": "Когда parallelism разный" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "By default все operators одного job в default slot sharing group — могут жить в одном slot. N parallel subtasks = N slots даже если 10 operators. Это efficient packing. Slot sharing groups изолируют: разные groups → разные slot families. Use cases: state-heavy isolation (separate RocksDB instances → separate managed memory budgets), heavy heap usage isolation (ML models), long blocking I/O isolation (sync external API не блокирует siblings). Cost: больше total slots required. Не путать с chaining: chain = task fusion (один thread), slot sharing = slot allocation policy.",
+      "studyHint": "Повторите урок — Slot sharing groups",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-06-q3",
+      "type": "multiple-choice",
+      "question": "Production job parallelism=32, keyBy(userId). Один TaskManager OOM раз в 6-12 часов, остальные normal. Subtask 12 busy=100%, numRecordsInPerSecond у него 50k/sec vs остальных 2-5k. Что и как fix?",
+      "options": [
+        { "id": "a", "text": "Restart job" },
+        { "id": "b", "text": "Classic data skew. Hot key (whale user или bot) mapped в один key group → subtask 12. 10-25× разница. Fix приоритизированно: (1) Short-term: two-stage aggregation с salting. keyBy(userId + '_' + hash % 32) → reduce → keyBy(userId) → reduce. 32× spread hot key. (2) Medium-term: identify hot users через side output, separate handling (broadcast или global aggregator). (3) Защита от OOM: state TTL state.setTtl(Duration.ofHours(1)) — не позволит state расти бесконечно для hot key. Critical: increasing parallelism НЕ решает skew" },
+        { "id": "c", "text": "Увеличить parallelism до 64" },
+        { "id": "d", "text": "Сменить state backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Severe data skew. Один hot key (или несколько mapped в один key group) overwhelms subtask 12. Diagnose: numRecordsInPerSecond per subtask — coefficient of variation > 0.5 = severe skew. Identify hot key через temporary metric или sample logs. Hot users patterns: single 'whale' (большой account), bot/synthetic traffic. Solutions: (1) Salting — biggest fix. cost: extra shuffle stage. (2) Hot key separation — split stream на 'hot' (round-robin) и 'cold' (normal keyBy). (3) Business logic review — bot detection, special handling. Critical insight: parallelism 32→64 НЕ решает skew — hot key всё равно concentrated в одном subtask из 64. Только salting/custom partitioning fix-ит underlying problem.",
+      "studyHint": "Повторите урок — Skew mitigation + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-06-q4",
+      "type": "true-false",
+      "question": "Если source parallelism > Kafka partitions, некоторые source subtasks будут idle — partitions не реfraintirовать.",
+      "correctAnswer": true,
+      "explanation": "True. Source parallelism в Flink ограничено доступными splits (для FLIP-27 sources). Для Kafka splits = partitions. Если topic имеет 8 partitions и source parallelism = 16 → 8 subtasks active, 8 idle (no partitions assigned). Flink НЕ перепартиционирует Kafka topic. Diagnosis: numRecordsInPerSecond per source subtask = 0 для половины. Правило: parallelism = min(partitions, available slots). Если меньше партиций — round-robin multiplex (subtask читает несколько partitions). Optimal — match partitions. Если нужен более высокий parallelism — увеличить partitions Kafka topic upfront.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

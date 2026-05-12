@@ -1,0 +1,554 @@
+---
+title: "AI functions — ML_PREDICT и VECTOR_SEARCH (Flink 2.2)"
+description: "FLIP-526 ML_PREDICT, FLIP-540 VECTOR_SEARCH. CREATE MODEL syntax, providers (OpenAI, custom), inline inference. Vector embeddings index"
+order: 7
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["ML_PREDICT", "VECTOR_SEARCH", "FLIP-526", "FLIP-540", "AI in SQL", "Flink 2.2"]
+---
+
+# AI functions — ML_PREDICT и VECTOR_SEARCH (Flink 2.2)
+
+Flink 2.2 (декабрь 2025) принёс две flagship AI features в SQL — **ML_PREDICT** (FLIP-526) для inference ML моделей и **VECTOR_SEARCH** (FLIP-540) для vector similarity search. Это disruptive: ML inference pipeline в 10 строк SQL вместо custom DataStream code с external HTTP calls. Этот урок разбирает CREATE MODEL syntax, providers (OpenAI, custom HTTP endpoints, embedded ONNX), vector indexing strategies и production patterns для real-time ML pipelines.
+
+Это не just convenience — это новая category streaming applications: real-time fraud scoring через GPT, semantic search streaming results, embedding-based recommendation в дашборде.
+
+---
+
+## Контекст — почему AI в streaming SQL
+
+Без AI functions ML inference в Flink требовал:
+1. AsyncFunction с HTTP client → OpenAI API.
+2. Manual rate limiting, retry, batching.
+3. Custom serialization запроса/ответа.
+4. Error handling per call.
+5. No deterministic replay (HTTP responses vary).
+
+С ML_PREDICT:
+```sql
+SELECT user_id,
+       ML_PREDICT('fraud_classifier', transaction) AS fraud_score
+FROM transactions;
+```
+
+Под капотом — Async I/O, retry, caching, batching. Declarative.
+
+---
+
+## CREATE MODEL — register inference endpoint
+
+```sql
+CREATE MODEL fraud_classifier
+INPUT (transaction ROW<user_id STRING, amount DECIMAL, location STRING>)
+OUTPUT (score DOUBLE, reasoning STRING)
+WITH (
+    'provider' = 'openai',
+    'task' = 'completion',
+    'endpoint' = 'https://api.openai.com/v1/chat/completions',
+    'model' = 'gpt-4',
+    'system_prompt' = 'You are a fraud detection assistant. Analyze the transaction and return JSON {"score": 0-1, "reasoning": "..."}',
+    'api_key' = 'sk-...',  -- или через env: '${OPENAI_API_KEY}'
+    'temperature' = '0.1',
+    'max_tokens' = '500',
+    'rate.limit.rpm' = '100',
+    'batch.size' = '10'
+);
+```
+
+Concepts:
+- **INPUT** — schema of input feature row.
+- **OUTPUT** — schema of model output. Flink parses response к этой schema.
+- **provider** — OpenAI, custom HTTP, ONNX embedded, TensorFlow Serving.
+- **task** — completion, embedding, classification.
+- **rate/batch settings** — built-in throttling и batching.
+
+---
+
+## ML_PREDICT — inline inference
+
+```sql
+SELECT
+    t.tx_id,
+    t.user_id,
+    t.amount,
+    pred.score AS fraud_score,
+    pred.reasoning AS fraud_reasoning
+FROM transactions AS t,
+LATERAL TABLE(ML_PREDICT(MODEL fraud_classifier, t.* )) AS pred;
+```
+
+`LATERAL TABLE(ML_PREDICT(...))` — table function expansion. Per input row, model inference produces output row(s), joined as additional columns.
+
+### Simpler syntax (function form)
+
+```sql
+SELECT
+    tx_id,
+    user_id,
+    ML_PREDICT('fraud_classifier', tx_id, user_id, amount, location) AS prediction
+FROM transactions;
+```
+
+Returns single ROW value, can access fields:
+```sql
+SELECT
+    tx_id,
+    prediction.score AS score,
+    prediction.reasoning AS reasoning
+FROM ...;
+```
+
+### Async behavior
+
+Under the hood: Async I/O запрос к provider. Default queue capacity 100 (configurable через model option). Throughput limited by API rate limit + latency.
+
+Performance estimates:
+- OpenAI GPT-4: ~1-5 sec latency → ~20-50 inferences/sec per worker.
+- Custom local ONNX: ~10-100 ms → ~100-1000/sec.
+- Embedded model (FLINK_AI): batched, ~10K/sec.
+
+---
+
+## Providers — OpenAI
+
+```sql
+CREATE MODEL chat_summarizer
+INPUT (text STRING)
+OUTPUT (summary STRING)
+WITH (
+    'provider' = 'openai',
+    'endpoint' = 'https://api.openai.com/v1/chat/completions',
+    'model' = 'gpt-4o-mini',
+    'system_prompt' = 'Summarize the following text in one sentence:',
+    'api_key' = '${OPENAI_API_KEY}',
+    'temperature' = '0.3',
+    'max_tokens' = '100',
+    'rate.limit.rpm' = '500',
+    'rate.limit.tpm' = '60000',  -- tokens per minute
+    'batch.size' = '5'
+);
+```
+
+Provider handles: API authentication, request formatting (chat completions schema), response parsing, retries with exponential backoff.
+
+---
+
+## Providers — Custom HTTP
+
+```sql
+CREATE MODEL custom_classifier
+INPUT (features ROW<f1 DOUBLE, f2 DOUBLE, f3 DOUBLE>)
+OUTPUT (label STRING, confidence DOUBLE)
+WITH (
+    'provider' = 'http',
+    'endpoint' = 'https://ml-service.internal/predict',
+    'method' = 'POST',
+    'headers' = 'Content-Type=application/json,Authorization=Bearer ${ML_API_KEY}',
+    'request.format' = '{"features": {"f1": ${f1}, "f2": ${f2}, "f3": ${f3}}}',
+    'response.format' = 'json',
+    'response.path.label' = '$.prediction.class',
+    'response.path.confidence' = '$.prediction.score',
+    'rate.limit.rpm' = '1000',
+    'timeout.ms' = '5000',
+    'retry.max' = '3'
+);
+```
+
+Configurable request body templating, JSONPath response extraction.
+
+---
+
+## Providers — Anthropic Claude
+
+```sql
+CREATE MODEL claude_classifier
+INPUT (text STRING)
+OUTPUT (category STRING, reasoning STRING)
+WITH (
+    'provider' = 'anthropic',
+    'model' = 'claude-opus-4-5',
+    'system_prompt' = 'Classify the customer support ticket into: BILLING, TECHNICAL, ACCOUNT, OTHER. Return JSON {"category": "...", "reasoning": "..."}',
+    'api_key' = '${ANTHROPIC_API_KEY}',
+    'max_tokens' = '500'
+);
+```
+
+Same conceptual model, different provider.
+
+---
+
+## Providers — Embedded ONNX/TensorFlow
+
+```sql
+CREATE MODEL embedded_classifier
+INPUT (features ARRAY<DOUBLE>)
+OUTPUT (probabilities ARRAY<DOUBLE>)
+WITH (
+    'provider' = 'onnx',
+    'model.path' = '/opt/flink/models/classifier.onnx',
+    'batch.size' = '32',
+    'cache' = 'true'
+);
+```
+
+Model loaded в Flink TaskManager memory. Inference local — no network. Highest throughput (~10K/sec), но static (model versions through deployment).
+
+---
+
+## VECTOR_SEARCH — similarity search в SQL
+
+Vector embeddings + similarity search built-in.
+
+### Create vector index
+
+```sql
+CREATE TABLE products (
+    product_id STRING,
+    name STRING,
+    description STRING,
+    embedding ARRAY<FLOAT>,  -- precomputed embedding vector (e.g., 1536-dim)
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'connector' = 'paimon',
+    'vector.column' = 'embedding',
+    'vector.index.type' = 'hnsw',           -- or 'ivf', 'flat'
+    'vector.index.metric' = 'cosine',       -- or 'l2', 'dot_product'
+    'vector.index.dim' = '1536'
+);
+```
+
+Paimon stores vectors with HNSW index. Other connectors: Pinecone, Weaviate, Milvus — through specific connector.
+
+### Query
+
+```sql
+SELECT
+    o.order_id,
+    o.search_query,
+    similar.product_id,
+    similar.name,
+    similar.similarity_score
+FROM orders AS o,
+LATERAL TABLE(VECTOR_SEARCH(
+    TABLE products,
+    'embedding',                              -- index column
+    o.search_embedding,                       -- query vector
+    5,                                        -- top-K
+    'cosine'                                  -- distance metric
+)) AS similar(product_id, name, similarity_score);
+```
+
+Returns top-K similar products per order's search embedding. Streaming nature: query vector комбинируется с indexed vectors continuously.
+
+### Combine с ML_PREDICT для full RAG
+
+```sql
+-- Use case: чат-bot с product recommendation
+CREATE MODEL query_embedder
+INPUT (query STRING)
+OUTPUT (embedding ARRAY<FLOAT>)
+WITH (
+    'provider' = 'openai',
+    'task' = 'embedding',
+    'model' = 'text-embedding-3-large',
+    'api_key' = '${OPENAI_API_KEY}'
+);
+
+SELECT
+    q.session_id,
+    q.user_query,
+    similar.product_id,
+    similar.name
+FROM user_queries AS q,
+LATERAL TABLE(VECTOR_SEARCH(
+    TABLE products,
+    'embedding',
+    -- inline embedding inference!
+    ML_PREDICT('query_embedder', q.user_query).embedding,
+    3,
+    'cosine'
+)) AS similar(product_id, name, score);
+```
+
+Per user query: embed it (ML_PREDICT), search products (VECTOR_SEARCH), join all in one SQL.
+
+---
+
+## State / external system trade-offs
+
+Vector index storage:
+
+| Backend | Vector count | Latency P99 | Streaming friendly |
+|---|---|---|---|
+| Paimon с HNSW | 10M-100M | 5-20ms | ✅ native |
+| Pinecone (SaaS) | 100M+ | 10-50ms | ✅ через connector |
+| Weaviate (self-hosted) | 100M+ | 5-30ms | ✅ |
+| Milvus (self-hosted) | 1B+ | 10-100ms | ✅ |
+| Flink in-state (HashMap) | 1M-10M | <5ms | ✅ для small |
+| External REST API | depends | 50-200ms | ⚠️ через ML_PREDICT |
+
+For most production: Paimon (lightweight) или dedicated vector DB.
+
+---
+
+## Real-time pipeline examples
+
+### Example 1 — real-time fraud scoring
+
+```sql
+CREATE MODEL fraud_scorer
+INPUT (features ROW<amount DOUBLE, hour INT, location_risk DOUBLE>)
+OUTPUT (score DOUBLE)
+WITH (
+    'provider' = 'http',
+    'endpoint' = 'https://ml-internal.com/fraud',
+    ...
+);
+
+CREATE MATERIALIZED TABLE fraud_alerts
+FRESHNESS = INTERVAL '5' SECOND
+AS SELECT
+    tx_id,
+    user_id,
+    amount,
+    pred.score AS fraud_score
+FROM transactions AS t,
+LATERAL TABLE(ML_PREDICT(MODEL fraud_scorer, t.amount, EXTRACT(HOUR FROM t.event_time), t.location_risk)) AS pred
+WHERE pred.score > 0.8;
+```
+
+Materialized table updates каждые 5 секунд с new fraud alerts. Downstream alerting reads this table.
+
+### Example 2 — Semantic search streaming
+
+```sql
+CREATE TABLE search_log (
+    session_id STRING,
+    query STRING,
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH ('connector' = 'kafka', ...);
+
+CREATE MODEL embedder
+INPUT (text STRING)
+OUTPUT (embedding ARRAY<FLOAT>)
+WITH ('provider' = 'openai', 'task' = 'embedding', 'model' = 'text-embedding-3-large', ...);
+
+CREATE MATERIALIZED TABLE search_results
+FRESHNESS = INTERVAL '1' SECOND
+PRIMARY KEY (session_id, rank) NOT ENFORCED
+AS SELECT
+    s.session_id,
+    s.query,
+    ROW_NUMBER() OVER (PARTITION BY s.session_id ORDER BY similar.score DESC) AS rank,
+    similar.product_id,
+    similar.name,
+    similar.score
+FROM search_log AS s,
+LATERAL TABLE(VECTOR_SEARCH(
+    TABLE products,
+    'embedding',
+    ML_PREDICT('embedder', s.query).embedding,
+    10,
+    'cosine'
+)) AS similar(product_id, name, score);
+```
+
+Real-time search-as-you-type backed by streaming embeddings.
+
+### Example 3 — Content moderation
+
+```sql
+CREATE MODEL moderator
+INPUT (content STRING)
+OUTPUT (toxic_score DOUBLE, categories ARRAY<STRING>)
+WITH ('provider' = 'openai', 'task' = 'moderation', 'model' = 'omni-moderation-latest', ...);
+
+CREATE MATERIALIZED TABLE moderated_posts
+FRESHNESS = INTERVAL '2' SECOND
+AS SELECT
+    p.post_id,
+    p.user_id,
+    p.content,
+    mod.toxic_score,
+    mod.categories,
+    CASE WHEN mod.toxic_score > 0.7 THEN 'BLOCK'
+         WHEN mod.toxic_score > 0.3 THEN 'REVIEW'
+         ELSE 'OK' END AS action
+FROM social_posts AS p,
+LATERAL TABLE(ML_PREDICT(MODEL moderator, p.content)) AS mod;
+```
+
+Real-time moderation pipeline, decision logic в SQL.
+
+---
+
+## Performance, batching, caching
+
+### Batching automatic
+
+```sql
+WITH ('batch.size' = '20')
+```
+
+Flink collects up to 20 rows, sends batch request to provider, distributes responses. Reduces API overhead 10-50x для OpenAI.
+
+### Caching
+
+```sql
+WITH (
+    'cache.enabled' = 'true',
+    'cache.max-rows' = '10000',
+    'cache.expire-after-write' = '1h'
+)
+```
+
+LRU cache на model inputs. Identical inputs serve from cache. Massive savings for repetitive inputs.
+
+### Rate limiting
+
+```sql
+WITH (
+    'rate.limit.rpm' = '500',   -- requests per minute
+    'rate.limit.tpm' = '60000', -- tokens per minute (LLMs)
+    'rate.limit.strategy' = 'block_until_available'
+)
+```
+
+Built-in rate limiting matches provider quotas. Avoids 429 errors.
+
+### Async queue size
+
+```sql
+WITH ('async.queue.capacity' = '200')
+```
+
+How many concurrent inferences. Tune based on expected latency.
+
+---
+
+## Production gotchas
+
+### 1. No deterministic replay для LLM-based predictions
+
+```sql
+ML_PREDICT('gpt-4', ...)
+```
+
+Same input → may return different output (especially temperature > 0). Replay не deterministic. State checkpoint can't guarantee exact outputs after replay.
+
+**Fix**: 
+- `temperature=0` для maximum determinism.
+- Cache responses (cache.enabled=true) — replay hits cache.
+- Accept that ML output is non-deterministic, design downstream accordingly.
+
+### 2. API key in DDL plain text
+
+```sql
+WITH ('api_key' = 'sk-real-key-12345')
+```
+
+DDL stored в catalog. Anyone с catalog access sees key.
+
+**Fix**: env var interpolation `${OPENAI_API_KEY}` (Flink reads from TM env). Or secrets manager integration.
+
+### 3. Rate limit ignored → 429 storm
+
+Without proper rate.limit settings, Flink can exceed provider limits → 429 cascades. Producer back-pressured, no progress.
+
+**Fix**: ALWAYS set rate.limit.rpm matching API tier. Plus monitor 429 rate.
+
+### 4. Vector dimension mismatch
+
+```sql
+CREATE TABLE products (embedding ARRAY<FLOAT>) WITH ('vector.index.dim' = '1536');
+-- Later inserted vectors с dim 768 — corruption
+```
+
+Index built for 1536-dim, inserting 768-dim breaks.
+
+**Fix**: validation pipeline upstream, или DDL constraint check.
+
+### 5. Latency cliff from cold model
+
+First inference after restart: model load, connection setup. Latency P99 may spike.
+
+**Fix**: 
+- Embedded models pre-loaded в open().
+- Health check before traffic.
+- Warm-up phase в pipeline initialization.
+
+### 6. Cost — every event hits API
+
+```sql
+SELECT ML_PREDICT('gpt-4', text) FROM events  -- 1M events/day × $0.03/inference = $30K/day
+```
+
+Naive ML_PREDICT on high-volume stream costs $$$.
+
+**Fix**: 
+- Pre-filter с simple rules before LLM (regex, threshold).
+- Cache repetitive inputs.
+- Sampling (predict 1 of 10 events).
+- Cheaper model для first pass, expensive только если flagged.
+
+### 7. PII в LLM requests
+
+Sending raw user data к OpenAI may violate GDPR/HIPAA. Logs of API contain sensitive info.
+
+**Fix**: 
+- Self-hosted model для PII.
+- Pseudonymize features before ML_PREDICT.
+- Data residency-aware provider (Azure OpenAI с EU region).
+
+### 8. Vector search recall vs latency
+
+```sql
+'vector.index.type' = 'hnsw'  -- fast but approximate
+```
+
+HNSW returns approximate nearest neighbors — может miss true top-K. For exact: 'flat' (full scan, slow).
+
+**Fix**: tune `ef_search` parameter для recall/latency balance.
+
+---
+
+## Cheat sheet
+
+```
+CREATE MODEL name
+INPUT (...)
+OUTPUT (...)
+WITH (
+    'provider' = 'openai | http | anthropic | onnx | tensorflow',
+    'model' = '...',
+    'api_key' = '${ENV_VAR}',
+    'rate.limit.rpm' = 'N',
+    'batch.size' = 'N',
+    'cache.enabled' = 'true'
+);
+
+ML_PREDICT(model_name, input_fields...) → ROW
+
+VECTOR_SEARCH(
+    TABLE indexed_table,
+    'vector_column',
+    query_vector,
+    top_k,
+    metric: 'cosine' | 'l2' | 'dot_product'
+) → table function
+
+Use cases:
+    Fraud scoring     — features → score
+    Content moderation — text → toxic_score
+    Semantic search   — query → embedding → VECTOR_SEARCH
+    Recommendation    — user_history → embedding → similar items
+    Translation       — text → translated
+```
+
+---
+
+<KnowledgeCheck
+  question="Design a real-time customer support ticket routing pipeline in Flink 2.2: tickets arrive via Kafka, route к right team (Billing / Technical / Sales / Account / Spam) based on content. Volume 10K tickets/hour. Budget: $100/day max. Production-grade design using AI functions."
+  answer="**Multi-stage pipeline с cost-aware design**: \n\n```sql\n-- Step 1: cheap pre-filter (rules + small model)\nCREATE MODEL fast_classifier\nINPUT (text STRING)\nOUTPUT (category STRING, confidence DOUBLE)\nWITH (\n    'provider' = 'onnx',                       -- embedded DistilBERT\n    'model.path' = '/opt/flink/models/distilbert-classifier.onnx',\n    'batch.size' = '32',\n    'cache.enabled' = 'true',\n    'cache.max-rows' = '50000',\n    'cache.expire-after-write' = '24h'\n);\n\n-- Step 2: expensive fallback для low-confidence (5-10% volume)\nCREATE MODEL llm_classifier\nINPUT (text STRING)\nOUTPUT (category STRING, reasoning STRING)\nWITH (\n    'provider' = 'openai',\n    'model' = 'gpt-4o-mini',                   -- cheap GPT model\n    'system_prompt' = 'Categorize support ticket. Categories: BILLING, TECHNICAL, SALES, ACCOUNT, SPAM. Return JSON {\"category\": \"...\", \"reasoning\": \"...\"}',\n    'api_key' = '${OPENAI_API_KEY}',\n    'temperature' = '0',\n    'max_tokens' = '100',\n    'rate.limit.rpm' = '500',\n    'batch.size' = '5',\n    'cache.enabled' = 'true',\n    'cache.max-rows' = '20000',\n    'cache.expire-after-write' = '24h'\n);\n\n-- Step 3: routing pipeline\nCREATE MATERIALIZED TABLE ticket_routing\nFRESHNESS = INTERVAL '30' SECOND\nPRIMARY KEY (ticket_id) NOT ENFORCED\nAS SELECT\n    t.ticket_id,\n    t.user_id,\n    t.created_at,\n    t.content,\n    -- Two-stage classification:\n    fast.category AS fast_category,\n    fast.confidence AS fast_confidence,\n    -- LLM fallback только если fast model uncertain:\n    CASE\n        WHEN fast.confidence > 0.85 THEN fast.category\n        ELSE llm.category\n    END AS final_category,\n    CASE\n        WHEN fast.confidence > 0.85 THEN 'FAST_MODEL'\n        ELSE 'LLM_FALLBACK'\n    END AS classifier_used\nFROM tickets AS t,\nLATERAL TABLE(ML_PREDICT(MODEL fast_classifier, t.content)) AS fast,\nLATERAL TABLE(ML_PREDICT(MODEL llm_classifier, t.content)) AS llm  -- evaluated lazily в actual Flink optimization\nWHERE fast.confidence > 0.85 OR llm.category IS NOT NULL;\n```\n\n**Cost analysis**: 10K tickets/hour × 24 hours = 240K tickets/day. Strategy: **fast model handles 90% (high confidence), LLM 10% fallback**. (1) Fast model (ONNX DistilBERT embedded): ~$0 inference cost (CPU only). Throughput 10K/sec per worker easily. (2) LLM fallback: 240K × 0.10 = 24K LLM calls. GPT-4o-mini = $0.15/1M input tokens, ~100 tokens per ticket = $0.000015 per call. 24K × $0.000015 = **$0.36/day**. Well under $100 budget. (3) Cache hits: support tickets often repetitive (same wording). 24h cache hits ~30% reduction → effective LLM cost ~$0.25/day. **Architectural points**: (a) **MATERIALIZED TABLE** для declarative pipeline — auto refresh, state managed. (b) **Two-stage classification** — fast first, LLM only when needed. Common pattern для cost optimization. (c) **Cache на обоих models** — repetitive content (FAQs, common bugs) hits cache. (d) **PRIMARY KEY ticket_id** в MT для exactly-once в Paimon. (e) **Downstream**: read `ticket_routing` table from team-specific consumers (Billing reads WHERE final_category='BILLING'), либо use Kafka mirror sink. (f) **Monitoring**: track classifier_used distribution — alert if LLM_FALLBACK > 20% (fast model accuracy degraded). **Production gotchas covered**: (i) **PII**: tickets may contain user data — use Azure OpenAI с private endpoint, or self-hosted Mistral для full data control. (ii) **Determinism**: temperature=0 для reproducible LLM responses. (iii) **Rate limiting**: rpm=500 matches OpenAI tier. (iv) **Cold start**: fast model pre-loaded, no first-request latency. (v) **Cost monitoring**: daily Cloudwatch alert on OpenAI spend >$5. **Future enhancement**: add **VECTOR_SEARCH** для similar past tickets — `LATERAL TABLE(VECTOR_SEARCH(TABLE past_tickets, 'embedding', ML_PREDICT('embedder', t.content).embedding, 3, 'cosine'))` — show агентам 3 similar resolved tickets for context. Adds ~$10/day for embeddings."
+/>

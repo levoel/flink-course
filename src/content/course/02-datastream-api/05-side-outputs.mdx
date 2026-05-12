@@ -1,0 +1,378 @@
+---
+title: "Side Outputs: multi-output stream, late events, exception routing"
+description: "OutputTag, ctx.output(tag, value), stream.getSideOutput(tag). Use cases: late events, multi-output split, exception routing."
+order: 5
+difficulty: "advanced"
+estimatedTime: 20
+topics: ["Side Outputs", "OutputTag", "Late Events", "Multi-Output"]
+---
+
+# Side Outputs: multi-output stream
+
+Side Outputs — механизм Flink, который позволяет одному оператору emit-ить в **несколько output streams одновременно**. Главный output идёт через обычный `out.collect(value)`, side outputs — через типизированные `OutputTag`. Это решает три классических задачи: capture late events, multi-output split (один input → разные downstream pipelines), exception routing (ошибки в DLQ).
+
+Side Outputs — это NOT alternative для `split() / select()` API (which removed in Flink 2.0). Они — fundamentally более типизированы и поддерживают different types per output.
+
+---
+
+## Зачем нужны side outputs
+
+Без side outputs split логика выглядит так:
+
+```java
+// Anti-pattern: union types через супер-class
+DataStream<EventOrError> processed = stream.process(new ProcessFunction() {
+    public void processElement(Tx tx, Context ctx, Collector<EventOrError> out) {
+        try {
+            Event e = parse(tx);
+            out.collect(e);
+        } catch (Exception ex) {
+            out.collect(new Error(tx, ex));  // плохая type safety
+        }
+    }
+});
+
+// Затем filter + cast
+DataStream<Event> events = processed.filter(x -> x instanceof Event).map(...);
+DataStream<Error> errors = processed.filter(x -> x instanceof Error).map(...);
+```
+
+С side outputs:
+
+```java
+OutputTag<Error> errorTag = new OutputTag<Error>("errors") {};
+
+DataStream<Event> events = stream.process(new ProcessFunction<Tx, Event>() {
+    public void processElement(Tx tx, Context ctx, Collector<Event> out) {
+        try {
+            out.collect(parse(tx));
+        } catch (Exception ex) {
+            ctx.output(errorTag, new Error(tx, ex));  // type-safe
+        }
+    }
+});
+
+DataStream<Error> errors = events.getSideOutput(errorTag);
+
+events.sinkTo(eventsKafka);
+errors.sinkTo(deadLetterKafka);
+```
+
+Преимущества:
+
+- **Type safety** — каждый OutputTag типизирован, compile-time check.
+- **Independent processing** — main и side outputs независимы. Errors могут иметь свой parallelism, sink, retention.
+- **Performance** — нет лишних filter / map / cast операций.
+- **Clear intent** — separate concerns в коде.
+
+---
+
+## API
+
+### Create OutputTag
+
+```java
+// Anonymous subclass обязателен для type inference!
+OutputTag<LateEvent> lateTag = new OutputTag<LateEvent>("late-events") {};
+OutputTag<ErrorRecord> errorTag = new OutputTag<ErrorRecord>("errors") {};
+```
+
+**Important**: anonymous subclass `{}` обязателен. Это позволяет Flink через reflection узнать type parameter (иначе Java generics erasure съест info).
+
+### Emit в side output (из ProcessFunction)
+
+```java
+public void processElement(Input in, Context ctx, Collector<Output> out) {
+    if (in.isValid()) {
+        out.collect(transform(in));               // main output
+    } else if (isLate(in)) {
+        ctx.output(lateTag, new LateEvent(in));   // side output
+    } else {
+        ctx.output(errorTag, new ErrorRecord(in)); // другой side output
+    }
+}
+```
+
+`ctx.output(tag, value)` — type checked (tag type должен соответствовать value).
+
+### Получить side output stream
+
+```java
+DataStream<Output> mainStream = stream.process(...);
+DataStream<LateEvent> lateStream = mainStream.getSideOutput(lateTag);
+DataStream<ErrorRecord> errorStream = mainStream.getSideOutput(errorTag);
+```
+
+`getSideOutput()` создаёт новый DataStream, привязанный к тому же operator. Один оператор может emit в несколько different-typed side outputs.
+
+---
+
+## Use Case 1: Late event capture
+
+Самый частый — capture late events из windowed aggregation:
+
+```java
+OutputTag<Transaction> lateTag = new OutputTag<Transaction>("late-txs") {};
+
+DataStream<Transaction> txs = env.fromSource(kafkaSource, ...);
+
+DataStream<Aggregate> aggregates = txs
+    .keyBy(Transaction::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Duration.ofMinutes(10))
+    .sideOutputLateData(lateTag)             // <-- side output late events
+    .aggregate(new SumAggregator());
+
+DataStream<Transaction> lateEvents = aggregates.getSideOutput(lateTag);
+
+// Sink late events отдельно для investigation
+lateEvents.sinkTo(lateEventsKafka);
+
+// Метрика для alerting
+lateEvents.map(tx -> {
+    Metrics.lateEventCounter.inc();
+    return tx;
+}).addSink(...);
+```
+
+Без side output для late events они просто **silently dropped** — это самый частый source of data loss в Flink jobs. Production rule: **ALWAYS добавляйте side output для late events** + alert если count > threshold.
+
+См. модуль 05 (Time and Watermarks) для full coverage allowedLateness.
+
+---
+
+## Use Case 2: Exception routing / Dead Letter Queue
+
+Production pipeline должен gracefully handle malformed records. Side output + DLQ — стандарт:
+
+```java
+OutputTag<DLQRecord> dlqTag = new OutputTag<DLQRecord>("dlq") {};
+
+class SafeParser extends ProcessFunction<String, ParsedEvent> {
+
+    @Override
+    public void processElement(String raw, Context ctx, Collector<ParsedEvent> out) {
+        try {
+            ParsedEvent event = JSON.parse(raw, ParsedEvent.class);
+            if (!event.isValid()) {
+                ctx.output(dlqTag, new DLQRecord(raw, "validation_failed", null));
+                return;
+            }
+            out.collect(event);
+        } catch (Exception e) {
+            ctx.output(dlqTag, new DLQRecord(raw, "parse_error", e.getMessage()));
+        }
+    }
+}
+
+DataStream<ParsedEvent> parsed = rawStream.process(new SafeParser());
+DataStream<DLQRecord> dlq = parsed.getSideOutput(dlqTag);
+
+dlq.sinkTo(KafkaSink.<DLQRecord>builder()
+    .setTopic("events-dlq")
+    .setRecordSerializer(...)
+    .build());
+```
+
+DLQ records можно потом reprocess через отдельный Flink job или manual investigation.
+
+---
+
+## Use Case 3: Multi-output split by type
+
+Один stream → несколько downstream по type:
+
+```java
+OutputTag<HighPriorityAlert> highTag = new OutputTag<HighPriorityAlert>("high") {};
+OutputTag<MediumPriorityAlert> mediumTag = new OutputTag<MediumPriorityAlert>("medium") {};
+
+class AlertRouter extends ProcessFunction<Event, LowPriorityAlert> {
+    public void processElement(Event e, Context ctx, Collector<LowPriorityAlert> out) {
+        Priority p = classify(e);
+        switch (p) {
+            case HIGH:
+                ctx.output(highTag, new HighPriorityAlert(e));
+                break;
+            case MEDIUM:
+                ctx.output(mediumTag, new MediumPriorityAlert(e));
+                break;
+            case LOW:
+                out.collect(new LowPriorityAlert(e));  // main output
+                break;
+        }
+    }
+}
+
+DataStream<LowPriorityAlert> low = events.process(new AlertRouter());
+DataStream<HighPriorityAlert> high = low.getSideOutput(highTag);
+DataStream<MediumPriorityAlert> medium = low.getSideOutput(mediumTag);
+
+// Each goes в свою pipeline с разными SLA / sinks
+high.sinkTo(pagerDutyKafka);
+medium.sinkTo(slackKafka);
+low.sinkTo(emailKafka);
+```
+
+Это лучше, чем три отдельных `.filter().map()` chain-а — один traversal, type safe.
+
+---
+
+## Use Case 4: Process timer side output
+
+Sometimes onTimer cleanup нужно отдельно от processElement:
+
+```java
+OutputTag<TimeoutEvent> timeoutTag = new OutputTag<TimeoutEvent>("timeouts") {};
+
+class OrderProcessor extends KeyedProcessFunction<String, Order, Match> {
+
+    public void processElement(Order o, Context ctx, Collector<Match> out) {
+        Payment p = paymentState.value();
+        if (p != null) {
+            out.collect(new Match(o, p));   // main: matched
+        } else {
+            orderState.update(o);
+            ctx.timerService().registerEventTimeTimer(o.eventTime + 60 * 60 * 1000);
+        }
+    }
+
+    public void onTimer(long ts, OnTimerContext ctx, Collector<Match> out) {
+        Order o = orderState.value();
+        if (o != null) {
+            // Не main collect — это unmatched timeout
+            ctx.output(timeoutTag, new TimeoutEvent(o, ts));
+            orderState.clear();
+        }
+    }
+}
+
+DataStream<Match> matches = stream.process(new OrderProcessor());
+DataStream<TimeoutEvent> timeouts = matches.getSideOutput(timeoutTag);
+```
+
+---
+
+## Side outputs в Window functions
+
+Можно emit side output из `WindowFunction` / `ProcessWindowFunction`:
+
+```java
+OutputTag<EmptyWindow> emptyTag = new OutputTag<EmptyWindow>("empty") {};
+
+stream.keyBy(Event::getKey)
+      .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+      .process(new ProcessWindowFunction<Event, Result, String, TimeWindow>() {
+          @Override
+          public void process(String key, Context ctx, Iterable<Event> elements,
+                              Collector<Result> out) {
+              if (Iterables.isEmpty(elements)) {
+                  ctx.output(emptyTag, new EmptyWindow(key, ctx.window()));
+                  return;
+              }
+              out.collect(aggregate(elements));
+          }
+      });
+```
+
+---
+
+## OutputTag — uniqueness rules
+
+OutputTag identity = (id, type). Два OutputTag с одинаковым id но разным type — **collision**, Flink будет fail.
+
+```java
+// Wrong: один и тот же id, разный type
+OutputTag<EventA> tag1 = new OutputTag<EventA>("data") {};
+OutputTag<EventB> tag2 = new OutputTag<EventB>("data") {};   // CRASH at runtime
+
+// Right: уникальные id
+OutputTag<EventA> tagA = new OutputTag<EventA>("data-a") {};
+OutputTag<EventB> tagB = new OutputTag<EventB>("data-b") {};
+```
+
+Лучше держать OutputTag-и в constants класса:
+
+```java
+public class OutputTags {
+    public static final OutputTag<LateEvent> LATE =
+        new OutputTag<LateEvent>("late-events") {};
+    public static final OutputTag<ErrorRecord> ERROR =
+        new OutputTag<ErrorRecord>("error-records") {};
+    public static final OutputTag<DLQRecord> DLQ =
+        new OutputTag<DLQRecord>("dlq") {};
+}
+```
+
+---
+
+## Performance characteristics
+
+| Aspect | Side output | Multiple operators (anti-pattern) |
+|---|---|---|
+| Traversals over data | 1 | N (один per split) |
+| Type safety | Compile-time | Runtime cast / filter |
+| Latency | Минимальная | Дополнительные network hops |
+| Parallelism control | Common с main | Each independent |
+| Backpressure | Per output | Combined |
+
+Side outputs efficient: один traversal, no extra serialization, no shuffle (если downstream operators colocated).
+
+---
+
+## Operators поддерживающие side outputs
+
+| Operator | Supports? |
+|---|---|
+| `ProcessFunction` | Yes |
+| `KeyedProcessFunction` | Yes |
+| `CoProcessFunction` | Yes |
+| `ProcessWindowFunction` | Yes |
+| `BroadcastProcessFunction` | Yes |
+| `map`, `flatMap`, `filter` | **No** |
+| `RichMapFunction`, etc. | **No** |
+
+Side outputs работают только в `*ProcessFunction`. Это limitation: для simple map с side output вам нужно переписать на ProcessFunction.
+
+---
+
+## Production gotchas
+
+- **Anonymous subclass обязателен** — `new OutputTag<T>("name") {}` (note braces). Иначе type inference fail.
+- **OutputTag не serializable directly** — если хотите хранить tag в config, используйте только id, recreate в job.
+- **Late events silently dropped без `sideOutputLateData(tag)`** — самый частый source потери данных.
+- **OutputTag id collision** — keep them в constants класса, никогда не используйте generic ids типа "data" или "errors".
+- **getSideOutput возвращает DataStream без upstream chaining** — это лёгкий performance hit (always shuffle break). Но это explicit cost для multi-output.
+- **Side output parallelism** — by default same as main operator. Если хотите разный — `.setParallelism(N)` на downstream operator после `getSideOutput()`.
+- **Watermarks propagation** — side output stream получает те же watermarks как main. Этa важно для downstream windowing.
+- **Metrics per output** — Flink не automatically counts records per side output. Add manual `Metrics.counter().inc()` если monitoring нужен.
+
+<Callout type="tip">
+В production обязательно add Prometheus alert на `late_events_count` метрику. Spike в late events — индикатор upstream проблем (skew, slow producer, time drift). Без metric late events silent loss.
+</Callout>
+
+---
+
+## Comparison vs removed split() API
+
+В Flink 1.x был `split(OutputSelector)` + `select(string)` API. Он REMOVED в Flink 1.13/2.0:
+
+```java
+// Removed legacy:
+SplitStream<Event> split = stream.split(e -> e.priority == HIGH ? "high" : "low");
+DataStream<Event> highStream = split.select("high");
+DataStream<Event> lowStream = split.select("low");
+```
+
+Проблемы legacy:
+- Same type для всех output streams (нет differentiation).
+- String-based names (typos сильно болеют).
+- Limited integration с window functions.
+
+Side outputs полностью покрывают use cases. Если видите legacy split/select code — мигрируйте.
+
+---
+
+<KnowledgeCheck
+  question="Production windowed aggregation: events keyBy userId, TumblingEventTimeWindows 5min, allowedLateness 10min. Without sideOutputLateData. После начала incident в upstream, latency events растёт до 15-30 min. Что происходит, и какие fixes (в порядке приоритета)?"
+  answer="Без sideOutputLateData late events SILENTLY DROPPED. Это самый частый production data loss issue в Flink. Когда event arrives с timestamp < watermark - allowedLateness (т.е. event старше 15 min от current watermark в нашем case), он не triggers re-emission window, не учитывается в aggregate, и **не emit-ится никуда**. Просто исчезает. Manifestation: aggregate metrics не соответствуют source data, downstream analytics показывает 'data gap' за период incident, customer/audit reports не consistent. Fixes (приоритет): (1) **Add sideOutputLateData(lateTag)** — IMMEDIATE fix. Capture late events в side output, sink в отдельный topic для investigation. Production rule: ВСЕ windowed operations должны иметь lateOutput. Без него теряете данные. Code: `.allowedLateness(Duration.ofMinutes(10)).sideOutputLateData(lateTag).aggregate(...)`. (2) **Alert on late event count** — Prometheus counter на side output records. Threshold (например, >100/min) → page on-call. Без alert вы не знаете, что есть проблема, пока кто-то не пожалуется. (3) **Increase allowedLateness** — если upstream regularly behaves с 30 min latency, set allowedLateness=30min. Но trade-off: window держит state дольше = больше memory. (4) **Address root cause upstream** — фиксить producer latency. Late events часто симптом backpressure в upstream Kafka producer или downtime. (5) **Reprocess late events** — separate Flink job читает DLQ topic + state Processor API (модуль 14) bootstraps state из них. (6) **Watermark Alignment (FLIP-217)** — для multi-source jobs со skew, выравнивает watermarks между sources, уменьшая 'effective lateness'. Долгосрочно: process с очень large allowedLateness + late side output даёт both: timely emission для most events и no data loss для outliers."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/04-tuple-types",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-04",
+    "description": "Tuple types, generics erasure, .returns() patterns"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-04-q1",
+      "type": "multiple-choice",
+      "question": "Когда правильно использовать Flink Tuple types vs POJO?",
+      "options": [
+        { "id": "a", "text": "Tuple всегда, потому что fastest" },
+        { "id": "b", "text": "Tuple — для intermediate streams внутри одного job (keyBy results, aggregation outputs, join inputs). POJO — для domain events, persistent state, public API contracts. Правило: Tuple никогда не пересекает job boundary. Schema evolution для Tuple невозможна (positional, no field names)" },
+        { "id": "c", "text": "POJO всегда — Tuple deprecated" },
+        { "id": "d", "text": "Tuple только для legacy code" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Tuple advantages: ~100% baseline (positional binary, no null markers для outer, no field names на wire), minimal overhead. Tuple limitations: no field names (positional only), arity capped at 25 (Tuple26+ невозможен), no schema evolution (add/remove component → incompatible serializer), implements equals/hashCode но не natural human-readable. Decision rule: внутри одного job, между operators — Tuple OK. Между jobs (Kafka boundary), persistent state, public APIs — POJO/Avro для names + evolution. Production rule: Tuple НИКОГДА не появляется в Kafka topic schema или в keyed state, который должен переживать code changes.",
+      "studyHint": "Повторите урок 04 — секцию 'Когда использовать Tuple'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-04-q2",
+      "type": "multiple-choice",
+      "question": "`stream.map(v -> Tuple3.of(v.userId, v.amount, v.eventTime))` без `.returns()` — что происходит?",
+      "options": [
+        { "id": "a", "text": "Job работает нормально с inferred type" },
+        { "id": "b", "text": "InvalidTypesException на job submission: 'The return type of function map could not be determined automatically, due to type erasure'. Lambda не сохраняет generic params <String, Tuple3<...>> в bytecode (invokedynamic). TypeExtractor не может вывести Tuple3 type. Для Tuple это fail-fast (deliberately, потому что Tuple без params бесполезен)" },
+        { "id": "c", "text": "Тихо работает с GenericTypeInfo через Kryo, 50% perf loss" },
+        { "id": "d", "text": "Compile error в Java" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Для Tuple types Flink TypeExtractor implements fail-fast logic — если generic params не определены, throws InvalidTypesException вместо silent GenericTypeInfo. Это deliberate: Tuple без типов компонентов бесполезен, лучше fail fast чем silent Kryo. Для других generic types (Tuple-like POJO classes) поведение может быть silent fallback (см. урок 07). Fix variants: (1) `.returns(Types.TUPLE(Types.STRING, Types.DOUBLE, Types.GENERIC(Instant.class)))` — concise. (2) `.returns(new TypeHint<Tuple3<String, Double, Instant>>() {})` — generic syntax. (3) Named class implements MapFunction + ResultTypeQueryable. Important: `Instant` остаётся Kryo (GenericType) даже после fix — replace на `long epochMillis` для full perf.",
+      "studyHint": "Повторите урок 04 — секцию 'Что происходит без .returns() после lambda'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-04-q3",
+      "type": "multiple-choice",
+      "question": "Tuple wire format vs POJO wire format — какие отличия и trade-offs?",
+      "options": [
+        { "id": "a", "text": "Одинаковые wire formats" },
+        { "id": "b", "text": "Tuple — positional binary без field names, без top-level null markers (Tuple itself non-null), per-field nullability через per-field serializer. POJO — fields sorted by name + per-field null markers (1 byte each). Tuple ~10-15% более compact на wire, но POJO дает schema evolution capability (add nullable field works). Trade-off: speed/compactness vs evolution" },
+        { "id": "c", "text": "POJO быстрее всегда из-за field names в wire" },
+        { "id": "d", "text": "Tuple записывает field names, POJO нет" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "TupleSerializer.serialize(): для каждого компонента T_i вызывает соответствующий per-field serializer без null marker для outer Tuple (если nested Tuple — каждый field имеет marker согласно типу). POJO PojoSerializer.serialize(): fields sorted by name (alphabetical, deterministic для evolution), для каждого field — null marker byte + serialized value. Wire format implications: Tuple2<Long, Long> = 16 bytes (8+8). POJO {long a, long b} = 18 bytes (1+8+1+8). На 10M records — Tuple saves ~20MB. Trade-off: POJO null markers enable schema evolution (новое field initially null), Tuple compactness foregoes evolution. Тhroughput: Tuple ~30M rec/sec, POJO ~28M rec/sec — small but measurable.",
+      "studyHint": "Повторите урок 04 — секцию 'TupleTypeInfo и TupleSerializer'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-04-q4",
+      "type": "true-false",
+      "question": "TupleTypeInfo не поддерживает schema evolution — добавление компонента (Tuple2 → Tuple3) или изменение типа компонента (Long → Double) приводит к incompatible serializer snapshot, savepoint не восстанавливается.",
+      "correctAnswer": true,
+      "explanation": "TupleSerializerSnapshot хранит arity + per-component TypeSerializerSnapshot. На recovery resolveSchemaCompatibility сравнивает: (1) Same class (TupleN)? — fail если arity changed. (2) Same component types? — recursive snapshot comparison per component. Add component: TupleSerializerSnapshot для old (Tuple2) hat arity=2, new serializer Tuple3 has arity=3 → incompatible(), savepoint fails recovery. Change component type Long → Double: per-component snapshot resolution returns incompatible → overall incompatible. Workaround если уже deployed: State Processor API batch migration читает state с TupleSerializer<old>, пишет с TupleSerializer<new> или POJO. Production rule: keyed state и operator state — NEVER Tuple. Только POJO/Avro для long-lived state.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

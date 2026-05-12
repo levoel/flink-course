@@ -1,0 +1,456 @@
+---
+title: "MATCH_RECOGNIZE — pattern recognition в SQL"
+description: "SQL:2016 синтаксис, PATTERN, MEASURES, DEFINE, AFTER MATCH SKIP. Use cases: stock tracking, fraud detection"
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["MATCH_RECOGNIZE", "CEP in SQL", "Pattern Detection", "SQL:2016", "Regex Patterns"]
+---
+
+# MATCH_RECOGNIZE — pattern recognition в SQL
+
+MATCH_RECOGNIZE — стандартный SQL:2016 syntax для row pattern matching, который Flink SQL implements полностью. Это **CEP в SQL** — declarative way выразить sequence patterns, что в DataStream API требовало бы verbose CEP API. Этот урок разбирает synтакс, semantics, use cases (price patterns, login anomalies, fraud detection) и production gotchas.
+
+Пример практический: detect head-and-shoulders pattern в stock prices, detect 3 failed login attempts followed by success (suspicious), detect customer journey patterns (browse → cart → checkout → abandon).
+
+---
+
+## Базовый синтаксис
+
+```sql
+SELECT *
+FROM input_stream
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY event_time
+    MEASURES
+        A.price AS start_price,
+        LAST(B.price) AS end_price,
+        A.event_time AS start_time,
+        LAST(B.event_time) AS end_time
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+ C)
+    DEFINE
+        A AS A.price > 100,
+        B AS B.price > LAST(B.price, 1) OR B.price > A.price,
+        C AS C.price > A.price * 1.1
+);
+```
+
+Six clauses:
+1. **PARTITION BY** — group rows by key (per symbol).
+2. **ORDER BY** — chronological order (по event time).
+3. **MEASURES** — output columns derived from matched pattern.
+4. **ONE ROW PER MATCH** — output one row per match (vs ALL ROWS).
+5. **AFTER MATCH SKIP** — strategy после match.
+6. **PATTERN** — regex-like pattern of row variables.
+7. **DEFINE** — predicates для каждой variable.
+
+---
+
+## PATTERN syntax — regex-like
+
+Pattern uses **row variables** (named A, B, C, ...) и regex quantifiers:
+
+```
+A           — exactly one row matching A
+A?          — zero or one
+A*          — zero or more (greedy)
+A+          — one or more (greedy)
+A{n}        — exactly n
+A{n,m}      — n to m
+A{n,}       — at least n
+A | B       — alternation (A or B)
+(A B C)     — grouping
+A*?         — non-greedy (reluctant)
+```
+
+Examples:
+```
+PATTERN (UP+ DOWN+)            — sequence of rising then falling prices
+PATTERN (FAILED{3} SUCCESS)    — 3 failures followed by success
+PATTERN (BROWSE+ CART CHECKOUT?) — customer journey
+```
+
+---
+
+## DEFINE — predicates
+
+Each row variable defined by SQL predicate:
+
+```sql
+DEFINE
+    UP   AS UP.price > LAST(UP.price, 1) OR UP.price > A.price,
+    DOWN AS DOWN.price < LAST(DOWN.price, 1) OR DOWN.price < LAST(UP.price)
+```
+
+Special functions inside DEFINE/MEASURES:
+- `LAST(var.column, N)` — value of column on N-th to last row matched as `var` (default N=0 = current).
+- `FIRST(var.column, N)` — N-th first row matched.
+- `PREV(var.column, N)` — N rows before current (regardless of variable).
+- `NEXT` — not allowed (streaming, future not known).
+- `RUNNING vs FINAL` — context-dependent value.
+
+### Implicit first variable
+
+```
+PATTERN (A B+)
+DEFINE B AS B.price > A.price
+```
+
+First variable (`A`) without DEFINE entry — matches any row. `B` defined via predicate referencing A.
+
+---
+
+## MEASURES — output columns
+
+Derived per match. Use special:
+- `LAST(var.col)` — final value matched as var.
+- `FIRST(var.col)` — first value.
+- `COUNT(var.col)` — number of rows matched as var.
+- `SUM(var.col)`, `AVG(var.col)` — aggregates.
+
+```sql
+MEASURES
+    A.event_time AS pattern_start,
+    LAST(B.event_time) AS pattern_end,
+    A.price AS initial_price,
+    LAST(B.price) AS peak_price,
+    LAST(B.price) - A.price AS price_change,
+    COUNT(B.*) AS rising_steps
+```
+
+`A.col` без LAST/FIRST — for unique vars (without quantifier) равноценно current value.
+
+---
+
+## AFTER MATCH SKIP — что после match
+
+Four strategies:
+
+```sql
+AFTER MATCH SKIP PAST LAST ROW         -- next match starts after last matched row
+AFTER MATCH SKIP TO NEXT ROW           -- next match starts at row after start of current
+AFTER MATCH SKIP TO FIRST var          -- skip to first row matched as var
+AFTER MATCH SKIP TO LAST var           -- skip to last row matched as var
+```
+
+Example difference:
+
+```
+Rows: r1, r2, r3, r4, r5
+Pattern: (A B+)
+Match: r1 (as A), r2-r4 (as B+)
+```
+
+- `SKIP PAST LAST ROW` — next match starts from r5 onwards.
+- `SKIP TO NEXT ROW` — next match starts from r2 onwards.
+- `SKIP TO FIRST B` — next match starts from r2 (first B).
+
+Choice depends on use case: «non-overlapping matches» (PAST LAST), «every possible match» (TO NEXT), nested patterns (TO FIRST).
+
+---
+
+## ONE ROW vs ALL ROWS PER MATCH
+
+```sql
+ONE ROW PER MATCH    -- one output row per match
+ALL ROWS PER MATCH   -- all rows of match emitted, each annotated
+```
+
+ALL ROWS — useful для debugging pattern matches.
+
+```sql
+SELECT *
+FROM stock_ticks
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY event_time
+    MEASURES
+        CLASSIFIER() AS class,        -- which variable matched this row?
+        MATCH_NUMBER() AS match_num   -- nth match
+    ALL ROWS PER MATCH
+    PATTERN (UP+ DOWN+)
+    DEFINE ...
+);
+```
+
+Output:
+```
+| symbol | event_time | price | class | match_num |
+| AAPL   | 10:00:00   | 150   | UP    | 1         |
+| AAPL   | 10:00:05   | 151   | UP    | 1         |
+| AAPL   | 10:00:10   | 152   | UP    | 1         |
+| AAPL   | 10:00:15   | 151   | DOWN  | 1         |
+| AAPL   | 10:00:20   | 150   | DOWN  | 1         |
+```
+
+---
+
+## WITHIN — time bound
+
+```sql
+PATTERN (FAILED+ SUCCESS) WITHIN INTERVAL '1' MINUTE
+```
+
+Match must complete within 1 minute (от first FAILED до SUCCESS). После expire — match abandoned, state cleaned.
+
+Use в production: prevent infinite waiting для patterns that may never complete.
+
+---
+
+## Use cases
+
+### Use case 1 — Stock price patterns
+
+Detect «V-shape» reversal:
+
+```sql
+SELECT *
+FROM stock_ticks
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY event_time
+    MEASURES
+        A.event_time AS start_time,
+        LAST(C.event_time) AS end_time,
+        A.price AS start_price,
+        LAST(B.price) AS bottom_price,
+        LAST(C.price) AS end_price
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+ C+) WITHIN INTERVAL '10' MINUTE
+    DEFINE
+        B AS B.price < LAST(B.price, 1) OR B.price < A.price,
+        C AS C.price > LAST(C.price, 1) OR C.price > LAST(B.price)
+);
+```
+
+Pattern: start (A) → falling (B+) → rising (C+) within 10 minutes. V-shape reversal.
+
+### Use case 2 — Failed login detection
+
+```sql
+SELECT user_id, attempts, success_time
+FROM login_events
+MATCH_RECOGNIZE (
+    PARTITION BY user_id
+    ORDER BY event_time
+    MEASURES
+        COUNT(F.*) AS attempts,
+        S.event_time AS success_time
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (F{3,} S) WITHIN INTERVAL '5' MINUTE
+    DEFINE
+        F AS F.status = 'FAILED',
+        S AS S.status = 'SUCCESS'
+);
+```
+
+Output users with 3+ failed logins followed by success within 5min — suspicious sequence.
+
+### Use case 3 — Customer abandonment
+
+```sql
+SELECT *
+FROM user_events
+MATCH_RECOGNIZE (
+    PARTITION BY session_id
+    ORDER BY event_time
+    MEASURES
+        FIRST(B.event_time) AS browse_start,
+        C.event_time AS cart_time,
+        LAST(I.event_time) AS last_idle_time
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (B+ C I+) WITHIN INTERVAL '1' HOUR
+    DEFINE
+        B AS B.event_type = 'BROWSE',
+        C AS C.event_type = 'ADD_TO_CART',
+        I AS I.event_type = 'IDLE' AND I.idle_seconds > 60
+);
+```
+
+Detect users who browse, add to cart, but then go idle for extended period without checkout. Trigger for marketing intervention.
+
+### Use case 4 — Fraud — transaction pattern
+
+```sql
+SELECT *
+FROM transactions
+MATCH_RECOGNIZE (
+    PARTITION BY user_id
+    ORDER BY event_time
+    MEASURES
+        L.event_time AS large_tx_time,
+        L.amount AS large_amount,
+        COUNT(S.*) AS small_tx_count
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (S{3,} L) WITHIN INTERVAL '10' MINUTE
+    DEFINE
+        S AS S.amount < 10,
+        L AS L.amount > 1000
+);
+```
+
+Detect «card testing» — multiple small transactions followed by large transaction. Classic fraud pattern.
+
+---
+
+## Semantics — RUNNING vs FINAL
+
+```sql
+DEFINE B AS RUNNING SUM(B.price) < 1000  -- predicate evaluates с running sum
+MEASURES FINAL SUM(B.price) AS total      -- output FINAL value after match
+```
+
+- **RUNNING** (default в DEFINE) — value as if pattern ended at current row.
+- **FINAL** (default в MEASURES with FINAL) — value at completion of match.
+
+Subtle but important: DEFINE predicates use running values (decision made progressively), MEASURES typically want final values.
+
+---
+
+## State management
+
+MATCH_RECOGNIZE state:
+- Per partition (PARTITION BY): pending matches (rows matched so far).
+- Cleanup: after WITHIN expires, abandoned.
+- Без WITHIN — unbounded если pattern not terminating. Avoid.
+
+Production: ALWAYS add WITHIN to bound state.
+
+---
+
+## Comparison: MATCH_RECOGNIZE vs CEP API
+
+| Aspect | MATCH_RECOGNIZE (SQL) | Flink CEP API (Java) |
+|---|---|---|
+| Syntax | SQL declarative | Java DSL |
+| Pattern expressiveness | regex (SQL:2016) | regex + after match conditions |
+| Conditions | SQL predicates | Java lambdas |
+| Performance | comparable | comparable |
+| Productivity | high (analysts can write) | low (требует Flink expertise) |
+| Output | rows (relational) | streams (custom output) |
+| Debugging | EXPLAIN PLAN | manual instrumentation |
+
+When use SQL: declarative needs, analyst writers, simple patterns. When CEP API: custom output transformations, complex stateful predicates, mixing with DataStream.
+
+---
+
+## Production gotchas
+
+### 1. Без WITHIN — unbounded state
+
+```sql
+PATTERN (A B+ C)  -- if C never arrives, state grows forever
+```
+
+State retains pending matches indefinitely. RocksDB OOM.
+
+**Fix**: ВСЕГДА `WITHIN INTERVAL 'n' UNIT`. Choose interval based on realistic completion time.
+
+### 2. Greedy quantifier with rare termination
+
+```sql
+PATTERN (UP+ DOWN)  -- UP+ greedy — matches all rising rows
+```
+
+If price rising forever, UP+ grows unbounded.
+
+**Fix**: WITHIN, или non-greedy `(UP+? DOWN)`.
+
+### 3. Performance — high partition count
+
+PARTITION BY high-cardinality column (user_id с millions distinct users):
+
+```sql
+PARTITION BY user_id
+```
+
+Each partition has own state machine. Millions of state machines → high memory overhead.
+
+**Fix**: pre-filter to active users, или reduce partition cardinality (e.g., region instead of user).
+
+### 4. ORDER BY non-time-attribute
+
+```sql
+ORDER BY amount   -- ❌ должен быть time attribute
+```
+
+Pattern requires temporal ordering для streaming context.
+
+**Fix**: ORDER BY event_time (или proc_time).
+
+### 5. AFTER MATCH SKIP TO NEXT ROW — overlapping matches
+
+```sql
+AFTER MATCH SKIP TO NEXT ROW
+```
+
+Same row может participate в multiple matches. Output volume can grow O(N^2).
+
+**Fix**: SKIP PAST LAST ROW для non-overlapping (default-like), TO NEXT ROW только если intentional.
+
+### 6. CLASSIFIER() и MATCH_NUMBER() в ONE ROW mode
+
+```sql
+ONE ROW PER MATCH
+MEASURES CLASSIFIER() AS class   -- ❌ CLASSIFIER не имеет смысла в ONE ROW
+```
+
+CLASSIFIER returns variable per row — works only в ALL ROWS mode.
+
+**Fix**: use ALL ROWS если нужен CLASSIFIER.
+
+### 7. Subqueries в DEFINE — limited support
+
+```sql
+DEFINE B AS B.price > (SELECT AVG(price) FROM stock_ticks)  -- ❌ not supported
+```
+
+DEFINE predicates limited к expressions on row variables.
+
+**Fix**: precompute reference values upstream (temporal join, broadcast).
+
+---
+
+## Cheat sheet
+
+```
+MATCH_RECOGNIZE (
+    PARTITION BY key
+    ORDER BY time_attribute
+    MEASURES
+        VAR.col [AS alias],
+        LAST(VAR.col) AS ...,
+        COUNT(VAR.*) AS ...
+    [ONE ROW PER MATCH | ALL ROWS PER MATCH]
+    AFTER MATCH [SKIP PAST LAST ROW | SKIP TO NEXT ROW | SKIP TO FIRST var | SKIP TO LAST var]
+    PATTERN (regex of vars)
+    [WITHIN INTERVAL 'n' UNIT]
+    DEFINE
+        VAR1 AS predicate,
+        VAR2 AS predicate
+)
+
+Quantifiers: A, A?, A*, A+, A{n}, A{n,m}, A | B, (A B)
+
+Use cases:
+    Stock V-shape:        PATTERN (A B+ C+)
+    Failed logins:        PATTERN (F{3,} S)
+    Browse-cart-abandon:  PATTERN (B+ C I+)
+    Fraud card test:      PATTERN (S{3,} L)
+
+State: bounded by WITHIN (REQUIRED для production)
+```
+
+---
+
+<KnowledgeCheck
+  question="Production fraud detection: detect «structuring» pattern — same user makes 4 transactions, each just under $10000 (likely $9000-$9999), within 24 hours, indicating attempt to evade reporting threshold. Then optional verification transaction $50-$200 in same window. Write MATCH_RECOGNIZE query."
+  answer="```sql\nSELECT * FROM transactions\nMATCH_RECOGNIZE (\n    PARTITION BY user_id\n    ORDER BY event_time\n    MEASURES\n        FIRST(T.event_time) AS pattern_start,\n        LAST(T.event_time) AS last_large_tx,\n        COUNT(T.*) AS large_tx_count,\n        SUM(T.amount) AS total_amount,\n        V.event_time AS verification_time,\n        V.amount AS verification_amount\n    ONE ROW PER MATCH\n    AFTER MATCH SKIP PAST LAST ROW\n    PATTERN (T{4,} V?) WITHIN INTERVAL '24' HOUR\n    DEFINE\n        T AS T.amount >= 9000 AND T.amount < 10000,\n        V AS V.amount >= 50 AND V.amount <= 200\n);\n```\n\n**Design decisions explained**: (1) **PARTITION BY user_id** — pattern detected per user. Important for state efficiency: each user has independent state machine, abandoned after WITHIN expires. (2) **ORDER BY event_time** — uses event time для deterministic detection during replay. Requires WATERMARK on transactions table. (3) **PATTERN (T{4,} V?)**: T{4,} means 4 or more large transactions (could be more — pattern still matches), V? means optional verification (zero or one). Using `{4,}` instead of `{4}` allows detection of 5, 6, etc. transactions — pattern grows greedy then verification check. (4) **DEFINE T**: `amount >= 9000 AND amount < 10000` — structuring threshold just under $10K which would trigger SARs reporting in US. (5) **DEFINE V**: small verification transaction ($50-$200) — typical 'test the account still works' after withdrawing limit. (6) **WITHIN INTERVAL '24' HOUR**: bounds state — if pattern not completed in 24h, abandoned. Critical для production state management. (7) **MEASURES**: capture pattern signatures для alert payload: start time, last large tx time, count of large txs, total, optional verification details. **Production-grade extensions**: (a) Add `AFTER MATCH SKIP PAST LAST ROW` (already done) for non-overlapping matches — same user won't have overlapping fraud reports. (b) Wrap query в materialized view: `CREATE MATERIALIZED TABLE fraud_alerts ... AS SELECT * FROM ... MATCH_RECOGNIZE ...` для real-time alerting. (c) Add post-pattern enrichment: `LEFT JOIN user_profile FOR SYSTEM_TIME AS OF pattern_start AS u ON user_id = u.user_id` to include user metadata in alert. (d) Side output для legitimate patterns (employees, businesses) via WHERE clause filtering known-OK accounts. (e) State monitoring: alert if `pattern_pending_count` per partition grows unbounded — indicates pattern is rarely completing (predicate too strict, или too narrow time bound). (f) Test pattern with historical data first — false positive rate critical для compliance use case. **Trade-offs**: (i) Pattern detects only sequential structuring within one user/24h — sophisticated attackers split across users или > 24h windows. Multi-user pattern detection beyond MATCH_RECOGNIZE scope. (ii) Doesn't detect single $19,999 transaction (which would be a single large but not structuring). Pattern complements rule-based detection. **Output volume estimate**: at 100k transactions/sec, partition by user (10M users), most users 0 large txs/day — vast majority partitions empty state. Pattern matches expected rare (< 100/day across all users)."
+/>

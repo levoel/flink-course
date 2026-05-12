@@ -1,0 +1,117 @@
+{
+  "moduleId": "01-architecture",
+  "title": "Module 01 Exam — Архитектура Flink",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m01-exam",
+    "description": "8-question integrated exam for Module 01"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-exam-q1",
+      "type": "multiple-choice",
+      "question": "JobManager в Flink 2.x — какая декомпозиция и как работает HA?",
+      "options": [
+        { "id": "a", "text": "Монолитный сервис, HA через replica file storage" },
+        { "id": "b", "text": "Три компонента: Dispatcher (REST + JobGraph persistence), ResourceManager (slot allocation, один на cluster), JobMaster (per-job lifecycle с ExecutionGraph и CheckpointCoordinator). HA через ZooKeeperHaServices или KubernetesHaServices (ConfigMap + lease для cloud-native). Leader election per-сервис, persistent state в storageDir (S3), pointers в ZK/K8s" },
+        { "id": "c", "text": "Только Dispatcher и Workers" },
+        { "id": "d", "text": "HA невозможна для streaming workloads" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "JobManager — три сервиса (с FLIP-6, 1.5+). Dispatcher: REST-фасад + JobGraph persist для HA. ResourceManager: один на cluster, на K8s native общается с K8s API для pod creation. JobMaster: per-job, держит ExecutionGraph (распараллеленный JobGraph), CheckpointCoordinator, SlotPool, FailoverStrategy. HA Services хранят leader pointers и JobGraph references в persistent storage (ZK znodes или K8s ConfigMap), blobs в storageDir (S3/HDFS). Leader election per-сервис, обычно on same pod.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-exam-q2",
+      "type": "multiple-choice",
+      "question": "Slot в Flink — что это, что изолируется, что нет?",
+      "options": [
+        { "id": "a", "text": "Slot = CPU core с hard CPU isolation" },
+        { "id": "b", "text": "Slot = единица планирования. Hard isolation: managed memory (RocksDB), network buffers. Soft isolation: CPU (OS scheduler), JVM heap (общий), metaspace. Через slot sharing groups несколько операторов одной job могут жить в одном slot. Memory per slot = managed total / numberOfTaskSlots" },
+        { "id": "c", "text": "Slot = отдельный JVM процесс" },
+        { "id": "d", "text": "Slot — устаревший концепт, не используется в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Slot — abstract scheduling unit. Каждый subtask занимает один slot. Hard изоляция (через MemoryManager, NetworkBufferPool): managed memory budget (RocksDB), network buffers. Soft isolation: CPU делится OS scheduler-ом (heavy slot может голодать соседей), JVM heap общий (OOM в одном валит TM), metaspace shared. Default slot sharing group 'default' позволяет N параллельных копий полного pipeline-а в N slots — sink/process/map одного pipeline-instance в одном slot.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-exam-q3",
+      "type": "multiple-choice",
+      "question": "Четыре уровня graph transformation в Flink и что происходит на каждом?",
+      "options": [
+        { "id": "a", "text": "Только StreamGraph и Physical" },
+        { "id": "b", "text": "(1) StreamGraph — отрисовка API-вызовов в DAG, каждый оператор отдельный node; (2) JobGraph — operator chaining optimization (соседние со compatible parallelism + forward partitioning сливаются в один task → одна thread, no serialization); (3) ExecutionGraph — parallelism expansion (каждый JobVertex → N ExecutionVertex); (4) Physical execution — Scheduler выделяет slots каждому ExecutionVertex" },
+        { "id": "c", "text": "Один уровень — JobGraph" },
+        { "id": "d", "text": "Пять уровней с дополнительным TaskGraph" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "4-уровневая трансформация. StreamGraph (API): DAG из StreamTransformation, без оптимизаций. JobGraph (chaining): соседние операторы со совместимым parallelism + forward partitioning + same slot sharing group сливаются в chained task. ExecutionGraph (parallelism): JobVertex с par=N → N ExecutionVertex. Physical execution: slot allocation через SlotPool, RM allocates slots, possibly creates TM-ов на K8s. Каждый уровень — своё место хранения и своя оптимизация.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-exam-q4",
+      "type": "multiple-choice",
+      "question": "Application mode vs Session mode — для каких use cases какой выбрать?",
+      "options": [
+        { "id": "a", "text": "Всегда Session — лучше utilization" },
+        { "id": "b", "text": "Application: production streaming 24/7, critical state jobs (dedicated managed memory для RocksDB), isolation требуется, CI/CD через Flink Kubernetes Operator FlinkDeployment manifest. Session: ad-hoc SQL/notebooks, many small stateless jobs (low JM overhead), dev environment. Per-job mode REMOVED в 2.0" },
+        { "id": "c", "text": "Всегда Application — лучше изоляция" },
+        { "id": "d", "text": "Per-job для всего" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Application mode = production default для serious streaming. Dedicated cluster per app, hard isolation, savepoint-based upgrades через FlinkDeployment, GitOps. Session mode для: ad-hoc SQL CLI, Zeppelin/Jupyter notebooks, many small stateless jobs где shared cluster экономит memory. Mixed approach в production — application для critical stateful, один session cluster для massive fleet of stateless. Per-job mode REMOVED в Flink 2.0 (FLIP-419) — application полностью его заменил.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m01-exam-q5",
+      "type": "multiple-choice",
+      "question": "Что такое credit-based flow control и какую проблему он решает по сравнению с старым TCP-window blocking?",
+      "options": [
+        { "id": "a", "text": "Credit-based использует UDP вместо TCP" },
+        { "id": "b", "text": "Consumer announce-ит credits (кол-во свободных buffers), producer не шлёт больше. Решает catastrophic проблему old TCP-window blocking: данные и control messages (checkpoint barriers) шли через один blocked socket → barriers застревали в backpressured channels → checkpoints stuck. Credit-based разделяет data/control plane через separate logical channels в одном TCP" },
+        { "id": "c", "text": "Это про database transactions" },
+        { "id": "d", "text": "Credit-based удалён в 2.0" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Credit-based flow control (Flink 1.5+, FLIP-1 era) — ключевая optimization network stack. Принцип: consumer заранее объявляет N credits per channel (количество свободных buffer-ов). Producer не шлёт без credit > 0. Critical benefit: data buffers и control messages идут separate logical channels в одном TCP — backpressure ограничивает throughput, но НЕ блокирует control plane (checkpoint barriers проходят). Old TCP-window: producer thread блокировался на socket.write, что включало blocking control messages — catastrophic checkpoint stuck.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-exam-q6",
+      "type": "multiple-choice",
+      "question": "Как мерить backpressure в Flink (Web UI), и как локализовать bottleneck?",
+      "options": [
+        { "id": "a", "text": "По CPU usage TaskManager-а" },
+        { "id": "b", "text": "Через mailbox timings (FLIP-26, Flink 1.13+): busyTimeMsPerSecond, idleTimeMsPerSecond, backPressuredTimeMsPerSecond (сумма ≤ 1000ms/s). Bottleneck = subtask с высоким busy и низким bp (CPU-bound). Backpressure cascade пропагируется upstream — высокий bp на source/map обычно следствие, а не причина. Healthy: sustained bp=100-300 ms/s OK, проблема при bp=900+ ms/s" },
+        { "id": "c", "text": "По log файлам TaskManager-а" },
+        { "id": "d", "text": "Только через JFR profiling" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Mailbox timings — это основной механизм. Каждый subtask tracks: busy (в processElement/userCode), idle (waiting input), backPressured (waiting output buffer). В Web UI: красный=busy, синий=idle, чёрный=backpressured. Bottleneck — subtask с busy near 1000 и low bp = CPU-bound, не успевает. Cascade: bp пропагируется upstream через credit-based control (consumer медленный → producer не получает credits → его bp растёт). Никогда не scale upstream при cascade — это усугубит. Fix downstream bottleneck.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-exam-q7",
+      "type": "multiple-choice",
+      "question": "Что включить в production для быстрого start и recovery в application mode на K8s?",
+      "options": [
+        { "id": "a", "text": "Default настройки достаточны" },
+        { "id": "b", "text": "(1) Pre-warm TM pods (slotmanager.number-of-slots.min); (2) Local recovery (state.backend.local-recovery=true + persistent volume) — same-TM restart skip download S3; (3) Incremental checkpoints (default); (4) Generic Log-Based Incremental Checkpoints (state.backend.changelog.enabled) для metadata-only checkpoints; (5) ForSt с disaggregated state для TB-state recovery in seconds; (6) Buffer debloating для checkpoint duration под backpressure; (7) Unaligned checkpoints" },
+        { "id": "c", "text": "Только увеличить heartbeat.timeout" },
+        { "id": "d", "text": "Disable checkpoints для скорости" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Cold start application mode дефолтом 70-300+ сек. Optimization stack: pre-warm pods skip 30-90s pod startup. Local recovery: при same-TM restart skip S3 download (10-100x speed для large state, но не работает при node failure). Incremental checkpoints (default в 2.x) уменьшают per-checkpoint upload. GIC: async upload changelog, recovery — replay small log. ForSt: state primary на S3, recovery metadata-only ~30s даже для TBs. Buffer debloating: drastically снижает checkpoint duration при backpressure. Unaligned checkpoints (см. модуль 06): barrier overtake, не ждёт alignment.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m01-exam-q8",
+      "type": "true-false",
+      "question": "Per-job mode и Reactive Mode оба удалены в Flink 2.0 — production setups должны использовать Application mode + Adaptive Scheduler соответственно.",
+      "correctAnswer": true,
+      "explanation": "Flink 2.0 cleanup. Per-job mode (FLIP-419): removed, заменён Application mode который полностью покрывает функционал. Reactive Mode (старый elastic scaling): заменён Adaptive Scheduler (FLIP-160) с in-place rescaling (FLIP-291). Также removed: DataSet API, Scala API, SourceFunction/SinkFunction (заменены FLIP-27 + FLIP-191 SinkV2), flink-conf.yaml format (заменён standard YAML config.yaml). Это структурное упрощение API surface — production должна migrate с legacy на новые abstractions.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

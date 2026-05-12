@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/03-native-kubernetes",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-03",
+    "description": "Quiz for Native Kubernetes integration lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-03-q1",
+      "type": "multiple-choice",
+      "question": "Чем 'native' Kubernetes integration отличается от 'standalone'?",
+      "options": [
+        { "id": "a", "text": "Native использует Helm chart, standalone — raw YAML" },
+        { "id": "b", "text": "Native: Flink JobManager сам создаёт TM pods через K8s API (active mode). Standalone: TM pods deploy-ятся заранее как static Deployment (passive mode)" },
+        { "id": "c", "text": "Native — это marketing term для standalone" },
+        { "id": "d", "text": "Standalone faster, native медленнее" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Native = ACTIVE resource management. JM имеет KubernetesResourceManagerDriver, который через K8s API создаёт/удаляет TM pods динамически. Это позволяет autoscaling (FLIP-271) и in-place rescaling (FLIP-291). Standalone = PASSIVE — заранее deploy N TM pods как static Deployment, JM их использует но не управляет. Standalone редко используется в 2.x, native — production default.",
+      "studyHint": "Повторите урок — Что такое 'native' vs 'standalone' K8s",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-03-q2",
+      "type": "multiple-choice",
+      "question": "JM выбрасывает в логах: 'Forbidden: User system:serviceaccount:streaming-prod:default cannot create pods'. Что происходит?",
+      "options": [
+        { "id": "a", "text": "K8s cluster overloaded" },
+        { "id": "b", "text": "JM использует default ServiceAccount namespace-а, у которого нет RBAC permissions создавать pods. Нужен dedicated ServiceAccount + Role/RoleBinding с verbs create/get/list/watch/update/delete на pods/configmaps/services" },
+        { "id": "c", "text": "Image pull secrets неправильно настроены" },
+        { "id": "d", "text": "TaskManager image incompatible" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Native integration требует от JM permissions для управления TM pods. Если не указали `kubernetes.service-account: flink`, JM использует `default` ServiceAccount namespace-а, обычно без permissions. Fix: создать ServiceAccount `flink`, Role с правильными verbs (create/get/list/watch/update/delete/patch на pods, configmaps, services из core API + deployments из apps), RoleBinding связывает их, FlinkDeployment.spec.serviceAccount: flink. С Flink Kubernetes Operator это handled автоматически.",
+      "studyHint": "Повторите урок — RBAC: что нужно",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-03-q3",
+      "type": "multiple-choice",
+      "question": "Какое имя ОБЯЗАТЕЛЬНО должно быть у main container в pod template?",
+      "options": [
+        { "id": "a", "text": "main" },
+        { "id": "b", "text": "flink-container" },
+        { "id": "c", "text": "flink-main-container" },
+        { "id": "d", "text": "Любое имя работает" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Main container в pod template ОБЯЗАТЕЛЬНО должен называться `flink-main-container`. Иначе Flink не сможет inject правильный command (jobmanager.sh / taskmanager.sh), environment variables, port mappings. Custom container с другим именем будет создан как sidecar, но main так и не получит configuration. Это одна из самых частых причин 'pod не стартует' при custom pod templates.",
+      "studyHint": "Повторите урок — Pod template — главный escape hatch",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-03-q4",
+      "type": "true-false",
+      "question": "В native K8s integration TaskManager pods deploy-ятся через отдельный YAML manifest, который вы должны вручную apply.",
+      "correctAnswer": false,
+      "explanation": "False. В native integration НЕТ external YAML для TM pods. JobManager (через свой ResourceManager component) создаёт TM pods динамически via K8s API при request от JobMaster-а. Pod manifests генерируются на лету с правильным image, resource limits, env vars. При завершении job — TM pods auto-delete. Custom-ization через pod template (kubernetes.pod-template-file.taskmanager), но это template, не deploy YAML.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/07-observability-setup",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-07",
+    "description": "Quiz for capstone observability"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-07-q1",
+      "type": "multiple-choice",
+      "question": "Top 12 charts в capstone Grafana dashboard — какие наиболее критичные для production health и почему?",
+      "options": [
+        { "id": "a", "text": "Только throughput и latency" },
+        { "id": "b", "text": "Critical: (1) Input throughput — primary pipeline health; (2) Watermark lag — event time progress; (3) Backpressure heatmap — bottleneck localization; (4) Checkpoint duration — EOS health; (5) State size — capacity planning; (6) Postgres replication slot lag — CDC source. Plus latency, late events, failed checkpoints. Each addresses different operational concern" },
+        { "id": "c", "text": "Только CPU/memory metrics" },
+        { "id": "d", "text": "Только error logs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Effective observability covers multiple layers. Throughput — primary health signal. Watermark lag — event time correctness (data freshness). Backpressure heatmap — quick visual bottleneck identification. Checkpoint duration — EOS state, predicts recovery time. State size — capacity planning, anti-pattern detection. Replication slot lag — CDC source liveness, prevents Postgres disk fill. Failed checkpoints — stability indicator. Late events — drift indicator. Sink commit duration — sink performance. K8s autoscaler decisions — capacity events. Each covers different operational concern; absence of any creates blind spot.",
+      "studyHint": "Повторите урок 07 — раздел 'Top 12 charts'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-07-q2",
+      "type": "multiple-choice",
+      "question": "Alert severity routing — critical / warning / info — какие practices для actionable alerting?",
+      "options": [
+        { "id": "a", "text": "Все alerts через PagerDuty" },
+        { "id": "b", "text": "Critical → PagerDuty (on-call page, requires immediate action — pipeline down, data loss risk); Warning → Slack channel (no page, daytime investigation — backpressure high, state growth); Info → dashboard only (no notification, awareness — autoscaler scaled). Plus runbooks linked from each alert для actionable response. Это reduces alert fatigue + ensures real issues reach right channel" },
+        { "id": "c", "text": "Email для всех" },
+        { "id": "d", "text": "Disable alerting, dashboards enough" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Alert routing critical для on-call sustainability. Without severity: all-or-nothing — either ignore everything (miss real issues) или overwhelm (alert fatigue, learned helplessness). Three tiers + routing: critical paging requires immediate response (job down, data loss risk); warnings слабее — channel mention, investigate during work hours; info — visible но non-disruptive. Runbooks per alert: link к troubleshooting guide. Without runbook — on-call helpless. Production maturity: regular alert tuning quarterly review (false positives, missed incidents, stale alerts).",
+      "studyHint": "Повторите урок 07 — раздел 'AlertManager routing'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-07-q3",
+      "type": "multiple-choice",
+      "question": "On-call response к 3 AM 'WatermarkSeverelyLagging' alert — proper diagnosis flow?",
+      "options": [
+        { "id": "a", "text": "Просто restart Flink job" },
+        { "id": "b", "text": "(1) Acknowledge alert; (2) Open Grafana dashboard — identify which operator lagging; (3) Check backpressure heatmap для bottleneck; (4) Check source health — Postgres replication slot lag, Kafka consumer lag; (5) Check resource health — TM heap, RocksDB compaction, K8s pod restarts; (6) Check checkpoint health; (7) Drill traces via Tempo + logs via Loki if needed; (8) Apply remediation per runbook; (9) Document timeline" },
+        { "id": "c", "text": "Wait for it to recover automatically" },
+        { "id": "d", "text": "Ignore until morning standup" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Structured incident response. Steps в order: (1) acknowledge stops repeat pages, marks 'investigating'; (2) dashboard первый view для overview; (3) backpressure heatmap quickly identifies bottleneck (red zones); (4) source health — может быть upstream issue not Flink; (5) resource health — pod crashes, OOM patterns; (6) checkpoints — stuck means restart needed; (7) deeper drill через traces/logs для root cause; (8) apply remediation specific to identified cause; (9) document для post-mortem. Без structured flow: panic, random fixes, longer outage. Runbook provides this structure. Practice через game days reinforces.",
+      "studyHint": "Повторите урок 07 — KnowledgeCheck",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-07-q4",
+      "type": "true-false",
+      "question": "Observability — это one-time setup. После initial deployment dashboards и alerts остаются accurate индефинитно.",
+      "correctAnswer": false,
+      "explanation": "Observability requires ongoing investment. Entropy: (1) Dashboards stale — new features добавлены, dashboard не updated; (2) Alerts no longer relevant — thresholds too tight/loose for current state, false positives common; (3) Runbooks outdated — fixes описанные не работают на current infrastructure; (4) Metric cardinality drift — new labels exploding Prometheus storage; (5) Dashboard sprawl — каждый team создаёт свои, hard to find canonical. Production maturity requires: quarterly review, runbook drills, alert tuning based на incident postmortems, dashboard pruning. Treat observability как product требующий maintenance.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

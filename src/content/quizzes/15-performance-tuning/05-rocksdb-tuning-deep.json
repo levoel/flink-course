@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/05-rocksdb-tuning-deep",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-05",
+    "description": "Quiz for RocksDB deep tuning lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-05-q1",
+      "type": "multiple-choice",
+      "question": "Какой PredefinedOptions профиль рекомендуется для production NVMe SSD и какие defaults он устанавливает?",
+      "options": [
+        { "id": "a", "text": "DEFAULT — самый conservative" },
+        { "id": "b", "text": "FLASH_SSD_OPTIMIZED. Defaults: WriteBuffer 64MB, MaxWriteBufferNumber 4, TargetFileSizeBase 64MB (parallel compaction friendly), MaxBackgroundJobs 4, MaxOpenFiles -1 (SSD random OK), Compression LZ4 (быстрее snappy на SSD), Leveled compaction, BloomFilter 10 bits/key. Это активно maintained, well-tested профиль" },
+        { "id": "c", "text": "SPINNING_DISK_OPTIMIZED_HIGH_MEM" },
+        { "id": "d", "text": "Custom factory обязателен" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLASH_SSD_OPTIMIZED — стандарт 95% production deployments на NVMe/SATA SSD. PredefinedOptions устанавливают per-CF settings и compaction, но НЕ memory management. Memory через separate config: state.backend.rocksdb.memory.managed: true (WriteBufferManager + Block Cache). Дальнейший tuning custom factory только при специфическом hardware/workload. Custom factory ОБЯЗАТЕЛЬНО extends DefaultConfigurableOptionsFactory — иначе WBM/BC injection теряется.",
+      "studyHint": "Повторите урок — PredefinedOptions",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-05-q2",
+      "type": "multiple-choice",
+      "question": "Зачем нужна WriteBufferManager (WBM) integration с Flink managed memory?",
+      "options": [
+        { "id": "a", "text": "Для ускорения writes" },
+        { "id": "b", "text": "WBM ограничивает суммарный size всех MemTable между всеми Column Families и slots. Без WBM каждая CF аллоцирует свою MemTable (e.g., 64MB), на 10 CF × 4 slots = 2.5GB pure MemTable. WBM делает budget deterministic — когда суммарно превышено, trigger flush largest MemTable. Critical для off-heap memory control" },
+        { "id": "c", "text": "Compression configuration" },
+        { "id": "d", "text": "Background compaction" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "WriteBufferManager — RocksDB feature для shared MemTable budget. Flink injects WBM при state.backend.rocksdb.memory.managed: true. Без WBM: 10 state primitives = 10 CF × 64MB MemTable + 8MB Block Cache × 4 slots = 2.88GB native memory per TaskManager — превышает 1.6GB managed budget → OS OOM-Killer. С WBM: total MemTable usage capped (write-buffer-ratio × managed = e.g. 800MB). Shared между slots для fairness. Block Cache shared analogously (LRU cache для disk blocks). high-prio-pool-ratio: 0.1 reserves 10% BC для filter/index blocks — critical для Bloom filter checks.",
+      "studyHint": "Повторите урок — Managed memory integration",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m15-05-q3",
+      "type": "multiple-choice",
+      "question": "Production: 1.5TB state, 16GB managed memory, FLASH_SSD_OPTIMIZED, read-heavy 70/30. Read P99 = 200ms (target 20ms), block-cache hit ratio = 65% (low). Какой план tuning?",
+      "options": [
+        { "id": "a", "text": "Увеличить parallelism" },
+        { "id": "b", "text": "Multi-step: (1) state.backend.rocksdb.memory.write-buffer-ratio: 0.25 (default 0.5) — BC становится 75% managed вместо 50%, освобождает 4GB для cache; (2) state.backend.rocksdb.memory.high-prio-pool-ratio: 0.2 (default 0.1) — больше space для filter+index blocks; (3) taskmanager.memory.managed.fraction: 0.55 (default 0.4) — больше total managed; (4) Bloom filter 15 bits/key через custom factory (extends DefaultConfigurableOptionsFactory); (5) tableConfig.setPinL0FilterAndIndexBlocksInCache(true). Goal: block-cache-hit > 90%, P99 < 30ms" },
+        { "id": "c", "text": "Switch к HashMapStateBackend" },
+        { "id": "d", "text": "Уменьшить state TTL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Read-heavy с low cache hit ratio — classic memory allocation mismatch. Default write-buffer-ratio 0.5 неоптимален для read-heavy: вы тратите 50% managed на MemTables (для writes), когда reads dominant. Solution: shift balance в сторону Block Cache. Trade-off: меньше WBM budget (8GB → 4GB) → MemTables меньше → больше L0 files, но writes только 30% так это acceptable. Если writes начнут backlog (write stalls появятся) — revert к balanced 0.4. Iterative tuning: apply changes one at a time, measure impact. Validation: cache hit ratio > 90%, P99 < 30ms.",
+      "studyHint": "Повторите урок — Production tuning: read-heavy + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-05-q4",
+      "type": "true-false",
+      "question": "Custom RocksDBOptionsFactory обязательно должна extends DefaultConfigurableOptionsFactory и вызывать super.createDBOptions()/super.createColumnOptions() первым — иначе WBM и Block Cache не injected, что вызывает OOM через несколько часов.",
+      "correctAnswer": true,
+      "explanation": "True. Это самая частая причина production OOM с RocksDB. Антипаттерн: return new DBOptions().setMaxBackgroundJobs(8) — fresh options, WBM потерян. Симптом: TaskManager растёт линейно по memory, K8s OOMKill через 2-6 часов после deploy. Status.JVM.Memory.Direct.MemoryUsed растёт линейно (не plateau). Math: 10 CF × 4 slots × 64MB MemTable + 8MB BC per CF = 2.88GB native (vs 1.6GB managed budget). Right way: opts = super.createDBOptions(opts, handles) → preserves WBM injection. Then opts.setMaxBackgroundJobs(8) — твои overrides on top. Аналогично для createColumnOptions (Block Cache injection). Без super() WBM/BC потеряны — even если ты ничего критичного больше не trogал.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

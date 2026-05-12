@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/02-abs-algorithm",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-02",
+    "description": "Quiz for ABS algorithm walkthrough lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-02-q1",
+      "type": "multiple-choice",
+      "question": "Какая роль CheckpointCoordinator в ABS algorithm?",
+      "options": [
+        { "id": "a", "text": "Хранит state operators на JobManager" },
+        { "id": "b", "text": "Per-job singleton на JobMaster. Trigger checkpoint каждые execution.checkpointing.interval, assigns ID, инжектит CheckpointBarrier во все Source operators параллельно через RPC, collects acknowledgements от всех operators, persist checkpoint metadata to DFS, invoke notifyCheckpointComplete после full success" },
+        { "id": "c", "text": "Координирует state replication между TaskManager-ами" },
+        { "id": "d", "text": "Это часть RocksDB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "CheckpointCoordinator — central component ABS algorithm. Lives на JobMaster (per-job singleton). Responsibilities: (1) Trigger periodic checkpoints (execution.checkpointing.interval); (2) Assign unique checkpoint ID; (3) Inject CheckpointBarrier во все Source operators в parallel через triggerCheckpointAsync RPC; (4) Collect StateHandle acks от каждого operator после async snapshot; (5) Persist checkpoint metadata к DFS once all acked; (6) Invoke notifyCheckpointComplete(id) callback на всех operators (critical для 2PC sinks Kafka commit); (7) Manage retention — cleanup old checkpoints. Параллельная injection во все sources — critical для consistency.",
+      "studyHint": "Повторите урок — раздел 'Step 1: Trigger'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m06-02-q2",
+      "type": "multiple-choice",
+      "question": "Operator с 3 input channels получает barrier на канале A. Что происходит при aligned checkpoint?",
+      "options": [
+        { "id": "a", "text": "Operator immediately snapshots state" },
+        { "id": "b", "text": "Alignment phase: канал A marked BLOCKED — records на A buffer-ятся в InputBuffer. Operator продолжает читать channels B и C. Когда barrier приходит на все 3 — alignment complete, sync snapshot, forward barrier downstream, unblock channels. Под backpressure alignment может быть minute+" },
+        { "id": "c", "text": "Operator drops все records и snapshots" },
+        { "id": "d", "text": "Operator forwards barrier немедленно без snapshot" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Aligned checkpoint alignment phase: при получении barrier(N) на channel A — A marked blocked, records на A буферизируются в InputBuffer (back-pressure cascades upstream). Operator продолжает читать B, C — обработка не останавливается. Когда barrier(N) пришёл на ВСЕ N channels — alignment complete. Это invariant: все события до barrier N processed, ничего после barrier N в state. Sync phase — миллисекунды (RocksDB native snapshot — hardlinks). Forward barrier downstream, unblock channels — A flushes buffered records, продолжает normal flow. Под backpressure alignment может быть долго (minutes-hours), что motivates unaligned checkpoints FLIP-76.",
+      "studyHint": "Повторите урок — раздел 'Step 4: Alignment'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-02-q3",
+      "type": "multiple-choice",
+      "question": "Почему RocksDB native snapshot занимает миллисекунды даже на TB state?",
+      "options": [
+        { "id": "a", "text": "RocksDB использует in-memory snapshots" },
+        { "id": "b", "text": "SST files в LSM-tree immutable. RocksDB native snapshot создаёт hardlinks на existing SST files — O(1) filesystem operation, никакого copy данных, никакого I/O. Sync phase < 100ms даже на TB state. Heap state: CopyOnWriteStateMap — увеличивает version number, тоже O(1)" },
+        { "id": "c", "text": "RocksDB skip-ит snapshot для больших state" },
+        { "id": "d", "text": "Это deprecated механизм" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "RocksDB native snapshot — magic Flink scalability. Основа: SST files в LSM immutable (once written, никогда не modified). Snapshot = hardlinks на existing SST files (filesystem operation O(1), no data copy). Local checkpoint directory становится immutable view RocksDB на момент. Async upload по этим hardlinks — длительное (network bound), но sync phase < 100ms даже TB state. CopyOnWriteStateMap для heap state — увеличивает version, новые writes идут new version, snapshot читает old. Тоже O(1). Это why Flink scaling — alignment + sync phase bounded milliseconds, async upload bounded network bandwidth — total checkpoint duration bounded.",
+      "studyHint": "Повторите урок — раздел 'Step 5: Sync phase'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-02-q4",
+      "type": "true-false",
+      "question": "notifyCheckpointComplete callback критически важен для 2PC sinks (Kafka EOS) — без него sink не commit transaction.",
+      "correctAnswer": true,
+      "explanation": "True. Two-Phase Commit: (1) preCommit на barrier — sink flushes data, creates pending transaction (хранится в state); (2) commit на notifyCheckpointComplete callback — actual Kafka transaction commit. Без notifyCheckpointComplete invocation transactions remain pending forever (eventually timeout, data loss). CheckpointCoordinator invokes notifyCheckpointComplete на всех operators ПОСЛЕ того как all acks received и checkpoint metadata persisted. Это guarantees: state durable AND sink commits. Recovery scenario: если crash между checkpoint complete и commit, на restart sink читает pending transactions из state и calls recoverAndCommit() — Kafka API supports finishing pending transactions by transactional.id. Это и есть exactly-once semantic. Без notifyCheckpointComplete — at-most-once at best.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

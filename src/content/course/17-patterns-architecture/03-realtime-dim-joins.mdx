@@ -1,0 +1,341 @@
+---
+title: "Real-time dim joins — broadcast, lookup, temporal"
+description: "Три способа enrichment streaming данных reference-данными: broadcast join (полная репликация мелких dim), lookup join через Async I/O (read-through cache), temporal join (FOR SYSTEM_TIME AS OF — historical correctness). Когда использовать каждый."
+order: 3
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Joins", "Broadcast State", "Async I/O", "Temporal Join", "Lookup Join"]
+---
+
+# Real-time dim joins — broadcast, lookup, temporal
+
+Streaming pipeline без enrichment — редкость. Транзакция приходит с user_id, но business-логике нужны user_country, user_segment, fraud_score, договорные ставки — всё, что живёт в reference / dimension таблицах. Вопрос: **как соединить streaming fact с slow-changing dimension**, чтобы не убить throughput и не получить stale data?
+
+Flink даёт три pattern-а: broadcast join, lookup join (Async I/O), temporal join (FOR SYSTEM_TIME AS OF). Каждый оптимален для своего профиля dim-таблицы. Выбор неправильного приводит либо к OOM (broadcast huge dim), либо к 100x slowdown (sync lookup), либо к incorrect results на historical reprocessing (instant join вместо temporal).
+
+---
+
+## Профиль dim-таблицы определяет pattern
+
+| Свойство dim | Broadcast | Lookup (Async I/O) | Temporal |
+|---|---|---|---|
+| Размер | Десятки MB - 1-2 GB total | Любой (per-key fetch) | Любой |
+| Скорость изменения | Минуты-часы | Любая | Любая |
+| Need historical version | Нет | Нет (всегда current) | Да (point-in-time) |
+| Operator state per subtask | Полная копия | Cache only | Versioned snapshot |
+| Latency на enrich | Микросекунды (in-memory) | Async I/O batched | Микросекунды (state) |
+| Источник | Kafka change topic | External DB (Cassandra, Redis) | Versioned table (CDC) |
+
+---
+
+## Pattern 1: Broadcast join
+
+Концепция: каждый TaskManager субtask получает **полную копию** dim-таблицы. Stream приходит, обогащение — locally без network.
+
+<DiagramContainer title="Broadcast join: dim полностью реплицирована" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Dim source"
+        tooltip="Kafka compacted topic 'countries' или 'product_catalog'. Compacted = только latest value per key. Размер manageable — 100k стран и категорий, ~10 MB. Initial load + updates."
+      >
+        Kafka: countries
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="broadcast" />
+    <FlowRow>
+      <DataBox
+        label="Subtask 0"
+        tooltip="Полная копия всех стран в BroadcastState. ~10 MB heap per subtask. При update — обновляется через processBroadcastElement."
+      >
+        Full dim copy
+      </DataBox>
+      <DataBox
+        label="Subtask 1"
+        tooltip="Полная копия. Реплицирована автоматически Flink-ом — broadcastStream доставляется каждому subtask независимо."
+      >
+        Full dim copy
+      </DataBox>
+      <DataBox
+        label="Subtask N"
+        tooltip="То же. Total memory cost = N × dim_size. Поэтому broadcast подходит только для small dim — десятки MB, не GB."
+      >
+        Full dim copy
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="up" label="enrich locally" />
+    <FlowRow>
+      <DataBox
+        label="Fact stream"
+        tooltip="Transactions stream. Каждый subtask обогащает свои records из локального BroadcastState. Микросекунды на lookup."
+      >
+        Transaction stream
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+```java
+MapStateDescriptor<String, Country> countryDescriptor =
+    new MapStateDescriptor<>("countries", String.class, Country.class);
+
+BroadcastStream<Country> countryBroadcast = countryStream.broadcast(countryDescriptor);
+
+DataStream<EnrichedTx> enriched = transactions
+    .connect(countryBroadcast)
+    .process(new BroadcastProcessFunction<Transaction, Country, EnrichedTx>() {
+
+        @Override
+        public void processBroadcastElement(Country country, Context ctx, Collector<EnrichedTx> out)
+                throws Exception {
+            ctx.getBroadcastState(countryDescriptor).put(country.code(), country);
+        }
+
+        @Override
+        public void processElement(Transaction tx, ReadOnlyContext ctx, Collector<EnrichedTx> out)
+                throws Exception {
+            Country c = ctx.getBroadcastState(countryDescriptor).get(tx.countryCode());
+            out.collect(new EnrichedTx(tx, c));
+        }
+    })
+    .uid("country-enrich");
+```
+
+**Когда применять:**
+- Dim ≤ 100-500 MB total.
+- Updates редкие (минуты-часы — feature flags, country list, product catalog).
+- Не нужны historical versions.
+
+**Когда НЕ применять:**
+- Dim > 1 GB — память умножается на parallelism. На parallelism=32 dim=1GB = 32GB total RAM. OOM.
+- Updates тысячи в секунду — broadcast stream становится bottleneck (надо delivered каждому subtask).
+
+<Callout type="warning">
+Broadcast state хранится в **heap memory**, не в RocksDB. Это значит — он не TTL-able, не off-heap, и считается в taskmanager.memory.task.heap.size. На parallelism=64 и dim 500 MB вам нужно ≥32 GB heap per TM. Учитывайте при sizing.
+</Callout>
+
+---
+
+## Pattern 2: Lookup join через Async I/O
+
+Концепция: dim живёт во **внешнем низколатентном store** (Redis, Cassandra, key-value DB). Stream делает asynchronous lookup, optionally caches result.
+
+```java
+DataStream<EnrichedTx> enriched = AsyncDataStream.unorderedWait(
+    transactions,
+    new AsyncDimLookup("redis://redis:6379"),
+    1000, TimeUnit.MILLISECONDS,
+    500   // capacity — макс in-flight requests per subtask
+).uid("redis-lookup");
+
+public class AsyncDimLookup extends RichAsyncFunction<Transaction, EnrichedTx> {
+    private transient AsyncCommands<String, String> redis;
+    private transient Cache<String, Country> cache;
+
+    @Override
+    public void open(Configuration cfg) {
+        RedisClient client = RedisClient.create(redisUrl);
+        redis = client.connect().async();
+        cache = Caffeine.newBuilder()
+            .maximumSize(100_000)
+            .expireAfterWrite(Duration.ofMinutes(5))
+            .build();
+    }
+
+    @Override
+    public void asyncInvoke(Transaction tx, ResultFuture<EnrichedTx> result) {
+        Country cached = cache.getIfPresent(tx.countryCode());
+        if (cached != null) {
+            result.complete(Collections.singleton(new EnrichedTx(tx, cached)));
+            return;
+        }
+        redis.get("country:" + tx.countryCode())
+            .thenAccept(raw -> {
+                Country c = parseCountry(raw);
+                cache.put(tx.countryCode(), c);
+                result.complete(Collections.singleton(new EnrichedTx(tx, c)));
+            });
+    }
+}
+```
+
+**Ключевые моменты:**
+- `unorderedWait` vs `orderedWait` — unordered эмитит как только готов, ordered сохраняет input order. Unordered drastically быстрее, но если downstream нужен strict ordering — orderedWait.
+- `capacity=500` — макс concurrent in-flight requests per subtask. Threshold должен соответствовать downstream DB capacity / parallelism.
+- Caffeine cache как L1 — снижает hit rate на Redis. Тradeoff: stale data до 5 минут.
+
+**Когда применять:**
+- Dim большая (GB+).
+- Updates real-time (нужно current value).
+- External store уже существует и имеет low latency.
+
+**Когда НЕ применять:**
+- External DB down → backpressure caskадирует на весь pipeline. Critical dependency.
+- Need historical versions для time-travel queries — lookup всегда current.
+
+<Callout type="note">
+Lookup join — это **eventual consistency** между fact и dim. Если product updated 5 секунд назад, и cache TTL = 5 минут, transaction обогащается старым названием продукта. Для большинства use cases это OK. Для finance/compliance — нет, нужен temporal join.
+</Callout>
+
+---
+
+## Pattern 3: Temporal join — FOR SYSTEM_TIME AS OF
+
+Концепция: dim — это **versioned table**, каждое значение помнит свою валидность (rowtime). Join производится по **historical version dim на event time fact-а**.
+
+Это решение проблемы reprocessing. Представьте: вы запускаете job 1 января для replay транзакций с 1 ноября. Цена продукта изменилась 15 ноября. Lookup join даст current price (как на 1 января — neправильно). Temporal join даст historical price (как на event time каждой транзакции).
+
+```sql
+-- Versioned table: products с PRIMARY KEY и rowtime
+CREATE TABLE products (
+    product_id STRING NOT NULL,
+    name STRING,
+    price DECIMAL(10,2),
+    update_time TIMESTAMP_LTZ(3),
+    WATERMARK FOR update_time AS update_time - INTERVAL '5' SECOND,
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'products-cdc',
+    'format' = 'debezium-json',
+    'scan.startup.mode' = 'earliest-offset'
+);
+
+-- Fact stream: orders
+CREATE TABLE orders (
+    order_id STRING,
+    product_id STRING,
+    quantity INT,
+    order_time TIMESTAMP_LTZ(3),
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH (...);
+
+-- Temporal join
+SELECT
+    o.order_id,
+    o.product_id,
+    o.quantity,
+    p.name,
+    p.price,
+    o.quantity * p.price AS total
+FROM orders AS o
+JOIN products FOR SYSTEM_TIME AS OF o.order_time AS p
+ON o.product_id = p.product_id;
+```
+
+Семантика: при обработке order o с `order_time=T`, Flink находит latest version product где `update_time ≤ T`. Это **point-in-time correctness** — не зависит от того, когда вы запускаете job.
+
+<DiagramContainer title="Temporal join: historical lookup по event time" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Versioned dim"
+        tooltip="Каждый ключ имеет несколько versions с rowtime. Flink держит versions в state (sortedKeyedState поверх RocksDB). Cleanup по watermark — versions старше maxOrderTime - retention не нужны."
+      >
+        product_id → [v1@T1, v2@T2, ...]
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="FOR SYSTEM_TIME AS OF" />
+    <FlowRow>
+      <DataBox
+        label="Temporal lookup"
+        tooltip="Для каждого order находит latest version где update_time ≤ order_time. Это range query — bsearch по sorted versions per key."
+      >
+        find version where ts ≤ order_time
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="historical value" />
+    <FlowRow>
+      <DataBox
+        label="Enriched output"
+        tooltip="order x product join, total посчитан с правильной historical ценой. Replay даёт identical results — pure function от input streams."
+      >
+        order + product@order_time
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+**Когда применять:**
+- Reprocessing/backfill — нужен determinism.
+- Финансовые/billing pipelines — нужна historical correctness.
+- Compliance/audit — нужно знать «какая была цена на момент order».
+
+**Когда НЕ применять:**
+- Если dim updates per second тысячи — state grows huge с versions.
+- Если 99% lookup-ов идёт на current value — лишний state overhead, лучше lookup join.
+
+---
+
+## Сравнительная таблица: profile → pattern
+
+| Сценарий | Лучший pattern | Почему |
+|---|---|---|
+| Список стран ISO (~250 stable) | Broadcast | Tiny, rarely updated |
+| Product catalog 1M items, real-time prices, replay required | Temporal | Historical correctness |
+| User profile 500M users, current value OK | Lookup (Async I/O + cache) | Too big для broadcast |
+| Feature flags (~1000), updates secunды | Broadcast | Tiny, real-time delivery |
+| Fraud rules ~10k, updates rare | Broadcast | Manageable, no replay concerns |
+| Currency rates 200 pairs, replay financial calcs | Temporal | Historical exchange rate critical |
+| User session state 100M, lookup current | Lookup (Redis) | Too big, current OK |
+| Geo-IP ranges, immutable per session | Broadcast | Manageable, stable |
+
+---
+
+## Combination в production pipelines
+
+В реальной job эти три pattern часто **комбинируются**:
+
+```sql
+-- Fact: clickstream events
+-- Dim 1: users (huge, Cassandra) — lookup join
+-- Dim 2: campaigns (small, ~10k, daily updates) — broadcast
+-- Dim 3: products (versioned, replay critical) — temporal join
+
+SELECT
+    e.user_id,
+    u.country,
+    u.segment,
+    c.name AS campaign_name,
+    p.name AS product_name,
+    p.price
+FROM events AS e
+
+-- Async lookup на Cassandra:
+JOIN users FOR SYSTEM_TIME AS OF e.event_time AS u
+ON e.user_id = u.user_id
+
+-- Broadcast в Flink job:
+JOIN campaigns AS c
+ON e.campaign_id = c.id
+
+-- Temporal:
+JOIN products FOR SYSTEM_TIME AS OF e.event_time AS p
+ON e.product_id = p.id;
+```
+
+Flink Table planner оптимизирует execution — temporal joins through state, lookups through Async I/O, broadcasts через replicated state.
+
+---
+
+## Production gotchas
+
+- **Broadcast OOM** — не учли, что dim растёт. Solution: monitoring broadcast state size, alerting при >50% heap. Если приближается → миграция на lookup join.
+- **Async I/O capacity не tuned** — слишком низкий = bottleneck (in-flight requests stuck), слишком высокий = downstream DB overload. Rule of thumb: capacity = expected_qps × latency_seconds / parallelism, плюс 30% буфер.
+- **Cache invalidation** — Caffeine TTL не reacting на dim updates. Если dim updates критично важно reflect-ить — subscribe to change events + invalidate cache. Иначе stale до TTL expires.
+- **Temporal join state growth** — versions накапливаются. Configure `table.exec.state.ttl` или watermark-based cleanup. Без этого state растёт линейно с количеством updates dim.
+- **Temporal join без watermark** — версии не cleanup-аются, eventually state overflow. Watermark на versioned table — обязателен.
+- **Lookup join blocking external DB** — sync lookup (не AsyncDataStream) сериализует каждый record. На 10k events/sec × 10ms DB = 100s/s — невозможно. Async I/O — обязателен.
+- **Mixing temporal и lookup** — некорректный choice легко сделать. Если запрос «какая цена сейчас» — lookup. Если «какая была цена тогда» — temporal. Финансы почти всегда хотят temporal.
+- **ordered vs unordered Async I/O** — ordered emit-ит в input order, но wait-ит slow requests блокируя fast. Unordered drastically быстрее. Используйте ordered только если downstream requires strict ordering.
+
+<Callout type="warning">
+В Flink CDC 3.x можно подписаться напрямую на Postgres binlog как source для temporal join. Это снимает необходимость в intermediate Kafka topic для versioned table — Flink CDC уже доставляет change events с rowtime. Это упрощение, но требует careful watermark configuration — replication lag должен быть учтён в bounded out-of-orderness.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: order processing pipeline. Order stream 50k events/sec. Нужно enrich тремя dimensions: (1) currency rates (~200 pairs, updates каждый час, replay financial reports critical), (2) user profile (200M users, current value достаточно), (3) feature flags (~500 flags, updates real-time, никаких historical). Какой pattern для каждого и какие gotchas?"
+  answer="(1) Currency rates — TEMPORAL JOIN: 200 pairs × несколько updates в день = manageable state, replay financial reports требует historical rates (если order был placed 15 ноября при rate 1.05, и сейчас rate 1.12, replay должен использовать 1.05). Versioned table из Kafka change topic, FOR SYSTEM_TIME AS OF order.event_time. Configure watermark + state TTL чтобы не накапливать ancient versions. (2) User profile — LOOKUP JOIN через Async I/O: 200M users × средний profile 2KB = 400GB total, broadcast невозможен (× parallelism = TBs RAM). Cassandra/ScyllaDB/Redis Cluster для key-value, Async I/O с capacity=1000-5000 per subtask, Caffeine L1 cache (5 min TTL) для hot users. Unordered wait, потому что order не критичен. Stale до 5 минут OK для profile. (3) Feature flags — BROADCAST: 500 flags × 1KB = 500KB, tiny. Real-time updates через broadcast stream. Каждый subtask получает full copy в BroadcastState. Latency on lookup — микросекунды. Gotchas overall: (a) currency state TTL обязателен — без cleanup versions растут вечно; (b) Async I/O для users — capacity нужно tune под Cassandra cluster QPS / parallelism; backpressure → весь pipeline stuck если Cassandra slow; (c) feature flags broadcast не TTL-able — если flags deprecated, нужна explicit cleanup logic в processBroadcastElement; (d) UID на каждый enrichment operator обязателен для savepoint compatibility."
+/>

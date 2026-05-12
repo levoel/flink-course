@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/02-e2e-eos-layers",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-02",
+    "description": "Quiz for End-to-end EOS layers lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-02-q1",
+      "type": "multiple-choice",
+      "question": "Какие три слоя должны быть exactly-once одновременно для end-to-end EOS в Flink?",
+      "options": [
+        { "id": "a", "text": "Source + State + Sink — все три должны поддерживать соответствующие гарантии" },
+        { "id": "b", "text": "(1) Replayable source (Kafka offsets, S3 file paths, CDC LSN); (2) Internal EOS через ABS (EXACTLY_ONCE checkpointing); (3) Transactional sink (2PC) или idempotent sink (UPSERT by PK). Если хотя бы один at-least-once — итог at-least-once" },
+        { "id": "c", "text": "Producer + Broker + Consumer в Kafka" },
+        { "id": "d", "text": "Достаточно env.enableCheckpointing(EXACTLY_ONCE)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "End-to-end EOS — emergent property трёх независимых слоёв. (1) Source должен support replay по саженной позиции — Kafka offsets, S3 byte offset, CDC LSN. Без этого после restart данные теряются. (2) Internal EOS через ABS (Asynchronous Barrier Snapshotting) — Flink алгоритм barrier propagation + consistent state snapshot. Требует EXACTLY_ONCE checkpointing mode. (3) Transactional sink через 2PC (KafkaSink EOS, Iceberg) или idempotent sink (Postgres ON CONFLICT DO UPDATE по PK). Weakest link wins: если sink at-least-once → итог at-least-once независимо от source/internal. Common mistake — думать что enableCheckpointing достаточно. Это только Layer 2.",
+      "studyHint": "Повторите урок — секция 'Три слоя гарантии'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m07-02-q2",
+      "type": "multiple-choice",
+      "question": "Если Flink job использует KafkaSource + EXACTLY_ONCE checkpointing + plain JDBC INSERT (без PK uniqueness) — какая итоговая семантика?",
+      "options": [
+        { "id": "a", "text": "Exactly-once — internal EOS гарантирует целостность" },
+        { "id": "b", "text": "At-least-once — после replay из checkpoint sink повторно INSERT-ит записи в БД, создаются дубликаты. Layer 3 нарушает overall EOS" },
+        { "id": "c", "text": "At-most-once — JDBC sink может терять записи" },
+        { "id": "d", "text": "Зависит от настроек Kafka" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic weakest link scenario. Layer 1 (Kafka) replayable ✅, Layer 2 (ABS) EOS ✅, Layer 3 (plain JDBC INSERT без PK) at-least-once ❌. После crash recovery: Flink restores from checkpoint, KafkaSource replays records с saved offset, JDBC sink повторно INSERT-ит те же records — БД получает дубликаты. Fix варианты: (a) JDBC XA-2PC через XADataSource — full 2PC через transaction manager; (b) idempotent UPSERT по PK через `INSERT ... ON CONFLICT DO UPDATE` — effectively EOS без XA overhead; (c) custom SinkV2 implementation с PreparedStatement в transaction + commit на notifyCheckpointComplete. Most practical — UPSERT, requires PK uniqueness в БД schema.",
+      "studyHint": "Повторите урок — секция 'Композиция: weakest link wins'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-02-q3",
+      "type": "multiple-choice",
+      "question": "Pipeline: HTTP webhook receiver (custom source) → Flink processing → KafkaSink EOS. Какая семантика и почему?",
+      "options": [
+        { "id": "a", "text": "Exactly-once — sink даёт EOS" },
+        { "id": "b", "text": "At-most-once — HTTP webhook не replayable. После crash потерянные webhook events не возвращаются. Layer 1 ломает overall EOS — даже Layer 2+3 EOS не спасают от source-side потерь" },
+        { "id": "c", "text": "At-least-once — webhook duplicates возможны" },
+        { "id": "d", "text": "Exactly-once если client retry" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "HTTP webhook receiver — non-replayable source. После Flink crash клиент уже ушёл с 200 OK ответом (если accept-ed). На recovery Flink восстанавливает state с saved offset, но 'offset' для webhook не имеет смысла — записи никто не повторит. Items, received between last successful checkpoint и crash, потеряны. Это at-most-once Layer 1, итог at-most-once независимо от sink. Fix: добавить buffer **между** webhook и Flink. Production pattern — HTTP receiver → Kafka topic → Flink pipeline. Kafka replayable, Flink читает с offset, EOS preserved. Custom non-replayable sources (UDP, plain TCP, sockets) имеют такую же проблему.",
+      "studyHint": "Повторите урок — секция 'Layer 1 — Replayable source'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m07-02-q4",
+      "type": "true-false",
+      "question": "В Kafka source для EOS обязательно установить enable.auto.commit=true, чтобы offsets фиксировались в Kafka __consumer_offsets.",
+      "correctAnswer": false,
+      "explanation": "False. Это anti-pattern! Для EOS offsets должны быть **только** в Flink state (single source of truth). Если включить enable.auto.commit=true, Kafka commits offsets независимо от Flink checkpoint cycle. После restart Flink restores state с saved offsets, но Kafka может вернуть offsets из __consumer_offsets, которые не согласованы — autocommit interval (default 5s) независим от checkpoint interval (60s). Возможны два scenario: (a) Kafka offset > Flink offset → потеря записей; (b) Kafka offset < Flink offset → дубликаты после replay. Default KafkaSource behavior — НЕ commit в Kafka, offsets в Flink state. Если нужна visibility в Kafka UI, использовать `commit.offsets.on.checkpoint=true` — commit ПОСЛЕ успешного checkpoint, side effect без нарушения EOS.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

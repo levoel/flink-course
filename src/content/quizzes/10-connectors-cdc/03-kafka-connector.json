@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/03-kafka-connector",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-03",
+    "description": "Quiz для Kafka connector"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-03-q1",
+      "type": "multiple-choice",
+      "question": "Production: KafkaSink с EXACTLY_ONCE, checkpoint interval = 5 минут, default transaction.timeout.ms. Замечают duplicate events. Что причина?",
+      "options": [
+        { "id": "a", "text": "EXACTLY_ONCE не работает в Flink 2.x" },
+        { "id": "b", "text": "Default transaction.timeout.ms = 60s, but checkpoint = 5 min. Когда checkpoint takes longer than 60s — Kafka aborts transaction. Flink pre-commits но commit phase fails — recovery может create inconsistencies. Fix: setProperty('transaction.timeout.ms', '900000') — must быть significantly > max checkpoint duration. Also verify Kafka broker transaction.max.timeout.ms >= 900000" },
+        { "id": "c", "text": "Нужно использовать NONE delivery guarantee" },
+        { "id": "d", "text": "Это normal — EXACTLY_ONCE даёт at-most duplicate 1%" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical Kafka EOS gotcha. Default Kafka transaction.timeout.ms = 60s, broker max = 15min. If Flink checkpoint takes > transaction.timeout.ms → Kafka aborts transaction → Flink thinks it's still alive → records либо lost либо при recovery duplicated. Production rule: transaction.timeout.ms = max(2 × checkpoint_interval, 900_000ms). Also broker config transaction.max.timeout.ms must allow this. Plus enable.idempotence=true (mandatory для EOS). Setup correctly — true exactly-once preserved end-to-end.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-03-q2",
+      "type": "multiple-choice",
+      "question": "Что означает transactionalIdPrefix в KafkaSink и почему он должен быть уникальный per job?",
+      "options": [
+        { "id": "a", "text": "Это metric label, не functional" },
+        { "id": "b", "text": "Flink uses pattern {prefix}-{subtask}-{checkpointId} для Kafka transactional.id. На recovery Flink lists transactions matching prefix, aborts orphaned, resumes valid. Если две jobs use same prefix — Kafka zombie fencing aborts конкурента → data loss / corruption" },
+        { "id": "c", "text": "Это deprecated — Kafka теперь автоматически генерирует ID" },
+        { "id": "d", "text": "Это для logging only" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "transactionalIdPrefix — critical для recovery semantics. Kafka transactional.id уникальный per producer instance — два producers с same ID → Kafka aborts один (zombie fencing). Flink generates IDs по pattern {prefix}-{subtask}-{checkpointId}. На recovery lists transactions матching prefix, aborts orphan (incomplete from crashed instance), resumes valid pending. Fix: unique prefix per job ('prod-fraud-tx', 'staging-fraud-tx', 'analytics-tx'). Common bug: two deployments same prefix → continuous fencing → data loss.",
+      "studyHint": "Повторите урок — transactionalIdPrefix",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m10-03-q3",
+      "type": "multiple-choice",
+      "question": "После migration от FlinkKafkaConsumer к KafkaSource (FLIP-27), Flink не подхватывает новые Kafka partitions добавленные runtime. Что fix?",
+      "options": [
+        { "id": "a", "text": "Restart job — partitions подхватываются только при start" },
+        { "id": "b", "text": "Dynamic partition discovery disabled by default в KafkaSource. setProperty('partition.discovery.interval.ms', '30000'). FlinkKafkaConsumer имел enabled by default — easy migration trap" },
+        { "id": "c", "text": "Это limitation FLIP-27 — нет dynamic discovery" },
+        { "id": "d", "text": "Использовать setTopicPattern вместо setTopics" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Subtle migration trap. FlinkKafkaConsumer (legacy) had partition discovery enabled by default (~5 min interval). KafkaSource (FLIP-27) — disabled by default (must explicit enable). Fix: setProperty('partition.discovery.interval.ms', '30000') — 30s discovery cycle. Это потому что FLIP-27 favors explicit configuration over magic defaults. Easy production gotcha при upgrade — new partitions silently miss, lag accumulates, downstream incomplete. Always enable explicit для long-running jobs.",
+      "studyHint": "Повторите урок — Production gotcha #3",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m10-03-q4",
+      "type": "true-false",
+      "question": "KafkaSink (FLIP-191 SinkV2) с EXACTLY_ONCE использует Two-Phase Commit: pre-commit на checkpoint barrier (producer.flush()), commit на notifyCheckpointComplete (producer.commitTransaction()).",
+      "correctAnswer": true,
+      "explanation": "Правда. KafkaSink реализует TwoPhaseCommittingSink interface (SinkV2). Phase 1 (pre-commit): на checkpoint barrier SinkWriter calls producer.flush() — все pending records written к Kafka brokers within open transaction, но НЕ committed. Records invisible для read_committed consumers. SinkV2 produces Committable (handle к transaction). Phase 2 (commit): после JobManager confirms all operators successfully checkpointed (notifyCheckpointComplete callback), KafkaSink Committer calls producer.commitTransaction() — records become visible. На failure between phases: recovery restores Committables из checkpoint, re-commits pending transactions. Это foundation exactly-once в Kafka sink.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

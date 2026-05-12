@@ -1,0 +1,409 @@
+---
+title: "PredefinedOptions и RocksDBOptionsFactory"
+description: "DEFAULT, SPINNING_DISK_OPTIMIZED, SPINNING_DISK_OPTIMIZED_HIGH_MEM, FLASH_SSD_OPTIMIZED. Custom RocksDBOptionsFactory. Critical gotcha с managed memory"
+order: 5
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["PredefinedOptions", "RocksDBOptionsFactory", "FLASH_SSD_OPTIMIZED", "Managed Memory"]
+---
+
+# PredefinedOptions и RocksDBOptionsFactory
+
+RocksDB имеет 100+ tunable parameters. Без guidance это overwhelming. Flink предлагает **PredefinedOptions** — curated профили для типовых hardware/workload combinations.
+
+Понимание этих профилей — необходимый шаг до custom tuning. Custom RocksDBOptionsFactory нужен в редких случаях, но когда нужен — критично сделать правильно (managed memory integration).
+
+---
+
+## Четыре PredefinedOptions
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+```
+
+Опции:
+
+### 1. DEFAULT (conservative)
+
+```
+WriteBuffer:    64MB
+WriteBuffer count: 2
+Compaction style: Leveled
+Compression:    Snappy
+Block cache:    8MB per CF (or managed)
+Bloom filter:   enabled
+```
+
+Используется когда нет более specific knowledge о hardware/workload. Это **самый conservative** профиль — works everywhere, optimized nowhere.
+
+### 2. SPINNING_DISK_OPTIMIZED
+
+```
+WriteBuffer:    128MB (bigger to absorb HDD seeks)
+WriteBuffer count: 4
+Compaction:     Leveled с bigger SSTs (256MB target)
+Compression:    Snappy
+Bloom filter:   enabled
+target_file_size_base: 256MB  # fewer larger files = fewer HDD seeks
+max_bytes_for_level_base: 1GB
+```
+
+Optimized for HDDs: меньше files (larger SST), меньше random seeks. WA выше, но HDD не имеет endurance concern.
+
+### 3. SPINNING_DISK_OPTIMIZED_HIGH_MEM
+
+Same as SPINNING but с larger memory buffers:
+
+```
+WriteBuffer:    256MB
+WriteBuffer count: 4
+Block cache:    256MB
+max_bytes_for_level_base: 2GB
+```
+
+Для HDD systems с lots of RAM. Trade-off: bigger MemTable means longer flush, but fewer flushes total.
+
+### 4. FLASH_SSD_OPTIMIZED (recommended для NVMe)
+
+```
+WriteBuffer:    64MB
+WriteBuffer count: 4
+Compaction:     Leveled
+Compression:    LZ4 (faster than snappy для SSD I/O speed)
+target_file_size_base: 64MB     # smaller SST = parallel compaction
+max_open_files: -1               # SSD random access OK
+max_background_jobs: 4
+```
+
+Optimized для NVMe: смolaller SSTs (parallel compaction), more background jobs, fast compression.
+
+---
+
+## Какой выбрать
+
+| Hardware / Workload | Recommended |
+|---|---|
+| Production NVMe SSD | **FLASH_SSD_OPTIMIZED** |
+| Production SATA SSD | FLASH_SSD_OPTIMIZED |
+| HDD + small RAM | SPINNING_DISK_OPTIMIZED |
+| HDD + large RAM (>32GB) | SPINNING_DISK_OPTIMIZED_HIGH_MEM |
+| Dev/testing | DEFAULT |
+| Unknown | DEFAULT (safe) |
+
+**95% of production deployments**: FLASH_SSD_OPTIMIZED. Этот профиль активно maintained Flink contributors, well-tested.
+
+---
+
+## Что PredefinedOptions НЕ устанавливают
+
+Critical: PredefinedOptions устанавливают **per-CF settings и compaction**, но НЕ memory management. Memory management через **separate config**:
+
+```yaml
+# Memory management (always set explicitly):
+taskmanager.memory.managed.fraction: 0.4
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.fixed-per-slot: # disabled by default
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1
+
+# PredefinedOptions сверху:
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+```
+
+С `memory.managed: true` Flink injects WriteBufferManager и Block Cache from shared resource pool, бypassing CF-level memory settings из PredefinedOptions.
+
+Это правильно: PredefinedOptions говорит «как RocksDB должен организовать», Memory management говорит «сколько памяти доступно».
+
+---
+
+## Custom RocksDBOptionsFactory
+
+Когда PredefinedOptions недостаточно — custom factory:
+
+```java
+public class MyRocksDBOptionsFactory
+        extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        // Apply PredefinedOptions сначала через super:
+        opts = super.createDBOptions(opts, handles);
+
+        // Custom overrides:
+        return opts
+            .setMaxBackgroundJobs(8)        // больше parallelism
+            .setStatsDumpPeriodSec(0);      // disable verbose stats
+    }
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        opts = super.createColumnOptions(opts, handles);
+
+        // Custom CF tweaks:
+        return opts
+            .setWriteBufferSize(128 * 1024 * 1024)
+            .setLevelCompactionDynamicLevelBytes(true);
+    }
+}
+```
+
+Register в `flink-conf.yaml`:
+
+```yaml
+state.backend.rocksdb.options-factory: com.example.MyRocksDBOptionsFactory
+```
+
+---
+
+## CRITICAL gotcha: managed memory будет broken
+
+Если override `createDBOptions` без preserving WriteBufferManager:
+
+```java
+public DBOptions createDBOptions(DBOptions opts, ...) {
+    return new DBOptions()           // ❌ FRESH DBOptions, no WBM
+        .setMaxOpenFiles(-1)
+        .setMaxBackgroundJobs(8);
+}
+```
+
+Проблема: `DefaultConfigurableOptionsFactory` injects WriteBufferManager в opts через `setWriteBufferManager(sharedWBM)`. Если вы создаёте fresh DBOptions или не extend default factory — WBM lost.
+
+Без WBM каждая CF имеет свой fixed 64MB MemTable. 10 CF × 4 slots × 64MB = 2.5GB native memory. Дополнительно immutable MemTables awaiting flush. На production TaskManager (4GB managed) — **OOM-Killed within hours**.
+
+### Right way
+
+```java
+public class SafeFactory extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        opts = super.createDBOptions(opts, handles);   // ← preserves WBM
+        // Сейчас можно override specific options:
+        return opts.setMaxBackgroundJobs(8);
+    }
+}
+```
+
+**Always extend `DefaultConfigurableOptionsFactory`** или explicitly inject WriteBufferManager from Flink shared resource.
+
+---
+
+## Programmatic option override (alternative)
+
+Вместо custom factory можно override specific options через flink-conf:
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+
+# Specific overrides на top of profile:
+state.backend.rocksdb.writebuffer.size: 128mb
+state.backend.rocksdb.writebuffer.count: 4
+state.backend.rocksdb.thread.num: 8
+state.backend.rocksdb.block.blocksize: 16kb
+state.backend.rocksdb.compaction.level.target-file-size-base: 128mb
+```
+
+Это **preferred** для most cases — preserves memory management, allows granular tuning without code.
+
+Список configurable options: `org.apache.flink.contrib.streaming.state.RocksDBConfigurableOptions` (там 50+ ключей).
+
+---
+
+## Tuning approach: metrics-driven
+
+Не tune speculatively. Tune based on metrics:
+
+```yaml
+state.backend.rocksdb.metrics.bytes-pending-compaction: true
+state.backend.rocksdb.metrics.estimate-pending-compaction-bytes: true
+state.backend.rocksdb.metrics.num-files-at-level: true
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-usage: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+state.backend.rocksdb.metrics.block-cache-miss: true
+```
+
+Используйте Prometheus + Grafana. Метрики per CF.
+
+### Decision tree
+
+1. **L0 files > 20**? → Compaction starved. Increase `thread.num` или `max_background_jobs`.
+2. **Block cache hit rate < 90%**? → Working set > cache. Increase `block.cache-size` или `memory.managed.fraction`.
+3. **Write stall events > 0**? → Эскалация: bigger `writebuffer.size`, more `writebuffer.count`, faster compaction.
+4. **Read P99 > 10ms**? → Check L0 file count, bloom filter enabled, block cache hit rate.
+5. **Compaction lag (bytes-pending-compaction) growing**? → More threads or universal compaction.
+
+---
+
+## Real production configs
+
+### Profile A: high-throughput ingestion (e-commerce events)
+
+```yaml
+state.backend.type: rocksdb
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.thread.num: 8
+state.backend.rocksdb.writebuffer.size: 128mb
+state.backend.rocksdb.writebuffer.count: 4
+taskmanager.memory.managed.fraction: 0.5
+state.backend.incremental: true
+state.backend.local-recovery: true
+```
+
+### Profile B: low-latency real-time queries
+
+```yaml
+state.backend.type: rocksdb
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.block.cache-size: 1gb
+state.backend.rocksdb.block.blocksize: 4kb       # smaller blocks for finer-grained cache
+state.backend.rocksdb.use-bloom-filter: true
+state.backend.rocksdb.bloom-filter.bits-per-key: 15  # less false positives
+taskmanager.memory.managed.fraction: 0.6
+```
+
+### Profile C: TB state с good observability
+
+```yaml
+state.backend.type: rocksdb
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.metrics.estimate-num-keys: true
+state.backend.rocksdb.metrics.live-sst-files-size: true
+state.backend.rocksdb.metrics.num-files-at-level: true
+state.backend.rocksdb.metrics.compaction-pending: true
+state.backend.rocksdb.metrics.background-errors: true
+taskmanager.memory.managed.fraction: 0.45
+state.backend.incremental: true
+state.checkpoints.num-retained: 10
+```
+
+---
+
+## ForSt и PredefinedOptions
+
+ForSt **не использует PredefinedOptions** — у него своя конфигурация:
+
+```yaml
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://bucket/state
+state.backend.forst.local-dir: /tmp/forst-cache
+state.backend.forst.cache.size: 4gb
+state.backend.forst.io.parallelism: 16
+```
+
+ForSt internally uses RocksDB engine, но wrapped с async I/O и remote storage layer. Standard RocksDB tuning не directly applicable.
+
+---
+
+## Production gotchas
+
+### 1. Custom factory без extends DefaultConfigurableOptionsFactory
+
+Самый частый и dangerous bug. Без extends:
+- WriteBufferManager не injected → OOM
+- Block Cache не shared → memory inefficient
+- Predefined profile options lost
+
+ВСЕГДА `extends DefaultConfigurableOptionsFactory` или `super.createXXX()` first.
+
+### 2. PredefinedOptions смешиваются с config overrides
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED   # base profile
+state.backend.rocksdb.writebuffer.size: 256mb                   # override
+```
+
+Конкретные `flink-conf` keys override PredefinedOptions defaults. Это правильное поведение — позволяет inheritance + customization.
+
+### 3. memory.managed: false breaks shared resources
+
+```yaml
+state.backend.rocksdb.memory.managed: false   # per-slot fixed, не shared
+state.backend.rocksdb.memory.fixed-per-slot: 256mb
+```
+
+Иногда полезно для predictable budget (especially K8s containers), но loses memory pooling benefit. Per-slot becomes hard limit.
+
+### 4. Outdated PredefinedOptions
+
+Flink updates PredefinedOptions occasionally (Flink 2.x с RocksDB upgrade). Если выставили fixed values в custom config:
+```yaml
+state.backend.rocksdb.writebuffer.size: 64mb  # old default
+```
+— upgrade Flink не auto-updates это. Stay with PredefinedOptions для get new improvements.
+
+### 5. `max-open-files: -1` на HDD systems
+
+```yaml
+state.backend.rocksdb.max-open-files: -1   # unlimited
+```
+
+OK на SSD (random access cheap). На HDD держать все files open ест memory (each open file ~50KB metadata). Use limit (`10000`) на HDD systems.
+
+### 6. ForSt confusion
+
+Pre-FLIP-427 users sometimes try set `predefined-options` для ForSt:
+```yaml
+state.backend.type: forst
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED  # ❌ ignored
+```
+
+ForSt имеет own config namespace. Migration RocksDB→ForSt = переписать flink-conf state.backend.* keys.
+
+---
+
+## Compare PredefinedOptions
+
+| Setting | DEFAULT | SPINNING | SPINNING_HIGH_MEM | FLASH_SSD |
+|---|---|---|---|---|
+| MemTable size | 64MB | 128MB | 256MB | 64MB |
+| MemTable count | 2 | 4 | 4 | 4 |
+| Block cache | 8MB | 8MB | 256MB | 8MB |
+| target SST size | 64MB | 256MB | 256MB | 64MB |
+| Level base | 256MB | 1GB | 2GB | 256MB |
+| Compression | Snappy | Snappy | Snappy | LZ4 |
+| Background jobs | 2 | 4 | 4 | 4 |
+
+Note: Block cache в DEFAULT and FLASH_SSD low потому что предполагается `memory.managed: true` (Flink provides shared cache from managed memory pool).
+
+---
+
+## Quick deciison flow
+
+```
+Start: I need RocksDB tuning
+   │
+   ├─ Is hardware unknown?
+   │    └─ Use DEFAULT.
+   │
+   ├─ Is это NVMe SSD?
+   │    └─ Use FLASH_SSD_OPTIMIZED.
+   │
+   ├─ Is это HDD?
+   │    ├─ Lots of RAM (>32GB per TM)?
+   │    │   └─ SPINNING_DISK_OPTIMIZED_HIGH_MEM.
+   │    └─ SPINNING_DISK_OPTIMIZED.
+   │
+   └─ Need specific override?
+        └─ Use flink-conf properties (НЕ custom factory).
+```
+
+---
+
+<Callout type="warning">
+Если pull request меняет state.backend.rocksdb.options-factory — это flag для extra careful review. Custom factory может выглядеть minor change, но если не extends DefaultConfigurableOptionsFactory — breaks managed memory, leading к OOM в production. Это самый costly category багов в Flink ecosystem.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Team написал custom RocksDBOptionsFactory для одной specific tweak (max_background_jobs=16). Deploy в production. Через 6 часов первый TaskManager OOM-Killed. Через 12 часов — все 8 TaskManagers cycle through OOM-restart loop. Что произошло и как fix?"
+  answer="Высочайшая вероятность: custom factory не extends DefaultConfigurableOptionsFactory и не вызывает super.createDBOptions(). Это significa lost WriteBufferManager инжекция. Без WBM каждая Column Family имеет свой fixed MemTable budget (64-128MB default), без shared budget между CF/slots. На typical state-heavy job с 10 state primitives × 4 slots × 128MB MemTable + immutable MemTables + Block Cache = легко 5GB+ native memory. На 4GB managed TaskManager — OOM-Killed через несколько часов как MemTables постепенно fill up. Fix patterns: (1) ИЗВЕРНУТЬ к ваниль PredefinedOptions: state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED, удалить custom factory; (2) Для max_background_jobs override использовать flink-conf: state.backend.rocksdb.thread.num: 8 (это preserves shared resources); (3) Если custom factory необходим — переписать чтобы extends DefaultConfigurableOptionsFactory и calls super.createDBOptions(opts, handles) BEFORE applying overrides. Проверка: после fix monitor Status.JVM.Memory.Direct + state.backend.rocksdb.size-all-mem-tables — должен plateau не accumulate. Best practice rule: в 95% случаев custom factory не нужен — flink-conf properties покрывают вы customization needs БЕЗ memory management риска."
+/>

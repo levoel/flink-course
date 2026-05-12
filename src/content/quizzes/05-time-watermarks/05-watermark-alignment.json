@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/05-watermark-alignment",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-05",
+    "description": "Quiz for Watermark Alignment FLIP-217 lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-05-q1",
+      "type": "multiple-choice",
+      "question": "Какую проблему решает Watermark Alignment (FLIP-217, GA 1.18)?",
+      "options": [
+        { "id": "a", "text": "Ускоряет watermark generation на 76x" },
+        { "id": "b", "text": "Multi-source jobs: один source убегает по event time (fast, в backlog), другой отстаёт (slow). MIN propagation tank-ит WM до slow, fast source 'overruns' и накапливает state в buffers waiting for slow → OOM или TB-state. Alignment паузит fast splits через SourceCoordinator, сохраняя bounded drift" },
+        { "id": "c", "text": "Заменяет watermark на distributed consensus protocol" },
+        { "id": "d", "text": "Решает проблему network jitter в Kafka" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic problem: multi-source с разной скоростью progress. Без alignment, fast source (e.g., events 1M/s в backlog) убегает по event time на дни/недели вперёд slow source (1K/s). Join operator MIN propagation: WM = MIN = slow WM, но fast source buffer fills с events которые не могут yet emit. State growth до TBs, OOM. Alignment: SourceCoordinator на JobManager отслеживает per-split WM, pause-ит splits с drift > maxAllowedDrift. Result: bounded drift, bounded state, stable progress. 76x speedup относится к benchmark на 5000 subtasks — coordination performance.",
+      "studyHint": "Повторите урок — раздел 'Проблема, которую решает FLIP-217'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-05-q2",
+      "type": "multiple-choice",
+      "question": "Как работает SourceCoordinator при alignment?",
+      "options": [
+        { "id": "a", "text": "Он замедляет глобальный watermark generation" },
+        { "id": "b", "text": "Каждые updateInterval (1s default) все SourceReader посылают current WM в SourceCoordinator (на JobManager). Coordinator вычисляет MIN WM по группе, maxDesired = MIN + maxAllowedDrift. Для каждого split: если split.WM > maxDesired — pauseSplit. Reader получает команду, для Kafka — consumer.pause(partition)" },
+        { "id": "c", "text": "SourceCoordinator посылает события из Kafka напрямую" },
+        { "id": "d", "text": "Это deprecated концепт" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SourceCoordinator — per-source coordinator на JobManager (создаётся одним для каждого Source operator). RPC connection с каждым SourceReader. Каждые updateInterval (default 1s): readers report WM, coordinator computes alignment, sends pause/resume commands. Implementation для Kafka: SourceReader implements WatermarkAlignmentParams, в pauseOrResumeSplits() вызывает consumer.pause(TopicPartition). Native Kafka pause — никакого poll-then-discard, никакого memory pressure. События остаются в Kafka, не накапливаются в SourceReader buffer.",
+      "studyHint": "Повторите урок — раздел 'SourceCoordinator'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-05-q3",
+      "type": "multiple-choice",
+      "question": "Правильное соотношение между outOfOrderness и maxAllowedDrift?",
+      "options": [
+        { "id": "a", "text": "maxAllowedDrift < outOfOrderness для быстрого alignment" },
+        { "id": "b", "text": "maxAllowedDrift >= outOfOrderness * 2 (sweet spot: 2-5x). Если maxDrift < outOfOrderness — impossible условие (один source с WM = T, другой WM = T - outOfOrderness — он outOfOrderness ahead, coordinator pause fast, но WM застывает). Слишком large (1h) — close to no alignment" },
+        { "id": "c", "text": "Они должны быть одинаковыми" },
+        { "id": "d", "text": "Соотношение не имеет значения" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "maxAllowedDrift должен быть >= 2x outOfOrderness. Reasoning: forBoundedOutOfOrderness(20s) даёт WM = maxTs - 20s. Два source: А только что начал, max_ts_a = T_now, WM_a = T_now - 20s. Б замедленный, max_ts_b = T_now - 60s, WM_b = T_now - 80s. Natural drift = 60s. Если maxDrift = 20s — pause-ит А постоянно, но natural drift не уменьшается потому что Б просто не успевает. Stall. Sweet spot: maxDrift = 2-5x outOfOrderness = 40-100s для 20s outOfOrderness. Достаточно space для natural lag, ограничивает abnormal divergence. Too large (1h) — не protects от состоит-как-нет alignment problem.",
+      "studyHint": "Повторите урок — раздел 'Production gotchas'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-05-q4",
+      "type": "true-false",
+      "question": "withWatermarkAlignment работает между partitions одного source автоматически — per-split alignment включён по дефолту в forBoundedOutOfOrderness без explicit конфигурации.",
+      "correctAnswer": false,
+      "explanation": "False. Per-split alignment — отдельная feature FLIP-217 и она НЕ включена by default. Нужно explicit .withWatermarkAlignment(group, maxDrift, updateInterval) — это включает alignment как между partitions одного source, так и между sources (если group имя совпадает). Без alignment per-split: fast Kafka partitions внутри одного SourceReader buffer fills, увеличивая checkpoint state, до того как slow partitions догонят. Это было известная проблема до FLIP-217 1.18. Sources с одинаковым group name alignment-ятся вместе (cross-source). Без common group или без call — нет alignment. Production: ALWAYS configure alignment на multi-source/multi-partition pipelines.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

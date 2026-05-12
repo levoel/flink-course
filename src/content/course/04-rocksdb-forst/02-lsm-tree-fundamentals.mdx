@@ -1,0 +1,478 @@
+---
+title: "LSM-tree fundamentals: MemTable, SSTable, compaction"
+description: "Анатомия LSM-tree: MemTable (skiplist) → flush L0 → compaction L1..LN. Read path с Bloom filter и Block Cache. Write/read/space amplification triangle"
+order: 2
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["LSM-tree", "MemTable", "SSTable", "Compaction", "Bloom filter", "Block Cache", "Write Amplification"]
+---
+
+# LSM-tree fundamentals — основа RocksDB
+
+RocksDB — это implementation **Log-Structured Merge tree** (LSM-tree). Без понимания LSM tuning RocksDB — гадание на кофейной гуще. Этот урок препарирует LSM-tree до уровня, на котором можно osмысленно интерпретировать metrics и принимать tuning решения.
+
+LSM — фундаментально разный от B-tree (Postgres, MySQL InnoDB). B-tree оптимизирован для random reads/updates, LSM — для high write throughput, sequential disk I/O.
+
+---
+
+## Базовый принцип: write первым
+
+<DiagramContainer title="LSM-tree write path: in-memory → disk" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Write (PUT key=v)"
+        tooltip="Запись приходит в RocksDB через PUT(key, value). Это может быть через JNI из Java (Flink state.update) или native C++ client."
+      >
+        PUT(k, v)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="append-only" />
+    <FlowRow>
+      <DataBox
+        label="Write-Ahead Log (WAL)"
+        tooltip="Опционально (Flink turns OFF). Sequential append к log файлу. Обеспечивает crash recovery. Flink выключает WAL потому что checkpoint обеспечивает durability."
+      >
+        WAL (optional)
+      </DataBox>
+      <DataBox
+        label="MemTable"
+        tooltip="In-memory skiplist (default). Хранит entries отсортированными по key. Когда достигает write_buffer_size (default 64MB) — становится immutable, flush в background."
+      >
+        MemTable (skiplist)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="MemTable full → Immutable" />
+    <FlowRow>
+      <DataBox
+        label="Immutable MemTable"
+        tooltip="Read-only copy MemTable. Queued for flush. Reads видят и активный, и immutable MemTable. Параметр max-write-buffer-number — сколько immutable можно иметь одновременно."
+      >
+        Read-only MemTable
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="flush thread writes to disk" />
+    <FlowRow>
+      <DataBox
+        label="L0 SSTable"
+        tooltip="Sorted String Table — immutable file на диске, отсортированный по key. L0 — первый уровень. Может содержать overlapping ranges (несколько SST с одинаковыми keys). Compaction позже merges их."
+      >
+        L0 SST file (immutable)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### MemTable как skiplist
+
+MemTable по умолчанию — **skiplist**: probabilistic balanced data structure с O(log n) insert/read, lock-free для concurrent reads. Альтернативы: hash-skip-list, vector — но skiplist дефолтный потому что balance.
+
+```
+write_buffer_size:           64MB     # размер MemTable до flush
+max_write_buffer_number:     2        # max immutable MemTable
+min_write_buffer_to_merge:   1        # минимум для flush
+```
+
+Параметры существенно влияют на write throughput:
+- Маленький `write_buffer_size` (8MB) → частые flush → много мелких L0 SST → много compactions
+- Большой (256MB) → больше memory usage, больше потерь при crash без WAL (Flink: OK, потому что checkpoint)
+
+### Almost free writes
+
+LSM делает write — это append в MemTable (O(log n) в skiplist) + optional WAL append. Никаких random disk I/O, никаких index updates. Это **why LSM делает 5-10x faster writes** чем B-tree.
+
+---
+
+## SSTable: immutable, sorted, on-disk
+
+Когда MemTable flushes, Flink RocksDB записывает **SSTable** (Sorted String Table):
+
+```
+SSTable file format:
+[Data Block 1] [Data Block 2] ... [Data Block N]
+[Index Block]   ← maps key range → data block offset
+[Bloom Filter Block]   ← per-block bloom filters
+[Metadata]      ← min/max keys, sequence numbers, etc.
+[Footer]
+```
+
+Key properties:
+- **Immutable** — once written, never modified. Это критично для checkpoint sharing!
+- **Sorted** — entries в порядке возрастания key
+- **Block-compressed** — каждый data block (default 4KB) сжат Snappy/ZSTD
+- **Bloom filter** — probabilistic «is key here» check (1-byte per key, 1% false positive)
+- **Index block** — позволяет O(1) lookup data block для key range
+
+### Block Cache — share between SSTables
+
+Когда RocksDB reads block from SST, он cached в **Block Cache** (LRU). Это shared memory pool, не per-SST. В Flink:
+
+```yaml
+state.backend.rocksdb.block.cache-size: 256mb  # per-slot или shared?
+state.backend.rocksdb.memory.managed: true     # shared между slots
+```
+
+Cache hits — micros. Misses — disk read (NVMe ~50μs, HDD ~5ms, S3 ~50ms).
+
+---
+
+## Levels и compaction
+
+L0 — special level. Может содержать **overlapping** SST: разные SST могут иметь одинаковые keys (потому что они dumped из MemTable в разные моменты). Reads на L0 должны check **все** SST.
+
+L1+ — каждый level содержит **non-overlapping** SST (если leveled compaction). Reads читают max 1 SST per level.
+
+<DiagramContainer title="LSM levels: L0 → L1 → L2 → ..." color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="MemTable (in-mem)"
+        tooltip="64MB skiplist. Active writes. Когда full — flushes to L0."
+      >
+        Skiplist 64MB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="flush (when full)" />
+    <FlowRow>
+      <DataBox
+        label="L0 (overlapping SSTs)"
+        tooltip="Multiple SST files, могут содержать дубликатные keys (последний write wins по sequence number). Read должен check все SST в L0. Когда file count > l0_file_num_compaction_trigger (default 4) — trigger L0→L1 compaction."
+      >
+        4 SST files, ~64MB each
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="compaction L0 → L1 (merges все L0 SST в L1)" />
+    <FlowRow>
+      <DataBox
+        label="L1 (non-overlapping)"
+        tooltip="Каждый SST не overlapping с другими в этом level — есть min_key/max_key ranges. Read нужно check max 1 SST per level. Target size: max_bytes_for_level_base (default 256MB)."
+      >
+        Non-overlapping SST, ~256MB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="L1 full → compaction L1 → L2 (×10 by default)" />
+    <FlowRow>
+      <DataBox
+        label="L2 (10x size)"
+        tooltip="Target size = max_bytes_for_level_base × max_bytes_for_level_multiplier (default 10). L2 = 2.5GB target. L3 = 25GB. L4 = 250GB. И так далее."
+      >
+        ~2.5GB (10x L1)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="L3..L6"
+        tooltip="Each level 10x larger. Default 7 levels. На L6 можно хранить TB data. Most reads (especially cold data) сидят в high levels."
+      >
+        ... up to L6
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Compaction process
+
+Когда `l0_file_num_compaction_trigger` (default 4) достигнут:
+
+1. Background thread picks несколько L0 SST + overlapping L1 SST
+2. Merges them (sorted merge join по key)
+3. Writes new L1 SST (могут быть больше)
+4. Deletes old L0/L1 SST
+
+Это **write amplification** — данные многократно переписываются с level на level. Counterpoint — это что упорядочивает данные для быстрого read.
+
+### Tunable parameters
+
+```yaml
+# L0 trigger:
+state.backend.rocksdb.level0_file_num_compaction_trigger: 4
+
+# Level size growth:
+state.backend.rocksdb.max_bytes_for_level_base: 256MB
+state.backend.rocksdb.max_bytes_for_level_multiplier: 10
+
+# Compression per level:
+state.backend.rocksdb.compression_per_level:
+  - none      # L0: no compression for fast flush
+  - none      # L1
+  - snappy    # L2+
+  - snappy
+  - snappy
+  - zstd      # cold levels: aggressive
+  - zstd
+```
+
+---
+
+## Read path: где может быть key
+
+<DiagramContainer title="Read path: lookup sequence" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="GET(key)"
+        tooltip="Client (Flink через JNI) запрашивает значение по key. Внутри Column Family этого state."
+      >
+        Read request
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="1. Active MemTable"
+        tooltip="Check in-memory skiplist первым делом. O(log n), все в RAM. Cache hit обычно <1μs."
+      >
+        Skiplist lookup
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="not found" />
+    <FlowRow>
+      <DataBox
+        label="2. Immutable MemTables"
+        tooltip="Если есть immutable MemTables waiting for flush — check them. Same skiplist structure. O(log n)."
+      >
+        Immutable check
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="not found" />
+    <FlowRow>
+      <DataBox
+        label="3. Block Cache"
+        tooltip="Шанс что blocks из недавно accessed SST уже в Block Cache (LRU). Cache hit ~10μs (no disk I/O)."
+      >
+        LRU cache check
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="not in cache" />
+    <FlowRow>
+      <DataBox
+        label="4. Bloom Filter"
+        tooltip="Перед disk read проверяем Bloom Filter (in memory per SST). Если bloom говорит 'definitely not here' — skip SST. Если 'might be here' (1% false positive) — read data block."
+      >
+        Probabilistic check
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="might be in SST" />
+    <FlowRow>
+      <DataBox
+        label="5. SST disk read"
+        tooltip="Read data block from SST file. Block decompressed, key search через index. Disk I/O — NVMe ~50μs, HDD ~5ms, S3 ~50ms. Block cached after read."
+      >
+        Index → Data block
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="repeat for L0, L1, L2, ..." />
+    <FlowRow>
+      <DataBox
+        label="Per level lookup"
+        tooltip="L0 — check ВСЕ SST (overlapping). L1+ — max 1 SST per level (non-overlapping). Total IO = 1 (L0 worst case 4 SST) + 1 per level. С 7 levels worst case ~10 disk seeks."
+      >
+        L0 (max 4) → L1 → ... L6
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Bloom Filter — критично для performance
+
+Без Bloom Filter каждый GET для несуществующего key читал бы **все** SST на дисках. С Bloom (default enabled):
+- 1% false positive rate
+- Per-SST in-memory structure (~1-2 bytes per key)
+- Read miss skips ~99% SST без disk I/O
+
+Параметры:
+```yaml
+state.backend.rocksdb.bloom_bits_per_key: 10  # default 10, higher = less false positives
+state.backend.rocksdb.use_bloom_filter: true   # critical для read perf
+state.backend.rocksdb.cache_index_and_filter_blocks: true  # Block cache
+```
+
+---
+
+## Tombstones и DELETE
+
+DELETE в LSM — это **append** записи tombstone. Original key+value остаётся в SST до compaction. Это означает:
+
+- DELETE = тот же cost что PUT
+- Space временно doubles (original + tombstone)
+- Read должен check tombstone — если найден, return null
+- Compaction physically removes tombstone+original
+
+Для Flink этим важно при state.clear() heavy workloads — tombstones накапливаются, требуют compaction.
+
+```yaml
+state.backend.rocksdb.compaction.delete_obsolete_files_period: 6h
+```
+
+---
+
+## Write/Read/Space amplification — fundamental tradeoff
+
+LSM имеет три «amplification» метрики, которые торгуются друг с другом:
+
+### Write Amplification (WA)
+
+`bytes_written_to_disk / bytes_written_by_user`. Каждый byte user-data пишется multiple times при compaction.
+
+Leveled compaction:
+```
+L0 → L1 (read L0+L1, write merged L1)         ~10x
+L1 → L2                                        ~10x
+L2 → L3                                        ~10x
+...
+Total WA для 7 levels: ~50-70x
+```
+
+То есть 1GB user writes = 50-70GB disk writes за lifetime. Killing SSD endurance.
+
+### Read Amplification (RA)
+
+`disk_reads_per_user_read`. Сколько раз обращаемся к SST для одного GET.
+
+Leveled: 1 (L0 best case) до 7 (worst case, key on every level). Bloom filter снижает RA для existing keys (1-2 SST) и для missing keys (~0.07).
+
+### Space Amplification (SA)
+
+`disk_space_used / live_data`. Сколько временно дубликатов из-за uncompacted data + tombstones.
+
+Leveled: typically 1.1-1.5 (10-50% overhead).
+Universal: 1.5-2 (50-100% overhead).
+
+### The triangle
+
+```
+       Write Amp
+         /\
+        /  \
+       /    \
+      / LSM  \
+     / TRIANGLE\
+    /          \
+   /────────────\
+Read Amp    Space Amp
+```
+
+**You can pick two**. Leveled compaction = low SA + low RA + high WA. Universal compaction = lower WA + higher SA. Урок 04 разбирает trade-offs.
+
+---
+
+## RocksDB tuning knobs (preview)
+
+Основные параметры, влияющие на LSM behaviour:
+
+```yaml
+# Memory:
+state.backend.rocksdb.writebuffer.size: 64mb
+state.backend.rocksdb.writebuffer.count: 2
+
+# Compaction:
+state.backend.rocksdb.compaction.style: LEVEL   # или UNIVERSAL
+state.backend.rocksdb.compaction.level.use-dynamic-size: true
+state.backend.rocksdb.compaction.level.max-size-level-base: 256mb
+state.backend.rocksdb.compaction.level.target-file-size-base: 64mb
+
+# Reads:
+state.backend.rocksdb.thread.num: 4
+state.backend.rocksdb.use-bloom-filter: true
+state.backend.rocksdb.block.cache-size: 256mb
+
+# Predefined (recommended starting point):
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+```
+
+Урок 05 разбирает PredefinedOptions детально.
+
+---
+
+## Production gotchas
+
+### 1. L0 file pile-up = write stall
+
+```
+L0 files: 24 / max 36 trigger stall
+```
+
+Если flush rate > compaction rate, L0 файлы накапливаются. После `level0_slowdown_writes_trigger` (default 20) — RocksDB ARTIFICIALLY slows writes. После `level0_stop_writes_trigger` (default 36) — STOPS writes полностью, ждёт compaction. Это видно в Flink Web UI как полный stall.
+
+**Fix**: больше compaction threads, увеличить L1 size, switch на universal compaction для write-heavy.
+
+### 2. Bloom filter disabled — read perf cliff
+
+Some custom RocksDB configs disable bloom filter. Reads без bloom = O(L * SST_per_L) disk seeks per GET. На large state это 100ms+ per read.
+
+**Always enable bloom**.
+
+### 3. Block cache size mis-set
+
+Слишком маленький (16MB) на TBs state → 99% cache miss → disk-bound. Слишком большой (16GB) на 1GB state → wasted memory.
+
+**Right size**: 10-30% of working set (hot data). Monitor cache hit rate.
+
+### 4. Compression on L0
+
+```yaml
+compression_per_level:
+  - snappy    # ❌ slows flush
+```
+
+Compression на L0 slows MemTable flush — увеличивает risk write stall. Recommended: L0/L1 без compression, L2+ с snappy/zstd.
+
+### 5. Too many SST files
+
+`open files` system limit (`ulimit -n`). Если number SST > limit → file open errors. С 1TB state и 64MB SST per file = 16k files. Default `ulimit -n 1024` insufficient.
+
+Fix: `ulimit -n 65536` в container/systemd.
+
+### 6. Compaction throttling
+
+```yaml
+state.backend.rocksdb.thread.num: 1   # ❌ slow compaction
+```
+
+Один compaction thread на TBs state = constant L0 pile-up. Set `thread.num: 4-8` для production.
+
+### 7. Sequential vs random key distribution
+
+Flink keys (часто Long, String через MurmurHash) уже random distributed. RocksDB LSM optimized для both, но certain optimizations (key prefix iterator) работают только при sequential prefixes. Обычно не tuneable из Flink.
+
+---
+
+## Performance numbers (NVMe SSD, 1TB state)
+
+| Operation | Latency P50 | Latency P99 |
+|---|---|---|
+| MemTable hit (read) | <1μs | 5μs |
+| Block cache hit | 10μs | 50μs |
+| L0 disk read (NVMe) | 50μs | 200μs |
+| L1-L3 disk read | 100μs | 500μs |
+| L4-L6 cold disk read | 500μs | 2ms |
+| Write (MemTable append) | 5μs | 50μs |
+| L0→L1 compaction (64MB files) | 100ms | 500ms |
+| Full GC pause (Java side) | 50ms | 500ms |
+
+Compare HDD: ~10x slower. S3 (ForSt without cache): ~100x slower.
+
+---
+
+## Cheat sheet
+
+```
+LSM-tree =
+  in-memory MemTable
+    + flushed to L0 SSTable (overlapping)
+    + compacted into L1+ (non-overlapping, 10x size each level)
+
+Write:    O(log n) to MemTable, almost free
+Read:     bloom filter check + up to L disk reads
+Tombstone: DELETE = append marker, removed at compaction
+
+Triangle: low Write Amp + low Read Amp + low Space Amp — pick 2
+```
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: Flink job с RocksDB backend на NVMe SSD. Метрики показывают L0 SST count = 30 (растёт), writes полностью stopped после достижения 36. Read latency P99 = 50ms (нормально было 5ms). Что происходит и как fix?"
+  answer="Это classic write stall — flush rate > compaction rate, L0 файлы накапливаются. По default level0_slowdown_writes_trigger=20 (writes throttle), level0_stop_writes_trigger=36 (full stop). Cause analysis: (1) compaction threads insufficient — default thread.num=1 не успевает merge L0→L1 при high write throughput; (2) L1 target size слишком маленький — каждый L0→L1 compaction triggers cascade L1→L2; (3) compaction throughput bottlenecked CPU или disk I/O. Fixes по эскалации: (1) state.backend.rocksdb.thread.num: 8 — больше compaction parallelism; (2) увеличить max_bytes_for_level_base до 512MB-1GB — меньше cascade; (3) увеличить level0_file_num_compaction_trigger до 8 — раньше start compaction (proactive); (4) если write-heavy — consider universal compaction (меньше WA); (5) на disk side — switch с consumer SSD на enterprise NVMe для consistent throughput; (6) применить PredefinedOptions.FLASH_SSD_OPTIMIZED — это устанавливает sane defaults для SSD. Read latency degraded потому что L0 содержит 30 overlapping SST — каждый read должен check все 30 (даже с bloom 1% miss × 30 SST = 0.3 false positives per read → 0.3 disk reads extra per GET)."
+/>

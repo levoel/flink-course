@@ -1,0 +1,574 @@
+---
+title: "Metrics system: Counter, Gauge, Meter, Histogram"
+description: "Counter / Gauge / Meter / Histogram. MetricGroup hierarchy. User metrics via getRuntimeContext().getMetricGroup(). Naming conventions. Production examples"
+order: 3
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Metrics", "Counter", "Gauge", "Meter", "Histogram", "User Metrics", "MetricGroup"]
+---
+
+# Flink Metrics System
+
+Метрики — главная observability primitive для Flink. Web UI красив для live debugging, но historical trends, alerting, capacity planning требуют persistent metrics. Flink имеет богатую metrics систему с 4 типами метрик, иерархической MetricGroup-аппой, и плагинов exporters (Prometheus, OTel, JMX, StatsD).
+
+В этом уроке препарируем 4 типа метрик (Counter / Gauge / Meter / Histogram), MetricGroup hierarchy, и как добавить user metrics в свой код правильно.
+
+---
+
+## Четыре типа метрик
+
+### 1. Counter — accumulated count
+
+Monotonically increasing integer counter. Можно increment/decrement, но обычно только increment.
+
+```java
+public class MyMapper extends RichMapFunction<Event, Result> {
+    private transient Counter errorCounter;
+    private transient Counter processedCounter;
+
+    @Override
+    public void open(Configuration cfg) {
+        errorCounter = getRuntimeContext()
+            .getMetricGroup()
+            .counter("errors");
+
+        processedCounter = getRuntimeContext()
+            .getMetricGroup()
+            .counter("processedRecords");
+    }
+
+    @Override
+    public Result map(Event e) {
+        try {
+            Result r = process(e);
+            processedCounter.inc();
+            return r;
+        } catch (Exception ex) {
+            errorCounter.inc();
+            throw ex;
+        }
+    }
+}
+```
+
+Counter подходит для:
+- Records processed
+- Errors / retries
+- Cache hits / misses
+- Custom business events
+
+В Prometheus это **counter** type, в Grafana обычно visualized as rate: `rate(my_counter[5m])`.
+
+### 2. Gauge — instantaneous value
+
+Текущее значение, может go up or down. Lambda evaluated каждый sample.
+
+```java
+public class StatefulMapper extends RichMapFunction<Event, Result> {
+    private transient Map<String, Long> userCache = new HashMap<>();
+
+    @Override
+    public void open(Configuration cfg) {
+        getRuntimeContext().getMetricGroup()
+            .gauge("cacheSize", () -> (long) userCache.size());
+
+        getRuntimeContext().getMetricGroup()
+            .gauge("memoryUsedMB", () ->
+                Runtime.getRuntime().totalMemory() / 1024 / 1024);
+    }
+
+    @Override
+    public Result map(Event e) {
+        userCache.computeIfAbsent(e.getUserId(), k -> 0L);
+        return process(e);
+    }
+}
+```
+
+Gauge подходит для:
+- Queue depth
+- Cache size
+- Memory usage
+- Connection pool active connections
+
+В Prometheus это **gauge** type, в Grafana `my_gauge` напрямую.
+
+**Performance**: lambda calculation вызывается на каждый scrape (e.g. 15s в Prometheus). Дорогие calculations → noticeable overhead. Cache при необходимости.
+
+### 3. Meter — events per second
+
+Rate measurement. Track records/sec, throughput.
+
+```java
+public class MyMapper extends RichMapFunction<Event, Result> {
+    private transient Meter recordsPerSecond;
+
+    @Override
+    public void open(Configuration cfg) {
+        com.codahale.metrics.Meter dropwizardMeter =
+            new com.codahale.metrics.Meter();
+        recordsPerSecond = getRuntimeContext()
+            .getMetricGroup()
+            .meter("recordsPerSecond",
+                new DropwizardMeterWrapper(dropwizardMeter));
+    }
+
+    @Override
+    public Result map(Event e) {
+        recordsPerSecond.markEvent();   // increment event count
+        return process(e);
+    }
+}
+```
+
+Meter computes:
+- `getRate()` — events/sec
+- `getCount()` — total events
+
+Это convenience wrapper — можно тоже самое через Counter + Gauge для rate. Прометheus auto-computes rate из counter.
+
+**В большинстве случаев** — используйте Counter, считайте rate в Prometheus query (`rate(counter[1m])`). Meter избыточен в этой setup.
+
+### 4. Histogram — distribution
+
+Distribution measurements: latency, sizes, etc. Compute percentiles (P50, P95, P99).
+
+```java
+public class AsyncLookup extends AsyncFunction<Event, Result> {
+    private transient Histogram lookupLatency;
+
+    @Override
+    public void open(Configuration cfg) {
+        com.codahale.metrics.Histogram dwHist =
+            new com.codahale.metrics.Histogram(
+                new SlidingTimeWindowReservoir(60, TimeUnit.SECONDS));
+        lookupLatency = getRuntimeContext()
+            .getMetricGroup()
+            .histogram("dbLookupLatencyMs",
+                new DropwizardHistogramWrapper(dwHist));
+    }
+
+    @Override
+    public void asyncInvoke(Event input, ResultFuture<Result> resultFuture) {
+        long start = System.currentTimeMillis();
+        db.lookupAsync(input.getId(), (result, error) -> {
+            long elapsed = System.currentTimeMillis() - start;
+            lookupLatency.update(elapsed);
+            resultFuture.complete(Collections.singleton(result));
+        });
+    }
+}
+```
+
+Histogram queries:
+- `getStatistics().getQuantile(0.99)` — P99
+- `getStatistics().getMean()` — average
+- `getCount()` — total samples
+
+**Reservoir matters**: `SlidingTimeWindowReservoir(60s)` — rolling 60s window. Без этого histogram использует `ExponentiallyDecayingReservoir` — биased для recent samples но не sharp window.
+
+В Prometheus histogram type экспортируется как multiple metrics: `_bucket`, `_count`, `_sum`.
+
+---
+
+## MetricGroup hierarchy
+
+Метрики организованы в **MetricGroup** иерархию:
+
+```
+<host>.taskmanager.<tm_id>.<job_name>.<task_name>.<subtask_index>.<operator_name>.<metric_name>
+```
+
+Пример:
+
+```
+host1.taskmanager.tm-1.MyJob.KeyedProcess.0.HotKeyDetector.errors
+host1.taskmanager.tm-1.MyJob.KeyedProcess.1.HotKeyDetector.errors
+```
+
+`getRuntimeContext().getMetricGroup()` возвращает operator-level group. Из этого можно создавать sub-groups:
+
+```java
+MetricGroup base = getRuntimeContext().getMetricGroup();
+
+MetricGroup userGroup = base.addGroup("userMetrics");
+MetricGroup categoryGroup = userGroup.addGroup("category", "fraud");
+// → user_metrics.category.fraud.<metric>
+
+Counter alerts = categoryGroup.counter("alerts");
+```
+
+Это даёт structured naming, легче alerts/dashboards filter by tag.
+
+### Variable scopes
+
+Default scope для operator:
+```
+taskmanager.<tm_id>.<job_name>.<task_name>.<subtask>.<operator_name>
+```
+
+Можно override через config:
+```yaml
+metrics.scope.tm: "<host>.taskmanager.<tm_id>"
+metrics.scope.tm.job: "<host>.taskmanager.<tm_id>.<job_name>"
+metrics.scope.task: "<host>.taskmanager.<tm_id>.<job_name>.<task_name>.<subtask_index>"
+metrics.scope.operator: "<host>.taskmanager.<tm_id>.<job_name>.<task_name>.<subtask_index>.<operator_name>"
+```
+
+Эти templates контролируют labels в Prometheus exporter.
+
+---
+
+## Naming conventions
+
+Flink не enforce conventions, но есть de-facto standards:
+
+| Metric type | Naming pattern | Example |
+|---|---|---|
+| Counter | `<noun>` или `<noun>Total` | `processedRecords`, `errorsTotal` |
+| Gauge | `<noun>` либо `<noun>Bytes` | `cacheSize`, `memoryUsedBytes` |
+| Meter | `<noun>PerSecond` | `recordsPerSecond` |
+| Histogram | `<noun>Ms` либо `<noun>Latency` | `dbLookupLatencyMs`, `serializeTimeNs` |
+
+Bad naming:
+- `latency` → не понятно units. Use `latencyMs`.
+- `count` → counter or gauge? Use `totalCount` (counter) или `currentCount` (gauge).
+- `time` → units? `timeMs`, `timeNs`.
+
+### Tags vs metric names
+
+Plain names:
+```
+errors.payment
+errors.billing
+errors.fraud
+```
+
+3 metrics. Cardinality высокая, графики разбросаны.
+
+Tags approach:
+```java
+MetricGroup base = getRuntimeContext().getMetricGroup();
+base.addGroup("category", category).counter("errors");
+```
+
+1 metric `errors` с label `category`. Меньше metrics names, queryable как `sum by (category)`. Prometheus loves это.
+
+---
+
+## Встроенные Flink metrics
+
+Flink exposes огромный набор built-in metrics. Top categories:
+
+### JVM metrics
+```
+flink_taskmanager_Status_JVM_Memory_Heap_Used
+flink_taskmanager_Status_JVM_Memory_Heap_Max
+flink_taskmanager_Status_JVM_Memory_NonHeap_Used
+flink_taskmanager_Status_JVM_Memory_Direct_Count
+flink_taskmanager_Status_JVM_Memory_Direct_MemoryUsed
+flink_taskmanager_Status_JVM_GarbageCollector_<gc_name>_Time
+flink_taskmanager_Status_JVM_GarbageCollector_<gc_name>_Count
+flink_taskmanager_Status_JVM_Threads_Count
+flink_taskmanager_Status_JVM_CPU_Load
+flink_taskmanager_Status_JVM_CPU_Time
+```
+
+### Network metrics
+```
+flink_taskmanager_Status_Network_AvailableMemorySegments
+flink_taskmanager_Status_Network_TotalMemorySegments
+flink_taskmanager_job_task_buffersInUseCount
+flink_taskmanager_job_task_buffersOutPoolUsage
+```
+
+### Per-operator metrics (1.13+)
+```
+flink_taskmanager_job_task_operator_busyTimeMsPerSecond
+flink_taskmanager_job_task_operator_idleTimeMsPerSecond
+flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond
+flink_taskmanager_job_task_operator_numRecordsIn
+flink_taskmanager_job_task_operator_numRecordsOut
+flink_taskmanager_job_task_operator_numLateRecordsDropped
+flink_taskmanager_job_task_operator_currentInputWatermark
+flink_taskmanager_job_task_operator_currentOutputWatermark
+```
+
+### Checkpoint metrics
+```
+flink_jobmanager_job_lastCheckpointDuration
+flink_jobmanager_job_lastCheckpointSize
+flink_jobmanager_job_numberOfCompletedCheckpoints
+flink_jobmanager_job_numberOfFailedCheckpoints
+flink_taskmanager_job_task_alignmentDurationMs
+flink_taskmanager_job_task_lastCheckpointAsyncDuration
+```
+
+### State backend metrics
+```
+flink_taskmanager_<state>_rocksdb_size_all_mem_tables
+flink_taskmanager_<state>_rocksdb_block_cache_usage
+flink_taskmanager_<state>_rocksdb_block_cache_hit
+flink_taskmanager_<state>_rocksdb_compaction_pending_bytes
+flink_taskmanager_<state>_rocksdb_estimate_num_keys
+```
+
+Включаются через config:
+```yaml
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+state.backend.rocksdb.metrics.compaction-pending-bytes: true
+```
+
+(Не все enabled by default из-за overhead).
+
+---
+
+## Metric reporters
+
+Reporters экспортируют metrics к external systems. Конфиг:
+
+```yaml
+metrics.reporters: prom
+
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+metrics.reporter.prom.filterLabelValueCharacters: true
+```
+
+Поддерживаемые reporters:
+
+| Reporter | Use case |
+|---|---|
+| **PrometheusReporter** (pull) | Стандарт для metrics в Kubernetes |
+| **PrometheusPushGatewayReporter** | Short-lived jobs (batch) |
+| **OpenTelemetryReporter** (1.20+, 2.3 gRPC GA) | Unified observability stack |
+| **InfluxDBReporter** | InfluxDB / TimescaleDB stacks |
+| **GraphiteReporter** | Legacy Graphite stacks |
+| **StatsDReporter** | Datadog (через statsd) |
+| **SLF4JReporter** | Logging metrics (debug only) |
+| **JMXReporter** | Local JMX inspection |
+
+Можно include multiple reporters concurrently:
+
+```yaml
+metrics.reporters: prom,otel
+
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OtelReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector:4317
+```
+
+---
+
+## Production patterns
+
+### Pattern 1: Business KPI metrics
+
+```java
+public class FraudDetector extends KeyedProcessFunction<String, Event, Alert> {
+    private transient Counter fraudDetected;
+    private transient Counter falsePositives;
+    private transient Histogram detectionLatency;
+
+    @Override
+    public void open(Configuration cfg) {
+        MetricGroup g = getRuntimeContext().getMetricGroup()
+            .addGroup("business");
+        fraudDetected = g.counter("fraudDetected");
+        falsePositives = g.counter("falsePositives");
+        detectionLatency = g.histogram("detectionLatencyMs",
+            new DropwizardHistogramWrapper(
+                new com.codahale.metrics.Histogram(
+                    new SlidingTimeWindowReservoir(60, TimeUnit.SECONDS))));
+    }
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Alert> out) {
+        long start = System.currentTimeMillis();
+        boolean isFraud = check(e);
+        detectionLatency.update(System.currentTimeMillis() - start);
+        if (isFraud) {
+            fraudDetected.inc();
+            out.collect(new Alert(e));
+        }
+    }
+}
+```
+
+Business metrics, alerting на fraud rate spike: `rate(business_fraudDetected[5m]) > 10`.
+
+### Pattern 2: External system health
+
+```java
+public class DbLookup extends RichAsyncFunction<Event, Result> {
+    private transient Counter dbCallsTotal;
+    private transient Counter dbCallsFailures;
+    private transient Histogram dbCallLatency;
+    private transient Gauge<Long> dbConnPoolActive;
+
+    @Override
+    public void open(Configuration cfg) {
+        MetricGroup g = getRuntimeContext().getMetricGroup().addGroup("db");
+        dbCallsTotal = g.counter("callsTotal");
+        dbCallsFailures = g.counter("callsFailures");
+        dbCallLatency = g.histogram("callLatencyMs", ...);
+        g.gauge("connectionsActive", () -> connectionPool.getActive());
+    }
+    // ...
+}
+```
+
+Monitor external dependency health: error rate, latency, connection pool depth.
+
+### Pattern 3: State-related debug metrics
+
+```java
+public class StatefulProcessor extends KeyedProcessFunction<...> {
+    private transient ValueState<UserHistory> state;
+    private transient Histogram stateSizeBytes;
+
+    @Override
+    public void open(Configuration cfg) {
+        state = getRuntimeContext().getState(...);
+        stateSizeBytes = getRuntimeContext().getMetricGroup()
+            .histogram("stateSizeBytes", ...);
+    }
+
+    @Override
+    public void processElement(...) {
+        UserHistory h = state.value();
+        stateSizeBytes.update(h == null ? 0 : h.estimateSize());
+        // ...
+    }
+}
+```
+
+Track state size distribution per key — detect skew, abnormal users.
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Histogram reservoir matters
+
+```java
+new com.codahale.metrics.Histogram();  // default ExponentiallyDecayingReservoir
+```
+
+Default reservoir biased для recent samples — но это не sharp window. Для P99 за «last 1 minute» используйте `SlidingTimeWindowReservoir`.
+
+```java
+new com.codahale.metrics.Histogram(
+    new SlidingTimeWindowReservoir(60, TimeUnit.SECONDS));
+```
+
+### Gotcha 2: Per-key metrics = cardinality explosion
+
+```java
+// ANTI-PATTERN:
+getMetricGroup()
+    .addGroup("user", record.getUserId())   // millions of users
+    .counter("events");
+```
+
+Million-cardinality label → millions of metrics → Prometheus dies.
+
+**Fix**: top-N tracking — track only top 10 hot users:
+
+```java
+private final Map<String, Counter> hotUserCounters = new HashMap<>();
+// На каждый record: если userId в top-10 (через HyperLogLog или Count-Min), track separately.
+```
+
+### Gotcha 3: Gauge lambda дорогая
+
+```java
+g.gauge("slowMetric", () -> {
+    return database.expensiveQuery();   // called every scrape!
+});
+```
+
+Каждые 15s (Prometheus default) тяжёлая операция → blocks metric reporter.
+
+**Fix**: cache value в RichFunction, update lazy:
+
+```java
+private volatile long cachedValue = 0;
+@Override
+public void open(Configuration cfg) {
+    // Update periodically через timer
+    new Thread(() -> {
+        while (running) {
+            cachedValue = database.expensiveQuery();
+            Thread.sleep(60_000);
+        }
+    }).start();
+    g.gauge("metric", () -> cachedValue);
+}
+```
+
+### Gotcha 4: Counter overflow
+
+`org.apache.flink.metrics.Counter` использует `long`, overflow невозможно практически. Но если используете `int` counter from Dropwizard через wrapper — overflow возможен.
+
+### Gotcha 5: Metric name conflicts
+
+Two operators named same → metrics merge with same name. Confusion в Grafana.
+
+**Fix**: explicit operator names:
+
+```java
+.uid("my-mapper")
+.name("MyMapper")
+```
+
+`name()` идёт в metric path → unique names = unique metrics.
+
+### Gotcha 6: Reporter overhead
+
+Prometheus reporter scraping → CPU/network spike каждые 15s. На huge cluster это noticeable.
+
+**Fix**: filter unused metrics:
+
+```yaml
+metrics.reporter.prom.scope-filter: "!flink.taskmanager.*.shuffle.*"
+```
+
+Exclude expensive subsystems вроде network shuffle internals.
+
+### Gotcha 7: Time units inconsistent
+
+Built-in metrics use mix of nanoseconds, milliseconds, seconds. `currentInputWatermark` — Unix milliseconds. `checkpointStartDelayNanos` — nanoseconds. Verify units перед alerting!
+
+---
+
+## Diagnostic checklist для metrics
+
+1. **Are metrics being exported?** Прometheus targets discoverable?
+2. **Counter rate**: `rate(counter[5m])` non-zero?
+3. **Histogram percentiles**: P50/P95/P99 reasonable?
+4. **Gauge fluctuation**: stable plateau или линейный рост?
+5. **Cardinality**: metric explosion?
+6. **Naming consistency**: easy filter и query?
+
+---
+
+<Callout type="note">
+Counter — самый используемый тип metrics. Если сомневаетесь — Counter. Rate computation делайте в Prometheus (`rate()`), не в Meter — это flexibility (window size variable, multi-rate views).
+</Callout>
+
+---
+
+<Callout type="warning">
+Per-key labels (userId, accountId, sessionId) — cardinality explosion. Prometheus может умереть с 1M+ unique series. Используйте top-N tracking или explicit aggregation. Лучше всего — track aggregate (counter + sum by category), не individual entities.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Design metrics для production Flink job: KafkaSource → JSON parse → KeyedProcess (fraud detection с RocksDB) → KafkaSink (EXACTLY_ONCE). Какие user metrics добавить? Какие built-in metrics критичны для production dashboards и alerting? Какие cardinality pitfalls избегать?"
+  answer="User metrics design: (1) Source-level (на parse): Counter parseErrors (catastrophic schema fails), Counter parseSuccess, Histogram parseLatencyMs. Кroup: 'source'. (2) Business KPI (в fraud detector): Counter fraudDetected (alert на rate spike), Counter falsePositivesEstimated, Histogram detectionLatencyMs, Gauge<Long> activeWatchedUsers (для capacity). Group: 'business'. (3) State health (в fraud detector): Histogram userStateSizeBytes (distribution per key — detect skew), Counter stateAccessErrors, Counter stateCleanupActions (TTL purges). Group: 'state'. (4) External integrations (если есть DB lookup): Counter dbCallsTotal, Counter dbCallsFailures, Histogram dbCallLatencyMs, Gauge connectionsActive. Group: 'db'. (5) Sink (Kafka producer): Counter kafkaSendErrors, Histogram kafkaCommitDurationMs (для EOS transaction time), Gauge inflightTransactions. Built-in metrics critical для dashboards и alerting: (1) Health: flink_jobmanager_numRunningJobs (== expected count?), flink_jobmanager_job_uptime (lifespan). (2) Backpressure: flink_taskmanager_job_task_operator_busyTimeMsPerSecond, idleTimeMsPerSecond, backPressuredTimeMsPerSecond — per operator для DAG-level view. Alert: avg_over_time(backPressured > 800)[5m]. (3) Throughput: flink_taskmanager_job_task_operator_numRecordsInPerSecond, numRecordsOutPerSecond. (4) Watermarks: flink_taskmanager_job_task_operator_currentInputWatermark, currentOutputWatermark. Alert: now() - currentInputWatermark > 5min (stuck). (5) Checkpoints: lastCheckpointDuration (alert > timeout/2), lastCheckpointSize (alert sudden growth), numberOfFailedCheckpoints (alert > 0). (6) GC: GarbageCollector_*_Time per minute (alert > 10s/min G1, > 3s/min ZGC). (7) Memory: Heap_Used (alert > 90%), Direct_MemoryUsed (alert linear growth = leak), RocksDB rocksdb_block_cache_hit ratio. (8) Network: AvailableMemorySegments (alert < 10% — insufficient buffers coming). (9) Late events: numLateRecordsDropped (alert > 0 if not side output). Cardinality pitfalls (avoid): (1) Per-user metrics: getMetricGroup().addGroup('user', userId) — millions cardinality kills Prometheus. Top-N approach или aggregate-only. (2) Per-transaction-id: same issue. (3) Per-request timestamp в label: unbounded growth. (4) Cardinality аnti-pattern: dynamic group names с unbounded vocabulary. Solution: aggregate metrics (counter per category, top-N detail с sliding window), use histograms для percentile distributions не per-entity tracking. Dashboard structure: (1) Overview row: throughput, error rate, latency P99, backpressure heatmap. (2) Health row: heap, GC, direct memory, checkpoints. (3) Pipeline row: per-operator busy/idle/bp, records flow. (4) Business row: fraud detection rate, latency, KPI. (5) Dependencies row: DB, sink (Kafka commit), state backend. Alerting tiers: Critical (P0): job stopped, checkpoint fail, EOOMKill. High (P1): sustained backpressure, watermark stuck, error rate spike. Medium (P2): high GC time, latency degradation, state size growth. Each tier с different routing (PagerDuty for P0, Slack for P2)."
+/>

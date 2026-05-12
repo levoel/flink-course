@@ -1,0 +1,419 @@
+---
+title: "FLIP-27 Source API: SplitEnumerator, SourceReader, SourceCoordinator"
+description: "Глубокий разбор FLIP-27 Source API в Flink 2.x: Source factory создаёт SplitEnumerator (JM) и SourceReader (TM). SourceCoordinator coordinates watermark alignment, recovery. Boundedness.BOUNDED vs CONTINUOUS_UNBOUNDED. Unified batch/streaming"
+order: 2
+difficulty: "advanced"
+estimatedTime: 35
+topics: ["FLIP-27", "Source API", "SplitEnumerator", "SourceReader", "SourceCoordinator", "Boundedness", "Unified Batch Streaming"]
+---
+
+# FLIP-27 Source API — unified batch/streaming foundation
+
+FLIP-27 — это re-design Source API, introduced в Flink 1.11, и **единственный** Source API в Flink 2.x (SourceFunction removed). Это foundational primitive — все modern connectors (Kafka, File, JDBC, Iceberg, Flink CDC) implement FLIP-27. Понимание его архитектуры — ключ к understanding почему unified batch/streaming работает, как watermark alignment coordinates multiple sources, и как custom connectors fit в этот framework.
+
+Этот урок — самый important в модуле. Без understanding FLIP-27 вы не понимаете architecture modern Flink connectors.
+
+---
+
+## Почему FLIP-27 заменил SourceFunction
+
+Pre-Flink 1.11 был SourceFunction (legacy):
+
+```java
+// LEGACY — removed в 2.0
+public interface SourceFunction<T> {
+    void run(SourceContext<T> ctx) throws Exception;   // запускается на TaskManager
+    void cancel();
+}
+```
+
+Проблемы:
+1. **Не unified batch/streaming** — bounded sources требовали отдельного DataSet API.
+2. **Coordination через TaskManager-ы** — нет central enumerator, splits assignments через external coordination (например Kafka consumer groups).
+3. **Checkpoint awkward** — `CheckpointedFunction` interface separate от Source logic.
+4. **Watermark generation tied к operator chain** — нельзя coordinate watermarks across sources.
+5. **Manual concurrency** — каждая implementation решала threading models по-своему.
+
+FLIP-27 (Flink 1.11+) решает все эти проблемы through **separation of concerns**:
+
+```
+JobManager:                              TaskManagers (per subtask):
+  ┌────────────────────────┐                ┌──────────────────────┐
+  │ SourceCoordinator      │  ←gRPC→        │ SourceOperator       │
+  │   └─ SplitEnumerator   │                │   └─ SourceReader    │
+  │       (split discovery)│                │       (data fetching)│
+  └────────────────────────┘                └──────────────────────┘
+```
+
+---
+
+## Three core components
+
+### Source — factory
+
+```java
+public interface Source<T, SplitT extends SourceSplit, EnumChkT> 
+        extends Serializable, ResultTypeQueryable<T> {
+
+    Boundedness getBoundedness();
+
+    SplitEnumerator<SplitT, EnumChkT> createEnumerator(SplitEnumeratorContext<SplitT> ctx);
+
+    SourceReader<T, SplitT> createReader(SourceReaderContext readerContext);
+
+    SimpleVersionedSerializer<SplitT> getSplitSerializer();
+
+    SimpleVersionedSerializer<EnumChkT> getEnumeratorCheckpointSerializer();
+}
+```
+
+`Source` — factory, не runtime component. Сериализуется и shipped на JM и TM-ы. Three generic types:
+
+- **T** — output record type
+- **SplitT** — type of splits (например `KafkaPartitionSplit`)
+- **EnumChkT** — type of enumerator checkpoint state
+
+### SplitEnumerator — runs on JobManager
+
+```java
+public interface SplitEnumerator<SplitT, EnumChkT> extends AutoCloseable {
+
+    void start();
+
+    void handleSplitRequest(int subtaskId, @Nullable String requesterHostname);
+
+    void addSplitsBack(List<SplitT> splits, int subtaskId);   // recovery
+
+    void addReader(int subtaskId);
+
+    EnumChkT snapshotState(long checkpointId) throws Exception;
+
+    void notifyCheckpointComplete(long checkpointId) throws Exception;
+}
+```
+
+**Один SplitEnumerator на job**, runs внутри SourceCoordinator на JobManager. Responsibilities:
+
+1. **Split discovery** — обнаруживает units of work (Kafka partitions, file paths, S3 prefixes). Может dynamic (Kafka partition discovery каждые 30s).
+2. **Split assignment** — distributes splits к SourceReader-ам. Может load-balance, может locality-aware.
+3. **Recovery** — на checkpoint snapshot pending splits state. На restart restore из checkpoint.
+4. **Watermark coordination** — поверх SplitEnumerator работает Watermark Alignment.
+
+### SourceReader — runs on TaskManagers
+
+```java
+public interface SourceReader<T, SplitT extends SourceSplit> 
+        extends AutoCloseable, CheckpointListener {
+
+    void start();
+
+    InputStatus pollNext(ReaderOutput<T> output) throws Exception;
+
+    List<SplitT> snapshotState(long checkpointId);
+
+    CompletableFuture<Void> isAvailable();
+
+    void addSplits(List<SplitT> splits);
+
+    void notifyNoMoreSplits();
+}
+```
+
+**Один SourceReader per subtask**, runs внутри SourceOperator на TaskManager. Responsibilities:
+
+1. **Fetch data** — readsы records из assigned splits.
+2. **Emit к downstream** — `pollNext(output)` emits records и watermarks.
+3. **Split lifecycle** — receives splits from enumerator, snapshots own state.
+4. **Backpressure aware** — `isAvailable()` future signals when data ready.
+
+---
+
+## Architecture diagram
+
+<DiagramContainer title="FLIP-27 architecture: SplitEnumerator (JM) + SourceReader (TM)" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager: SourceCoordinator"
+        tooltip="Один SourceCoordinator per source per job. Hosts SplitEnumerator. Communicates с SourceReader через gRPC OperatorEventDispatcher. Participates в checkpoint coordination — snapshots enumerator state."
+      >
+        SourceCoordinator + SplitEnumerator
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="discover splits (Kafka partitions, S3 files, ...)" />
+    <FlowRow>
+      <DataBox
+        label="Split discovery"
+        tooltip="SplitEnumerator periodically (или once для bounded sources) discovers splits. Для Kafka: list topics, get partitions, новые partitions detected continuously. Для S3: list bucket prefix, новые files appear."
+      >
+        List of SplitT
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="assign splits к readers (via gRPC)" />
+    <FlowRow>
+      <DataBox
+        label="TM subtask 0: SourceReader"
+        tooltip="One per parallel subtask. Owns some assigned splits, reads data, emits к downstream operators. Heartbeats SplitEnumerator через 'request split' messages when no more work."
+      >
+        SourceReader (subtask 0)
+      </DataBox>
+      <DataBox
+        label="TM subtask 1: SourceReader"
+        tooltip="Каждый subtask owns disjoint splits. Reader state — pending splits, current offset в split. На checkpoint snapshot этот state в Flink keyed/operator state."
+      >
+        SourceReader (subtask 1)
+      </DataBox>
+      <DataBox
+        label="TM subtask N: SourceReader"
+        tooltip="N = source parallelism. Каждый subtask может fetch concurrently. Watermark generation per subtask, emit к operator chain."
+      >
+        SourceReader (subtask N)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="emit data + per-split watermarks" />
+    <FlowRow>
+      <DataBox
+        label="Downstream operators"
+        tooltip="Дальше DataStream pipeline — keyBy, windows, joins, sinks. Watermark обычно min(per-source watermarks)."
+      >
+        Map / KeyBy / Window / Sink
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Boundedness — unified batch/streaming
+
+```java
+public enum Boundedness {
+    BOUNDED,                  // finite — для batch jobs
+    CONTINUOUS_UNBOUNDED      // infinite — для streaming
+}
+```
+
+`source.getBoundedness()` определяет:
+
+- **BOUNDED**: Flink knows source has finite data. SplitEnumerator emits `notifyNoMoreSplits()` после discovery. Когда все splits processed, SourceReader returns `InputStatus.END_OF_INPUT`. Downstream operators finalize state, sink finalizes commits.
+
+- **CONTINUOUS_UNBOUNDED**: Flink treats source as infinite. SplitEnumerator может keep discovering new splits forever. Job runs до explicit cancel.
+
+Это foundation **unified batch/streaming** в Flink:
+
+```java
+KafkaSource<String> streaming = KafkaSource.<String>builder()
+    .setBootstrapServers(...)
+    .setTopics("orders")
+    .setStartingOffsets(OffsetsInitializer.latest())
+    .setBounded(OffsetsInitializer.latest())   // ← BOUNDED: stop at current end
+    .build();
+
+// Same source can be BOUNDED (batch backfill) or CONTINUOUS_UNBOUNDED (live).
+// DataStream pipeline identical.
+env.fromSource(streaming, ws, "kafka").map(...).keyBy(...).window(...).sinkTo(sink);
+```
+
+В batch mode (`env.setRuntimeMode(BATCH)`) Flink applies дополнительные optimizations (sort-based shuffles, blocking aggregations). В streaming mode — incremental processing.
+
+<Callout type="note">
+Boundedness — runtime property. Один Source implementation может both modes — например `KafkaSource` с `setBounded()` дает BOUNDED, иначе CONTINUOUS_UNBOUNDED. `FileSource` для historical files — BOUNDED, для monitoring directory — CONTINUOUS_UNBOUNDED.
+</Callout>
+
+---
+
+## SourceCoordinator — runs in JobManager
+
+`SourceCoordinator` — wrapper around SplitEnumerator inside JobManager. Responsibilities:
+
+1. **Hosts SplitEnumerator** в thread pool на JM.
+2. **Communicates с SourceReader** через OperatorEventDispatcher (gRPC).
+3. **Participates в checkpoint coordination**:
+   - Receives checkpoint barrier inject signal.
+   - Calls `enumerator.snapshotState(chkId)`.
+   - Stores в JobManager checkpoint metadata.
+4. **Watermark Alignment** (FLIP-217) — coordinates across multiple sources в group:
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withWatermarkAlignment("group-1", Duration.ofMinutes(1), Duration.ofSeconds(5));
+```
+
+SourceCoordinator collects watermarks from все sources в group, broadcasts maxAllowedDrift constraints. Когда один source advancing too fast — its SourceReader is paused.
+
+5. **Failover handling** — на subtask failure, splits assigned к failed reader return via `addSplitsBack()`, re-assigned к other readers.
+
+---
+
+## Recovery semantics
+
+FLIP-27 has clean recovery model:
+
+1. **On checkpoint:**
+   - SourceCoordinator calls `enumerator.snapshotState(chkId)` → produces `EnumChkT`.
+   - Каждый SourceReader calls own `snapshotState(chkId)` → produces `List<SplitT>` (pending splits with offsets).
+   - Both stored в Flink checkpoint metadata.
+
+2. **On recovery:**
+   - JobManager restores SourceCoordinator from `EnumChkT`.
+   - Subtasks restore SourceReader from `List<SplitT>`.
+   - Reading resumes from saved offsets.
+
+3. **On subtask failure (без full restart):**
+   - SourceCoordinator detects failed subtask.
+   - Pending splits returned via `addSplitsBack()`.
+   - Re-assigned к other readers.
+
+Это **fundamentally cleaner** чем SourceFunction era, где recovery require manual coordination между source instances.
+
+---
+
+## Example: simplified Kafka source flow
+
+```java
+// 1. JobManager constructs SourceCoordinator + SplitEnumerator
+KafkaSource<Order> source = KafkaSource.<Order>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("orders")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setValueOnlyDeserializer(new OrderDeserializer())
+    .build();
+
+DataStream<Order> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka");
+
+// 2. Под the hood:
+//    JobManager:
+//      KafkaSourceEnumerator.start()
+//        → discover все partitions of "orders" topic
+//        → emit splits (KafkaPartitionSplit per partition)
+//        → assign splits round-robin к available readers
+//        → periodic background discovery (default 5min)
+//    
+//    TaskManager (per subtask):
+//      KafkaSourceReader.addSplits([split1, split3])
+//        → start fetching from Kafka brokers (one consumer per assigned partition)
+//        → pollNext(output): emit records + per-split watermarks
+//        → snapshotState: List<KafkaPartitionSplit> с current offsets
+```
+
+---
+
+## SourceReaderBase: framework для implementations
+
+Flink provides `SourceReaderBase<E, T, SplitT, SplitStateT>` — abstract base class который handles common concerns:
+
+- Multi-threaded split fetching через `SplitFetcherManager`
+- Buffering records в element queue
+- Coordination между fetcher threads и main thread (`isAvailable()`)
+- State management для splits
+
+Реализация custom reader через extending SourceReaderBase:
+
+```java
+public class MySourceReader extends SourceReaderBase<RawRecord, MyRecord, MySplit, MySplitState> {
+    
+    public MySourceReader(SourceReaderContext readerContext, ...) {
+        super(splitFetcherManager, recordEmitter, config, readerContext);
+    }
+    
+    @Override
+    public List<MySplit> snapshotState(long checkpointId) {
+        // return active splits с current positions
+    }
+    
+    @Override
+    protected void onSplitFinished(Map<String, MySplitState> finishedSplitIds) {
+        // optional cleanup
+    }
+}
+```
+
+Большинство connectors используют этот base.
+
+---
+
+## Сравнительная таблица: FLIP-27 vs SourceFunction (legacy)
+
+| Aspect | SourceFunction (removed) | FLIP-27 Source |
+|---|---|---|
+| Architecture | Single class на TaskManager | SplitEnumerator (JM) + SourceReader (TM) |
+| Boundedness | Manual через DataSet vs DataStream | Native через `Boundedness` enum |
+| Split coordination | External / manual | SourceCoordinator |
+| Recovery model | CheckpointedFunction + manual | Built-in via snapshotState |
+| Watermark generation | Tied к operator chain | Per-split + SourceCoordinator alignment |
+| Watermark alignment | Manual | FLIP-217 first-class |
+| Threading model | Per-implementation | SourceReaderBase + SplitFetcherManager |
+| Discoverability of new work | Manual | Built-in dynamic discovery |
+| Flink 2.0 | Removed | Only supported API |
+
+---
+
+## Production gotchas
+
+### 1. SplitEnumerator runs single-threaded on JobManager
+
+SplitEnumerator runs в SourceCoordinator thread pool, но per-source coordinator handles events sequentially. Heavy split discovery logic (например full S3 listing) blocks coordinator → ack-delays для split requests → idle readers.
+
+**Mitigation:**
+- Background threads inside enumerator для heavy operations
+- Cache discovery results
+- For S3: use object listing API efficiently (prefix-based, sorted listing)
+
+### 2. Hot partition skew
+
+SplitEnumerator assigns splits to readers, но не **dynamically rebalance** based on rate. Если один Kafka partition has 10x traffic — assigned reader becomes bottleneck. Other readers idle.
+
+**Mitigation:**
+- Pre-key data в Kafka так чтобы partition rates balanced
+- Не over-provision parallelism — иначе много readers без splits
+- Monitor `KafkaSourceReader.numRecordsInPerSecond` per subtask
+
+### 3. Bounded source + unbounded watermark — common bug
+
+```java
+// ❌ Source BOUNDED но WatermarkStrategy для unbounded
+KafkaSource<Order> bounded = KafkaSource.<Order>builder()
+    .setBounded(OffsetsInitializer.latest())
+    .build();
+env.fromSource(bounded, WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(10)), "kafka");
+// ↑ idleness не помогает — bounded source finishes, watermark = max value
+```
+
+При BOUNDED source когда reader finishes, emits MAX_WATERMARK. Это правильно для batch finalization. Но downstream window operators могут эмитить накопленные results все одновременно → memory spike.
+
+**Mitigation:** для batch use `env.setRuntimeMode(BATCH)` — Flink applies batch-specific optimizations (sort-based aggregations, etc.). Don't mix bounded sources с streaming watermark policies.
+
+### 4. SourceCoordinator deserialization errors → job failure
+
+Изменение `EnumChkT` или `SplitT` serialization format между versions → savepoint restoration breaks. SimpleVersionedSerializer supports versioned upgrades, но требует careful migration.
+
+**Mitigation:**
+- Use `SimpleVersionedSerializer<SplitT>` с version field
+- Test savepoint compatibility перед deploy
+- Standard connectors (Kafka, File) handle this — но custom connectors require attention
+
+### 5. Watermark alignment + slow source → backpressure
+
+```java
+WatermarkStrategy.withWatermarkAlignment("group", Duration.ofMinutes(1), Duration.ofSeconds(5));
+```
+
+Если один source значительно slower — fast source paused waiting for slow. Effectively backpressure через watermark mechanism. На production make sure alignment group члены comparable.
+
+---
+
+## Key takeaways
+
+- **FLIP-27 — единственный Source API в Flink 2.x** (SourceFunction removed).
+- **Three components**: Source (factory), SplitEnumerator (JM), SourceReader (TM). SourceCoordinator wraps enumerator.
+- **Boundedness enum** — foundation unified batch/streaming. Same Source может both modes.
+- **Clean recovery model** — `snapshotState` для obeих enumerator и reader.
+- **Watermark Alignment (FLIP-217)** работает на уровне SourceCoordinator across sources в group.
+- **SourceReaderBase** — framework для most implementations (threading, buffering).
+
+---
+
+<KnowledgeCheck
+  question="Объясните как FLIP-27 enables unified batch/streaming. Что значит Boundedness BOUNDED vs CONTINUOUS_UNBOUNDED в runtime?"
+  answer="FLIP-27 introduces Boundedness enum на Source level. Same Source implementation (например KafkaSource) может both modes через configuration — KafkaSource.setBounded(OffsetsInitializer.latest()) → BOUNDED (stops at current Kafka end), без этого call → CONTINUOUS_UNBOUNDED (forever). Runtime: BOUNDED → SplitEnumerator после discovery emits notifyNoMoreSplits(); SourceReader returns InputStatus.END_OF_INPUT когда все splits processed; downstream operators finalize state; sink finalizes commits. CONTINUOUS_UNBOUNDED → SplitEnumerator может keep discovering splits forever, job runs до cancel. Plus с env.setRuntimeMode(BATCH) Flink applies batch optimizations (sort-based shuffles, blocking aggregations). Без FLIP-27 batch требовал separate DataSet API — теперь один DataStream API. Это foundation для Hybrid Source (combining bounded + unbounded в одной job)."
+/>

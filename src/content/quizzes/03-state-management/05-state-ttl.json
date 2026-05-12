@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/05-state-ttl",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-05",
+    "description": "Quiz for state TTL lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-05-q1",
+      "type": "multiple-choice",
+      "question": "В чём разница между UpdateType.OnCreateAndWrite и UpdateType.OnReadAndWrite?",
+      "options": [
+        { "id": "a", "text": "OnCreateAndWrite обновляет ttl_timestamp на read И write. OnReadAndWrite — только write" },
+        { "id": "b", "text": "OnCreateAndWrite — timestamp на write/add только. OnReadAndWrite — timestamp на read И write (sliding TTL). Последний имеет write penalty на RocksDB" },
+        { "id": "c", "text": "OnReadAndWrite быстрее работает" },
+        { "id": "d", "text": "Никакой разницы — синонимы" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "OnCreateAndWrite обновляет ttl_timestamp только при update/add — это классический TTL. OnReadAndWrite обновляет timestamp на read И write — sliding TTL, пока state читается, он не expires. ВАЖНО: OnReadAndWrite превращает read в write (PUT для refresh timestamp) — на RocksDB это убивает performance на read-heavy workload. Используйте только когда действительно нужен sliding behavior (session timeouts).",
+      "studyHint": "Повторите урок — секция UpdateType",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m03-05-q2",
+      "type": "multiple-choice",
+      "question": "RocksDB state, нужен production-ready TTL с cleanup для GDPR. Какие cleanup strategies использовать?",
+      "options": [
+        { "id": "a", "text": "Только cleanupIncrementally(1000, true) — он работает на всех backends" },
+        { "id": "b", "text": "cleanupFullSnapshot() + cleanupInRocksdbCompactFilter(1000) — snapshots не растут, disk eventually cleanup через RocksDB compaction" },
+        { "id": "c", "text": "cleanupFullSnapshot() — этого достаточно" },
+        { "id": "d", "text": "Никакой cleanup, TTL автоматически чистит" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Standard production стратегия: cleanupFullSnapshot() гарантирует чистоту snapshot-ов (expired entries не пишутся при checkpoint), cleanupInRocksdbCompactFilter(1000) активирует C++ JNI filter, который при compaction пропускает expired entries (они не пишутся в new SST). cleanupIncrementally работает ТОЛЬКО для heap backend, не для RocksDB! Без cleanup strategy disk continues to grow даже после TTL expiry.",
+      "studyHint": "Повторите урок — Combined strategy для production",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-05-q3",
+      "type": "multiple-choice",
+      "question": "StateVisibility.NeverReturnExpired vs ReturnExpiredIfNotCleanedUp — когда какой выбрать?",
+      "options": [
+        { "id": "a", "text": "ReturnExpiredIfNotCleanedUp быстрее, всегда лучше" },
+        { "id": "b", "text": "NeverReturnExpired — safe default, application НЕ видит stale. ReturnExpiredIfNotCleanedUp — best-effort, может вернуть expired value до physical cleanup. Risky для correctness" },
+        { "id": "c", "text": "Никакой разницы" },
+        { "id": "d", "text": "NeverReturnExpired игнорирует TTL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "NeverReturnExpired — safe для correctness: read возвращает null если entry expired, даже если он физически ещё в RocksDB (cleanup async). ReturnExpiredIfNotCleanedUp — best-effort: возвращает stale value пока physical cleanup не сработал. Risky для correctness — application может видеть expired data часами (slow compaction). Используйте только для best-effort cleanup без correctness требований (например performance optimization на cold data).",
+      "studyHint": "Повторите урок — секция StateVisibility",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-05-q4",
+      "type": "true-false",
+      "question": "State TTL в Flink 2.x работает по event time, синхронизируется с watermark.",
+      "correctAnswer": false,
+      "explanation": "False. State TTL в Flink 2.x работает по PROCESSING TIME (wall clock TaskManager-а). 24 часа TTL = 24h processing time. Это часто удивляет: event-time pipeline + TTL семантика processing time. Если нужен event-time TTL — регистрируйте event time timer через ctx.timerService().registerEventTimeTimer(eventTs + duration) + state.clear() в onTimer manually. Event-time TTL — experimental, не stable feature в 2.x.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

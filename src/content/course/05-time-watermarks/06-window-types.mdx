@@ -1,0 +1,443 @@
+---
+title: "Window types: Tumbling, Sliding, Session, Global"
+description: "Все типы windows в Flink с state implications. Sliding multiplies by overlap ratio, session per active key. Triggers (default on watermark, custom), evictors."
+order: 6
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Tumbling Window", "Sliding Window", "Session Window", "Global Window", "Triggers", "Evictors"]
+---
+
+# Windows: типы и их state implications
+
+Windows — способ группировать unbounded stream в bounded chunks для агрегации. Звучит просто, но выбор типа окна имеет драматические последствия для **state size**, **latency** и **correctness**. Sliding window с большим overlap может удесятерить state. Session window с millions of users — отдельная state entry per user.
+
+Этот урок: четыре типа окон, их state cost, как кастомизировать через Triggers и Evictors, и production gotchas.
+
+---
+
+## Анатомия Window operator
+
+<DiagramContainer title="WindowOperator внутри" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Запись с event time ts"
+        tooltip="Запись приходит из upstream operator. Имеет timestamp ts (присвоенный TimestampAssigner) и payload."
+      >
+        StreamRecord
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="WindowAssigner.assignWindows(record, ts)"
+        tooltip="Главный логический компонент. Возвращает Collection<Window> — в какие окна попадает событие. Tumbling: 1 окно. Sliding: N окон (overlap). Session: создаёт новое или merge с existing."
+      >
+        Assign to N windows
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Window state add"
+        tooltip="Для каждого window state добавляется запись. State backend хранит per-window-per-key. Это критично для понимания state size."
+      >
+        State[w1, w2, ...].add(record)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Trigger.onElement(record, ts, window)"
+        tooltip="Trigger решает, что делать: FIRE (emit window), CONTINUE (wait), PURGE (clear state). Default trigger — EventTimeTrigger: FIRE когда watermark > windowEnd."
+      >
+        Trigger decision
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="на watermark progress" />
+    <FlowRow>
+      <DataBox
+        label="EventTimeTimer fires"
+        tooltip="Когда watermark пересекает windowEnd, timer fires → Trigger.onEventTime → FIRE → invoke window function (process / aggregate / reduce) → emit result downstream."
+      >
+        Window emits
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## 1. Tumbling Windows — простейший случай
+
+**Definition**: non-overlapping окна фиксированного размера. Каждое событие попадает в ровно **одно** окно.
+
+```java
+stream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .aggregate(new SumAgg());
+```
+
+```
+Time:    10:00 10:05 10:10 10:15 10:20
+Windows: |w1|  |w2|  |w3|  |w4|
+                              ↑ next event-time tumble
+```
+
+### State characteristics
+
+- **State per key**: O(N) где N = events в активных окнах
+- **Latency**: bounded by window size + watermark delay
+- **Use cases**: счётчики, агрегации, fixed-interval metrics
+
+### Variants
+
+```java
+// Tumbling event-time windows
+TumblingEventTimeWindows.of(Time.minutes(5))
+
+// Tumbling processing-time windows
+TumblingProcessingTimeWindows.of(Time.minutes(5))
+
+// С offset (для timezone alignment)
+TumblingEventTimeWindows.of(Time.days(1), Time.hours(-5))   // дни выровнены по UTC-5
+```
+
+### Cleanup после fire
+
+Default cleanup PolicY: state cleared когда window past watermark + allowedLateness. Если `.allowedLateness(0)` — state cleared сразу после emit. Если allowed lateness > 0 — state удерживается, поздние события могут попасть.
+
+---
+
+## 2. Sliding Windows — overlap multiplier
+
+**Definition**: окна фиксированного размера, sliding с заданным slide step. Каждое событие попадает в **несколько** окон.
+
+```java
+stream
+    .keyBy(Event::getUserId)
+    .window(SlidingEventTimeWindows.of(
+        Time.minutes(15),   // window size
+        Time.minutes(5)     // slide
+    ))
+    .aggregate(new SumAgg());
+```
+
+```
+Time:   10:00     10:05     10:10     10:15     10:20
+       |--- w1 (10:00-10:15) ---|
+              |--- w2 (10:05-10:20) ---|
+                     |--- w3 (10:10-10:25) ---|
+                            |--- w4 (10:15-10:30) ---|
+```
+
+### State multiplier
+
+Если **size / slide = 3**, каждое событие попадает в **3 окна**. State per key умножается на 3.
+
+| Window size | Slide | Overlap multiplier | Comment |
+|---|---|---|---|
+| 5 min | 5 min | 1x (= tumbling) | Не sliding фактически |
+| 15 min | 5 min | 3x | Реальный sliding |
+| 1 hour | 1 min | 60x | **Опасно** — state ×60 |
+| 24 hours | 1 hour | 24x | Очень частая ошибка |
+
+### Production gotcha: sliding на small slide
+
+Sliding window 24 часа с slide 1 минута → **1440 копий** каждого события в state. На 1M events/day per user → 1.44B state entries per user. RocksDB OOM-Killer.
+
+**Решение**: использовать **incremental aggregation** (AggregateFunction вместо ProcessWindowFunction) — Flink держит только running aggregate per window, не raw events. Но всё равно 1440 aggregates per user.
+
+```java
+// ❌ ProcessWindowFunction — все события в state per window
+.window(SlidingEventTimeWindows.of(Time.hours(24), Time.minutes(1)))
+.process(new MyProcessFunction())   // events stored per window per key
+
+// ✅ AggregateFunction — только running aggregate per window
+.window(SlidingEventTimeWindows.of(Time.hours(24), Time.minutes(1)))
+.aggregate(new MyAggregateFunction())   // лишь sum/count per window per key
+```
+
+Альтернатива — переписать через CumulateWindow (Table API) или per-event state в KeyedProcessFunction.
+
+---
+
+## 3. Session Windows — per-key dynamic
+
+**Definition**: окна, которые начинаются с event и расширяются, пока не пройдет gap timeout без events. Per-key — каждый key имеет свои sessions.
+
+```java
+stream
+    .keyBy(Event::getUserId)
+    .window(EventTimeSessionWindows.withGap(Time.minutes(30)))
+    .aggregate(new SessionAgg());
+```
+
+```
+User A events:  E1 ... E2 .... E3 ............................. E4 .................
+                |←30min gap→|              |←30min gap exceeded→|
+                |  Session 1: E1, E2, E3   |  Session 2: E4    |
+
+User B events:  E1 ........ E2 ......................... E3 ........
+                |Session 1: E1, E2|                      |Session 2: E3|
+```
+
+### Window merging
+
+Session windows **мержатся**. Когда события приходят out-of-order, Flink может объединить два session window:
+
+```
+T=10:00  E1 arrives → create Window[10:00, 10:30]
+T=10:05  E3 arrives с ts=10:00 → попадает в Window[10:00, 10:35]
+T=10:04  E2 arrives с ts=10:25 → создаёт Window[10:25, 10:55]
+                                  → но overlap с [10:00, 10:35] →
+                                  → MERGE → Window[10:00, 10:55]
+```
+
+`MergingWindowAssigner` делает logic. Triggers для merging window получают `onMerge()` callback для cleanup.
+
+### State characteristics
+
+- **State per active session per key**: O(active_sessions × events_per_session)
+- На high cardinality keys (UUID-based session IDs, etc.) — massive state
+- Cleanup при close session
+
+### Dynamic gap
+
+В 1.13+ можно динамически вычислять gap per event:
+
+```java
+EventTimeSessionWindows.withDynamicGap((event) -> {
+    if (event.isVIPUser()) return Time.hours(1).toMilliseconds();
+    return Time.minutes(30).toMilliseconds();
+});
+```
+
+---
+
+## 4. Global Windows — custom trigger logic
+
+**Definition**: окно, в которое попадают **все** события одного key. Бесполезно без custom trigger.
+
+```java
+stream
+    .keyBy(Event::getUserId)
+    .window(GlobalWindows.create())
+    .trigger(CountTrigger.of(100))   // fire каждые 100 events
+    .process(...);
+```
+
+### Use cases
+
+- **Count-based emission** — emit каждые N events, не по времени
+- **Custom triggers** — например, fire на sentinel value в record
+- **Building blocks** для exotic windowing
+
+### State implications
+
+Global windows **никогда не закрываются автоматически**. Без PURGE trigger state растёт unbounded.
+
+```java
+.trigger(PurgingTrigger.of(CountTrigger.of(100)))   // ← fire AND purge state
+```
+
+---
+
+## Triggers — когда window fires
+
+Default trigger — `EventTimeTrigger`: FIRE когда watermark > windowEnd.
+
+### TriggerResult API
+
+```java
+public enum TriggerResult {
+    CONTINUE,        // wait, don't fire
+    FIRE,            // emit window, keep state
+    PURGE,           // clear state, don't fire
+    FIRE_AND_PURGE   // emit AND clear state
+}
+```
+
+### Built-in triggers
+
+```java
+// Default event time trigger
+.trigger(EventTimeTrigger.create())
+
+// Processing time trigger
+.trigger(ProcessingTimeTrigger.create())
+
+// Continuous (early firing)
+.trigger(ContinuousEventTimeTrigger.of(Time.seconds(30)))
+
+// Count trigger
+.trigger(CountTrigger.of(100))
+
+// Custom — fire on each record + final fire at watermark
+.trigger(new PurgingTrigger.of(CountTrigger.of(1000)))
+```
+
+### Custom trigger example: early firing
+
+```java
+public class EarlyFiringTrigger<W extends Window> extends Trigger<Event, W> {
+    private final long earlyFireInterval = 5000;   // 5s
+
+    public TriggerResult onElement(Event event, long ts, W window, TriggerContext ctx) {
+        ctx.registerProcessingTimeTimer(ctx.getCurrentProcessingTime() + earlyFireInterval);
+        ctx.registerEventTimeTimer(window.maxTimestamp());
+        return TriggerResult.CONTINUE;
+    }
+
+    public TriggerResult onProcessingTime(long time, W window, TriggerContext ctx) {
+        // Early fire каждые 5s — emit promising result, не purge
+        return TriggerResult.FIRE;
+    }
+
+    public TriggerResult onEventTime(long time, W window, TriggerContext ctx) {
+        // Final fire когда watermark пересёк windowEnd
+        return TriggerResult.FIRE_AND_PURGE;
+    }
+
+    public void clear(W window, TriggerContext ctx) {
+        ctx.deleteProcessingTimeTimer(...);
+        ctx.deleteEventTimeTimer(window.maxTimestamp());
+    }
+}
+```
+
+---
+
+## Evictors — фильтрация перед window function
+
+Evictor работает **между** state и window function. Может удалить events перед агрегацией:
+
+```java
+stream
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .evictor(TimeEvictor.of(Time.minutes(1)))   // оставить только последнюю минуту
+    .process(...);
+```
+
+### Built-in evictors
+
+- `CountEvictor.of(N)` — оставить последние N
+- `TimeEvictor.of(Duration)` — оставить только последнюю Duration
+- `DeltaEvictor` — оставить events с delta function > threshold
+
+### Performance impact
+
+Evictor требует, чтобы все events стояли в state **до** invocation (не incremental aggregate). Это эквивалентно `ProcessWindowFunction` overhead — state per event, не per aggregate.
+
+**Используйте evictor только когда нужно**. Чаще можно реализовать через trigger + state cleanup.
+
+---
+
+## Allowed lateness и late events
+
+```java
+.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+.allowedLateness(Duration.ofMinutes(2))
+.sideOutputLateData(lateTag)
+```
+
+**Поведение**:
+- Window emit-ит когда WM > windowEnd
+- State удерживается до WM > windowEnd + allowedLateness
+- Если событие приходит в `[windowEnd, windowEnd + lateness]` — window **fires again** (incremental update)
+- После `WM > windowEnd + lateness` — состояние cleared, late events → side output
+
+**Side output** captured (детали в уроке 07):
+
+```java
+SingleOutputStreamOperator<Result> main = stream
+    .window(...)
+    .allowedLateness(Duration.ofMinutes(2))
+    .sideOutputLateData(lateTag)
+    .process(...);
+
+DataStream<Event> late = main.getSideOutput(lateTag);
+late.print();   // или sink в dead letter queue
+```
+
+---
+
+## Comparison table
+
+| Window | State per key | Latency | Use case |
+|---|---|---|---|
+| Tumbling | O(window) | windowSize + WM delay | Fixed-time aggregations |
+| Sliding | O(window × overlap) | windowSize + WM delay | Moving averages |
+| Session | O(active sessions × events) | gap timeout + WM delay | User session analysis |
+| Global | Unbounded (без PURGE) | Custom (trigger) | Count-based, custom logic |
+
+---
+
+## Production gotchas
+
+### 1. Sliding window slide=1ms — это NOT sliding window
+
+```java
+.window(SlidingEventTimeWindows.of(Time.hours(1), Time.milliseconds(1)))
+```
+
+3.6M overlap, каждое событие в 3.6M окон. Точная семантика, но computationally infeasible. Используйте custom KeyedProcessFunction с MapState или TVF CUMULATE.
+
+### 2. Session windows на UUID keys — explosion
+
+`keyBy(sessionId)` где sessionId UUID — каждый session = 1 key. Millions sessions = millions state entries. RocksDB OK, heap state OOM.
+
+### 3. Window function без incremental agg
+
+```java
+// ❌ Каждое событие в state, ProcessWindowFunction
+.window(...).process(new MyProcessFunc())
+
+// ✅ Incremental: AggregateFunction + ProcessWindowFunction final
+.window(...).aggregate(new RunningAvg(), new FinalProcess())
+```
+
+Incremental drastically снижает state (constant per window vs N per window).
+
+### 4. Default allowedLateness = 0
+
+Без явной allowedLateness late events ВСЕГДА **dropped**. Production must: всегда задавать allowedLateness и side output для late.
+
+### 5. Window time vs processing time mix
+
+```java
+// ❌ Tumbling event-time с processing-time evictor — confusing
+.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+.evictor(TimeEvictor.of(Time.seconds(30)))   // wall clock, не event time!
+```
+
+Evictor TimeEvictor работает в processing time. Это бывает желаемо (recent N seconds in wall clock), но чаще баг.
+
+### 6. State TTL на window state
+
+State TTL **не работает** для window state. Window cleanup управляется allowedLateness, не TTL. Это разные mechanisms.
+
+### 7. Window cleanup для merged sessions
+
+При session merge, Trigger.onMerge() должен handle state — иначе old session state может остаться. Стандартные triggers это делают, custom — debug.
+
+---
+
+## TVF Windows (Table API) — alternative
+
+В Table API/SQL Flink с 1.13 предлагает TVF Windows (`TUMBLE`, `HOP`, `CUMULATE`, `SESSION`). Они **рекомендуются** для Table contexts. Детали в уроке 08.
+
+```sql
+-- Tumble в SQL
+SELECT window_start, window_end, SUM(amount)
+FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTE))
+GROUP BY window_start, window_end;
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: real-time analytics dashboard показывает 'sum of orders в последние 24 часа' с обновлением каждую минуту. Реализовано как SlidingEventTimeWindows.of(Time.hours(24), Time.minutes(1)) + ProcessWindowFunction. После 3 дней state RocksDB вырос с 100GB до 8TB, checkpoint занимает 45 минут, job регулярно падает с timeout. Что происходит и как переписать?"
+  answer="Проблема — двойная: (1) sliding window с overlap 1440x (24h / 1min) — каждое событие попадает в 1440 окон, состояние × 1440. (2) ProcessWindowFunction хранит ВСЕ raw события per window per key, не incremental aggregate. При 100K events/sec × 86400 sec/day × 3 days = 26B events × 1440 windows = unbounded growth. State 8TB логичен. Fixes: (1) Заменить ProcessWindowFunction на AggregateFunction с running sum — Flink хранит ровно одно double per window per key, не raw events. State снижается на 6+ порядков. 100K keys × 1440 windows × 8 bytes = 1.15GB вместо 8TB. (2) Использовать CumulateWindow в Table API — специально дизайнен для этого pattern. Семантика: rolling window с emit каждые stepSize, окно растёт от 0 до maxSize, потом restart. ```sql SELECT window_start, window_end, SUM(amount) FROM TABLE(CUMULATE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '1' MINUTE, INTERVAL '24' HOUR)) GROUP BY window_start, window_end ``` (3) Альтернатива в DataStream API: KeyedProcessFunction с ValueState<Map<window_start, double>>, manual aggregate, register timers для emit каждую минуту и cleanup expired windows. Manual но fully controlled. (4) Если требуется именно sliding semantics, переписать через explicit MapState<windowStart, RunningAgg> + onTimer cleanup expired entries (window_start + 24h < currentWM). (5) Для checkpoint stability — добавить state.backend.changelog.enabled: true (GIC/DSTL) для stable checkpoint time независимо от state size; включить incremental checkpoints + RocksDB native. (6) Architecturally: если бизнес requirement 'last 24h' — это не sliding window, это 'rolling counter'. Дешевле реализовать через materialized view в OLAP DB (ClickHouse, Druid) после Flink emit per-minute aggregates через TumblingWindow. Production правило: если sliding window slide < windowSize / 10 — реализуйте через incremental aggregate или CUMULATE/custom state."
+/>

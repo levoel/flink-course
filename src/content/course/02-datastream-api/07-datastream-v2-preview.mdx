@@ -1,0 +1,320 @@
+---
+title: "DataStream API V2 (FLIP-409, experimental preview)"
+description: "DataStream API V2 — preview новых abstractions в Flink 2.0. Building blocks: DataStream, ProcessFunction, Partitioning + extensions. Migration future. НЕ для production до 2.3-2.4."
+order: 7
+difficulty: "advanced"
+estimatedTime: 20
+topics: ["DataStream V2", "FLIP-409", "API Evolution", "Experimental"]
+---
+
+# DataStream API V2 (FLIP-409): preview
+
+В Flink 2.0 (март 2025) представлен **DataStream API V2 (FLIP-409)** — переосмысление DataStream API после 9 лет накопленного опыта. Это experimental preview, **не для production до Flink 2.3-2.4**, но важно понимать direction. Через 1-2 версии V2 станет default, V1 окажется в legacy mode (как DataSet API в своё время).
+
+В этом уроке: motivation для V2, ключевые abstractions (DataStream, ProcessFunction, Partitioning + extensions), сравнение V1 vs V2, и production-планирование migration.
+
+---
+
+## Зачем DataStream V2
+
+DataStream API родился в 2014 (Flink 0.9). Девять лет эволюции наслаивало решения друг на друга, что привело к ряду проблем:
+
+1. **Concept overload** — KeyedStream, DataStream, WindowedStream, ConnectedStreams, BroadcastStream, JoinedStream — six different abstractions for related concepts. Cognitive load выше необходимого.
+2. **Tight coupling watermarks** — watermark machinery встроен глубоко. Бounded streams ведут себя странно, потому что API designed для streaming-first.
+3. **Mixed batch / streaming** — после unified `Boundedness`, watermark mechanics стали awkward для bounded jobs.
+4. **Implicit вещи** — typing, partitioning, state — много implicit poведения, hard to introspect.
+5. **Constraints on extensions** — добавить новый kind of operation требует API surface change.
+
+V2 цель: **chist, composable, explicit API**.
+
+---
+
+## Ключевые abstractions V2
+
+V2 строится на **трёх core building blocks** + extensions.
+
+<DiagramContainer title="DataStream V2 architecture" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="DataStream"
+        tooltip="Базовая абстракция: упорядоченный поток records одного типа. Может быть bounded или unbounded. Один main concept вместо иерархии Keyed/Connected/Broadcast/Windowed."
+      >
+        универсальный stream
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="ProcessFunction"
+        tooltip="Единый processing primitive. Принимает inputs, produces outputs. Stateful или stateless. Аналог current KeyedProcessFunction, но более composable."
+      >
+        unified processing
+      </DataBox>
+      <DataBox
+        label="Partitioning"
+        tooltip="Explicit partitioning abstraction. Раньше keyBy создавал KeyedStream — implicit type. В V2 partitioning — explicit parameter ProcessFunction (поля доступа к state, partitioning strategy)."
+      >
+        explicit data partitioning
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Extensions"
+        tooltip="Window, Join, CEP и др. — composable extensions, реализованные через base abstractions. Можно writing custom extensions без core API changes."
+      >
+        windows, joins, CEP via extensions
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### DataStream
+
+Один main type вместо иерархии. Operations возвращают `DataStream<T>`:
+
+```java
+// V2 syntax (preview, может измениться)
+DataStream<Tx> txs = env.fromSource(kafkaSource, ...);
+
+DataStream<EnrichedTx> enriched = txs
+    .process(new EnrichmentProcess());  // одно — process() для всех типов processing
+
+DataStream<Alert> alerts = enriched
+    .partitionBy(EnrichedTx::getUserId)  // partitioning отдельно от processing
+    .process(new FraudDetectionProcess());
+```
+
+### ProcessFunction (V2)
+
+Единый интерфейс — без 12 разных подклассов:
+
+```java
+// V2 ProcessFunction (preview)
+public class FraudDetection extends ProcessFunction<EnrichedTx, Alert> {
+
+    private StateDescriptor<ValueState<UserHistory>> historyState =
+        ValueStateDescriptor.of("history", UserHistory.class);
+
+    @Override
+    public void open(OpenContext ctx) {
+        ctx.requireKeyed();  // declare что нужно keyed state
+    }
+
+    @Override
+    public void processRecord(
+            EnrichedTx record,
+            ProcessContext ctx,
+            Collector<Alert> out) {
+        // Доступ к state, timers, side outputs
+        UserHistory history = ctx.state(historyState).value();
+        // ... logic
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<Alert> out) {
+        // unchanged
+    }
+}
+```
+
+### Partitioning explicit
+
+В V1: `keyBy()` создавал `KeyedStream` — implicit type. В V2 partitioning — explicit parameter:
+
+```java
+// V1 (current):
+stream.keyBy(Tx::getUserId).process(new MyProcess());  // implicit KeyedStream
+
+// V2 (preview):
+stream
+    .partitionBy(Tx::getUserId)  // partitioning explicit
+    .process(new MyProcess());
+
+// Или для не-keyed processing:
+stream
+    .partitionBy(Partitioning.broadcast())
+    .process(new MyBroadcastProcess());
+```
+
+Это даёт benefits:
+
+- **Composable** — partitioning сам по себе abstraction.
+- **Multiple partitioning strategies** — broadcast, custom hash, range — все uniform.
+- **Type clear** — `DataStream<T>` остаётся одним типом независимо от partitioning.
+
+---
+
+## V1 vs V2 — comparison
+
+| Aspect | V1 (current) | V2 (preview) |
+|---|---|---|
+| Main abstractions | DataStream, KeyedStream, ConnectedStreams, WindowedStream, BroadcastStream | DataStream + ProcessFunction + Partitioning |
+| ProcessFunction variants | 12+ subclasses | 1 unified |
+| Partitioning | Implicit через keyBy() | Explicit parameter |
+| Watermark machinery | Coupled с DataStream | Decoupled, optional |
+| Bounded / unbounded | Same API but semantics differ | Unified properly |
+| Window API | Built-in | Extension |
+| Joins API | Built-in | Extension |
+| Adding new operations | Requires core changes | Through extensions |
+| Type safety | Java generics + reflection | Improved |
+
+---
+
+## Когда V2 будет ready
+
+**Roadmap (предполагаемый, может измениться):**
+
+| Version | Status | Что новое |
+|---|---|---|
+| **2.0 (Mar 2025)** | Experimental preview | Basic abstractions, не все features |
+| **2.1 (Jul 2025)** | Stabilization | Bug fixes, более complete features |
+| **2.2 (Dec 2025)** | Production preview | Major features stable |
+| **2.3** | Beta | Recommended для new projects |
+| **2.4-2.5** | GA | Default for new APIs |
+| **3.0** | Mature | V1 deprecated |
+
+**Текущий рекомендация (December 2025)**: используйте V1 в production. Изучайте V2 для предварительной подготовки.
+
+---
+
+## Что НЕ меняется
+
+Важно понять, что V2 — это эволюция API, не разрушение фундамента:
+
+- **Runtime** — JobManager / TaskManager / slots / scheduling неизменно.
+- **State backends** — RocksDB / ForSt одинаковые.
+- **Checkpointing / Recovery** — ABS алгоритм, savepoints, 2PC — те же.
+- **Connectors** — FLIP-27 sources, FLIP-191 sinks работают с V1 и V2.
+- **Table API / SQL** — отдельный API, не affected.
+- **Deployment** — Application/Session mode, K8s Operator — те же.
+
+Это значит: знание Flink fundamentals (что мы изучаем в этом курсе) полностью transferable на V2. Меняется только syntax layer.
+
+---
+
+## Migration strategy
+
+Когда V2 будет stable (предположительно 2.4-2.5), migration:
+
+1. **Interoperability layer** — V1 и V2 будут coexist в одном job. Можно постепенно migrate operator-by-operator.
+2. **Automatic conversion** — для simple jobs (без custom ProcessFunction) — программный rewrite tool.
+3. **Savepoint compatibility** — state from V1 jobs должен restore в V2 (с UIDs обязательно). Это критическое требование.
+4. **API parity** — V2 будет полностью покрывать V1 use cases прежде чем V1 deprecated.
+
+Production strategy:
+
+```
+Phase 1 (now): use V1, follow current course
+Phase 2 (~2.3 release): experiment с V2 в development environments
+Phase 3 (~2.5 release): new jobs на V2
+Phase 4 (~3.0): migrate existing V1 jobs к V2
+```
+
+---
+
+## DataStream V2 sample (preview API)
+
+Внимание: API в alpha, syntax может measure-измениться. Это **conceptual preview**, не final syntax.
+
+```java
+// Hypothetical V2 syntax — для educational purposes
+public class FraudDetectionV2 {
+
+    public static void main(String[] args) throws Exception {
+        ExecutionEnvironment env = ExecutionEnvironment.getEnvironment();
+        env.enableCheckpointing(60_000);
+
+        DataStream<Transaction> txs = env.fromSource(
+            KafkaSource.builder().build(),
+            "transactions");
+
+        DataStream<EnrichedTx> enriched = txs
+            .process(new EnrichmentFunction());
+
+        DataStream<Alert> alerts = enriched
+            .partitionBy(EnrichedTx::getUserId)
+            .process(new FraudDetectionFunction());
+
+        alerts.sinkTo(KafkaSink.builder().build());
+
+        env.execute("Fraud Detection V2");
+    }
+}
+
+class FraudDetectionFunction extends ProcessFunction<EnrichedTx, Alert> {
+
+    private static final StateDescriptor<ValueState<UserState>> STATE =
+        ValueStateDescriptor.of("user-state", UserState.class);
+
+    @Override
+    public void configure(ProcessFunctionContext ctx) {
+        ctx.requireKeyed();
+        ctx.declareState(STATE);
+    }
+
+    @Override
+    public void processRecord(EnrichedTx record, ProcessContext ctx,
+                              Collector<Alert> out) {
+        UserState state = ctx.state(STATE).value();
+        // ... fraud logic
+    }
+}
+```
+
+---
+
+## Связь с Flink Agents
+
+В марте 2026 появился отдельный sub-project **Flink Agents (0.2.1)** — для event-driven AI agents на Flink runtime. Он использует **V2 abstractions** для composability — extensions для LLM calls, tools, memory.
+
+Это пример, как V2 enables новые use cases, которые сложно реализовать в V1 (например, Async I/O + memory + tool routing).
+
+---
+
+## Production gotchas
+
+- **Не используйте V2 в production до 2.3-2.4** — experimental status означает breaking changes между minor versions. Production миграция на experimental API — recipe для боли.
+- **Изучайте V1 fundamentals** — это transferable knowledge. KeyedProcessFunction concepts, state, timers, side outputs — всё это будет в V2.
+- **State migration** — V1 → V2 будут поддерживать savepoints, но с UIDs обязательно. Без UIDs на V1 — потеря state при V2 migration. Set UIDs **NOW** на V1 jobs.
+- **Track FLIP-409 progress** — Flink mailing list, release notes. По мере stabilization обновляйте опытные jobs.
+- **Mixed V1+V2 jobs** — будут поддерживаться, но потенциально complex для debugging. Лучше migrate целым.
+
+<Callout type="warning">
+**Hype warning**: некоторые conference talks 2025 могут представлять V2 как "ready". Reality: 2.0 release — preview. Production-ready timeline 2.3-2.4 (2026). Не торопитесь.
+</Callout>
+
+---
+
+## Что это значит для курса
+
+Этот курс **намеренно фокусируется на V1 API** — он production-grade в 2.2.x. Все fundamentals (ProcessFunction, state, timers, async I/O) — concepts transferable на V2.
+
+После V2 GA планируется update курса с migration guide. Сейчас:
+
+- **New jobs**: V1, follow this course.
+- **Existing jobs**: продолжайте на V1, миграция через 1-2 года.
+- **Future preparation**: знайте V2 concepts, но не используйте experimental API в production.
+
+---
+
+## Comparison: similar API evolutions
+
+Flink не первый, кто делает major API rewrite:
+
+| Project | V1 | V2 | Migration time |
+|---|---|---|---|
+| **Spark DataFrame** | RDD API | DataFrame API | 2-3 года coexistence |
+| **Spark Streaming** | DStream API | Structured Streaming | 2-3 года |
+| **Flink DataSet** | DataSet API | Unified DataStream (Bounded) | 5+ years deprecation, removed 2.0 |
+| **Flink DataStream** | V1 | V2 (FLIP-409) | Estimate 2-3 года |
+
+Pattern: stable production использует old API ещё долго после introduction нового. Это нормально.
+
+---
+
+<KnowledgeCheck
+  question="Ваш team planning new streaming project в начале 2026. У вас Flink 2.2 stable. Решение: использовать DataStream V1 или подождать V2? Что должно влиять на этот выбор, и какие preparation steps нужны?"
+  answer="**Используйте V1.** В начале 2026 V2 — experimental preview (FLIP-409 в 2.0/2.1/2.2). Production deployment на experimental API — серьёзный risk: breaking changes между minor versions, less mature tooling и documentation, less community support для troubleshooting. V2 production-ready timeline: 2.3-2.4 (estimate 2027). Использовать V1 в 2026 — sound choice. Что должно влиять на choice (даже если бы V2 был stable): (1) **Team experience** — V1 имеет 9 лет community knowledge, blog posts, Stack Overflow. V2 — minimal external resources. Onboarding new engineers тяжело. (2) **Ecosystem readiness** — мониторинг tools, Flink Kubernetes Operator, third-party connectors могут не полностью поддерживать V2 в раннем GA. (3) **Production criticality** — если job critical (revenue-impacting), всегда выбирайте mature stack. Experimental может wait. (4) **Hiring market** — V2 expertise rare. V1 engineers легко найти. **Preparation steps для будущей migration V1 → V2**: (a) **ALWAYS set .uid()** на каждом stateful operator. Это абсолютно critical — без UIDs savepoint migration сломается. Pattern: `stream.keyBy(...).process(...).uid('my-process-v1')`. (b) **Use FLIP-27 sources (fromSource) and FLIP-191 sinks (sinkTo)** — не legacy addSource/addSink. Legacy API уже removed в 2.0 и не будет поддерживаться в V2. (c) **POJO discipline** — public class, no-arg ctor, public fields/getters. Pipeline.generic-types: false для fail-fast. (d) **State design clean** — explicit state descriptors с named identifiers (через STATE constants). Это helps state migration tooling. (e) **Avoid deprecated patterns** — split/select (removed), Queryable State (removed), Reactive Mode (removed). (f) **Track FLIP-409 progress** — mailing list, GitHub. По мере stabilization (2.3+) experiment в dev environments. (g) **Document operator semantics** — clear naming UIDs, comments в коде. Это help-ит migration tooling и code review. With эти preparations, migration к V2 будет smooth когда придёт time."
+/>

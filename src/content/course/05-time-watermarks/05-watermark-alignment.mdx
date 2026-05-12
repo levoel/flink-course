@@ -1,0 +1,405 @@
+---
+title: "Watermark Alignment (FLIP-217): ultimate killer feature"
+description: "FLIP-217 Watermark Alignment GA 1.18+: max-allowed-drift между sources, SourceCoordinator паузит fast splits, 76x speedup на 5000 subtasks. Multi-topic Kafka backfill scenario."
+order: 5
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Watermark Alignment", "FLIP-217", "SourceCoordinator", "Multi-source", "Backpressure"]
+---
+
+# Watermark Alignment — ultimate feature для multi-source jobs
+
+Watermark Alignment (FLIP-217) — одна из самых важных feature, добавленных в Flink за последние 5 лет. Она решает фундаментальную проблему multi-source jobs: **один источник убегает по event time, другой отстаёт, и watermark всего pipeline зависит от медленного**. До FLIP-217 это было причиной OOM, drift в gigabytes state и невозможности правильного backfill.
+
+GA в Flink 1.18, продолжает совершенствоваться. На 5000 subtasks benchmark показывает **76x speedup** vs alignment без FLIP-217. Этот урок — детальный разбор алгоритма, configuration и production гoтча.
+
+---
+
+## Проблема, которую решает FLIP-217
+
+<DiagramContainer title="Multi-source без alignment: fast source overruns" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Kafka topic A (events)"
+        tooltip="Topic с 100k events/sec. Полный backlog за месяц, replay делается с самого начала. Fast — нет backpressure, Flink читает на максимальной throughput."
+      >
+        Fast: replay 30 дней
+      </DataBox>
+      <DataBox
+        label="Kafka topic B (users)"
+        tooltip="Topic с 1k events/sec. Slow — медленный source. Один поток, ограничен producer rate. Flink быстро догоняет live."
+      >
+        Slow: 1k events/sec
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Source A: WM=2024-01-15"
+        tooltip="После replay 7 дней. Backlog за оставшиеся 23 дня впереди — events идут с event time 2024-01-15. Source 'убежал' по event time."
+      >
+        WM(A) = 2024-01-15
+      </DataBox>
+      <DataBox
+        label="Source B: WM=2024-02-12"
+        tooltip="Догнал до live. Текущая дата 2024-02-12, события приходят с event time почти-realtime. 'Опережает' A на 28 дней."
+      >
+        WM(B) = 2024-02-12
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Join operator: MIN(WM)" />
+    <FlowRow>
+      <DataBox
+        label="Join WM = 2024-01-15 (28 days drift)"
+        tooltip="MIN(2024-01-15, 2024-02-12) = 2024-01-15. Join operator думает 'мы на 2024-01-15'. События с topic B с timestamp 2024-02-12 буферизируются — могут join'иться с событиями A в будущем. State от topic B растёт unbounded."
+      >
+        State(B) grows to GB/TB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Outcome: OOM / disk full"
+        tooltip="Buffer для events topic B в state накопил 28 дней данных. На large topic это TBs. RocksDB на локальном диске не выживает. ForSt на S3 переживает, но waste. Job не может progress."
+      >
+        Pipeline stalls
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Реальные числа
+
+```
+Backfill 30 дней Kafka events на 5000 subtasks:
+  Без alignment:    OOM через 4 часа, buffered state 2TB
+  С alignment:      Stable, drift bounded к 20 секунд, no OOM
+```
+
+FLIP-217 benchmark: 76x speedup на 5000 subtask cluster — потому что без alignment координация через MIN watermark делалась через single coordination point.
+
+---
+
+## Архитектура FLIP-217
+
+### Two-level alignment
+
+FLIP-217 определяет alignment на **двух уровнях**:
+
+1. **Alignment между splits внутри одного source** (per-source) — для Kafka partitions, файлов S3
+2. **Alignment между разными sources** (cross-source) — для multi-source jobs
+
+```java
+WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((e, ts) -> e.getEventTime())
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment(
+        "alignment-group-1",      // имя группы alignment
+        Duration.ofSeconds(20),   // maxAllowedDrift
+        Duration.ofSeconds(1)     // updateInterval
+    );
+```
+
+Все sources с **одинаковым именем группы** alignment-ятся друг с другом. Sources в разных группах независимы.
+
+### SourceCoordinator: централизованный координатор
+
+<DiagramContainer title="SourceCoordinator pauses fast splits" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="SourceCoordinator (JobManager)"
+        tooltip="Per-source coordinator на JobManager. Получает per-split watermark reports от SourceReader-ов каждые updateInterval. Вычисляет minWatermark по группе. Отправляет pause/resume сигналы splits, которые drift > maxAllowedDrift."
+      >
+        Centralized coord
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="report WM каждую секунду" />
+    <FlowRow>
+      <DataBox
+        label="SourceReader 1: WM=2024-02-10"
+        tooltip="Реальная Kafka SourceReader на TaskManager. Reports current watermark to SourceCoordinator через RPC. Получает обратно ManagedSplit pause/resume команды."
+      >
+        Reports WM
+      </DataBox>
+      <DataBox
+        label="SourceReader 2: WM=2024-01-15"
+        tooltip="Slow reader — отстаёт по event time. Coordinator вычисляет maxDesired = currentMin + maxDrift. Если WM > maxDesired, split paused."
+      >
+        Reports WM
+      </DataBox>
+      <DataBox
+        label="SourceReader N: WM=2024-02-09"
+        tooltip="Fast reader, drift > maxDrift. SourceCoordinator отправляет pauseSplits([split-ids]). KafkaSourceReader stops polling этих partitions."
+      >
+        Paused (WM > drift)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Алгоритм coordination
+
+```
+Каждые updateInterval (default 1s):
+1. Все SourceReader посылают current WM в SourceCoordinator
+2. Coordinator вычисляет: minWM = MIN(reported WMs across group)
+3. maxDesiredWM = minWM + maxAllowedDrift
+4. Для каждого split:
+   if (split.WM > maxDesiredWM):
+       coordinator.pauseSplit(split)
+   else:
+       coordinator.resumeSplit(split)
+5. SourceReader получает команды, blocks/unblocks
+```
+
+### Detailed: KafkaSourceReader реализация
+
+`KafkaSourceReader` implements `WatermarkAlignmentParams`:
+
+```java
+public void pauseOrResumeSplits(Collection<String> splitsToPause,
+                                Collection<String> splitsToResume) {
+    splitsToPause.forEach(splitId -> {
+        TopicPartition tp = idToTp(splitId);
+        consumer.pause(Collections.singleton(tp));   // Kafka native pause API
+    });
+    splitsToResume.forEach(splitId -> {
+        consumer.resume(...);
+    });
+}
+```
+
+Kafka native consumer pause/resume — **никакого poll-then-discard**. Никакого memory pressure. SourceReader просто перестаёт читать из paused partitions, события остаются в Kafka.
+
+---
+
+## Real example: Kafka multi-topic backfill
+
+### Setup
+
+Production E-commerce platform: 3 Kafka topics, нужен join всех трёх по `customerId` для analytics:
+- `orders` — 50k events/sec
+- `payments` — 30k events/sec
+- `clickstream` — 200k events/sec (10x volume of orders)
+
+Backfill 30 дней истории. Без alignment clickstream «убежит» быстрее всех, accumulate state, OOM.
+
+### Configuration
+
+```java
+WatermarkStrategy<Order> orderWM = WatermarkStrategy
+    .<Order>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((o, ts) -> o.getEventTime())
+    .withIdleness(Duration.ofMinutes(2))
+    .withWatermarkAlignment("ecommerce", Duration.ofSeconds(30), Duration.ofSeconds(1));
+
+WatermarkStrategy<Payment> paymentWM = WatermarkStrategy
+    .<Payment>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((p, ts) -> p.getEventTime())
+    .withIdleness(Duration.ofMinutes(2))
+    .withWatermarkAlignment("ecommerce", Duration.ofSeconds(30), Duration.ofSeconds(1));
+
+WatermarkStrategy<Click> clickWM = WatermarkStrategy
+    .<Click>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((c, ts) -> c.getEventTime())
+    .withIdleness(Duration.ofMinutes(2))
+    .withWatermarkAlignment("ecommerce", Duration.ofSeconds(30), Duration.ofSeconds(1));
+
+DataStream<Order> orders = env.fromSource(orderSource, orderWM, "orders");
+DataStream<Payment> payments = env.fromSource(paymentSource, paymentWM, "payments");
+DataStream<Click> clicks = env.fromSource(clickSource, clickWM, "clicks");
+
+// Join по customerId с event-time interval
+orders.keyBy(Order::getCustomerId)
+      .intervalJoin(payments.keyBy(Payment::getCustomerId))
+      .between(Time.minutes(-5), Time.minutes(5))
+      .process(new OrderPaymentMatcher())
+      ...
+```
+
+### Поведение под нагрузкой
+
+```
+T=0    : start backfill
+T=1m   : orders WM = T-29d 23h 50m, payments WM = T-29d 23h 50m, clicks WM = T-29d 23h 30m
+         (clicks вперёд на 20 мин потому что больше throughput)
+T=1m+1s: SourceCoordinator: clicks drift = 20m > 30s maxDrift → pauseSplits для clicks
+         clicks SourceReader pauses 80% partition (часть продолжает чтобы держать WM)
+T=2m   : orders WM = T-29d 23h 30m, clicks WM = T-29d 23h 25m (paused, но не stuck)
+         alignment работает — clicks WM медленно растёт, не убегая больше 30s
+T=...  : steady state — все 3 streams продвигаются вместе, drift bounded 20-30s
+T=30d  : полный catch-up. Все WM ≈ live timestamp. Resume normal operation.
+```
+
+State remains bounded — clicks events с timestamp > maxDesired не accumulated в state, потому что не emitted из source.
+
+---
+
+## Configuration parameters detail
+
+### `withWatermarkAlignment(group, maxAllowedDrift, updateInterval)`
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `group` | String | — | Имя alignment group. Sources с одинаковым group sync'аются |
+| `maxAllowedDrift` | Duration | — | Maximum allowed WM drift между splits/sources в группе |
+| `updateInterval` | Duration | 1s | Как часто SourceCoordinator вычисляет alignment |
+
+### Tuning maxAllowedDrift
+
+Too small (1 sec):
+- Любая натуральная вариация в throughput → constant pause/resume
+- Overhead от RPC между SourceCoordinator и SourceReader
+- Возможно underutilization fast sources
+
+Too large (1 hour):
+- Защищает только от extreme drift
+- State buffering может всё ещё стать large
+- Близко к no alignment
+
+**Sweet spot**: `outOfOrderness * 2 to 5` — в нашем примере outOfOrderness = 30s, maxDrift = 30s-2min.
+
+### Tuning updateInterval
+
+```java
+.withWatermarkAlignment("group", Duration.ofSeconds(30), Duration.ofMillis(500))
+```
+
+Маленький interval (100ms) → responsive, но RPC chatter. Большой (10s) → events накапливаются между checks.
+
+**Default 1s** — оптимальный для большинства случаев.
+
+---
+
+## Per-split alignment (внутри source)
+
+FLIP-217 также alignment **между Kafka partitions одного source**:
+
+```
+KafkaSource (orders, 24 partitions, parallelism=6):
+  partition 0..3 on subtask 0:
+    p0: WM = T
+    p1: WM = T-2m   ← drift 2m
+    p2: WM = T-15s
+    p3: WM = T-3m   ← drift 3m
+```
+
+Без per-split alignment: subtask WM = MIN partition WM = T-3m. Партиции с WM=T продолжают читать, fill buffer в SourceReader. Если maxAllowedDrift = 30s, FLIP-217 паузит p0 и p2 (drift > 30s от T-3m), оставляет p1 и p3 работать. p3 «догоняет» через 3 минуты, потом resume p0 и p2.
+
+Без per-split alignment не было до FLIP-217 — fast partitions фактически overran SourceReader buffer, увеличивая checkpoint state.
+
+---
+
+## Production gotchas
+
+### 1. Alignment группа должна быть consistent
+
+```java
+// ❌ Разные имена → независимые группы, alignment не работает
+orders.withWatermarkAlignment("orders-group", ...);
+payments.withWatermarkAlignment("payments-group", ...);
+
+// ✅ Одна группа → alignment друг с другом
+orders.withWatermarkAlignment("ecommerce", ...);
+payments.withWatermarkAlignment("ecommerce", ...);
+```
+
+Если намеренно sources не должны align (например, два independent pipelines в одной job), используйте разные группы.
+
+### 2. maxAllowedDrift < outOfOrderness — bug
+
+```java
+.forBoundedOutOfOrderness(Duration.ofSeconds(60))   // WM = max_ts - 60s
+.withWatermarkAlignment("g", Duration.ofSeconds(20), Duration.ofSeconds(1));
+```
+
+maxDrift меньше чем outOfOrderness → невозможное условие. Один source с WM = T, второй WM = T - 60s (он outOfOrderness апсетит). Coordinator pause-ит fast, но даже без events fast стоит, его WM не двигается — потому что forBoundedOutOfOrderness тривиально WM = max_ts - 60s. **Stall**.
+
+Правило: `maxAllowedDrift >= outOfOrderness * 2`.
+
+### 3. Idle source с alignment — sneaky bug
+
+Source становится idle (через `withIdleness`). Его WM excluded from MIN. Но alignment группа всё ещё мониторит — если он resume позже, его WM в прошлом → coordinator pause его. Но он только что resume! Cycle.
+
+В 1.19+ исправлено: idle source excluded из alignment computation тоже. В 1.18 может быть hit.
+
+### 4. Single-source jobs с alignment — wasted overhead
+
+```java
+// ❌ Один source — alignment без смысла
+DataStream<Event> stream = env.fromSource(
+    source,
+    WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+        .withWatermarkAlignment("g", Duration.ofSeconds(20), Duration.ofSeconds(1)),
+    "single-source"
+);
+```
+
+Если только одна source — alignment между splits полезен, но overhead RPC может быть значимый. На small parallelism (< 10) обычно не нужно.
+
+### 5. Watermark alignment не fixes idle source
+
+Если у вас один source idle, alignment не поможет — потому что его WM = Long.MIN_VALUE, идёт в MIN, drift «infinity». Сначала `withIdleness`, потом alignment.
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withIdleness(Duration.ofMinutes(1))     // ← first
+    .withWatermarkAlignment("g", Duration.ofSeconds(30), Duration.ofSeconds(1));  // ← then
+```
+
+### 6. Connectors без поддержки FLIP-217
+
+Не все connectors implement `WatermarkAlignmentParams`. Kafka — да. FileSource — да. Legacy SourceFunction (removed в 2.0) — нет. Если используете 3rd-party source — проверьте.
+
+### 7. Effect на throughput
+
+Pause splits ограничивает peak throughput. На production system это хорошо (smooth backfill), но на benchmarks может выглядеть медленнее «без alignment». Это feature, не bug.
+
+### 8. Сохранение alignment между restart
+
+После recovery из checkpoint, alignment state восстанавливается — pause/resume decisions resume на основе current WM из state. Это работает корректно с 1.18+.
+
+---
+
+## Configuration cheat sheet
+
+```java
+// Production multi-source pattern
+WatermarkStrategy<MyEvent> wmStrategy = WatermarkStrategy
+    .<MyEvent>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((e, ts) -> e.getEventTime())
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment(
+        "my-job-alignment",       // одна группа для всех sources job
+        Duration.ofSeconds(60),   // 3x outOfOrderness
+        Duration.ofSeconds(1)     // default OK
+    );
+```
+
+```yaml
+# Cluster-level defaults (если хотите)
+pipeline.watermark-alignment.max-drift: 1min
+pipeline.watermark-alignment.update-interval: 1s
+```
+
+---
+
+## Performance characteristics
+
+| Cluster size | Without alignment | With alignment (FLIP-217) | Speedup |
+|---|---|---|---|
+| 100 subtasks | OOM at backfill 3d | Stable | ∞ |
+| 1000 subtasks | OOM at backfill 1d | Stable | ∞ |
+| 5000 subtasks | Coordination death-spiral | 76x faster | 76x |
+
+(FLIP-217 design doc benchmark)
+
+---
+
+<KnowledgeCheck
+  question="Production setup: job с 4 Kafka source-ами для real-time analytics. Топология: KafkaSource(events 1M/s) + KafkaSource(users 10K/s) + KafkaSource(products 5K/s) + KafkaSource(inventory 1K/s) → join по entityId → window 5 min → sink Iceberg. Reprocess 30 дней истории. Без alignment — OOM на TM через 2 часа. Cost для company: $50k за wasted compute + delayed insights. Спроектируйте alignment configuration. Объясните выбор parameters."
+  answer="Этот scenario — classic FLIP-217 use case. Configuration: WatermarkStrategy для каждого source-а должен иметь withWatermarkAlignment с одной общей группой ('analytics-reprocess'), maxAllowedDrift = 60s, updateInterval = 1s. Параметры обоснование: (1) outOfOrderness = 20-30s per source (стандарт для Kafka multi-producer), maxAllowedDrift = 2-3x outOfOrderness = 60s — даёт fast sources buffer выше slow без risk pause/resume thrashing. (2) updateInterval = 1s — default, оптимален для 4 source-ов и parallelism 100-500. (3) withIdleness(Duration.ofMinutes(2)) на каждом source — обязательно before alignment, иначе idle partitions tank WM. Ожидаемое поведение: events 1M/s — fastest по throughput, будет постоянно paused когда WM > min + 60s. inventory 1K/s — slowest, всегда unpaused. Group WM продвигается со скоростью самого медленного, обычно бизнес-метрика inventory обновления (1K/s = OK для real-time analytics). State per operator bounded — буферы не накапливаются больше maxDrift worth of data. Memory math: 1M/s × 60s × ~500 bytes/event = 30GB peak buffer per fast source — это размер можно accommodate в TM memory или ForSt cache. Без alignment этот буфер был бы 30 дней × 1M/s × 500 bytes = 1.3 PB → OOM. Дополнительные considerations: (1) для replay — set parallelism высокий (200-500), потом scale down после catch-up через savepoint-stop-restart; (2) использовать ForSt state backend (FLIP-427) — disaggregated state на S3, нет local disk limit; (3) включить unaligned checkpoints + GIC для стабильного checkpoint time под высокой backpressure (alignment создаёт backpressure intentionally); (4) Monitor pipeline.watermark-alignment метрики в UI — если pause percentage растёт > 90% на fast sources, увеличить maxDrift. Если < 10% — drift не достигнут, alignment не активен, OK; (5) Test на staging cluster сначала — FLIP-217 GA с 1.18, но edge cases с idle sources исправлены в 1.19+."
+/>

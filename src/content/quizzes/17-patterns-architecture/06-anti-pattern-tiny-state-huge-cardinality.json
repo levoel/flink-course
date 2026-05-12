@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/06-anti-pattern-tiny-state-huge-cardinality",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-06",
+    "description": "Quiz for anti-pattern tiny state huge cardinality"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-06-q1",
+      "type": "multiple-choice",
+      "question": "Anti-pattern 'tiny state, huge key cardinality' — почему 8-byte value × 1B keys занимает 200-400 GB на disk?",
+      "options": [
+        { "id": "a", "text": "RocksDB compression плохой" },
+        { "id": "b", "text": "Per-entry overhead в RocksDB SST: key (UID + namespace + serialized user key) 30-80 bytes + value envelope 40 bytes + bloom filter probe 10 bytes + index entry 20 bytes ≈ 200-400 bytes total. Для 8-byte value это 25-50x amplification. Overhead dominates payload" },
+        { "id": "c", "text": "Это bug Flink 2.x" },
+        { "id": "d", "text": "Не имеет значения, GC справится" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical insight для understanding state sizing. RocksDB storage = LSM-tree с structured layout. Каждый entry имеет: serialized key (state UID prefix + namespace + user key), value envelope с timestamp metadata, bloom filter slot, index entry. Total per-entry overhead 150-300 bytes. На billion keys: даже 8-byte value занимает 200-400 GB. Это объясняет почему dedup или per-key-tracking с миллиардами keys убивает Flink jobs — overhead × cardinality dominates всё.",
+      "studyHint": "Повторите урок 06 — раздел 'Анатомия проблемы'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-06-q2",
+      "type": "multiple-choice",
+      "question": "Production: dedup pipeline 10M unique messages/sec, retention 7 days. ValueState<Boolean> seen + keyBy(messageId). Какая основная проблема и стратегия?",
+      "options": [
+        { "id": "a", "text": "Просто увеличить parallelism" },
+        { "id": "b", "text": "6 trillion unique keys (10M × 86400 × 7) — катастрофа. Solutions в порядке effectiveness: (1) Bloom filter — constant memory 99.9% accuracy; (2) external Redis с SETNX TTL — no state в Flink; (3) Hash bucketing — bound cardinality на bucket count; (4) re-architect — может dedup нужен только на subset?" },
+        { "id": "c", "text": "Disable checkpointing для speed" },
+        { "id": "d", "text": "Использовать только heap state backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "6T unique keys × 200 bytes overhead = 1.2 PB. Невозможно. Mitigations: (1) Bloom filter: 100M expected × 0.001 FPP = 180MB per bloom. 99.9% accuracy. Constant memory. False positive rate 0.1% означает 0.1% legitimate events dropped — для most use cases OK. (2) External Redis: SETNX с TTL — atomic dedup, zero Flink state, EOS sacrificed для at-least-once. (3) Hash bucketing: 6T → 10M buckets, collisions accepted. (4) Re-architect: может dedup нужен per-day, не cross-week? Granularity change drastically снижает cardinality. Pure keyed state for этого scenario — пытаться построить highway из дерева.",
+      "studyHint": "Повторите урок 06 — раздел 'Mitigation'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-06-q3",
+      "type": "multiple-choice",
+      "question": "Hash bucketing pattern (1B IPs → 1M buckets) — какие trade-offs?",
+      "options": [
+        { "id": "a", "text": "Нет trade-offs, win-win" },
+        { "id": "b", "text": "Trade-off: collisions. Два IP с одинаковым hash попадают в один counter. Rate-limit может срабатывать на innocent IP. Приемлемо для noisy-neighbor mitigation, но НЕ для targeted limiting / per-user accuracy. State bounded — constant memory irrespective input cardinality" },
+        { "id": "c", "text": "Это identity bug, нельзя использовать" },
+        { "id": "d", "text": "Только для batch processing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Hash bucketing — pragmatic technique. Bound cardinality к chosen bucket count (1M buckets). Each subtask handle proportional buckets. Trade-off: pigeonhole — 1B distinct IPs в 1M buckets → average 1000 IPs per bucket. Rate limit на bucket triggers для всех 1000 IPs same time. Collisions inevitable. Use cases: DDoS mitigation (block aggressively, false positives acceptable), generic rate limiting, noisy-neighbor detection. NOT for: per-user precise limits (false positives cause user issues), security access control.",
+      "studyHint": "Повторите урок 06 — раздел 'Mitigation 4: Key hashing buckets'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-06-q4",
+      "type": "true-false",
+      "question": "Если state grows unbounded и TTL не fix-ит проблему, всегда есть technical solution в Flink для preservation correctness.",
+      "correctAnswer": false,
+      "explanation": "Sometimes the design is wrong. Если TTL не fix (например, retention business requirement), accuracy approximate NOT OK, external state scary — pre-вышенный решение может быть changing the requirement. Re-evaluate на higher level: изменить granularity (per-user-per-day buckets), агрегировать pre-dedup, или принять что pipeline должен иметь large state (TBs disk, hours recovery) plus invest в proper sizing + DR plan. Иногда anti-pattern это symptom — task wrong, не solution wrong.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

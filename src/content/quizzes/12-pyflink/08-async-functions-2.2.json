@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/08-async-functions-2.2",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-08",
+    "description": "Async UDFs Flink 2.2, asyncio, external API"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-08-q1",
+      "type": "multiple-choice",
+      "question": "Async UDFs в Flink 2.2 — что они closed и какой ключевой use case?",
+      "options": [
+        { "id": "a", "text": "Async UDFs только для GPU code" },
+        { "id": "b", "text": "Closed критический gap — PyFlink не имел async I/O equivalent Java's AsyncDataStream. Synchronous UDF blocking external API call (LLM, REST, embedding) → throughput 0.3-3 rec/sec/subtask, useless для real-time. Async UDF integrates asyncio + Flink runtime: `@async_udf` + `async def` Python coroutine, concurrent in-flight requests up to capacity. Killer use case: LLM-powered processing (fraud classification, content moderation, sentiment analysis), embedding API calls (real-time RAG), external ML inference services. 500x+ throughput improvement vs sync" },
+        { "id": "c", "text": "Async UDFs deprecated" },
+        { "id": "d", "text": "Не отличаются от sync UDFs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Pre-2.2 problem**: PyFlink не имел async I/O capability. Java's `AsyncDataStream.unorderedWait` (см. M02 урок 06) allowed concurrent in-flight external requests с capacity-based concurrency. Python не имел equivalent. **Workaround attempts**: synchronous UDF doing external call — blocks entire Python interpreter slot ~1-3s per LLM call → throughput 0.3-1 rec/sec/subtask. Catastrophic для production. Alternative: external Python service called via Java Async I/O — added network hop, complexity, deployment overhead. **Flink 2.2 solution — Async UDFs**: native asyncio integration. `@async_udf` decorator on `async def` Python coroutine. Per-slot event loop manages multiple concurrent coroutines (up to `capacity` setting). External API calls await without blocking interpreter — другие coroutines progress simultaneously. **Real numbers**: synchronous LLM UDF — 0.3 rec/sec/subtask (3s per call). Async UDF capacity=500 — concurrent 500 in-flight × (1/3 sec response) = 166 rec/sec/subtask. **500x improvement**. **Killer use cases**: (1) **LLM-powered processing** — OpenAI/Anthropic API calls for classification, content moderation, summarization. (2) **Real-time RAG** — embedding API + vector search per query. (3) **External ML inference** — internal ML services (model team owns model, Flink team owns pipeline). (4) **Knowledge graph lookups** — Neo4j, GraphQL queries. (5) **Cache fetches** — Redis (но usually fast enough sync). **Combined with Flink 2.2 features**: ML_PREDICT (FLIP-526) для embedded models, VECTOR_SEARCH (FLIP-540) для vector ops, Async UDF для external calls = complete AI/ML pipeline в pure PyFlink Table API + SQL.",
+      "studyHint": "Повторите урок 08 — секцию 'Зачем async — проблема blocking'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-08-q2",
+      "type": "multiple-choice",
+      "question": "Capacity sizing для async UDF — какая формула?",
+      "options": [
+        { "id": "a", "text": "Capacity всегда 100" },
+        { "id": "b", "text": "capacity = target_throughput_per_subtask × p99_latency_external_system. Example: target 1000 events/sec/subtask, OpenAI p99 latency 3 sec → capacity = 1000 × 3 = 3000 concurrent in-flight. Round up для 50% headroom → 4500. Trade-offs: too low (10) — throughput limited by capacity. Too high (10000) — may OOM external service or exhaust connection pool. Production: 500-1000 для LLM calls (1-3s latency), 100-500 для embeddings (100-500ms), 100 для cache lookups (1-10ms). Always pair с timeout=3×p99_latency для tail absorption" },
+        { "id": "c", "text": "Capacity не влияет на throughput" },
+        { "id": "d", "text": "Зависит только от parallelism" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Little's Law applied к async UDFs: throughput = capacity / latency. Therefore capacity = throughput × latency. **Sizing example для LLM**: (1) Target 1000 events/sec/subtask. (2) OpenAI p99 latency 3 sec. (3) Capacity = 1000 × 3 = 3000 in-flight requests. (4) Add 50% headroom для spikes/tail latency: 4500. (5) Configure `@async_udf(..., capacity=4500)`. **Workload-specific guidance**: (a) **LLM calls** (1-3s p99): capacity 500-3000. Generous because each request long. (b) **Embedding APIs** (100-500ms p99): capacity 100-500. Faster turnover. (c) **Internal ML inference** (10-50ms p99): capacity 100-1000. Many can be in-flight. (d) **Cache lookups** (1-10ms p99): capacity 50-200. Often Pandas UDF batched lookup faster anyway. **Trade-offs**: (1) **Too low capacity**: throughput = capacity / latency bottleneck. If target 1000/sec but capacity=100, only 100/0.003 = 33 records/sec/subtask possible — well below target. (2) **Optimal**: matches external system serving capacity. (3) **Too high**: may overwhelm external service (OpenAI rate limits, internal service overload), exhaust connection pool (aiohttp default limit 100 — need increase via TCPConnector(limit=2000) для capacity 1000). May trigger 429 rate limit responses cascade. **Timeout sizing**: `timeout = 3 × p99_latency`. Example p99=3s → timeout 10s. Absorbs tails (p99.9 may be 6-8s). Too short — false timeouts при normal spikes. Too long — slow records hold capacity → throughput drop. **Monitoring**: track UDF in-flight count, success rate, p50/p99/p999 latency. Adjust capacity based on observed metrics.",
+      "studyHint": "Повторите урок 08 — секцию 'Configuration: Capacity sizing'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-08-q3",
+      "type": "multiple-choice",
+      "question": "Production patterns для async UDF — какие critical safeguards?",
+      "options": [
+        { "id": "a", "text": "Просто увеличить capacity" },
+        { "id": "b", "text": "(1) Connection pooling — single aiohttp.ClientSession created в open(), reused во всех calls. (2) Rate limiting client-side (aiolimiter) для respect external API TPM/RPM. (3) Error handling — catch exceptions, return fallback value, NOT let bubble (would fail operator). (4) Idempotency keys в external requests для at-least-once safety на recovery. (5) Pre-filtering в SQL WHERE — don't call expensive LLM для filterable cases. (6) Caching common results в Redis (separate from Flink) для repeated queries. (7) Cost monitoring — track API call count, daily extrapolation, budget alerts. (8) UNORDERED ordering default — head-of-line blocking слишком costly otherwise" },
+        { "id": "c", "text": "Только timeout matters" },
+        { "id": "d", "text": "Production использование не recommended" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production-grade async UDF requires multiple safeguards. **(1) Connection pooling**: ```python\\nasync def open(self, ctx):\\n    connector = aiohttp.TCPConnector(\\n        limit=2000, limit_per_host=2000,\\n        ttl_dns_cache=300\\n    )\\n    self.session = aiohttp.ClientSession(\\n        connector=connector,\\n        timeout=aiohttp.ClientTimeout(total=10)\\n    )```. Default aiohttp limit 100 connections — bottleneck for high capacity. DNS cache reduces lookup overhead. **(2) Rate limiting**: use `aiolimiter` library для respect external API TPM/RPM limits. Without — request cascade при traffic spike → 429 errors flood → cascading failures. ```python\\nfrom aiolimiter import AsyncLimiter\\nrate_limit = AsyncLimiter(60, 1)  # 60 req/sec\\nasync def eval(self, text):\\n    async with rate_limit:\\n        ...```. **(3) Error handling**: wrap external call в try/except, return fallback value. NEVER let exception bubble — would fail operator with cascade restart. ```python\\ntry:\\n    return result\\nexcept (asyncio.TimeoutError, aiohttp.ClientError) as e:\\n    logger.warning(f'API error: {e}')\\n    return 'uncertain'  # Fallback, pipeline continues```. **(4) Idempotency**: Flink at-least-once semantics — on recovery in-flight requests re-issued. If external has side effects, duplicate execution. Use idempotency keys: `headers={'x-idempotency-key': f'{record_id}-{retry}'}`. External service deduplicates. **(5) Pre-filtering**: don't call expensive LLM unless necessary. ```sql\\nSELECT llm_classify(text) FROM events\\nWHERE message_priority='HIGH' OR contains_urgent_keywords(text)```. Saves 80%+ API calls. **(6) Caching**: separate Redis cache outside Flink. Hash query → cached response 1h TTL. Hit rate >70% for common queries. **(7) Cost monitoring**: emit UDF metrics for call count, sum daily, alert at budget threshold. **(8) UNORDERED ordering**: default. ORDERED имеет head-of-line blocking — slow record blocks all subsequent until completes. Only use if downstream strictly requires order.",
+      "studyHint": "Повторите урок 08 — Production gotchas section",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-08-q4",
+      "type": "true-false",
+      "question": "Async UDFs provide AT-LEAST-ONCE semantics для external system: checkpoints persist in-flight request list, on recovery requests re-issued — duplicate side effects possible. Production patterns: (1) pure read operations safe (idempotent by nature), (2) side-effect operations require idempotency keys (e.g., `x-idempotency-key: {tx_id}-{retry_count}` header).",
+      "correctAnswer": true,
+      "explanation": "Async UDF state management: Flink async operator persists list of in-flight requests в checkpoint state. Records that были sent к external но response не received yet — included. On recovery после failure, Flink replays these requests (because output не was emitted, Flink doesn't know if external processed them). **Implication — at-least-once для external**: a single record may cause multiple external invocations. For pure read operations (SELECT, GET, embedding lookup), это safe — same input yields same output, no side effects. **Side-effect risks**: external API that creates resources (POST to webhook, INSERT в external DB, send email) — duplicate execution creates duplicate resources. **Mitigation patterns**: (1) **Idempotency keys** — include unique key в request header/body that external service uses для deduplication: ```python\\nasync def eval(self, record):\\n    idempotency_key = f'{record.id}-{record.checkpoint_id}'\\n    async with session.post(url, headers={'x-idempotency-key': idempotency_key}, ...):```. External service tracks idempotency keys (typically 24h window), rejects duplicates. (2) **Stateless side-effects** — design external operation as upsert (PUT not POST). Multiple identical requests have same effect as one. ```python\\n# Bad: POST /create_resource\\n# Good: PUT /resource/{id} (idempotent)```. (3) **Conditional writes** — external service checks current state, applies write only if not already applied: `INSERT ... ON CONFLICT DO NOTHING` for DBs. (4) **Compensating actions** — if duplicate detected post-hoc, separate process reconciles. **Examples**: LLM API call returning classification — pure read, safe. Webhook posting к customer — side effect, need idempotency. Embedding API computation — pure (or close), safe. Email sending — must idempotency key. **Production rule**: assume duplicates will happen, design for safety. Audit each async UDF for side effects, add safeguards. Document recovery semantics в pipeline docs.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,408 @@
+---
+title: "State TTL — управление жизненным циклом state"
+description: "StateTTLConfig: NeverReturnExpired vs ReturnExpiredIfNotCleanedUp, cleanup strategies (full snapshot, on-read, in-background). Session timeouts, GDPR compliance"
+order: 5
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["State TTL", "Cleanup strategies", "GDPR", "Session timeout", "RocksDB compaction filter"]
+---
+
+# State TTL — управление жизненным циклом state
+
+Unbounded state — main reason of Flink job выходят из-под контроля. Когда `keyBy` по `userId` копит state forever, через 6 месяцев state size — сотни GB на TaskManager. Diskpressure, slow recovery, OOM-killer.
+
+State TTL (Time-To-Live) решает это: каждый state entry имеет expiration timestamp. После expiry Flink либо not return value, либо физически cleanup. Эта функциональность — must для GDPR, session windows, sliding aggregates с natural decay.
+
+---
+
+## Базовая идея
+
+<DiagramContainer title="State entry с TTL: жизненный цикл" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="state.update(v)"
+        tooltip="При update Flink сохраняет (value, lastUpdateTime). lastUpdateTime — UTC timestamp в millis. Это metadata для TTL — read overhead минимальный."
+      >
+        write: v + ts=NOW
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="время идёт..." />
+    <FlowRow>
+      <DataBox
+        label="TTL elapsed"
+        tooltip="После TTL = T entry считается expired. Само по себе значение в backend остаётся (lazy cleanup). Чтобы освободить storage — cleanup strategy должен зачистить."
+      >
+        ts + TTL < NOW → expired
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="state.value() read поведение" />
+    <FlowRow>
+      <DataBox
+        label="NeverReturnExpired"
+        tooltip="Read возвращает null для expired entry. Это safe default — приложение не видит stale значения. Если cleanup strategy slow — storage временно держит expired data."
+      >
+        return null
+      </DataBox>
+      <DataBox
+        label="ReturnExpiredIfNotCleanedUp"
+        tooltip="Read возвращает expired value, если он ещё физически не зачищен. Risky — приложение видит stale data. Используется ТОЛЬКО для best-effort cleanup без correctness требований."
+      >
+        return stale value
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Базовая конфигурация
+
+```java
+StateTtlConfig ttlConfig = StateTtlConfig
+    .newBuilder(Duration.ofHours(24))
+    .setUpdateType(UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupFullSnapshot()
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+ValueStateDescriptor<UserProfile> descriptor =
+    new ValueStateDescriptor<>("profile", UserProfile.class);
+descriptor.enableTimeToLive(ttlConfig);
+
+profile = getRuntimeContext().getState(descriptor);
+```
+
+После этого все entries в `profile` state живут не дольше 24 часов после последнего write.
+
+---
+
+## UpdateType — когда обновлять lastUpdateTime
+
+### `Disabled` — TTL не активен
+
+Default. State entries не expire.
+
+### `OnCreateAndWrite` (typical)
+
+```java
+.setUpdateType(UpdateType.OnCreateAndWrite)
+```
+
+`lastUpdateTime` обновляется на `update()`, `add()` (для ListState/MapState/etc). На read — нет.
+
+**Use case**: user profile, который должен expiry через 24h после последнего update. Если user не активен 24h — profile cleanup.
+
+### `OnReadAndWrite`
+
+```java
+.setUpdateType(UpdateType.OnReadAndWrite)
+```
+
+`lastUpdateTime` обновляется И на read, И на write. Equivalent к "sliding TTL" — пока пользователь хоть как-то взаимодействует, state живёт.
+
+**Use case**: session window — пока есть события, state не expires.
+
+```java
+StateTtlConfig sessionTtl = StateTtlConfig
+    .newBuilder(Duration.ofMinutes(30))
+    .setUpdateType(UpdateType.OnReadAndWrite)
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+```
+
+<Callout type="warning">
+`OnReadAndWrite` имеет write penalty: каждый read становится write. На RocksDB это значит каждый `state.value()` → PUT для refresh timestamp. На read-heavy workload это убивает performance.
+</Callout>
+
+---
+
+## StateVisibility — что возвращает read для expired
+
+### `NeverReturnExpired` (safe default)
+
+Если entry expired, `state.value()` возвращает `null` независимо от того, физически зачищен он или нет.
+
+```java
+.setStateVisibility(StateVisibility.NeverReturnExpired)
+```
+
+**Garantees correctness**: application code никогда не видит stale state.
+
+### `ReturnExpiredIfNotCleanedUp` (performance optimization)
+
+Если cleanup strategy ещё не зачистила entry, read возвращает его value. Application sees stale data.
+
+```java
+.setStateVisibility(StateVisibility.ReturnExpiredIfNotCleanedUp)
+```
+
+**Use case**: best-effort GDPR compliance, где небольшой lag между TTL expiry и actual return null не критичен.
+
+**Pitfall**: race conditions, особенно при slow background cleanup. Avoid если есть требования к correctness.
+
+---
+
+## Cleanup strategies
+
+Когда entry expired, **storage** всё ещё держит данные. Cleanup strategy — это **когда и как** Flink физически удалит expired entries из backend.
+
+### 1. `cleanupFullSnapshot()` — на snapshot
+
+```java
+.cleanupFullSnapshot()
+```
+
+На каждом checkpoint Flink скан state и пропускает expired entries при записи snapshot. Active state не trim — только snapshot версия не содержит expired.
+
+**Pros**: free, не affects runtime hot path.
+**Cons**: NOT cleanup live state — RocksDB на диске продолжает расти. Local state может быть terabytes, хотя snapshot — gigabytes.
+
+### 2. `cleanupIncrementally(N, runOnEveryRecord)` — heap only
+
+```java
+.cleanupIncrementally(1000, true)
+```
+
+На каждый `processElement` Flink делает incremental cleanup — сканирует N entries в state, удаляет expired.
+
+**Pros**: непрерывный cleanup live state.
+**Cons**: только для **heap state backend** (Hashmap), не работает с RocksDB! Для RocksDB используйте compact filter.
+
+### 3. `cleanupInRocksdbCompactFilter(queryTimeAfterNumEntries)` — RocksDB only
+
+```java
+.cleanupInRocksdbCompactFilter(1000)
+```
+
+Активируется специальный RocksDB compact filter (написан на C++ через JNI). При compaction RocksDB вызывает filter, который проверяет TTL и пропускает expired entries (они не пишутся в new SST).
+
+`queryTimeAfterNumEntries`: filter checks current time каждые N entries (default 1000), потому что вызов System.currentTimeMillis() на каждую — overhead.
+
+**Pros**: zero runtime overhead (cleanup случается во время compaction, которое и так running).
+**Cons**: cleanup happens только при compaction — может быть delay часы для cold data.
+
+### Combined strategy для production
+
+```java
+StateTtlConfig ttlConfig = StateTtlConfig
+    .newBuilder(Duration.ofHours(24))
+    .setUpdateType(UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupFullSnapshot()                  // снимки чистые
+    .cleanupInRocksdbCompactFilter(1000)    // disk cleanup через compaction
+    .build();
+```
+
+Snapshots не растут + disk eventually cleanup. Это стандартная конфигурация production.
+
+---
+
+## Internal layout: как TTL хранится
+
+Когда TTL enabled, Flink wrapps original TypeSerializer в `TtlStateFactory`. Serialized value становится:
+
+```
+[ttl_timestamp (8 bytes)] [original_value bytes]
+```
+
+Каждый `state.value()` десериализует timestamp prefix, проверяет TTL:
+- Если ttl_timestamp + TTL > NOW → не expired → возвращает value
+- Else → expired → возвращает null (или value если ReturnExpiredIfNotCleanedUp)
+
+Overhead: +8 bytes на каждый entry. На MapState — на каждую entry. Это noticeable для huge maps с small values.
+
+---
+
+## Use case 1: GDPR right to be forgotten
+
+```java
+// User profile должен удаляться через 90 дней inactivity:
+StateTtlConfig gdprTtl = StateTtlConfig
+    .newBuilder(Duration.ofDays(90))
+    .setUpdateType(UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupFullSnapshot()
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+ValueStateDescriptor<UserProfile> descriptor =
+    new ValueStateDescriptor<>("profile", UserProfile.class);
+descriptor.enableTimeToLive(gdprTtl);
+```
+
+После 90 дней без update profile expired. `NeverReturnExpired` гарантирует, что Flink job больше не использует old profile. RocksDB compaction постепенно зачищает SST. Через несколько compactions disk space освобождён.
+
+<Callout type="warning">
+TTL не дает hard delete guarantee для compliance с rigorous GDPR. Если требуется **физическое удаление в пределах X дней** — нужен manual cleanup pipeline + State Processor API audit. TTL — best-effort: «через TTL не вернёт value, но физически может остаться в SST некоторое время до compaction».
+</Callout>
+
+---
+
+## Use case 2: session timeout
+
+```java
+// Session window: пользователь idle 30min → session closes
+StateTtlConfig sessionTtl = StateTtlConfig
+    .newBuilder(Duration.ofMinutes(30))
+    .setUpdateType(UpdateType.OnReadAndWrite)   // ← sliding
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+ListStateDescriptor<Event> descriptor =
+    new ListStateDescriptor<>("session-events",
+        TypeInformation.of(Event.class));
+descriptor.enableTimeToLive(sessionTtl);
+```
+
+Каждое interaction обновляет lastUpdateTime — session живёт. Через 30 минут idle — expires.
+
+Combined с timer:
+
+```java
+public void processElement(Event e, Context ctx, Collector<?> out) {
+    sessionState.add(e);
+    ctx.timerService().registerEventTimeTimer(e.getTimestamp() + 30 * 60 * 1000);
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<?> out) {
+    // Emit session, clear state
+    List<Event> session = new ArrayList<>();
+    sessionState.get().forEach(session::add);
+    if (!session.isEmpty()) out.collect(makeSession(session));
+    sessionState.clear();
+}
+```
+
+Timer — explicit cleanup at exact time. TTL — fallback на случай stuck timer.
+
+---
+
+## Use case 3: sliding metrics
+
+Хранить только последние 24h данных для metric:
+
+```java
+StateTtlConfig metricsTtl = StateTtlConfig
+    .newBuilder(Duration.ofHours(24))
+    .setUpdateType(UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+MapStateDescriptor<Instant, Double> descriptor =
+    new MapStateDescriptor<>("hourly-metrics", Instant.class, Double.class);
+descriptor.enableTimeToLive(metricsTtl);
+```
+
+Старые hourly buckets автоматически expire через 24h.
+
+---
+
+## TTL и event time vs processing time
+
+**Важное ограничение Flink 2.x**: TTL работает только в **processing time** (wall clock TaskManager-а).
+
+`StateTtlConfig.newBuilder(Duration.ofDays(90))` — это 90 дней processing time.
+
+```java
+// Future API (still experimental в 2.x):
+.setTtlTimeCharacteristic(TimeCharacteristic.EventTime)
+```
+
+Если нужен event-time TTL — используйте explicit `timerService().registerEventTimeTimer` + `state.clear()`.
+
+<Callout type="note">
+Это иногда удивляет: «у меня event-time pipeline, почему state TTL не работает?». Потому что TTL — processing time. Если хотите cleanup по event timestamp в record, регистрируйте event time timer и cleanup manually в onTimer.
+</Callout>
+
+---
+
+## TTL и schema evolution
+
+При schema evolution state может быть migrated на restart. TTL сохраняется — ttl_timestamp prefix остаётся, изменяется только value serializer.
+
+```java
+// v1: ValueState<UserProfileV1>, TTL=24h
+// v2: ValueState<UserProfileV2>, TTL=48h
+// Restart: existing entries keep their TTL timestamps
+```
+
+Если TTL duration изменился, **new** entries используют new TTL, **existing** — старый timestamp + new TTL для re-evaluation. Это может привести к ситуации, когда entries unexpectedly survive longer.
+
+---
+
+## Production gotchas
+
+### 1. `cleanupIncrementally` не работает на RocksDB
+
+```java
+.cleanupIncrementally(1000, true)  // ❌ ignored для RocksDB!
+```
+
+Это для heap backend only. На RocksDB используйте `cleanupInRocksdbCompactFilter`.
+
+### 2. TTL не делает hard delete для compliance
+
+Для GDPR с rigorous requirements:
+- Используйте explicit pipeline для delete commands → publish в Kafka → Flink consume → `state.clear()`
+- TTL — soft expiry, не hard delete
+
+### 3. ReturnExpiredIfNotCleanedUp + slow compaction = stale data
+
+В RocksDB compaction может быть delayed на часы для cold key groups. Если используете ReturnExpiredIfNotCleanedUp, application может видеть stale values долго.
+
+### 4. TTL overhead на metadata
+
+Каждый state entry с TTL хранит +8 bytes timestamp. На MapState<String, Long> где value = 8 bytes, overhead = 50%. Для huge maps это noticeable.
+
+### 5. UpdateType.OnReadAndWrite превращает read в write
+
+```java
+.setUpdateType(UpdateType.OnReadAndWrite)
+```
+
+На RocksDB это значит каждый read → PUT для refresh timestamp. Read-heavy workload deteriorates badly. Используйте только если действительно нужен sliding TTL.
+
+### 6. Cleanup filter performance в RocksDB
+
+`cleanupInRocksdbCompactFilter(1000)` — checks current time каждые 1000 entries. Если очень small entries и компакция scan большой объём, time check overhead может быть значимым. Tuning: больше число (10000) = меньше overhead, более stale cleanup.
+
+### 7. TTL не работает для broadcast state
+
+Broadcast state в Flink 2.2 **не поддерживает TTL**. Если нужен expiry — implement manually в processBroadcastElement через explicit cleanup.
+
+---
+
+## Monitoring TTL
+
+Metrics для monitoring:
+
+```
+flink.taskmanager.<job>.<operator>.numKeysWithStateTtlExpired
+flink.taskmanager.<job>.<operator>.numStateEntriesTrimmed
+```
+
+В Web UI / Prometheus:
+- `state.size` метрика должна plateau (не расти бесконечно) — если растёт → TTL не работает или cleanup slow
+- `numStateEntriesTrimmed` — counter cleanup activity
+
+---
+
+## Comparison: TTL vs explicit timer cleanup
+
+| Подход | Pros | Cons |
+|---|---|---|
+| **State TTL** | Declarative, no boilerplate, embedded in serializer | Processing time only, slow physical cleanup |
+| **Explicit Timer** | Event-time aware, exact time control | Verbose, timer state grows |
+
+В большинстве случаев — TTL. Для строгого event-time cleanup — timer.
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: per-user state с UpdateType.OnReadAndWrite, TTL=30min для session timeout. Workload — 100k events/sec, в среднем 10 reads per event. State backend — RocksDB. Какая будет проблема?"
+  answer="Catastrophic write amplification. С OnReadAndWrite каждый read становится write — 100k events/sec × 10 reads = 1M reads/sec → 1M writes/sec в RocksDB. RocksDB MemTable будет постоянно flushing → L0 compactions постоянно running → cascade compactions L0→L1, L1→L2 etc. Write amplification может достичь 50-100x для leveled compaction. CPU TaskManager-ов >90% на compaction threads, disk I/O насыщен, latency events растёт до seconds, backpressure. Решения по эскалации: (1) переключиться на UpdateType.OnCreateAndWrite, если 30min TTL от write OK; (2) использовать explicit event-time timer с registerEventTimeTimer(e.ts + 30min) + state.clear() в onTimer — write happens только на event, no extra refreshes; (3) увеличить TTL в 10x до 5 часов чтобы сократить frequency refresh; (4) для real session timeout — Session Window API, не raw TTL. Lesson: OnReadAndWrite очень редко правильный выбор на RocksDB."
+/>

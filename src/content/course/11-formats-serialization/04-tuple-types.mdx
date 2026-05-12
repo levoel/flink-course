@@ -1,0 +1,365 @@
+---
+title: "Tuple types: Tuple2..TupleN и generics erasure"
+description: "Tuple2..Tuple25, когда применять, generics erasure problem с lambdas, обязательный .returns(...) или TypeHint."
+order: 4
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Tuple", "TupleTypeInfo", "Generics Erasure", "TypeHint"]
+---
+
+# Tuple types: Tuple2..TupleN и generics erasure
+
+Flink Tuples (`Tuple0` ... `Tuple25` из `org.apache.flink.api.java.tuple`) — это самый быстрый serializer в системе. Positional binary representation без field names, без headers, без null markers (Tuple-fields сами хранят null-flags при необходимости). Идеально для intermediate stream representations: keyBy-ed pairs, aggregation results, join inputs.
+
+Но Tuples живут в эпицентре одной из самых частых ловушек Flink: **lambdas + generic Tuple = type erasure catastrophe**. Без явного `.returns(...)` после lambda вы либо получите `InvalidTypesException`, либо silent Kryo fallback (50% perf hit). В этом уроке — Tuple API, performance characteristics, generics erasure deep dive и production patterns.
+
+---
+
+## Tuple hierarchy
+
+```
+Tuple (abstract)
+  ├── Tuple0     ()                       — singleton, immutable
+  ├── Tuple1<T0> (T0)
+  ├── Tuple2<T0, T1> (T0, T1)
+  ├── ...
+  └── Tuple25<T0..T24>
+```
+
+26 generic classes. Каждый имеет public fields `f0`, `f1`, ..., `f24` (соответствующая arity). Factory methods:
+
+```java
+Tuple2<String, Long> t = Tuple2.of("alice", 42L);
+String name = t.f0;
+Long count = t.f1;
+```
+
+> **Когда нужен Tuple26+?** Тогда вам нужен POJO. Tuple25 — hard limit. Если ваш intermediate record достиг 25 fields, читаемость кода уже страдает.
+
+---
+
+## TupleTypeInfo и TupleSerializer
+
+```java
+TupleTypeInfo<Tuple2<String, Long>> info = new TupleTypeInfo<>(
+    Types.STRING, Types.LONG);
+
+// Внутри TupleSerializer:
+public void serialize(Tuple2<String, Long> value, DataOutputView target) {
+    // No null marker for tuple itself — assumes non-null
+    // Per-field nullability handled by per-field serializer
+    StringSerializer.INSTANCE.serialize(value.f0, target);
+    LongSerializer.INSTANCE.serialize(value.f1, target);
+}
+```
+
+Ключевые свойства:
+
+- **Positional**: только порядок, никаких field names → меньше bytes на wire.
+- **No top-level null marker**: Flink не позволяет `null`-Tuple. Поля могут быть null, сам Tuple — никогда.
+- **Per-field serializer**: каждый T_i имеет свой TypeSerializer. Хорошо composable.
+- **No schema evolution by default**: добавление f3 к Tuple2 несовместимо — TupleSerializer ожидает фиксированную arity. Для evolution — POJO или Avro.
+
+---
+
+## Когда использовать Tuple
+
+| Use case | Recommendation |
+|---|---|
+| keyBy + aggregation: `(userId, count)` | Tuple2 — perfect |
+| Multi-key keyBy: `(userId, deviceId)` | Tuple2 |
+| Join result: `(left, right)` | Tuple2 |
+| Side output с originalKey | Tuple2 |
+| Domain event с >3 named fields | POJO, не Tuple |
+| Persistent state | POJO/Avro (для schema evolution) |
+| Public API contract между jobs | Avro/Protobuf, не Tuple |
+
+Правило: **Tuple — внутри одного job-а, никогда не пересекает job boundary**.
+
+---
+
+## Generics erasure: фундаментальная проблема
+
+Java generics — compile-time only. После компиляции type params стёрты (с некоторыми исключениями для inheritance hierarchies). Lambda — особый случай: signature lambda-функции не сохраняет generic params.
+
+### Что Flink видит на runtime
+
+```java
+// Source code
+DataStream<Tuple2<String, Long>> stream = input.map(v -> Tuple2.of(v, 1L));
+
+// На runtime Flink делает:
+Class<?> lambdaClass = mapFunction.getClass();           // some$Lambda$1
+Type[] generics = lambdaClass.getGenericInterfaces();
+// → [MapFunction] — без <String, Tuple2<String, Long>>
+// Generic params СТЁРТЫ для lambdas
+```
+
+Для named class — generics сохраняются:
+
+```java
+public class MyMap implements MapFunction<String, Tuple2<String, Long>> { ... }
+
+// Runtime:
+Type[] generics = MyMap.class.getGenericInterfaces();
+// → [MapFunction<String, Tuple2<String, Long>>]  ← params сохранены!
+// TypeExtractor может извлечь Tuple2<String, Long>
+```
+
+Это асимметрия compile/runtime: **named classes сохраняют generics на interface declaration, lambdas — нет**.
+
+---
+
+## Что происходит без `.returns()` после lambda
+
+<DiagramContainer title="Lambda + Tuple: code path Flink" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="DataStream.map(lambda)"
+        tooltip="API ищет TypeInformation для return type. Пытается через TypeExtractor.getMapReturnTypes(lambda, inputType, fnName, allowMissing)."
+      >
+        map(v -> Tuple2.of(v, 1L))
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="TypeExtractor introspects lambda"
+        tooltip="Class.getGenericInterfaces() на lambda class — возвращает raw MapFunction без params. TypeExtractor пытается через LambdaMetafactory information, но это work-around."
+      >
+        Generic info missing
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Two outcomes"
+        tooltip="(1) InvalidTypesException — если allowMissing=false. Это default для Tuple types. (2) GenericTypeInfo<Tuple2> — если allowMissing=true. Это путь к Kryo."
+      >
+        Exception OR Kryo
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Конкретно для Tuple — обычно exception, потому что Flink **знает** что Tuple parametrised и без params бесполезен:
+
+```
+org.apache.flink.api.common.functions.InvalidTypesException: 
+The return type of function 'map' could not be determined automatically, 
+due to type erasure. You can give type information hints by using the 
+returns(...) method on the result of the transformation call, or by 
+letting your function implement the 'ResultTypeQueryable' interface.
+```
+
+Это **good failure mode** — fail-fast на job submission, видно сразу. Хуже когда возвращается `GenericTypeInfo<Tuple2>` для POJO-like classes (см. урок 03) — там silent Kryo fallback.
+
+---
+
+## Fix 1: `.returns(TypeInformation)`
+
+Самый идиоматичный путь:
+
+```java
+import org.apache.flink.api.common.typeinfo.Types;
+
+DataStream<Tuple2<String, Long>> tagged = input
+    .map(v -> Tuple2.of(v.userId, 1L))
+    .returns(Types.TUPLE(Types.STRING, Types.LONG));
+```
+
+`Types.TUPLE(...)` принимает variadic TypeInformation, возвращает `TupleTypeInfo<Tuple>`. Все элементы обязательно явно указаны.
+
+```java
+// Tuple3
+.returns(Types.TUPLE(Types.STRING, Types.LONG, Types.DOUBLE));
+
+// Tuple с nested POJO
+.returns(Types.TUPLE(Types.STRING, Types.POJO(Transaction.class)));
+
+// Tuple с List
+.returns(Types.TUPLE(Types.STRING, Types.LIST(Types.LONG)));
+```
+
+---
+
+## Fix 2: `TypeHint`
+
+Если хочется generic syntax с type params в angle brackets:
+
+```java
+import org.apache.flink.api.common.typeinfo.TypeHint;
+
+DataStream<Tuple2<String, Long>> tagged = input
+    .map(v -> Tuple2.of(v.userId, 1L))
+    .returns(new TypeHint<Tuple2<String, Long>>() {});  // anonymous subclass
+```
+
+Внутри `TypeHint<T>`:
+
+```java
+public abstract class TypeHint<T> {
+    private final TypeInformation<T> typeInfo;
+
+    public TypeHint() {
+        // Class.getGenericSuperclass() на anonymous TypeHint subclass
+        // → TypeHint<Tuple2<String, Long>>
+        // Generics сохраняются в anonymous class signature!
+        typeInfo = TypeExtractor.createTypeInfo(
+            this.getClass(), TypeHint.class, 0);
+    }
+
+    public TypeInformation<T> getTypeInfo() { return typeInfo; }
+}
+```
+
+Trick: **anonymous class** (`new TypeHint<...>() {}`) создаёт synthetic subclass, в bytecode которого generic params сохранены в `Signature` attribute (для inheritance hierarchies generics НЕ стёрты).
+
+Когда использовать TypeHint vs Types:
+
+- `Types.TUPLE(...)` — concise, нет anonymous class overhead, idiomatic.
+- `TypeHint` — когда type очень сложный (deep nested generics), читаемость лучше.
+
+---
+
+## Fix 3: ResultTypeQueryable interface
+
+Для re-usable function:
+
+```java
+public class TaggingMap implements MapFunction<String, Tuple2<String, Long>>,
+                                   ResultTypeQueryable<Tuple2<String, Long>> {
+
+    @Override
+    public Tuple2<String, Long> map(String value) {
+        return Tuple2.of(value, 1L);
+    }
+
+    @Override
+    public TypeInformation<Tuple2<String, Long>> getProducedType() {
+        return Types.TUPLE(Types.STRING, Types.LONG);
+    }
+}
+
+// Использование — никакого .returns() не нужно
+DataStream<Tuple2<String, Long>> stream = input.map(new TaggingMap());
+```
+
+`ResultTypeQueryable.getProducedType()` имеет higher priority чем reflection — Flink сначала проверяет этот interface.
+
+Когда использовать: для функций, которые часто переиспользуются и где `.returns()` на call-site утомляет.
+
+---
+
+## Practical: типичные patterns с Tuple
+
+### keyBy на multi-field key
+
+```java
+// Tuple2 как composite key
+DataStream<Transaction> txs = ...;
+
+KeyedStream<Transaction, Tuple2<String, String>> keyed = txs
+    .keyBy(tx -> Tuple2.of(tx.getUserId(), tx.getDeviceId()),
+           Types.TUPLE(Types.STRING, Types.STRING));
+// keyBy variant с явным TypeInformation для key
+```
+
+> Note: `Tuple2` как key — корректно работает, потому что Tuple реализует `equals/hashCode` через AbstractMap-like pattern.
+
+### Window aggregation result
+
+```java
+DataStream<Tuple2<String, Long>> counts = input
+    .map(tx -> Tuple2.of(tx.getUserId(), 1L))
+    .returns(Types.TUPLE(Types.STRING, Types.LONG))
+    .keyBy(t -> t.f0)
+    .window(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+    .sum(1);   // sum field f1
+// sum() возвращает stream того же типа Tuple2<String, Long>
+```
+
+### Side output как Tuple
+
+```java
+final OutputTag<Tuple2<String, Throwable>> errorTag = new OutputTag<>("errors",
+    Types.TUPLE(Types.STRING, Types.GENERIC(Throwable.class)));
+// Throwable — Generic (Kryo). Если хотите fast — convert в String stacktrace.
+
+stream.process(new ProcessFunction<Tx, Result>() {
+    @Override
+    public void processElement(Tx tx, Context ctx, Collector<Result> out) {
+        try {
+            out.collect(process(tx));
+        } catch (Exception e) {
+            ctx.output(errorTag, Tuple2.of(tx.getUserId(), e));
+        }
+    }
+});
+```
+
+---
+
+## Performance microbench: Tuple vs POJO
+
+Микробенчмарк serialize+deserialize 10M записей:
+
+```
+Type                                Throughput      Bytes/record
+Tuple2<Long, Long>                   28M rec/sec    16 bytes
+Tuple2<String, Long> (10char)        22M rec/sec    ~22 bytes
+POJO with 2 long fields              26M rec/sec    18 bytes (null markers)
+POJO with Long + String              20M rec/sec    ~24 bytes
+GenericType Tuple2 via Kryo           9M rec/sec    ~30 bytes (class FQN)
+```
+
+Outcomes:
+
+- Tuple немного быстрее POJO (~10%), потому что нет null markers, нет field name lookup.
+- Kryo fallback Tuple — 3-4x медленнее.
+- Strings — overhead from variable-length encoding.
+
+В production реальные pipelines I/O-bound на network/disk, не serialize-bound. Tuple vs POJO выбор обычно determined readability, не perf.
+
+---
+
+## Production gotchas
+
+- **Lambda + Tuple без `.returns()`** — самая частая ошибка. Каждый PR review должен это catch-ить. Тест `disableGenericTypes()` ловит автоматически.
+- **`Tuple2<String, Object>`** — Object value → Kryo. Sealed alternatives поверх Object — flat-out не работают через Tuple.
+- **Tuple25 limit** — если упёрлись, конвертируйте в POJO. Schema evolution бонус.
+- **TupleSerializer не handles null Tuple** — `tx.collect(null)` для Tuple stream → NPE при serialize. Defaultable Tuple — нужен `.filter(Objects::nonNull)`.
+- **Comparison/Ordering** — Tuple реализует `Comparable` только если все T_i Comparable. Иначе `keyBy` через Tuple работает по equals/hashCode, но `compareTo` ломается.
+- **Tuple immutability** — Tuple mutable (`t.f0 = ...` legal). Это feature для performance reuse в loops, но bug magnet. Документируйте.
+- **Scala Tuple ≠ Flink Tuple** — `scala.Tuple2` имеет другой serializer. После remove Scala API в 2.0 это не должно быть проблемой, но legacy code остаётся.
+- **Kotlin `Pair`/`Triple`** — Kryo fallback. Используйте Flink Tuple либо POJO.
+- **Tuple в Avro schemas** — нет direct mapping. Avro использует records, не tuples. Cross-format conversion требует custom logic.
+
+<Callout type="warning">
+Самая болезненная regression: добавили `.map(v -> Tuple2.of(...))` без `.returns()` в новый PR, локальные тесты passed (TypeExtractor иногда работает для простых cases), production показывает 50% throughput drop через неделю. Профилактика — `env.getConfig().disableGenericTypes()` в integration tests.
+</Callout>
+
+<Callout type="tip">
+Convention: для job-internal data используйте Tuple2/3 (concise, fast). Для anything крупнее 3 fields, или для anything с schema evolution requirement — POJO/Avro. Никогда не используйте Tuple как event type в Kafka — schema невозможно evolve, names отсутствуют, новый field = breaking change.
+</Callout>
+
+---
+
+## Comparison summary
+
+| Aspect | Tuple | POJO | Avro |
+|---|---|---|---|
+| Speed | Fastest (100%) | ~95% | ~85% |
+| Schema evolution | None | Limited (add nullable) | Full |
+| Field names | f0, f1 (positional) | Named | Named (schema) |
+| Cross-language | No (Java-only) | No | Yes (Java/Python/Go) |
+| Boilerplate | None | Constructor + getters | Schema + codegen |
+| Recommended for | Internal intermediate | Domain events | External contract |
+
+---
+
+<KnowledgeCheck
+  question="Команда переписала старый Flink job с anonymous MapFunction на современный lambda syntax: `stream.map(tx -> Tuple3.of(tx.userId, tx.amount, tx.eventTime))`. Job стал failing на submission с `InvalidTypesException`. Объясните root cause, дайте три fix-варианта в порядке предпочтения, и предложите CI guard."
+  answer="**Root cause**: lambda не сохраняет generic params (`<String, Tuple3<String, Double, Instant>>`) в bytecode из-за того, что lambdas компилируются в `invokedynamic` calls к `LambdaMetafactory`, и Class.getGenericInterfaces() возвращает raw MapFunction без params. TypeExtractor не может вывести return type → `InvalidTypesException: The return type of function 'map' could not be determined automatically`. Anonymous class `new MapFunction<String, Tuple3<...>>() {}` сохранял generics в Class signature → TypeExtractor работал. Lambda — нет. **Fix варианты по предпочтению**: (1) **`.returns(Types.TUPLE(...))`** — самое идиоматичное: `stream.map(tx -> Tuple3.of(tx.userId, tx.amount, tx.eventTime)).returns(Types.TUPLE(Types.STRING, Types.DOUBLE, Types.GENERIC(Instant.class)))`. Concise, readable, no extra classes. ВАЖНО: `Instant` не имеет `BasicTypeInfo` → нужен `Types.GENERIC(Instant.class)` (Kryo для этого field). Лучше заменить на `long epochMillis` — тогда `Types.LONG` и full perf. (2) **`TypeHint<Tuple3<String, Double, Long>>()`** — если хочется generic angle-bracket syntax: `.returns(new TypeHint<Tuple3<String, Double, Long>>() {})`. Anonymous subclass сохраняет generics. Чуть verbose, но иногда читаемее для deep nested. (3) **Создать named class `TxToTuple3 implements MapFunction<Tx, Tuple3<...>>, ResultTypeQueryable<Tuple3<...>>`** — verbose, но reusable. Подходит когда mapping logic > 3 строк или используется в нескольких pipelines. **CI guard**: добавить в integration tests bootstrap `env.getConfig().disableGenericTypes()`. После этого любой regression к Kryo fallback (через generics erasure) fails в CI с `IllegalArgumentException` — explicit message с указанием класса. Дополнительно: PR template checklist с пунктом 'все `.map`/`.flatMap` с lambda имеют `.returns()`'. Дополнительно: integration test `assertNoGenericTypes(env.getStreamGraph())` который walks через все StreamNodes и assert-ит что output TypeInformation не GenericTypeInfo. Это catches не только Tuple lambdas, но и любые другие Kryo regressions."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/02-streamexecutionenvironment",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-02",
+    "description": "Use IDs: flink-m02-02-q1, flink-m02-02-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-02-q1",
+      "type": "multiple-choice",
+      "question": "В Flink 2.x какой правильный API для создания source-а из Kafka?",
+      "options": [
+        { "id": "a", "text": "env.addSource(new FlinkKafkaConsumer(...))" },
+        { "id": "b", "text": "env.fromSource(KafkaSource.builder()...build(), watermarkStrategy, name) — FLIP-27 unified Source API. Legacy SourceFunction / FlinkKafkaConsumer REMOVED в 2.0" },
+        { "id": "c", "text": "env.kafkaSource(...).build()" },
+        { "id": "d", "text": "env.read(KafkaSource.create(...))" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "В Flink 2.x все legacy SourceFunction / RichSourceFunction / FlinkKafkaConsumer REMOVED. Остался единый FLIP-27 Source interface через env.fromSource(source, watermarkStrategy, name). FLIP-27 разделяет source на SplitEnumerator (один на job в JobMaster, distributes splits) + SourceReader (N в TaskManager-ах, fetches data). Unified для bounded и unbounded sources через Boundedness.",
+      "studyHint": "Повторите урок 02 — раздел 'FLIP-27 Source API'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-02-q2",
+      "type": "multiple-choice",
+      "question": "Объясните FLIP-27 архитектуру source и где живут компоненты физически?",
+      "options": [
+        { "id": "a", "text": "Один SourceFunction на subtask, всё в TaskManager-е" },
+        { "id": "b", "text": "SplitEnumerator (один в JobMaster) обнаруживает splits и distributes их к SourceReader-ам (N в TaskManagers по parallelism). Reader fetches данные из своих splits. При scaling SplitEnumerator rebalance-ит splits — нет потери offsets. Unified API для bounded (files) и unbounded (Kafka)" },
+        { "id": "c", "text": "Только SourceFunction на каждом TM" },
+        { "id": "d", "text": "SplitEnumerator на каждом TM" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-27 — два компонента. SplitEnumerator: единственный instance в JobMaster, отвечает за discovery splits (Kafka partitions, S3 files), их распределение между readers через RPC, rebalance при scaling. SourceReader: N instances в TM-ах (по parallelism), получает свои splits через addSplits(), fetches data и emit-ит. Это разделение даёт: proper rescaling без потери offsets, locality-aware split assignment, unified bounded/unbounded API. Legacy SourceFunction не имел такого разделения.",
+      "studyHint": "Повторите урок 02 — диаграмма 'FLIP-27 Source архитектура'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-02-q3",
+      "type": "multiple-choice",
+      "question": "Что делает HybridSource (FLIP-150) и где это полезно?",
+      "options": [
+        { "id": "a", "text": "Это про hybrid storage" },
+        { "id": "b", "text": "Комбинирует bounded + unbounded sources в один stream. Pipeline сначала processит файлы (например, исторический backfill из S3), затем seamless переключается на live stream (Kafka). Без HybridSource нужны отдельные backfill jobs — усложняет ops. Активно используется в lakehouse" },
+        { "id": "c", "text": "Поддержка двух source-ов одновременно" },
+        { "id": "d", "text": "Источник для HDFS+S3" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "HybridSource — мощная фича для bootstrapping streaming jobs с historical data. Pattern: HybridSource.builder(fileSource).addSource(kafkaSource).build(). Сначала processит bounded file source (например, последние 30 дней из S3), затем automatically switches на unbounded Kafka. State, watermarks преемственны между source-ами. Без HybridSource часто пишут две отдельные jobs (backfill batch + live streaming) — это complicate-ит ops, нужно coordinate state handoff. HybridSource делает unified pipeline.",
+      "studyHint": "Повторите урок 02 — раздел 'Hybrid Sources (FLIP-150)'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-02-q4",
+      "type": "true-false",
+      "question": "В Flink 2.x legacy SourceFunction, RichSourceFunction, SinkFunction, RichSinkFunction, TwoPhaseCommitSinkFunction — все REMOVED. Production код должен использовать FLIP-27 (fromSource) и FLIP-191 SinkV2 (sinkTo).",
+      "correctAnswer": true,
+      "explanation": "Все legacy source/sink interfaces removed в Flink 2.0. FLIP-27 (Source API): fromSource(source, watermarkStrategy, name) с SplitEnumerator/SourceReader декомпозицией. FLIP-191 (SinkV2): sinkTo(sink) с SinkWriter / Committer / PreCommit / PostCommit topology. SinkV2 поддерживает многоуровневые commit semantics — обязательно для Iceberg/Paimon/Hudi sinks с manifest publish. Если видите legacy addSource/addSink — это 1.x код, нужна миграция.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

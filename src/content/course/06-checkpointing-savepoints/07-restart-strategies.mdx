@@ -1,0 +1,371 @@
+---
+title: "Restart strategies и failover regions"
+description: "Restart strategies: fixed-delay, failure-rate, exponential-delay (default), none. Failover region strategy — restart только regions of failed task."
+order: 7
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Restart Strategy", "Failover", "Failure Rate", "Exponential Delay", "Region Failover"]
+---
+
+# Restart strategies — auto-recovery после failures
+
+Когда task падает (OOM, network failure, transient bug), Flink должен решить: restart job, restart часть job, или just fail. **Restart strategy** определяет это decision. Plus **failover region strategy** определяет scope restart — full job vs только affected operators.
+
+Этот урок — обзор всех 4 restart strategies, failover regions, и production tuning.
+
+---
+
+## Restart strategies
+
+### 1. exponential-delay (default with checkpointing)
+
+С Flink 1.18 — default если checkpointing enabled. Exponential backoff между retries:
+
+```yaml
+restart-strategy.type: exponential-delay
+restart-strategy.exponential-delay.initial-backoff: 1s
+restart-strategy.exponential-delay.max-backoff: 1min
+restart-strategy.exponential-delay.backoff-multiplier: 1.5
+restart-strategy.exponential-delay.reset-backoff-threshold: 1h
+restart-strategy.exponential-delay.jitter-factor: 0.1
+restart-strategy.exponential-delay.attempts-before-reset-backoff: 8
+```
+
+**Поведение**:
+- Attempt 1: wait 1s
+- Attempt 2: wait 1.5s
+- Attempt 3: wait 2.25s
+- ...
+- Attempt 8: wait 17s (capped at max-backoff)
+- Attempt 9+: cap at 1min
+- After `reset-backoff-threshold` (1h) without failure — reset to initial-backoff
+- Plus jitter ±10% для avoid thundering herd
+
+**Use cases**:
+- Default — handles большинство transient failures
+- Avoids hammering cluster при persistent issue
+- Eventually recovers when issue resolves
+
+### 2. fixed-delay
+
+Fixed interval между retries, fixed total attempts:
+
+```yaml
+restart-strategy.type: fixed-delay
+restart-strategy.fixed-delay.attempts: 10        # max attempts before fail
+restart-strategy.fixed-delay.delay: 30s          # between attempts
+```
+
+**Use cases**:
+- Predictable behavior
+- Limited number retries — eventually fail после N attempts
+- Simple environments
+
+### 3. failure-rate
+
+Limit failures per time window:
+
+```yaml
+restart-strategy.type: failure-rate
+restart-strategy.failure-rate.max-failures-per-interval: 3
+restart-strategy.failure-rate.failure-rate-interval: 5min
+restart-strategy.failure-rate.delay: 10s
+```
+
+**Поведение**: allow до 3 failures за 5 minutes. После 3 — fail job. Reset counter каждые 5 min.
+
+**Use cases**:
+- Detect persistent issues (3 failures в 5 min — что-то не так)
+- Alerts trigger когда rate exceeded
+- Different от exponential — based на rate, не на total attempts
+
+### 4. none
+
+Никогда не restart. Job fails on first task failure.
+
+```yaml
+restart-strategy.type: none
+```
+
+Synonym: `restart-strategy.type: off`
+
+**Use cases**:
+- Development / testing
+- One-off jobs (batch)
+- Custom failure handling через external orchestrator (Argo, Airflow)
+
+---
+
+## Default selection
+
+Flink выбирает default based on configuration:
+
+```
+If restart-strategy.type explicit set: use it
+Else if checkpointing enabled (interval > 0): use exponential-delay
+Else: use none (fail on first failure)
+```
+
+С Flink 2.x: если checkpointing enabled — **always exponential-delay default**. Это encourages best practice.
+
+### Programmatic
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.enableCheckpointing(60_000);
+
+env.setRestartStrategy(RestartStrategies.exponentialDelayRestart(
+    Duration.ofSeconds(1),         // initialBackoff
+    Duration.ofMinutes(1),         // maxBackoff
+    1.5,                           // backoffMultiplier
+    Duration.ofHours(1),           // resetBackoffThreshold
+    0.1                            // jitterFactor
+));
+```
+
+---
+
+## Failover region strategy
+
+Когда task fails, Flink restart **что-то**. Что именно — определяет failover region strategy.
+
+### full (legacy default)
+
+Restart **весь job** при любом task failure. Все state restored from last checkpoint, source replay из saved offsets.
+
+**Pros**: simple, predictable, no edge cases
+**Cons**: TBs state replay для small failure, big downtime
+
+```yaml
+jobmanager.execution.failover-strategy: full
+```
+
+### region (default с Flink 1.10+)
+
+Identify **pipelined region** — connected subgraph через pipelined edges (no shuffle). Restart только regions, containing failed task.
+
+```yaml
+jobmanager.execution.failover-strategy: region
+```
+
+#### Что такое pipelined region
+
+DAG operators connected по pipelined exchange (forward) → same region. Hash/rebalance/broadcast → разные regions.
+
+```
+Source A --forward-- Map A --forward-- Sink A     ← Region 1
+                                |
+Source B --forward-- Map B --hash-- KeyByOperator --forward-- Sink B
+                                                                ↑
+                                                            Region 2
+```
+
+В этом примере Source A → Sink A — pipelined region 1. Если Map B died — restart только Region 2 (downstream от hash). Region 1 untouched.
+
+#### Math для region failover
+
+```
+Pipelined region = transitively connected operators через forward edges
+
+When task в region R fails:
+  Restart all subtasks в R
+  Replay records от upstream regions (через blocking edges)
+  Downstream regions blocked, восстанавливаются после R recovery
+```
+
+### Benefits of region failover
+
+| Job topology | Failure scope (full) | Failure scope (region) | Speedup |
+|---|---|---|---|
+| Simple linear pipeline (1 region) | All operators | All operators (1 region = all) | 1x |
+| Source→KeyBy→Sink (2 regions) | All | 50% | 2x |
+| Multi-source merge → split (4 regions) | All | 25% | 4x |
+| Many independent jobs in 1 cluster | All | Only failed | Nx |
+
+Real production: 2-10x recovery speedup typically.
+
+---
+
+## Recovery time breakdown
+
+```
+Total recovery time =
+  Failure detection (heartbeat timeout) +
+  Restart strategy delay (backoff) +
+  Resource acquisition (slot allocation) +
+  State restore (download SSTs / DSTL replay) +
+  Source replay (from saved offset to current)
+```
+
+| Component | Typical time | Optimizations |
+|---|---|---|
+| Detection | 30s-2min | `heartbeat.timeout` (default 50s) |
+| Delay | 1-60s | Restart strategy tuning |
+| Slot allocation | Seconds-minutes | Pre-allocated slots, K8s autoscaling |
+| State restore | Seconds-hours | Local recovery, incremental, ForSt |
+| Source replay | Seconds-hours | Smaller checkpoint interval |
+
+Production goal: **bounded recovery time** independent of state size. ForSt + GIC + local recovery delivers это.
+
+---
+
+## Local recovery — state на local disk
+
+```yaml
+state.backend.local-recovery: true
+```
+
+После restart, если TaskManager **same node** (rescheduled там же), Flink использует local SST copies — не нужно download из DFS. Recovery time от minutes к seconds.
+
+### Constraints
+
+- Только works если TM placed на same node (K8s pod affinity helpful)
+- Disk usage doubles (live RocksDB + local recovery snapshots)
+- Не работает если TM полностью died (new pod на different node)
+
+### Practical impact
+
+```
+1TB state recovery:
+  Without local recovery: download 1TB from S3 ≈ 10-30 min
+  With local recovery: read from local NVMe ≈ 30-120 sec
+```
+
+20x speedup для same-node recovery — типичный scenario при transient TM failure (OOM kill, restart).
+
+---
+
+## Sticky allocation (Adaptive Scheduler)
+
+Adaptive Scheduler (FLIP-291) на 1.18+: TaskManagers try to keep same workload mapping across restarts. Это increases local recovery hit rate.
+
+```yaml
+jobmanager.scheduler: adaptive
+jobmanager.adaptive.preferred-resource-rotation: STICKY
+```
+
+Combined с local recovery — almost guaranteed local restore for transient failures.
+
+---
+
+## Production restart strategy
+
+### Recommended baseline
+
+```yaml
+# Restart strategy
+restart-strategy.type: exponential-delay
+restart-strategy.exponential-delay.initial-backoff: 1s
+restart-strategy.exponential-delay.max-backoff: 30s
+restart-strategy.exponential-delay.backoff-multiplier: 2.0
+restart-strategy.exponential-delay.reset-backoff-threshold: 1h
+restart-strategy.exponential-delay.jitter-factor: 0.1
+restart-strategy.exponential-delay.attempts-before-reset-backoff: 5
+
+# Failover strategy
+jobmanager.execution.failover-strategy: region
+
+# Local recovery
+state.backend.local-recovery: true
+
+# Adaptive scheduler for sticky allocation
+jobmanager.scheduler: adaptive
+```
+
+### Failure rate limit (additional safeguard)
+
+Combine exponential-delay с manual monitoring:
+
+```yaml
+# Если 10 failures за 1h — alert и manual intervention
+# (не configured directly, but external Prometheus alert)
+```
+
+Это лучше чем `restart-strategy.type: failure-rate` с hard limit — позволяет full recovery from transient issues, но alerts на persistent problems.
+
+---
+
+## Production gotchas
+
+### 1. Recovery loop — restart strategy doesn't help
+
+Сценарий: bug в code causes immediate OOM after start. Restart strategy retries → another OOM → loop. Exponential backoff slows, но job never recovers.
+
+**Mitigation**: Add monitoring alert на `flink_jobmanager_job_numRestarts` > 10 за час. Manual intervention required.
+
+### 2. Source offsets vs checkpoint replay
+
+После restart Flink restores state from checkpoint **и** Kafka offsets from same checkpoint. Sources replay from saved position. Если source committed offsets to Kafka (external metric), they don't matter for Flink replay — checkpoint offsets used.
+
+### 3. Kafka transaction timeout vs recovery time
+
+```
+Kafka transaction.timeout.ms = 15min
+Job recovery time = 20min (downloads 2TB state)
+→ All in-flight Kafka transactions expire → at-least-once instead of EOS
+```
+
+**Mitigation**: increase `transaction.timeout.ms` к expected max recovery time × 2.
+
+### 4. Region failover requires no global state
+
+If operators в разных regions share external state (например, shared cache), region failover может leave inconsistent. Plan state isolation per region.
+
+### 5. Restart attempts metric не resets correctly
+
+В rare cases `numRestarts` counter wrong after long-running job. Trust failure rate alerts on real metrics (job state, throughput), not just restart counter.
+
+### 6. Failure rate window confusing
+
+```yaml
+restart-strategy.failure-rate.failure-rate-interval: 5min
+restart-strategy.failure-rate.max-failures-per-interval: 3
+```
+
+Это означает: rolling window 5 min, allow 3 failures. NOT "reset after 5 min". If 3 failures за last 5 min — fail job.
+
+### 7. exponential-delay + max-concurrent-checkpoints=1
+
+Если предыдущий checkpoint failed и restart triggers, новый checkpoint не может start пока previous resolved. С exponential backoff + slow recovery — checkpoint cadence broken. Plan timeout accordingly.
+
+### 8. State migration через savepoint vs restart
+
+Restart использует last successful checkpoint — same Flink version, same backend. Schema changes, version upgrades, backend switch — требуют savepoint (manual). Restart strategy не помогает с этими scenarios.
+
+---
+
+## Cheat sheet
+
+```yaml
+# Production-grade restart configuration
+restart-strategy.type: exponential-delay
+restart-strategy.exponential-delay.initial-backoff: 1s
+restart-strategy.exponential-delay.max-backoff: 30s
+restart-strategy.exponential-delay.backoff-multiplier: 2.0
+restart-strategy.exponential-delay.reset-backoff-threshold: 1h
+restart-strategy.exponential-delay.jitter-factor: 0.1
+
+# Failover region — restart только affected operators
+jobmanager.execution.failover-strategy: region
+
+# Local recovery — keep SSTs on local disk
+state.backend.local-recovery: true
+
+# Adaptive scheduler — sticky allocation
+jobmanager.scheduler: adaptive
+jobmanager.adaptive.preferred-resource-rotation: STICKY
+
+# Faster failure detection
+heartbeat.timeout: 30s
+
+# Kafka EOS — enough timeout
+# (в Kafka producer config)
+transaction.timeout.ms: 1800000   # 30 min — accommodates long recovery
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: job состоит из 4 logical pipelines: (1) Kafka source A → fraud detection → Kafka sink A; (2) Kafka source B → enrichment → Kafka sink B; (3) merge A+B → analytics → ClickHouse sink; (4) clickstream → ML model → alert Kafka. State 500GB total. Failure mode: KafkaSource B periodically fails (Kafka broker restart). С 'full' failover — job restart полностью 5 min. С 'region' — может быть лучше?"
+  answer="Region failover может drastically улучшить recovery. Analyze DAG для regions: (1) Pipeline 1 (KafkaSource A → fraud → Kafka A): all forward connected — 1 region; (2) Pipeline 2 (KafkaSource B → enrichment → Kafka B): 1 region; (3) Pipeline 3 (merge A+B → analytics → ClickHouse): merge — это hash partition? Если да — separate region downstream от merge. Pipeline 1 и 2 outputs идут к merge через blocking exchange (если hash) или forward (если same parallelism); (4) Pipeline 4 (clickstream → ML → alert): independent — 1 region. С full failover: KafkaSource B fail → restart ENTIRE job — pipelines 1, 2, 3, 4 — all 500GB state restored, all sources replay from checkpoint, downtime 5 min. С region failover (default with 1.10+): Pipeline 2 region affected — restart только Pipeline 2 operators (likely 25-30% of subtasks). Pipelines 1 и 4 continue running без disruption (independent regions). Pipeline 3 (merge consumer) blocked waiting for Pipeline 2 recovery, но не itself restarted — state preserved, just paused. Recovery: only Pipeline 2 subtasks need state restore (~125GB Pipeline 2 portion), only KafkaSource B replays from checkpoint offset. Downtime для Pipeline 2 = 1-2 min (smaller state). Pipelines 1, 3, 4 continue running, business critical fraud detection не interrupted. Recovery time improvement: 5 min → 1-2 min для affected pipeline, zero downtime для unaffected pipelines. ~5x improvement effective business downtime. To make это work: (a) Ensure jobmanager.execution.failover-strategy: region (default 1.10+, verify); (b) Connect pipelines через blocking exchange (hash partition или explicit hash strategy) — forward edges would merge regions; (c) Enable local recovery для faster Pipeline 2 recovery (state.backend.local-recovery: true) — saves Pipeline 2's 125GB download from S3; (d) Independent uids для each pipeline operator — for clean savepoint operations later; (e) Per-pipeline metrics — separate dashboards для each region, easier to detect localized failures; (f) Pre-allocated slots или K8s pod affinity для sticky allocation; (g) Consider further splitting via slot sharing groups — different memory/CPU budgets для each pipeline. Edge cases consider: if Pipeline 3 (merge) state is shared между A и B logical paths in shared keyed state — single region. To split — use intermediate Kafka topics между pipelines (Pipeline 1 → Kafka topic A → Pipeline 3 reads A) — creates blocking boundary, separate regions. Trade-off: more Kafka topics, more I/O, but better isolation. For mission-critical fraud detection (Pipeline 1) — total isolation worth it. Если KafkaSource B failure rate increases (e.g., daily restarts), consider: separate Flink job for Pipeline 2 entirely — independent failure domains, completely zero impact на Pipeline 1. This is microservice approach к streaming."
+/>

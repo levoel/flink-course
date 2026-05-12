@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/06-runtime-data-sampling-flip570",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-06",
+    "description": "Quiz for Runtime Data Sampling FLIP-570 lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-06-q1",
+      "type": "multiple-choice",
+      "question": "Что такое FLIP-570 Runtime Data Sampling (Flink 2.3+) и как работает?",
+      "options": [
+        { "id": "a", "text": "Сэмплирование метрик через Prometheus" },
+        { "id": "b", "text": "Live sampling реальных records в Web UI без redeploy. Click 'Sample 100 records' на operator → 1-2 секунды → live data displayed. Архитектура: UI → JM (REST) → TM (RPC) → sampler attaches к mailbox processor → копирует каждую N-ю запись в buffer → return результаты. Near-zero overhead (<1% throughput drop active, 0% inactive)" },
+        { "id": "c", "text": "Sampling stack traces" },
+        { "id": "d", "text": "Performance profiling tool" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-570 — game changer для production debugging. До этого опции: per-record logging (flood logs), redeploy с debug code (slow), угадывание (slow root cause). Sample size до 1000 records, optional filter (SQL-like expression: userId = 'u_001', amount > 100). Lightweight wrapper на mailbox, fixed-size buffer, autodetach при full/timeout. UI display + REST API для automation. После Web UI click — actual production data visible в 1-2 sec.",
+      "studyHint": "Повторите урок — Что такое Runtime Data Sampling",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-06-q2",
+      "type": "multiple-choice",
+      "question": "Какие 5 типовых use cases для Runtime Data Sampling в production?",
+      "options": [
+        { "id": "a", "text": "Только performance benchmarking" },
+        { "id": "b", "text": "(1) Data skew investigation — sample input на busy subtask, identify hot key за 30s. (2) Data quality issues — sample output, find malformed/null/empty fields. (3) Schema evolution — verify все records have new fields. (4) Deduplication verification — filter specific user, check for duplicates. (5) Watermark/event-time issues — sample after window operator, see late events" },
+        { "id": "c", "text": "Только metrics collection" },
+        { "id": "d", "text": "Pre-deploy testing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-570 specifically designed для these patterns. Use case 1: hot user / bot pattern detection в 30 seconds (sample shows 80 records single userId). Use case 2: parser issues (sample output sees null amounts, negative values, empty categories). Use case 3: post-deploy verification — confirms new field present в samples. Use case 4: deduplication broken — same txn_id appears twice в filtered sample. Use case 5: watermark misconfiguration — two emissions для same window indicates allowedLateness triggered.",
+      "studyHint": "Повторите урок — Use cases",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-06-q3",
+      "type": "multiple-choice",
+      "question": "Customer report: fraud alerts перестали приходить для high-value transactions ($10k+). Throughput unchanged, no errors. План diagnose с Runtime Sampling?",
+      "options": [
+        { "id": "a", "text": "Add logs, redeploy, wait" },
+        { "id": "b", "text": "Systematic bisection через stages: (1) Sample output Source с filter amount > 10000 — 0 events? Issue upstream. (2) Sample input/output Map (parse) с filter — events dropped? Parser issue. (3) Sample input KeyedProcess (fraud detector) — events arrive? (4) Sample output detector с filter alert_severity=high — 0 alerts emit для high-value? Fraud logic broken. (5) Sample output Sink — alerts written? Diff input/output reveals offending stage. 15 minutes from incident к identified fix. Without sampling: 1-3 hours blind debugging" },
+        { "id": "c", "text": "Restart job" },
+        { "id": "d", "text": "Check metrics только" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sampling at multiple stages bisects problem space efficiently. Always sample BOTH input и output suspected operator — diff reveals stage transformation. Hypothesis discovered через sampling — likely fraud detector logic broken (recent schema change, rule references field changed semantics). Production lesson: Runtime Sampling shines в these scenarios — narrow-down через stages takes 5-10 minutes. С access control (production), proper PII blocklist для sensitive operators. Train team на using этот diagnostic playbook standard.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-06-q4",
+      "type": "true-false",
+      "question": "Runtime Data Sampling — security risk если access не controlled, потому что samples содержат real production data, possibly PII.",
+      "correctAnswer": true,
+      "explanation": "True. Production sampling раскрывает реальные production данные в UI. Без blocklist для PII operators и без access control — это security/compliance violation (GDPR, CCPA для регулируемых юрисдикций). Production config: runtime-sampling.operator-blocklist для PII-sensitive operators (user-pii-processor, payment-handler), runtime-sampling.access-control.enabled: true, required-role flink-debugger. Plus reverse proxy с OAuth2/SSO. Audit log sampling requests. Training: 'sampling != free debugging для anything'. Review с security team перед production rollout.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

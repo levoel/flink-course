@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/06-savepoints",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-06",
+    "description": "Quiz for savepoints lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-06-q1",
+      "type": "multiple-choice",
+      "question": "Чем savepoints отличаются от checkpoints?",
+      "options": [
+        { "id": "a", "text": "Savepoints быстрее" },
+        { "id": "b", "text": "Checkpoints — auto periodic, owned by Flink (auto-delete), optimized (incremental/GIC), native format only. Savepoints — manual trigger, owned by user (persist forever), full snapshot, canonical format (portable cross-backend, cross-version) или native. Use savepoints для planned operations: upgrade, backend switch, A/B testing" },
+        { "id": "c", "text": "Они идентичны, синонимы" },
+        { "id": "d", "text": "Savepoints для batch, checkpoints для streaming" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Fundamental differences: (1) Trigger — checkpoints automatic (interval), savepoints manual (CLI/REST API); (2) Ownership — checkpoints owned by Flink (auto-delete according retention), savepoints owned by user (persist indefinitely); (3) Format — checkpoints native only (RocksDB internal), savepoints canonical (portable, cross-backend, cross-version) или native; (4) Optimization — checkpoints incremental/GIC, savepoints always full (self-contained, portable); (5) Purpose — checkpoints fault tolerance, savepoints planned upgrades; (6) Lifecycle — checkpoints tied к job, savepoints independent; (7) Speed — checkpoints fast (incremental), savepoints slow (full). Use savepoints для: code upgrade, schema migration, backend switch (RocksDB → ForSt), A/B testing, long-term backup.",
+      "studyHint": "Повторите урок — раздел 'Checkpoint vs Savepoint'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m06-06-q2",
+      "type": "multiple-choice",
+      "question": "Canonical vs native savepoint format — выбор?",
+      "options": [
+        { "id": "a", "text": "Canonical всегда лучше" },
+        { "id": "b", "text": "Native — fast (same path как checkpoint), но tied к Flink version + state backend. Canonical — portable (cross-backend RocksDB ↔ ForSt, cross-version 1.18 → 2.x), но 3-10x slower (full serialization) и 2-5x bigger. Use native для daily operations (same backend, same version). Use canonical для backend switch, version migration, long-term backup. Both supported simultaneously" },
+        { "id": "c", "text": "Native deprecated" },
+        { "id": "d", "text": "Canonical только в Java, не Python" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Format choice: Native — same format как checkpoints (RocksDB SST files или ForSt format directly). Fast — uses incremental path. Restrictions: same Flink version, same state backend (no switching). Use for daily operations, periodic backups. Canonical — Flink-internal portable serialization, backend-agnostic. Restore-time: deserialize → backend-specific format. Slower create/restore (3-10x), bigger (2-5x size). Required для: (1) Backend switch RocksDB → ForSt (or vice versa); (2) Flink version upgrade 1.18 → 2.x; (3) Long-term backup (future-proof). Production: keep both. Native для most savepoints, canonical для major operations. Use --savepoint-format canonical or native flag.",
+      "studyHint": "Повторите урок — раздел 'Canonical format'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-06-q3",
+      "type": "multiple-choice",
+      "question": "Почему explicit .uid() на operators critical для savepoints?",
+      "options": [
+        { "id": "a", "text": "Для debugging" },
+        { "id": "b", "text": "Savepoint stores state per operator UID. Без explicit .uid() Flink auto-generates UID на основе topology position. Любое изменение topology (add/remove/reorder operators) меняет auto-generated UIDs downstream → state не restored, savepoint useless. Production: ALWAYS .uid('descriptive-id') на КАЖДОМ stateful operator. CI check добавить" },
+        { "id": "c", "text": "UIDs только для logging" },
+        { "id": "d", "text": "UIDs deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical для savepoint stability. Savepoint persists state per operator UID. Без explicit .uid() Flink auto-generates на основе hash topology position — fragile. Adding/removing/reordering operators changes auto-UIDs of everything downstream. На restore Flink не can match savepoint state к current operators → state не restored для тех operators (если --allowNonRestoredState — silently empty, else error). Production rule: ALWAYS explicit uid на КАЖДОМ stateful operator. Example: stream.keyBy(...).uid('kb-user').process(new FraudDetector()).uid('fraud-detector-v3').sinkTo(s).uid('kafka-sink'). CI check для PR: verify все stateful operators имеют .uid(). На code review reject without. Это сохраняет savepoint compatibility across топологии изменений.",
+      "studyHint": "Повторите урок — раздел 'UIDs must be persistent'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m06-06-q4",
+      "type": "true-false",
+      "question": "Stop-with-savepoint with canonical format на 1TB state может занимать часы — это normal.",
+      "correctAnswer": true,
+      "explanation": "True. Canonical savepoint — full serialization всего state в backend-agnostic format. На 1TB state: (1) Read all state из RocksDB (через KeyedStateBackend iterator); (2) Serialize в canonical format (slower than native binary copy); (3) Upload к DFS (network bound, может быть hours на slow S3); (4) Multiple operators in parallel но overall bottleneck — DFS bandwidth. Realistic: 1TB canonical savepoint = 1-3 hours typical. Production planning: (a) Set --savepoint-timeout 4-6h (default execution.checkpointing.timeout = 10min, much too low); (b) Schedule migration during low-traffic windows; (c) Use native format for daily operations (faster — incremental path); (d) Consider migration to ForSt where savepoint can be metadata-only (state already в S3). Pro tip: для quick rollback option use retained checkpoint (native incremental, fast) instead of canonical savepoint.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

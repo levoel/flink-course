@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/06-lakehouse-sinks",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-06",
+    "description": "Quiz для lakehouse sinks"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-06-q1",
+      "type": "multiple-choice",
+      "question": "Зачем нужна pre-commit topology в SinkV2 и какой пример в Iceberg sink?",
+      "options": [
+        { "id": "a", "text": "Pre-commit topology — это deprecated концепт" },
+        { "id": "b", "text": "Pre-commit topology — operator graph между SinkWriter и Committer, обрабатывает Committables перед commit. В Iceberg pre-commit topology используется для small file compaction: SinkWriter pишет Parquet файлы в staging, pre-commit operator collects committables (DataFile entries), merges small файлы в larger (например 4 файла по 30MB → 1 файл 120MB), produces consolidated committables. Без этого нужна external compaction job (Spark RewriteDataFilesAction)" },
+        { "id": "c", "text": "Pre-commit topology для compression" },
+        { "id": "d", "text": "Только для Kafka sink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SinkV2 advanced feature через WithPreCommitTopology interface. Critical для lakehouse sinks — streaming sink natural создаёт small files (file per checkpoint × parallelism). Pre-commit topology runs operator graph между writer и committer, может: compact small files (Iceberg, Paimon), deduplicate committables, batch regional commits, etc. Iceberg использует это для consolidation. Без pre-commit — external compaction (Spark RewriteDataFilesAction, Iceberg's Java compaction action) running на schedule. Pre-commit topology = automatic, in-pipeline. Strict improvement over legacy TwoPhaseCommitSinkFunction где compaction hand-rolled или absent.",
+      "studyHint": "Повторите урок — секция SinkV2 advanced",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m10-06-q2",
+      "type": "multiple-choice",
+      "question": "Чем Paimon отличается от Iceberg для Flink streaming sink?",
+      "options": [
+        { "id": "a", "text": "Они идентичны — different names same tech" },
+        { "id": "b", "text": "Paimon — LSM-tree storage (memtable + L0 SSTs + compaction levels на S3), streaming-first design с native automatic compaction. Iceberg — manifest-based snapshots, batch-first дизайн, requires external compaction job (Spark RewriteDataFilesAction). Paimon native CDC support — designed для Flink CDC + Paimon stack. Iceberg более broad ecosystem (Trino, Spark, Flink, Athena)" },
+        { "id": "c", "text": "Paimon только для batch, Iceberg streaming" },
+        { "id": "d", "text": "Iceberg deprecated в favor Paimon" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Different design philosophies. Paimon (originally Flink Table Store, Apache с 2024): LSM-tree native (как RocksDB but на object storage), streaming-first, native upsert/delete, automatic background compaction, native Flink CDC integration. Choose для Flink-centric streaming workloads. Iceberg: manifest-based snapshots, batch-first дизайн (хотя streaming supported), requires explicit compaction job. Choose для broad ecosystem (multi-engine queries Trino + Spark + Flink + Athena). For greenfield Flink CDC → lakehouse pipeline — Paimon preferred. For mixed workload analytics — Iceberg.",
+      "studyHint": "Повторите урок — Сравнительная таблица",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-06-q3",
+      "type": "multiple-choice",
+      "question": "Production: Iceberg sink с parallelism=8 имеет committer parallelism=1 что является bottleneck — backpressure растёт. Что fix?",
+      "options": [
+        { "id": "a", "text": "Increase committer parallelism к 8" },
+        { "id": "b", "text": "Committer parallelism=1 для атомического serial commit (atomic metadata.json update через optimistic concurrency) — нельзя просто увеличить. Mitigations: (1) Increase committer JVM heap; (2) Reduce committable size — fewer files, larger files (через pre-commit compaction или larger files в writer); (3) Optimize metadata size (Iceberg partition expressions efficient); (4) Iceberg supports parallel writes к different partitions (если partitioning aligns) — writers parallel, but committer still 1. Architectural: если committer chronically slow — consider Paimon с distributed committers, или batch downstream processing" },
+        { "id": "c", "text": "Использовать SaveSinkAsParallel option" },
+        { "id": "d", "text": "Это normal — игнорировать" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Committer parallelism=1 — fundamental design constraint Iceberg/lakehouse sinks. Atomic commit requires serial coordination — metadata.json updates через CAS (optimistic concurrency control). С multiple parallel committers — conflicting writes. Iceberg parallel writes (multiple writers parallel) supported но finalizing commit serial. Mitigation: reduce committable cardinality (fewer файлов с larger size — pre-commit compaction critical), tune JVM heap, optimize partition expressions. For chronically slow committer — architectural change: Paimon (LSM-style commit cheaper), или batch-style downstream (less frequent commits).",
+      "studyHint": "Повторите урок — Production gotcha #3",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-06-q4",
+      "type": "true-false",
+      "question": "Все lakehouse formats (Iceberg, Paimon, Hudi, Delta) реализуют SinkV2 (FLIP-191) interface в Flink 2.x, что включает TwoPhaseCommittingSink semantics с writer и committer split.",
+      "correctAnswer": true,
+      "explanation": "Правда. SinkV2 (FLIP-191) — единственный Sink API в Flink 2.x (SinkFunction/SinkV1 removed). Все 4 major lakehouse formats реализуют его: Iceberg (FlinkSink.forRowData), Paimon (FlinkSinkBuilder), Hudi (HoodieFlinkSink), Delta (DeltaSink.forRowData). Все используют TwoPhaseCommittingSink pattern: SinkWriter writes data files в staging area, produces Committables (pointers к staged files); Committer atomically applies — Iceberg writes manifest, Paimon writes snapshot, Hudi writes commit timeline, Delta writes _delta_log entry. SinkV2 plus WithPreCommitTopology/WithPostCommitTopology — granular control для compaction (pre) и metastore sync (post). Это standardised foundation modern lakehouse ingestion в Flink.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

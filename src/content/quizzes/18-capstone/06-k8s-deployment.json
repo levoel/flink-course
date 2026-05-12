@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/06-k8s-deployment",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-06",
+    "description": "Quiz for capstone K8s deployment"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-06-q1",
+      "type": "multiple-choice",
+      "question": "Adaptive Scheduler + in-place rescaling (FLIP-291) — что это даёт vs traditional 'savepoint + restart' для scaling?",
+      "options": [
+        { "id": "a", "text": "Просто переименование" },
+        { "id": "b", "text": "In-place rescaling: только impacted slots restart, остальные continue processing. State redistribution через key groups — fast. Traditional: full job savepoint + stop + start с new parallelism = 1-3 min downtime. Adaptive: scaling event = 10-30s minor disruption. Critical для autoscaler responsiveness" },
+        { "id": "c", "text": "Это deprecated" },
+        { "id": "d", "text": "Только для batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Major architectural improvement в Flink 2.x. Pre-2.x scaling: savepoint trigger (slow на large state), stop job, change parallelism, restore from savepoint — total minutes downtime. Adaptive Scheduler + FLIP-291: (1) detects available slots; (2) adjusts parallelism dynamically; (3) only affected subtasks restart, rest continue; (4) state redistribution через key groups happens fast. Result: scaling event ~10-30s vs 1-3 min. Это enabler для autoscaler — frequent scaling decisions становятся practical. Configure: `jobmanager.scheduler: adaptive`.",
+      "studyHint": "Повторите урок 06 — раздел 'Adaptive Scheduler'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-06-q2",
+      "type": "multiple-choice",
+      "question": "Autoscaler (FLIP-271) — как работает и что критично для config?",
+      "options": [
+        { "id": "a", "text": "Просто scales pods через CPU usage" },
+        { "id": "b", "text": "Monitors busyTimeMsPerSecond per operator (mailbox timings). Если sustained busy > target.utilization.boundary (e.g. 0.85) → scale up. Если sustained idle/low busy → scale down. Operator-level scaling — adjusts parallelism per operator, не just sink/source. Critical config: target.utilization (e.g. 0.7), bounds parallelism.min/max для cost control, stabilization.interval (avoid flapping)" },
+        { "id": "c", "text": "Это identical to K8s HPA" },
+        { "id": "d", "text": "Не работает без manual triggers" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink-specific autoscaler. K8s HPA inappropriate для streaming — pod-level CPU metrics не reflect actual job utilization (idle TM с lots assigned work). Flink autoscaler uses mailbox timings — internal Flink metrics: busy (processing), idle (waiting input), backpressured (waiting output). Operator-level decisions — может scale UserAggregator independent of source. Critical config: bounds parallelism.min/max prevent runaway, stabilization.interval avoids flapping, target.utilization sets desired headroom. Combined с Adaptive Scheduler — in-place rescaling, not full restart.",
+      "studyHint": "Повторите урок 06 — раздел 'Autoscaler'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-06-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: Black Friday traffic spike 5x normal. Autoscaler enabled. Что реально произойдёт автоматически, и какие preparations критичны до event?",
+      "options": [
+        { "id": "a", "text": "Autoscaler handles everything autonomously" },
+        { "id": "b", "text": "Autoscaler reacts со lag (5-10min metrics window + stabilization). For 5x sudden spike — TOO SLOW; first 15-20min будут backpressure, latency degradation. Preparations critical: (1) Pre-scale parallelism manually до event; (2) Pre-provision K8s nodes (cluster autoscaler slow); (3) Increase autoscaler max для headroom; (4) Test 5x в staging; (5) Increase checkpoint timeout; (6) Disable scale-down during event; (7) War room ready" },
+        { "id": "c", "text": "Просто disable autoscaler" },
+        { "id": "d", "text": "Manual scaling daily basis" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical reality check на autoscaler limitations. Autoscaler designed для unknown traffic patterns, не sudden known spikes. Mailbox timings need 5-10min metrics window + stabilization period before scaling decisions. K8s cluster autoscaler (separate from Flink autoscaler) adds further delay для node provisioning. For Black Friday 5x: combined scaling takes 15-20min — unacceptable. Pre-event preparations are non-negotiable: manual pre-scale (kubectl patch parallelism), pre-provision nodes, increased bounds, staging test. Autoscaler — safety net, not primary capacity strategy. Lesson: 'autoscaler handles it' misconception causes production incidents.",
+      "studyHint": "Повторите урок 06 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-06-q4",
+      "type": "true-false",
+      "question": "Blue/green deployment strategy для Flink — это automatic feature operator, no manual steps needed.",
+      "correctAnswer": false,
+      "explanation": "Blue/green requires deliberate orchestration: (1) Trigger savepoint blue (kubectl annotate savepoint-trigger-nonce); (2) Deploy green как parallel FlinkDeployment, with initialSavepointPath; (3) Green writes to parallel paths (Paimon table suffix _green) для not corrupting blue data; (4) Validate green outputs vs blue для hours-days; (5) Atomic cutover downstream consumers (query routing change) с rollback ready; (6) Decommission blue. Operator manages individual FlinkDeployment lifecycle but не automate orchestration choice. Manual steps + careful validation = safe upgrades. Без этого — risk corrupting prod при code bug.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

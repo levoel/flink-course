@@ -1,0 +1,366 @@
+---
+title: "Anti-pattern: tiny state, huge key cardinality"
+description: "Когда per-key state мизерный (десятки байт), но количество unique keys миллиарды — unbounded state growth. Анализ симптомов, mitigations: TTL strategies, key sampling, hashing buckets, переход на operator state."
+order: 6
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Anti-patterns", "State Cardinality", "TTL", "Key Sampling", "Operator State"]
+---
+
+# Anti-pattern: tiny state, huge key cardinality
+
+Один из самых частых production-disasters в Flink — это **миллиарды tiny state entries**. Каждый entry — 50 байт. Логика — просто `ValueState<Long>` для last-seen timestamp. На первый взгляд всё разумно: «hashmap простой». Через 3 месяца production: state size 400 GB, recovery 40 минут, RocksDB compaction нон-stop, диск переполняется каждую неделю.
+
+Симптом — overhead, не payload. Каждый state entry в RocksDB имеет per-entry overhead: key serialization, namespace, family metadata, RocksDB internal pointers, bloom filter. Для 50-byte value реальный footprint — 200-400 байт. Умножьте на миллиарды keys — state балансирует на edge of disk space.
+
+Этот урок — глубокий разбор anti-pattern: типичные приёмы которые его создают, симптомы, и пять mitigation strategies.
+
+---
+
+## Анатомия проблемы
+
+<DiagramContainer title="Tiny payload, huge overhead" color="orange">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Logical state"
+        tooltip="Application видит: ValueState<Long> per key. Каждый entry — 8 bytes timestamp. На 1B keys: 1B × 8 = 8 GB. Простой arithmetic."
+      >
+        8 bytes × 1B keys = 8 GB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="через RocksDB layout" />
+    <FlowRow>
+      <DataBox
+        label="Per-entry overhead"
+        tooltip="Каждый entry в RocksDB SST: key (UID + namespace + user key serialized) ~30-80 bytes + value envelope ~40 bytes + bloom filter probe ~10 bytes + index entry ~20 bytes."
+      >
+        + key + envelope + index
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="real disk footprint" />
+    <FlowRow>
+      <DataBox
+        label="Total per entry"
+        tooltip="50-byte value занимает 200-400 bytes на disk. Это 4-8x amplification. На 1B keys → 200-400 GB disk space только для state."
+      >
+        ~200-400 bytes
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="× 1B keys" />
+    <FlowRow>
+      <DataBox
+        label="Реальный footprint"
+        tooltip="Это убивает: (1) checkpoint duration линейно растёт, (2) recovery 30-60 минут, (3) RocksDB compaction постоянно running, (4) operating cost огромный."
+      >
+        200-400 GB
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Типичные сценарии-источники
+
+### Сценарий 1: dedup по messageId
+
+```java
+public class DedupFunction extends KeyedProcessFunction<String, Event, Event> {
+    private ValueState<Boolean> seen;
+
+    public void processElement(Event e, Context ctx, Collector<Event> out) {
+        if (seen.value() == null) {
+            seen.update(true);
+            out.collect(e);
+        }
+    }
+}
+
+// keyBy(Event::messageId) на 10M unique messages/sec, retention 7 days:
+// 10M × 86400 × 7 = 6 trillion unique keys. УБИЙСТВЕННО.
+```
+
+### Сценарий 2: last-seen timestamp per device
+
+```java
+// IoT: 500M devices, last-seen update per heartbeat
+public class DeviceTracker extends KeyedProcessFunction<String, Heartbeat, Alert> {
+    private ValueState<Long> lastSeen;
+    // 500M devices × 200 bytes overhead = 100 GB state.
+    // Каждый ValueState — это, по сути, лишь 8 байт значения.
+}
+```
+
+### Сценарий 3: click counter per ad slot per user
+
+```java
+// 10M ads × 100M users × 100 partitions = 100 trillion potential keys
+// Per-pair counter — десятки байт payload. State catastrophic.
+```
+
+### Сценарий 4: rate limiting per IP
+
+```java
+// 1B unique IPs (IPv6) × short-lived rate limit counter
+// Без cleanup state растёт linear с traffic volume.
+```
+
+---
+
+## Симптомы в production
+
+Эти признаки означают, что вы попали в anti-pattern:
+
+1. **State size grows linearly with elapsed time**, не plateau-ит. Healthy state plateau-ит (входы ≈ выходы через TTL/cleanup).
+
+2. **Recovery time линеен от state size**. С 500 GB state — 30+ минут recovery, даже с incremental checkpoints.
+
+3. **RocksDB compaction runs constantly** — CPU и disk I/O 80%+ постоянно, потому что L0→L1→L2 cascade на enormous SST файлы.
+
+4. **Per-checkpoint upload time растёт** — даже incremental checkpoints передают много delta SST файлов.
+
+5. **`numKeyedStateEntries` метрика в millions/billions** и продолжает расти.
+
+6. **`taskmanager_job_task_operator_currentDir_size`** превышает все expectations.
+
+7. **OOM на job restart** — restoring billions key entries не fit в memory.
+
+8. **Reproducible scaling problems** — at parallelism=16 OK, at parallelism=64 каждый subtask ещё держит N/4 keys (4x меньше), но overhead per-key одинаковый, общий footprint × parallelism — хуже.
+
+---
+
+## Mitigation 1: State TTL
+
+Самый простой первый ход — TTL.
+
+```java
+StateTtlConfig ttl = StateTtlConfig
+    .newBuilder(Duration.ofDays(7))
+    .setUpdateType(UpdateType.OnCreateAndWrite)
+    .setStateVisibility(StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter(1000)
+    .build();
+
+ValueStateDescriptor<Boolean> seenDesc =
+    new ValueStateDescriptor<>("seen", Boolean.class);
+seenDesc.enableTimeToLive(ttl);
+```
+
+**Pros**: declarative, embedded в state, простой setup.
+**Cons**: TTL — processing time, не event time. Cleanup happens через RocksDB compaction → могут быть delays часы. Не сразу освобождает disk.
+
+**Когда хватает**: классический dedup, last-seen tracking, где natural retention 7-30 дней.
+
+**Когда НЕ хватает**: cardinality так велик, что даже с TTL 24 часа state remains terabytes (например, 10M events/sec × 86400 sec = 864B keys/day).
+
+---
+
+## Mitigation 2: Bloom filters / probabilistic dedup
+
+Если 100% accurate dedup не критичен, **Bloom filter** даёт 99.99% dedup при 1% memory.
+
+```java
+public class BloomDedupFunction extends KeyedProcessFunction<String, Event, Event> {
+    private transient BloomFilter<String> bloom;
+    private ValueState<byte[]> serializedBloom;
+
+    public void open(Configuration cfg) {
+        // 100M expected items, FPP = 0.001 → ~180 MB
+        bloom = BloomFilter.create(
+            Funnels.stringFunnel(StandardCharsets.UTF_8),
+            100_000_000,
+            0.001
+        );
+    }
+
+    public void processElement(Event e, Context ctx, Collector<Event> out) {
+        if (!bloom.mightContain(e.messageId())) {
+            bloom.put(e.messageId());
+            out.collect(e);
+        }
+        // false positives 0.1% → 0.1% events dropped (но мы duplicates тоже dropping)
+    }
+}
+```
+
+**Trade-off**: 0.1% legitimate events дропаются (false positives bloom-а). Подходит для metrics, не для financial.
+
+**Pros**: constant memory regardless of unique key count.
+**Cons**: false positive rate, нет TTL (bloom growing). Periodic reset необходим.
+
+---
+
+## Mitigation 3: Key sampling / sketches
+
+Иногда вместо точного counter нужно approximate.
+
+```java
+// HyperLogLog для distinct count — constant 12 KB на 4B distinct values, accuracy 1%
+public class HllCounter extends KeyedProcessFunction<String, Event, Long> {
+    private ValueState<byte[]> hll;
+
+    public void processElement(Event e, Context ctx, Collector<Long> out) {
+        HyperLogLog instance = deserialize(hll.value());
+        instance.offer(e.userId());
+        hll.update(serialize(instance));
+        out.collect(instance.cardinality());
+    }
+}
+```
+
+12 KB на HLL × 10M keys = 120 GB. Но если key пер day, не per user — 365 keys × 12 KB = 4.4 MB. Drastically меньше, чем raw billion-user state.
+
+Аналогично — **Count-Min Sketch** для approximate frequency.
+
+---
+
+## Mitigation 4: Key hashing buckets
+
+Если cardinality unbounded (миллиарды IPs), но точные values не нужны — **hash to buckets**.
+
+```java
+// 1B unique IPs → 1M buckets через hash
+public class BucketedRateLimit extends KeyedProcessFunction<Integer, Request, Block> {
+    private ValueState<Long> count;
+    private ValueState<Long> windowStart;
+
+    public void processElement(Request r, Context ctx, Collector<Block> out) {
+        int bucket = Math.abs(r.ip().hashCode()) % 1_000_000;
+        // process for this bucket
+    }
+}
+
+// pipeline:
+stream.keyBy(r -> Math.abs(r.ip().hashCode()) % 1_000_000)
+```
+
+**Trade-off**: collisions. Два IP с одинаковым hash попадают в один counter, rate-limit может срабатывать на innocent IP.
+
+Принимаемо для **noisy-neighbor mitigation**, не для targeted limiting.
+
+---
+
+## Mitigation 5: переход на Operator State / Broadcast State
+
+Если состояние реально global (или small per-subtask), можно отказаться от keyed state.
+
+```java
+// Anti-pattern: keyed state для глобального счётчика
+public class GlobalCounter extends KeyedProcessFunction<String, Event, Event> {
+    private ValueState<Long> count;
+    // Всегда один key — useless keyed state, плюс keyBy shuffle.
+}
+
+// Лучше: операторное состояние, реплицируется broadcast
+public class OperatorStateCounter extends RichMapFunction<Event, Event>
+        implements CheckpointedFunction {
+
+    private long localCount = 0;
+    private ListState<Long> stateForRestore;
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext ctx) {
+        stateForRestore.clear();
+        stateForRestore.add(localCount);
+    }
+
+    @Override
+    public void initializeState(FunctionInitializationContext ctx) {
+        ListStateDescriptor<Long> desc = new ListStateDescriptor<>("counter", Long.class);
+        stateForRestore = ctx.getOperatorStateStore().getListState(desc);
+        if (ctx.isRestored()) {
+            for (Long v : stateForRestore.get()) localCount += v;
+        }
+    }
+
+    @Override
+    public Event map(Event e) {
+        localCount++;
+        return e;
+    }
+}
+```
+
+Operator state per subtask, не per key. Drastically меньше overhead.
+
+---
+
+## Mitigation 6: External state (Redis, Cassandra)
+
+В некоторых случаях разумнее **вынести state из Flink в external store**.
+
+```java
+public class ExternalDedup extends RichAsyncFunction<Event, Event> {
+    private transient AsyncCommands<String, String> redis;
+
+    public void asyncInvoke(Event e, ResultFuture<Event> result) {
+        // SETNX с TTL — atomic dedup
+        redis.set("seen:" + e.messageId(), "1",
+                  SetArgs.Builder.ex(86400).nx())
+            .thenAccept(set -> {
+                if ("OK".equals(set)) {
+                    result.complete(Collections.singleton(e));
+                } else {
+                    result.complete(Collections.emptyList());
+                }
+            });
+    }
+}
+```
+
+**Pros**: state не растёт в Flink, recovery быстрый, external store optimized для KV.
+**Cons**: external dependency, latency на каждом event, EOS труднее (need idempotent operations).
+
+**Когда применять**: cardinality unbounded, retention long, EOS не critical.
+
+---
+
+## Decision tree
+
+| Свойство | Стратегия |
+|---|---|
+| Cardinality < 100M, TTL 7-30 дней работает | TTL + cleanupInRocksdbCompactFilter |
+| Cardinality 100M-1B, exact counting не нужен | Bloom filter / HLL sketches |
+| Cardinality unbounded, exact OK на bucket level | Hash bucketing |
+| Global state без keyBy | Operator state |
+| Cardinality unbounded, EOS не critical | External Redis с TTL |
+| Critical EOS + huge cardinality | Re-architect: меняйте granularity, агрегируйте до dedup, или принимайте cost |
+
+---
+
+## Comparison summary
+
+| Подход | State size | Accuracy | EOS | Complexity |
+|---|---|---|---|---|
+| Raw keyed state + no TTL | Unbounded | 100% | Yes | Low |
+| Keyed state + TTL | Plateau на retention | 100% | Yes | Low |
+| Bloom filter | Constant per bloom | 99.9% | Yes | Medium |
+| HLL / sketches | Constant | ~99% (approx) | Yes | Medium |
+| Hash bucketing | Constant (bucket count) | Collision-affected | Yes | Medium |
+| Operator state | Per subtask | 100% | Yes | Medium |
+| External Redis | Zero in Flink | 100% | At-least-once | High |
+
+---
+
+## Production gotchas
+
+- **TTL solves problem only если retention reasonable** — TTL 90 дней на 10M events/sec = 78B keys → всё равно catastrophic. Иногда retention есть business requirement, и TTL не выручит. Тогда — hash bucketing или external.
+- **Bloom filter reset** — bloom накапливается, false positive rate растёт. Strategy: rolling bloom-ы (новый каждый день, retire старый), или periodic reset.
+- **RocksDB compaction filter cost** — `cleanupInRocksdbCompactFilter(1000)` — check current time каждые 1000 entries. На billions entries это значимый overhead. Tune `queryTimeAfterNumEntries` выше для меньшего overhead.
+- **External state latency** — Redis async lookup даёт 5ms. На 100k events/sec × 5ms = 500s/sec per pipeline — needs parallelism + capacity tuning. Бывает быстрее, чем local RocksDB на multi-TB state, потому что в RocksDB random reads через L3+ медленные.
+- **State migration** — переход с keyed state на bloom/hashbucket требует **savepoint discard** (state schema incompatible). План: deploy V2 параллельно, drain V1, V1 retired. Не drop-in upgrade.
+- **maxParallelism gotcha** — Flink maxParallelism определяет количество key groups (default 128). Huge cardinality + low maxParallelism = ineffective key distribution. Set explicit maxParallelism=1024+ для billion-key scenarios.
+- **Hash bucketing reduces parallelism opportunities** — если bucketed на 1M virtual keys, but parallelism=8, у каждого subtask 125k buckets — fine. Но не используйте hash buckets ниже parallelism × maxParallelism / N.
+- **Per-key state в Materialized Tables** — agreggations create unbounded keyed state. Watermark + state TTL обязательны для bound.
+
+<Callout type="warning">
+Если вы видите billion-key state, и TTL не fix, и accuracy approximate OK, и переход на external scary — **пересмотрите задачу на higher level**. Иногда правильное решение — изменить granularity (per-user → per-user-per-day buckets), агрегировать pre-dedup, или принять что pipeline должен иметь large state и invest в proper sizing (TBs disk, hours recovery с DR plan). Anti-pattern не всегда поправим — иногда дизайн просто wrong.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: IoT telemetry pipeline. 100M devices, каждое шлёт heartbeat раз в минуту. Логика: detect 'device offline' = no heartbeat за 5 минут → alert. Текущий код: keyBy(deviceId) + ValueState<Long> lastSeen + EventTimeTimer на ts+5min для check. State grows linearly с device count, recovery 25 минут с 100M keys. Какие mitigation strategies применить (в порядке impact)?"
+  answer="State size analysis: 100M devices × ~200 bytes (key + value + RocksDB overhead) = 20 GB. Это manageable, но recovery 25 min — проблема. Каждое heartbeat обновляет lastSeen + регистрирует timer → timer state тоже растёт (100M concurrent timers). Mitigations в порядке impact: (1) **Remove redundant lastSeen state** — он не нужен! Timer уже хранит next-check time. Замените ValueState<Long> на просто `timerService().registerEventTimeTimer(e.ts + 5min)` + при новом event делайте `timerService().deleteEventTimeTimer(oldTimer)` и регистрируйте new. State = только timers, automatically managed. ~30% reduction. (2) **State TTL для inactive devices** — если device offline 7 days, его state не нужен. StateTtlConfig 7 days + cleanupInRocksdbCompactFilter. Снижает state до active-device count (часто 60-80% of total). (3) **maxParallelism tuning** — default 128. С 100M keys на parallelism=8 каждый subtask владеет 12.5M keys. Set maxParallelism=512 для better future scaling (in-place rescale до parallelism=128 без savepoint). (4) **ForSt state backend** — disaggregated state на S3, recovery time независим от state size. Drop recovery с 25 min до ~30s metadata-only. Это game-changer для large-state jobs. (5) **Generic Log Incremental Checkpoints (state.backend.changelog.enabled)** — DSTL для metadata-only checkpoints, predictable latency. (6) **Avoid: don't switch на bloom/HLL** — нужен exact tracking per device для alerting; approximations здесь incorrect. (7) **Long-term: re-architect** — если ALL devices не должны быть online concurrent, partition pipeline на active vs dormant tracks. Active devices в keyed state, dormant — external store. Final state: 5-8 GB (60% reduction), recovery <1 min (ForSt). Lesson: anti-pattern fix often involves несколько layers, не один magic switch."
+/>

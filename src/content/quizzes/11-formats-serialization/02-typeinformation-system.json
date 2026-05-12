@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/02-typeinformation-system",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-02",
+    "description": "TypeInformation hierarchy, TypeExtractor, generics erasure"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-02-q1",
+      "type": "multiple-choice",
+      "question": "В иерархии TypeInformation, какие подклассы дают best performance, а какой — катастрофа?",
+      "options": [
+        { "id": "a", "text": "Все подклассы примерно равны по performance" },
+        { "id": "b", "text": "TupleTypeInfo (~100% baseline) и BasicTypeInfo — fastest; PojoTypeInfo (~95%); AvroTypeInfo (~85%); GenericTypeInfo через Kryo (~50%) — катастрофа в production" },
+        { "id": "c", "text": "GenericTypeInfo через Kryo — fastest, потому что universal" },
+        { "id": "d", "text": "RowTypeInfo всегда медленнее остальных" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Иерархия по performance: TupleTypeInfo (positional binary, no null markers, ~100% baseline 30M rec/sec) > PojoTypeInfo (reflection с null markers, ~95%) > AvroTypeInfo (codegen schema, ~85%) > ProtobufTypeInfo (~80%) > AvroGeneric (~75%) > GenericTypeInfo через Kryo (~50%). Kryo медленный из-за class FQN в wire (~30 bytes overhead), reflection-based field discovery без pre-built schema, и no structural validation. Production rule: never accept Kryo fallback (см. урок 07).",
+      "studyHint": "Повторите урок 02 — секцию 'Иерархия TypeInformation' с performance table",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-02-q2",
+      "type": "multiple-choice",
+      "question": "Lambda `.map(v -> Tuple2.of(v, 1L))` без `.returns()` вызывает InvalidTypesException. Какое объяснение verno?",
+      "options": [
+        { "id": "a", "text": "Tuple2.of() имеет bug в Flink 2.x" },
+        { "id": "b", "text": "Lambdas компилируются в invokedynamic calls к LambdaMetafactory без сохранения generic params в bytecode signature. Class.getGenericInterfaces() на lambda class возвращает raw MapFunction без <String, Tuple2<...>>. TypeExtractor не может вывести return type → exception. Named classes (anonymous MapFunction) сохраняют generics в Class signature attribute" },
+        { "id": "c", "text": "Lambda всегда несовместима с Tuple" },
+        { "id": "d", "text": "Это проблема Java compiler, не Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Lambda compilation: Java compiler генерирует invokedynamic + LambdaMetafactory с runtime synthesis lambda class. Generic params <String, Tuple2<String, Long>> присутствуют в lambda's enclosing method signature, но НЕ в generated lambda class itself. Class.getGenericInterfaces() returns [MapFunction] raw. Для named class (anonymous или regular `class MyMap implements MapFunction<A, B>`) generics сохраняются в Class file Signature attribute → getGenericInterfaces() returns [MapFunction<A, B>] — TypeExtractor извлекает. Fix для lambda: `.returns(Types.TUPLE(...))` или `.returns(new TypeHint<...>(){})` (anonymous TypeHint subclass сохраняет generics в supertype signature).",
+      "studyHint": "Повторите урок 02 — секцию 'Generics erasure: глубокий разбор'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-02-q3",
+      "type": "multiple-choice",
+      "question": "POJO Transaction с public no-arg ctor, public Long id, public String userId, public Instant eventTime, public double amount. Что выведет println TypeInformation?",
+      "options": [
+        { "id": "a", "text": "PojoTypeInfo с всеми fields как BasicTypeInfo" },
+        { "id": "b", "text": "PojoType<Transaction>(amount: Double, eventTime: GenericType<java.time.Instant>, id: Long, userId: String) — класс POJO, но field eventTime — Kryo, потому что Instant не имеет no-arg ctor и не BasicTypeInfo. Performance страдает только на eventTime field" },
+        { "id": "c", "text": "GenericTypeInfo<Transaction> — Kryo для всего класса" },
+        { "id": "d", "text": "InvalidTypesException на job submission" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Transaction класс **сам** распознан как POJO (no-arg ctor, public fields). НО per-field: id (Long) → BasicTypeInfo, userId (String) → BasicTypeInfo, amount (double) → BasicTypeInfo, eventTime (Instant) → GenericType (Kryo). Instant не POJO (нет public Instant()), не BasicTypeInfo (нет встроенного). Field order — alphabetical (для schema evolution determinism). Это **самый коварный случай** — throughput не падает на 50%, а зависит от какие fields hot. Если eventTime читается reзкo чаще id, perf hit existing но invisible. Fix: long epochMillis вместо Instant, или @TypeInfo(InstantTypeInfoFactory.class).",
+      "studyHint": "Повторите урок 02 — секцию 'Detailed: PojoTypeInfo' и production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-02-q4",
+      "type": "true-false",
+      "question": "`TypeHint<T>` через anonymous subclass `new TypeHint<Tuple2<String, Long>>(){}` сохраняет generic params в bytecode, потому что Java generics НЕ стираются в inheritance hierarchies — generic params сохраняются в Signature attribute класса.",
+      "correctAnswer": true,
+      "explanation": "Это true и фундаментально важно для понимания Flink TypeExtractor. Java generics erasure имеет несколько исключений: (1) Class signatures (when extending generic class) — generics сохраняются в class Signature attribute. (2) Method signatures (when methods declared with generic params) — сохраняются в method Signature. (3) Field signatures — сохраняются. Что СТИРАЕТСЯ: local variables generic types, lambda's own generic params (lambdas implement raw functional interface). TypeHint exploits inheritance preservation: `new TypeHint<Tuple2<String, Long>>(){}` создаёт anonymous subclass of TypeHint<Tuple2<String, Long>>. В bytecode этого anonymous class — Signature attribute содержит `Lflink/.../TypeHint<Lflink/.../Tuple2<Ljava/lang/String;Ljava/lang/Long;>;>;`. TypeHint constructor извлекает via `this.getClass().getGenericSuperclass()` → ParameterizedType с full type info.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

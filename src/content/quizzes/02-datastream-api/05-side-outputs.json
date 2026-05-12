@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/05-side-outputs",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-05",
+    "description": "Use IDs: flink-m02-05-q1, flink-m02-05-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-05-q1",
+      "type": "multiple-choice",
+      "question": "Что такое OutputTag в Flink, и почему обязателен anonymous subclass `new OutputTag<T>(...) {}`?",
+      "options": [
+        { "id": "a", "text": "Это просто string identifier" },
+        { "id": "b", "text": "OutputTag — типизированный identifier для side output. Anonymous subclass {} обязателен потому что Java generics erasure съест type parameter T при runtime — anonymous subclass позволяет Flink через reflection узнать concrete type. Type safety проверяется compile-time через ctx.output(tag, value)" },
+        { "id": "c", "text": "Anonymous subclass — стилистическое предпочтение" },
+        { "id": "d", "text": "OutputTag не требует subclass" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "OutputTag — fundamental abstraction для side outputs. Anonymous subclass `new OutputTag<LateEvent>('late') {}` (note braces) обязателен из-за Java generics erasure — без subclass type parameter `<LateEvent>` теряется при runtime. Subclass создаёт anonymous class что preserve type info через reflection (TypeToken pattern). Flink использует это для serialization. Без `{}` — runtime exception. Type safety: ctx.output(tag, value) проверяется compile-time — value должно совпадать с tag's type parameter.",
+      "studyHint": "Повторите урок 05 — раздел 'API: Create OutputTag'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-05-q2",
+      "type": "multiple-choice",
+      "question": "Production windowed aggregation БЕЗ sideOutputLateData. Watermark stuck из-за upstream incident, latency events растёт до 15-30 min. Что происходит с этими late events?",
+      "options": [
+        { "id": "a", "text": "Они эмит в main output с пометкой 'late'" },
+        { "id": "b", "text": "Они SILENTLY DROPPED. Это самый частый source потери данных в Flink. Production rule: ВСЕ windowed operations должны иметь sideOutputLateData(tag) + Prometheus alert на late_events_count. Без этого нет visibility, что данные теряются" },
+        { "id": "c", "text": "Они автоматически retry-ятся" },
+        { "id": "d", "text": "Они processed на следующем checkpoint" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Late events без sideOutputLateData — silently dropped. Это серьёзный data loss issue: aggregate metrics не соответствуют source data, downstream analytics показывает 'gap', невозможно объяснить customer/audit. Production rule: ALWAYS .allowedLateness(Duration).sideOutputLateData(lateTag).aggregate(...). Side output capture лateevents в отдельный stream для investigation, plus Prometheus counter с alert при >100/min. Без alert вы blind. Дополнительно можно: increase allowedLateness, fix upstream root cause, reprocess через State Processor API.",
+      "studyHint": "Повторите урок 05 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-05-q3",
+      "type": "multiple-choice",
+      "question": "Какие операторы поддерживают side outputs?",
+      "options": [
+        { "id": "a", "text": "Все DataStream operators" },
+        { "id": "b", "text": "Только *ProcessFunction варианты: ProcessFunction, KeyedProcessFunction, CoProcessFunction, ProcessWindowFunction, BroadcastProcessFunction. НЕ поддерживают: map, flatMap, filter, RichMapFunction, etc. Это limitation: для simple map с side output нужно переписать на ProcessFunction" },
+        { "id": "c", "text": "Только KeyedProcessFunction" },
+        { "id": "d", "text": "map и process" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Side outputs работают только в *ProcessFunction family — это где доступен Context с методом ctx.output(tag, value). Поддерживают: ProcessFunction, KeyedProcessFunction, CoProcessFunction, KeyedCoProcessFunction, ProcessWindowFunction, BroadcastProcessFunction, KeyedBroadcastProcessFunction. НЕ поддерживают: map, flatMap, filter (RichMap), reduce, aggregate. Limitation: если у вас простая map с условным DLQ, нужно переписать на ProcessFunction. Это minor overhead для huge benefits в type safety и multi-output flexibility.",
+      "studyHint": "Повторите урок 05 — раздел 'Operators поддерживающие side outputs'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-05-q4",
+      "type": "true-false",
+      "question": "Side outputs более efficient, чем альтернатива через множественные .filter().map() — один traversal данных, no extra serialization, type-safe (compile-time check вместо runtime cast).",
+      "correctAnswer": true,
+      "explanation": "Side outputs efficient pattern. Single traversal: один pass над stream, internal split в operator. Multiple .filter() pattern: каждый .filter() — отдельный operator, отдельный traversal, отдельный sharing channel, extra serialization. Type safety: OutputTag<T> — compile-time check. Alternative через union types (Object или sealed class) требует runtime cast/filter — больше boilerplate, error-prone. Clear intent: separate concerns в коде.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

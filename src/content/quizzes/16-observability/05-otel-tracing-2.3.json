@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/05-otel-tracing-2.3",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-05",
+    "description": "Quiz for OpenTelemetry tracing lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-05-q1",
+      "type": "multiple-choice",
+      "question": "Что покрывает OpenTelemetry tracing в Flink 2.3 и какой trace structure для checkpoint?",
+      "options": [
+        { "id": "a", "text": "Только metrics, не traces" },
+        { "id": "b", "text": "Coverage 1.20+: checkpoint lifecycle, job submission, task lifecycle, async I/O. Checkpoint trace structure: root span Checkpoint-N → barrier-injection → barrier-propagation (per-operator alignment) → async-snapshot (per-subtask) → dfs-upload → notify-complete. Spans с tags: checkpoint_id, state_size, alignment_duration. Identifies slow alignment / async / upload в seconds" },
+        { "id": "c", "text": "Только task lifecycle" },
+        { "id": "d", "text": "Custom user metrics" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "OTel в Flink relatively new — initial 1.20, real coverage 2.0+, GA gRPC export 2.3. Checkpoint trace — main use case. Каждый child span показывает где время тратится: alignment (backpressure detection), async (state size), upload (DFS throughput). Roadmap 2.3+: per-record tracing (sampled), state access spans, source/sink internal spans. Context propagation через Kafka headers — end-to-end trace через сервисы. Без OTel slow checkpoint debugging — археология; с OTel — 15min trace exploration.",
+      "studyHint": "Повторите урок — Anatomy: checkpoint trace",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-05-q2",
+      "type": "multiple-choice",
+      "question": "Sampling rate для production OTel tracing — какие values правильные и почему?",
+      "options": [
+        { "id": "a", "text": "Always 100%" },
+        { "id": "b", "text": "0.01-0.05 (1-5%) для regular spans, always_on для checkpoint spans (rare events). 100% sampling на 1M records/sec = 1M spans/sec → backend storage explosion. Sampler: parentbased_traceidratio с arg 0.01. Checkpoints — exception (rare, always sample). Тune based на data volume и storage budget" },
+        { "id": "c", "text": "Always 0% (disabled)" },
+        { "id": "d", "text": "Fixed 50%" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sampling critical для production tracing economics. Без sampling: 1M records/sec × 5KB span = 5GB/sec → storage cost больше чем job runtime cost. Cardinality limit обычно через Tempo/Jaeger backend storage. Production sweet spot: 1-5% sampling для high-volume operators (statistical inference достаточна). Sampler parentbased_traceidratio respects parent context (если upstream trace sampled, child тоже). Checkpoint spans always_on — events rare (60s interval), volume manageable. Tail-based sampling roadmap — sample IF span duration > threshold (capture only outliers).",
+      "studyHint": "Повторите урок — Sampling",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-05-q3",
+      "type": "multiple-choice",
+      "question": "Customer complaint: P99 latency 2-3s для one event type (target 200ms). Throughput stable, backpressure нет в metrics. План diagnose через OTel?",
+      "options": [
+        { "id": "a", "text": "Просто увеличить parallelism" },
+        { "id": "b", "text": "(1) Per-record tracing for slow event type. User code: tracer.spanBuilder('record-processing').setAttribute('event_type', e.getType()).setAttribute('user_id', e.getUserId()).startSpan(). Sampling 100% для slow types. (2) Open Tempo в Grafana, filter event_type=slow, sort by duration. (3) Drill slow trace, identify outlier span (state.value() 1.5s = hot key, db.lookup 2s = external slow, kafka.send 2s = broker overload). (4) Apply targeted fix. С traces — 15min diagnosis vs hours blind tuning" },
+        { "id": "c", "text": "Switch к batch processing" },
+        { "id": "d", "text": "Disable EXACTLY_ONCE" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Metrics tell that latency bad — traces tell why. Common patterns from analysis: (a) state-access slow (hot key, RocksDB compaction concurrent); (b) async I/O slow (DB query, connection pool exhausted); (c) sink slow (Kafka broker overload, transaction timeout); (d) serialization slow (large objects, complex schema); (e) chained operator blocked. Structured attributes критичны: filter в Tempo 'show me slow events where state_size > 1MB' impossible без attributes. Production setup: enable tail-based sampling (when duration > 500ms) для tail latency events. Combine с metrics панель в Grafana для correlation.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-05-q4",
+      "type": "true-false",
+      "question": "Flink 2.3 GA — OTel gRPC export — преимущество над HTTP/protobuf primarily в bandwidth efficiency (~30% less overhead).",
+      "correctAnswer": true,
+      "explanation": "True. gRPC vs HTTP/protobuf: gRPC использует binary protobuf, persistent HTTP/2 connections, multiplexing → ~30% less overhead. HTTP/protobuf — chunked HTTP, easier debugging (curl-able) но более expensive per-request. Production preference gRPC. Configuration: traces.reporter.otel.endpoint: http://otel-collector:4317 (gRPC port), traces.reporter.otel.protocol: grpc. До 2.3 был только HTTP — gRPC GA в 2.3 — это significant production improvement. Pair с OTel Collector clustered для HA. Single Collector — single point of failure.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

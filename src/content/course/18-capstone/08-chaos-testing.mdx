@@ -1,0 +1,331 @@
+---
+title: "Capstone — chaos testing: failures и data loss verification"
+description: "★ DEEP — chaos scenarios: kill TaskManager, JobManager, network partition, Kafka broker down, S3 slow. Verify zero data loss with EOS, recovery time SLO, side effects observation."
+order: 8
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Chaos Testing", "Failure Modes", "Recovery", "EOS Verification"]
+---
+
+# Capstone — chaos testing: failures и data loss verification
+
+Phase 6: chaos testing. Production-grade pipeline должен survive failures. Это `★ DEEP` урок — explicit list scenarios, expected behaviors, verification approach. Цель — **verify zero data loss** под EOS configuration, recovery time соответствует SLO.
+
+Chaos engineering — это не «break stuff for fun». Это **structured testing of failure modes** в staging environment, с pre-defined expected behaviors, prior to production exposure.
+
+---
+
+## Test environment setup
+
+Идентичный production setup в staging cluster:
+- 8 Flink TaskManagers, 2 JobManagers HA.
+- Real Postgres + Kafka + Paimon + S3 (МinIO для testing).
+- Synthetic load generator producing 50k events/sec.
+- Observability fully wired.
+- Data validator running — comparing output Paimon counts vs source Postgres counts continuously.
+
+```bash
+# Load generator example
+docker run --rm \
+    -e KAFKA_BOOTSTRAP=kafka:9092 \
+    -e POSTGRES_URL=jdbc:postgresql://postgres:5432/staging \
+    -e RATE=50000 \
+    -e DURATION=24h \
+    ghcr.io/our-org/capstone-load-gen:latest
+```
+
+Verification approach: **Reconciliation script** runs every 5 min, comparing:
+- Source counts (Postgres + Kafka offsets).
+- Sink counts (Paimon snapshots).
+- Side output counts (late events archive).
+
+Expected: source = sink + late_events. Zero discrepancy under EOS.
+
+---
+
+## Scenario 1: Kill TaskManager
+
+**Hypothesis**: Job recovers с zero data loss, processing resumes в RTO ≤ 2 минут.
+
+```bash
+# Identify TM pod
+kubectl get pods -n flink -l component=taskmanager
+
+# Kill one
+kubectl delete pod capstone-pipeline-taskmanager-0 -n flink --grace-period=0 --force
+```
+
+**Expected behavior**:
+1. Job detects TM disconnect через heartbeat timeout (~15s).
+2. Adaptive Scheduler attempts in-place recovery — restart impacted tasks on remaining TMs (if slots available).
+3. If no slack — wait для new TM pod (K8s schedules ~30-60s).
+4. Failed tasks restart from last checkpoint.
+5. Total recovery: ~1-3 minutes for healthy cluster.
+
+**Verification**:
+- Watermark lag temporarily spikes, returns к normal.
+- `numLateRecordsDropped` stays at 0 (events within allowed lateness).
+- Reconciliation script after recovery: source = sink. No data loss.
+
+<Callout type="note">
+**Local Recovery** (`state.backend.local-recovery: true`) — на same-TM restart skip S3 download. Не работает при node failure (different node = no local state). Combined с node-stickiness (pod restart policy + affinity) — sometimes preserved.
+</Callout>
+
+---
+
+## Scenario 2: Kill JobManager (leader)
+
+**Hypothesis**: Standby JM acquires leadership, job restarts from latest checkpoint, ≤ 3 минуты downtime.
+
+```bash
+# Identify current leader (через REST API или K8s lease)
+kubectl get lease -n flink flink-capstone-cluster -o yaml | grep holderIdentity
+
+# Kill it
+kubectl delete pod <leader-pod> -n flink --grace-period=0 --force
+```
+
+**Expected**:
+1. K8s lease released (timeout ~15s).
+2. Standby JM acquires lease.
+3. Reads JobGraph from S3 (HA storageDir).
+4. Reads latest checkpoint pointer.
+5. Restarts job — coordinates с all TMs to restore from checkpoint.
+6. Total recovery: 60-180s.
+
+**Verification**:
+- Job completes restart visible в Flink Web UI.
+- Reconciliation после recovery: source = sink, no duplicates (EOS + idempotent sinks).
+- Side output count consistent (no «hole» в late events).
+
+---
+
+## Scenario 3: Network partition Flink ↔ Kafka
+
+**Hypothesis**: Source backpressure cascades correctly, no checkpoint corruption, recovery clean после network restore.
+
+```bash
+# В K8s — block egress to Kafka via NetworkPolicy
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-kafka
+  namespace: flink
+spec:
+  podSelector:
+    matchLabels:
+      app: capstone-pipeline
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: NOT-kafka  # все кроме Kafka
+EOF
+
+# Через 5 минут — remove partition
+kubectl delete networkpolicy block-kafka -n flink
+```
+
+**Expected**:
+1. KafkaSource не может fetch — backpressure.
+2. Cascading bp на downstream operators.
+3. Checkpoint duration spikes (data in flight, нечего flush).
+4. После 30s — unaligned checkpoints kick in (если configured).
+5. После network restore — source catches up, processing resumes.
+
+**Verification**:
+- Job не crash (graceful degradation).
+- After restore, checkpoint succeeds.
+- Reconciliation: source = sink. EOS gives no duplicates from in-flight Kafka commits.
+
+---
+
+## Scenario 4: Kafka broker down
+
+**Hypothesis**: KafkaSource fail over к remaining brokers, processing continues с возможно brief lag.
+
+```bash
+# Если Kafka в same K8s namespace:
+kubectl delete pod kafka-broker-1 -n kafka
+
+# Brief downtime ~30-60s pod восстановление
+```
+
+**Expected**:
+1. Consumer detects broker failure (Kafka client timeout).
+2. Partition reassignment in Kafka cluster.
+3. Consumer rebalances — new broker takes leadership for partitions on failed broker.
+4. KafkaSource subtasks pick up new leaders.
+5. Brief lag spike, returns к normal.
+
+**Verification**:
+- Reconciliation: source = sink.
+- No `numLateRecordsDropped` spike (assuming Kafka producer reliable).
+- Consumer group lag temporary increase, recovers.
+
+---
+
+## Scenario 5: Postgres replication slot exceeded
+
+**Hypothesis**: Flink CDC source unable to recover beyond slot expiration; need re-snapshot.
+
+```bash
+# Stop Flink job temporarily
+kubectl scale flinkdeployment capstone-pipeline --replicas=0
+
+# Postgres slot накапливает WAL ~ часа
+# Then set max_slot_wal_keep_size = 1GB (below current lag)
+
+# В Postgres
+ALTER SYSTEM SET max_slot_wal_keep_size = '1GB';
+SELECT pg_reload_conf();
+
+# Postgres detects exceeded, drops slot
+SELECT pg_drop_replication_slot('flink_cdc');  # simulate exceeded
+
+# Restart Flink
+kubectl scale flinkdeployment capstone-pipeline --replicas=1
+```
+
+**Expected (BAD scenario — data loss possible)**:
+1. Flink CDC startup fails: 'slot does not exist'.
+2. Recovery procedure:
+   - Create new slot — only future events.
+   - **OR** re-snapshot full database — current state, losing intermediate changes.
+3. Some changes during window slot-dropped → reading slot creation may be lost.
+
+**This scenario shows the importance of guardrails**: `max_slot_wal_keep_size` should be set high enough для recovery scenarios. Без proper monitoring + alerting, this is way of data loss.
+
+**Verification**:
+- Document data loss window (timestamp X to Y).
+- Reconciliation после re-snapshot: source = sink, но gap during window.
+- This is **acceptable failure mode** if alerted; **unacceptable** if undetected.
+
+---
+
+## Scenario 6: S3 slow / throttled
+
+**Hypothesis**: Checkpoint duration spike, eventually fails. Unaligned checkpoints help. After S3 recovery, processing normal.
+
+```bash
+# Simulate S3 latency через iptables tc qdisc:
+kubectl exec -n flink capstone-pipeline-taskmanager-0 -- \
+    tc qdisc add dev eth0 root netem delay 5000ms
+
+# 5 секунд delay на каждый S3 request
+
+# Через 10 минут — remove
+kubectl exec -n flink capstone-pipeline-taskmanager-0 -- \
+    tc qdisc del dev eth0 root
+```
+
+**Expected**:
+1. Checkpoint async phase slow — uploading state files to S3 takes much longer.
+2. With `checkpointing.timeout: 10min`, checkpoint may timeout.
+3. После несколько failed checkpoints (tolerable=3), job restart.
+4. Restart from older checkpoint — events после old checkpoint reprocessed (EOS gives no duplicates at sink, idempotent).
+
+**Verification**:
+- `flink_jobmanager_job_numFailedCheckpoints` increments.
+- Eventually job restart triggered (after 3 failures).
+- Reconciliation после S3 recovery: source = sink. EOS handled reprocessing.
+- Side output count consistent.
+
+---
+
+## Scenario 7: OOM kill TaskManager
+
+**Hypothesis**: TM evicted by K8s OOM-killer, Adaptive Scheduler reschedules with restart. State backend (ForSt) restore from S3 quickly.
+
+```bash
+# Trigger artificial OOM (stress-ng в TM pod)
+kubectl exec -n flink capstone-pipeline-taskmanager-0 -- \
+    stress-ng --vm 1 --vm-bytes 100G --timeout 60s
+# OOM killer kills the pod
+```
+
+**Expected**:
+1. K8s OOM kill — TM pod terminated.
+2. Adaptive Scheduler detects, restarts on other TM или waits for new pod.
+3. ForSt state recovery from S3 — metadata-only, ~30s vs traditional minutes.
+4. Job resumes from last checkpoint.
+
+**Verification**:
+- TM pod restart visible в `kubectl describe pod`.
+- Recovery time measured: target ≤ 2 минуты.
+- Reconciliation: zero data loss.
+
+---
+
+## Scenario 8: ClickHouse sink down
+
+**Hypothesis**: ClickHouse sink failures cause backpressure, main pipeline continues writing к Paimon (independent sink).
+
+```bash
+# Stop ClickHouse
+kubectl scale statefulset clickhouse --replicas=0 -n analytics
+
+# Wait 10 minutes
+
+# Restart
+kubectl scale statefulset clickhouse --replicas=3 -n analytics
+```
+
+**Expected**:
+1. ClickHouse sink encountering connection errors.
+2. Backpressure on ClickHouse sink branch.
+3. Other branches (Paimon, anomaly Kafka) continue independently если sinks are parallel.
+4. После restart — sink resumes, может быть catch-up lag.
+
+**Verification**:
+- Paimon writes continued during outage.
+- ClickHouse missing 10 min of data (gap).
+- After restore, decide: backfill ClickHouse from Paimon, или accept gap.
+- This scenario shows **why independent sinks important** — single sink failure не убивает pipeline.
+
+---
+
+## Chaos testing schedule
+
+Production deployment requires regular chaos exercises:
+
+| Frequency | Scenarios |
+|---|---|
+| Weekly (staging) | Kill TM, kill JM, Kafka broker down |
+| Monthly (staging) | Network partition, S3 slow, OOM |
+| Quarterly (production game day) | Full disaster recovery — primary region down |
+| Pre-deploy (any) | Specific scenarios для new features |
+
+**Chaos engineering principles**:
+1. **Define hypothesis** before testing.
+2. **Limit blast radius** — start small (one TM), not full cluster.
+3. **Have rollback plan** — can you stop the chaos quickly?
+4. **Document expected vs actual** — capture learnings.
+5. **Iterate** — fix issues found, retest.
+
+---
+
+## Production gotchas
+
+- **Chaos in production без safety** — bad idea для critical pipelines. Always staging first. Production game days — coordinated, low-traffic windows, ready rollback.
+- **OOM кill rapid restart loop** — если TM keeps OOM-ing, K8s endless restart. Set restart backoff, alerting на restart frequency.
+- **Network policies persistence** — chaos network policies may persist if delete forgotten. Audit policies regularly.
+- **Test data validation** — without reconciliation script, you don't know data loss happened. **Always verify** after chaos test.
+- **State backend choice impact** — ForSt makes most recovery scenarios fast. With local RocksDB, large state recovery hours.
+- **Idempotent sinks critical** — non-idempotent sinks turn EOS into «mostly once». Verify sink idempotency in chaos tests.
+- **Replication slot scenarios reveal config gaps** — `max_slot_wal_keep_size` без alerting = silent data loss eventually. Real-world testing exposes such gaps.
+- **Test in production-similar config** — staging без real load, real network, real S3 — chaos result misleading. Match production as close as possible.
+
+<Callout type="warning">
+**Chaos testing — это не one-time exercise**. Production environments evolve — new features, scale changes, infrastructure migrations. Annual chaos coverage should include all critical scenarios. New incident types after production exposure — add to chaos suite. «We chaos-tested it once» — false sense of security.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Chaos exercise review: вы тестируете Scenario 6 (S3 slow) в staging. After 10 min slow S3, checkpoints failing 3 times in row, job restarts. Reconciliation script comparison: source has 1,000,000 events, sink Paimon has 1,000,032 events. Кодекс — discrepancy of 32 events. EOS supposedly активен. Что произошло, как diagnose, и какие fixes требуются?"
+  answer="32 extra events в sink — это **at-least-once behavior somewhere**, не EOS. Diagnosis: **Hypothesis 1: Sink не truly idempotent**. Verify Paimon config: (1) `merge-engine: deduplicate` set? (2) primary-key declared and Flink uses it correctly? (3) Sink configured с EXACTLY_ONCE delivery guarantee, не AT_LEAST_ONCE? Verify через checking Paimon snapshot metadata — duplicate row IDs visible через `SELECT order_id, COUNT(*) FROM fact_orders GROUP BY order_id HAVING COUNT(*) > 1`. **Hypothesis 2: Checkpoint coordination broken**. Под капотом, EOS sink requires alignment с Flink checkpoint. If checkpoint partially failed (some operators committed, others timed out), data может быть committed inconsistently. Check Flink JM logs for 'checkpoint partial failure' messages. **Hypothesis 3: 2PC transaction abandon**. Paimon uses Flink 2PC: pre-commit на barrier, commit на notifyCheckpointComplete. If commit notification lost (например, JM crashed между barrier и notification), transaction может recommit on recovery if state tracking imperfect. Check Paimon snapshot history for any 'recovered transaction' messages. **Hypothesis 4: Sink не используется EOS variant**. Paimon sink имеет EOS mode только если конкретные options set. Verify writeBuffer mode, 2PC enabled. Sometimes default config is at-least-once. **Diagnosis steps**: (1) Examine Paimon snapshot history during the chaos window — multiple commits for same data range? (2) Query duplicates: `SELECT order_id FROM fact_orders GROUP BY order_id HAVING COUNT(*) > 1`. Compare 32 to expected dedupe. (3) Flink JM logs: 'commit', 'rollback', 'recover' messages во время restart. (4) Sink subtask metrics — `numRecordsOut` during recovery vs expected. **Fixes по hypothesis**: (1) Verify and force `merge-engine: deduplicate`, primary-key correctly declared. Tested via small synthetic load. (2) Tighten checkpoint timeout to fail fast (избегать partial commits). Set `execution.checkpointing.timeout: 5min` instead of 10. (3) Verify Paimon version compatible with Flink 2PC semantic (some versions had bugs). (4) Explicit EOS opt-in: `setDeliveryGuarantee(EXACTLY_ONCE)` для KafkaSink, equivalent for Paimon. (5) Add reconciliation alert (delta > 0.001%) and re-run chaos test после fix. **Lesson**: EOS is config-dependent. 'It says EOS' не достаточно — verify через chaos testing. Most production EOS bugs surface only under failure scenarios. This is exactly why chaos testing matters — found this bug в staging, not в production. Document fix, update runbook, add reconciliation alert."
+/>

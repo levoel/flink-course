@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/02-jobmanager-components",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-02",
+    "description": "Use IDs: flink-m01-02-q1, flink-m01-02-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-02-q1",
+      "type": "multiple-choice",
+      "question": "JobManager в Flink — это монолитный сервис или декомпозиция на компоненты? Что он содержит?",
+      "options": [
+        { "id": "a", "text": "Монолитный JVM с одним сервисом, координирующим всё" },
+        { "id": "b", "text": "Три внутренних компонента: Dispatcher (REST API + persistence), ResourceManager (управление slots, один на cluster), JobMaster (один per running job, держит ExecutionGraph + CheckpointCoordinator)" },
+        { "id": "c", "text": "Два компонента — Master и Workers" },
+        { "id": "d", "text": "Это просто Web UI + REST API endpoint" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "JobManager — это процесс с тремя внутренними сервисами (с Flink 1.5, FLIP-6): (1) Dispatcher — REST-фасад, принимает submissions, persistит JobGraph для HA; (2) ResourceManager — один на cluster, управляет slot allocation, на K8s native общается с K8s API; (3) JobMaster — один на каждую running job, держит ExecutionGraph, CheckpointCoordinator, SlotPool, FailoverStrategy. В HA leader election происходит per-сервис, но обычно все три на одном leader-е.",
+      "studyHint": "Повторите урок 02 — раздел 'Зачем три компонента, а не один'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-02-q2",
+      "type": "multiple-choice",
+      "question": "JobMaster детектирует, что TaskManager не отвечает на heartbeats в течение default 50 секунд. Что происходит дальше?",
+      "options": [
+        { "id": "a", "text": "Весь job FAILED, нужно ручной restart" },
+        { "id": "b", "text": "TM считается dead, все subtasks на нём переводятся в FAILED. FailoverStrategy (Pipelined Region) restartit только affected region, state восстанавливается из последнего checkpoint. ResourceManager может создать новый TM (K8s) или job ждёт slots (Standalone)" },
+        { "id": "c", "text": "JobMaster ждёт ещё 5 минут перед action" },
+        { "id": "d", "text": "Все checkpoints invalidate-ятся" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Heartbeat timeout (default heartbeat.timeout=50s) — TM считается dead. Subtasks на нём → FAILED. Default FailoverStrategy — Region-based: только affected pipelined region (граница shuffle) restartится, не весь job. State recovered из last checkpoint. На K8s ResourceManager создаёт новый TM-pod автоматически, на Standalone ждёт available slot. Important production tip — снижайте heartbeat.timeout до 30s на K8s, чтобы rolling updates не тригерили лишних restarts.",
+      "studyHint": "Повторите урок 02 — раздел 'Что значит JobManager умер'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-02-q3",
+      "type": "multiple-choice",
+      "question": "Какая разница между ZooKeeperHaServices и KubernetesHaServices в Flink?",
+      "options": [
+        { "id": "a", "text": "Никакой — это alias-ы" },
+        { "id": "b", "text": "ZK HA использует ZooKeeper для leader election и pointers (большие blob-ы в storageDir). K8s HA использует ConfigMaps для leader info + JobGraph pointers, leader election через K8s lease. K8s HA убирает зависимость от ZK для cloud-native deployments, типичен для Flink Kubernetes Operator" },
+        { "id": "c", "text": "ZK быстрее, K8s медленнее" },
+        { "id": "d", "text": "K8s HA работает только на AWS" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ZooKeeperHaServices: использует ZK для leader election (ephemeral znodes), JobGraph blob-ы хранятся в storageDir (S3/HDFS), ZK хранит только pointers (znode 1MB limit). KubernetesHaServices: leader election через K8s lease mechanism (annotation в ConfigMap + renew), JobGraph pointers в ConfigMap, blob-ы в storageDir. K8s HA убирает ZK как dependency — типичен для Flink Kubernetes Operator. Performance практически одинаковая. Cluster-id должен быть уникальным per environment.",
+      "studyHint": "Повторите урок 02 — раздел 'HA через ZooKeeper и Kubernetes ConfigMap'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-02-q4",
+      "type": "true-false",
+      "question": "В Application mode JobManager pod содержит один Dispatcher, один ResourceManager и один JobMaster (для единственной application job). В Session mode тот же Dispatcher и ResourceManager обслуживают много параллельных JobMaster-ов.",
+      "correctAnswer": true,
+      "explanation": "Это ключевое архитектурное различие. Application mode: dedicated cluster — один Dispatcher + один RM + один JobMaster для одной application. Чистый lifecycle, hard isolation. Session mode: long-running cluster — один Dispatcher и один RM обслуживают N параллельных JobMaster-ов (каждая submitted job получает свой JobMaster). Lifecycle Dispatcher + RM независимы от jobs, JobMaster-ы приходят/уходят.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

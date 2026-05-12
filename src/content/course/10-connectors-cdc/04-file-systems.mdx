@@ -1,0 +1,384 @@
+---
+title: "File systems: FileSource и FileSink с bucketing"
+description: "FileSource (bulk vs record-wise), FileSink с bucketing strategies, rolling policies, in-progress vs finished files, recovery semantics. S3/HDFS/local FS"
+order: 4
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["FileSource", "FileSink", "Bucketing", "Rolling Policy", "Parquet", "Avro", "S3", "Recovery"]
+---
+
+# File systems — bulk и streaming для files
+
+FileSource и FileSink — workhorse connectors для batch ETL, lakehouse ingestion, и backfill scenarios. Они implement FLIP-27 и SinkV2, supports множество forms (CSV, JSON, Avro, Parquet, ORC), работают над любым Flink FileSystem (HDFS, S3, GCS, Azure Blob, local).
+
+Этот урок разбирает: bulk vs record-wise modes, bucketing strategies, rolling policies, in-progress / finished file lifecycle, transactional recovery semantics, common production patterns.
+
+---
+
+## FileSource — FLIP-27 для files
+
+### Bulk format (Parquet, ORC, Avro)
+
+```java
+FileSource<Order> source = FileSource.forBulkFileFormat(
+    new ParquetBulkReaderFormat<>(Order.class),
+    new Path("s3://lakehouse/orders/")
+).monitorContinuously(Duration.ofMinutes(1))    // dynamic discovery
+ .build();
+
+DataStream<Order> orders = env.fromSource(
+    source,
+    WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+        .withTimestampAssigner((o, ts) -> o.getOrderTime()),
+    "orders-files"
+);
+```
+
+**Bulk format** — reads whole file (или blocks Parquet/ORC) сразу:
+- Parquet: column-pruning, predicate pushdown, async I/O.
+- ORC: similar.
+- Avro container files: row-based, sequential.
+
+Performance critical для analytical workloads — column pruning + predicate pushdown reduce I/O 10-100x.
+
+### Record-wise format (CSV, JSON, text)
+
+```java
+FileSource<String> source = FileSource.forRecordStreamFormat(
+    new TextLineInputFormat(),
+    new Path("s3://logs/")
+).build();
+```
+
+Reads line-by-line. Splits per file or per chunk (для splittable formats).
+
+### Boundedness
+
+```java
+// One-time read (BOUNDED)
+FileSource.forBulkFileFormat(...).build()
+// → Boundedness.BOUNDED — process existing files, stop
+
+// Continuous monitoring (CONTINUOUS_UNBOUNDED)
+FileSource.forBulkFileFormat(...).monitorContinuously(Duration.ofMinutes(1)).build()
+// → keep discovering new files каждую минуту
+```
+
+`monitorContinuously` polls directory listing, detects new files, emits new splits.
+
+---
+
+## SplitEnumerator + SourceReader для files
+
+**SplitEnumerator (`StaticFileSplitEnumerator` или `ContinuousFileSplitEnumerator`):**
+- Walks directory tree (recursive)
+- Each file → один или больше `FileSourceSplit` (splittable formats — multiple splits per file)
+- В CONTINUOUS mode periodic re-listing для new files
+
+**SourceReader (`FileSourceReader`):**
+- Per-subtask, owns assigned splits
+- Opens file, reads records, emits
+- Snapshots: list of pending splits с current positions
+
+---
+
+## FileSink — anatomy через SinkV2
+
+```java
+FileSink<Order> sink = FileSink.forBulkFormat(
+        new Path("s3://lakehouse/orders/"),
+        ParquetAvroWriters.forSpecificRecord(Order.class))
+    .withBucketAssigner(new DateTimeBucketAssigner<>("yyyy-MM-dd--HH"))
+    .withRollingPolicy(OnCheckpointRollingPolicy.build())
+    .build();
+
+stream.sinkTo(sink);
+```
+
+### Internal lifecycle
+
+<DiagramContainer title="FileSink lifecycle: in-progress → pending → finished" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Record arrives к sink"
+        tooltip="SinkWriter receives record. Determines target bucket через BucketAssigner. Opens new in-progress file если бакет не имеет open file (или предыдущий closed)."
+      >
+        record → BucketAssigner → bucket path
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="write к in-progress" />
+    <FlowRow>
+      <DataBox
+        label="In-progress file"
+        tooltip="File suffix .inprogress (или .partXXX). Записан текущим subtask. Не visible для downstream consumers — это transactional staging. Может grow до rolling policy trigger."
+      >
+        s3://...bucket/.subtask-N.part-uuid.inprogress
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="checkpoint barrier OR rolling policy fires" />
+    <FlowRow>
+      <DataBox
+        label="Pending file (pre-commit)"
+        tooltip="На checkpoint barrier writer closes in-progress file, renames to .pending. Pending file written, но не visible до commit phase. Это Committable в SinkV2 model."
+      >
+        .pending (Committable produced)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="notifyCheckpointComplete" />
+    <FlowRow>
+      <DataBox
+        label="Finished file"
+        tooltip="Когда JobManager confirms checkpoint complete, Committer renames pending → final filename. Now visible. Recovery semantics: на crash перед commit phase — pending file remains, recovery completes commit. Exactly-once."
+      >
+        s3://...bucket/part-N-uuid.parquet (final)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Three file states
+
+1. **In-progress** — currently being written. Suffix `.inprogress`. Not visible.
+2. **Pending** — closed, waiting checkpoint complete. Suffix `.pending`. Not visible.
+3. **Finished** — committed, final name, visible.
+
+Crash recovery: на restart Flink restores Committables from checkpoint, re-applies commit phase. Pending files become finished. No data loss, no duplicates (exactly-once).
+
+---
+
+## Bucketing strategies
+
+Bucket = subdirectory куда records partition. Three common:
+
+### DateTimeBucketAssigner (most common)
+
+```java
+.withBucketAssigner(new DateTimeBucketAssigner<>("yyyy-MM-dd--HH"))
+// → s3://bucket/2026-05-12--14/part-...
+```
+
+Buckets by processing time или event time (configurable). Standard для time-partitioned datasets.
+
+### BasePathBucketAssigner
+
+```java
+.withBucketAssigner(new BasePathBucketAssigner<>())
+// → s3://bucket/part-...  (no sub-bucket)
+```
+
+All files в base directory. Используется когда уже есть external partitioning (Hive partitions, S3 prefix-based).
+
+### Custom BucketAssigner
+
+```java
+.withBucketAssigner(new BucketAssigner<Order, String>() {
+    @Override
+    public String getBucketId(Order order, Context context) {
+        return String.format("region=%s/year=%d/month=%02d",
+            order.getRegion(), order.getYear(), order.getMonth());
+    }
+    @Override
+    public SimpleVersionedSerializer<String> getSerializer() {
+        return SimpleVersionedStringSerializer.INSTANCE;
+    }
+});
+```
+
+Hive-style partition layout. Critical для downstream query engines (Presto, Spark, Trino).
+
+---
+
+## Rolling policies
+
+When close current in-progress file и start new?
+
+### OnCheckpointRollingPolicy (bulk format default)
+
+```java
+.withRollingPolicy(OnCheckpointRollingPolicy.build())
+```
+
+Roll on every checkpoint. **Exactly-once compatible** для bulk formats (Parquet, ORC — closes Parquet footer, file becomes self-describing). Used для bulk format всегда.
+
+### DefaultRollingPolicy (record format)
+
+```java
+.withRollingPolicy(DefaultRollingPolicy.builder()
+    .withRolloverInterval(Duration.ofMinutes(15))      // roll каждые 15 min
+    .withInactivityInterval(Duration.ofMinutes(5))     // roll если 5 min без записей
+    .withMaxPartSize(MemorySize.ofMebiBytes(128))      // roll при 128MB
+    .build())
+```
+
+Combines time + size + inactivity. Used для record formats (CSV, JSON) где можно append к open file.
+
+**Note для record format:** S3 не supports append → каждая запись `re-uploads` whole file via multipart upload coordination. Это handled via Multi-Part Upload (MPU) — parts uploaded incrementally, finalized on rolling.
+
+---
+
+## Compression
+
+Parquet:
+
+```java
+ParquetWriterFactory<Order> factory = ParquetAvroWriters.forSpecificRecord(Order.class);
+// Defaults — SNAPPY compression
+// Можно customize:
+ParquetWriterFactory<Order> factory = (out) -> AvroParquetWriter.<Order>builder(out)
+    .withSchema(Order.getClassSchema())
+    .withCompressionCodec(CompressionCodecName.ZSTD)   // lz4, snappy, gzip, zstd
+    .withRowGroupSize(128 * 1024 * 1024)
+    .build();
+```
+
+ZSTD — sweet spot для most workloads (2-3x compression vs Snappy с small CPU overhead).
+
+---
+
+## S3 integration considerations
+
+### Multi-Part Upload (MPU)
+
+S3 sink uploads through multipart API:
+- Files split на parts (default 5MB each)
+- Parts uploaded sequentially
+- On checkpoint: `complete_multipart_upload` call
+
+### S3 eventual consistency
+
+S3 теперь strongly consistent (since 2020) — но **rename операции expensive** (copy + delete). FileSink avoids rename — pending file path **уже** is final path, just commitstate moves.
+
+### S3 staging directory
+
+```java
+FileSink.forBulkFormat(...)
+    .withOutputFileConfig(OutputFileConfig.builder()
+        .withPartPrefix("orders")
+        .withPartSuffix(".parquet")
+        .build())
+```
+
+S3 prefix structure влияет на listing performance — avoid too many files в one prefix (S3 throttles при >5000 PUT/sec per prefix).
+
+---
+
+## Recovery semantics
+
+Detailed scenario crash recovery:
+
+**Before crash:**
+- T1: subtask 0 writes records, in-progress file = `s3://bucket/date=2026-05-12/.subtask0.inprogress`
+- T2: checkpoint barrier arrives, FileSink closes file, renames to `.pending`. Committable persisted to checkpoint.
+- T3: JM coordinates checkpoint, calls `notifyCheckpointComplete` to all subtasks.
+- T4: Subtask 0 begins commit phase (rename pending → final).
+- **CRASH** during T4 (e.g., TM killed).
+
+**Recovery:**
+- Flink restores from checkpoint state.
+- Recovered Committables in subtask state.
+- Re-applies commit phase: rename `.pending` → final name.
+- Idempotent — если уже renamed, rename retries безопасно.
+
+**Outcome:** **exactly-once**. No data loss, no duplicates.
+
+Если crash before T2 (during write) — in-progress file truncated на recovery. Data re-written from source. Correctness preserved.
+
+---
+
+## Сравнительная таблица: bulk vs record-wise
+
+| Aspect | Bulk format | Record-wise format |
+|---|---|---|
+| Examples | Parquet, ORC, Avro container | CSV, JSON Lines, text |
+| Roll policy | On checkpoint only | Time + size + inactivity |
+| File format | Self-describing (schema embedded) | Plain rows |
+| Compression | Native (column-level для Parquet) | Whole-file compression |
+| Splittable | Parquet — yes (row groups) | CSV / JSON — only on newlines |
+| Use case | Analytical, lakehouse | Logs, archive, audit |
+| Streaming-friendly | Less (block-oriented) | Yes (line-by-line) |
+
+---
+
+## Production gotchas
+
+### 1. Too many small files на S3
+
+```java
+.withRollingPolicy(DefaultRollingPolicy.builder()
+    .withRolloverInterval(Duration.ofMinutes(1))       // ❌ Way too frequent!
+    .build())
+```
+
+Cost: миллион small files = list operations slow, query engines (Presto, Athena) deteriorate, S3 throttling. **Production rule:** target 100-512MB per file. Adjust rolling interval to match throughput.
+
+```java
+// Если throughput 100MB/min и хотите 200MB файлы:
+.withRolloverInterval(Duration.ofMinutes(2))
+```
+
+Plus consider downstream compaction (Iceberg compaction, Hive ALTER TABLE CONCATENATE).
+
+### 2. S3 listing slow на directories с millions files
+
+Дискавери в FileSource через `monitorContinuously` does listing per cycle. С 10M files это minutes. SourceCoordinator blocked → readers idle.
+
+**Mitigation:**
+- Hive-style partitioning (year/month/day/hour) — listings scoped to prefixes
+- Skip already-processed files через tracking state (timestamps, manifest)
+- Or use lakehouse format (Iceberg) — manifest-based listing O(1)
+
+### 3. Bucket-id changes on restart → orphan files
+
+If `BucketAssigner` depends on processing time:
+
+```java
+new BucketAssigner<>() {
+    public String getBucketId(Order order, Context ctx) {
+        return String.valueOf(System.currentTimeMillis() / 3600_000);
+        // ↑ Changes on each restart — bucket reassigned
+    }
+};
+```
+
+На restart subtask может start writing к different bucket — old pending files orphaned.
+
+**Mitigation:** bucket assignment должен depend on event data, not processing time. Use `DateTimeBucketAssigner` (uses event timestamp если available).
+
+### 4. Parquet writer memory
+
+Parquet writes row groups в memory before flush:
+- Default row group size = 128MB.
+- N parallel subtasks × M concurrent buckets → memory consumption.
+
+Если sink subtask has 10 active buckets — может consume 1.3GB just для Parquet buffers. Add heap headroom.
+
+```yaml
+taskmanager.memory.task.heap.size: 4g    # generous
+```
+
+### 5. Watermark progress + checkpoint = file commit latency
+
+Files commit only on checkpoint complete. С `enableCheckpointing(300_000)` (5 min) — finished files appear with 5 min latency. Если нужны fresher results — shorter checkpoint interval (но trade-off с overhead).
+
+### 6. Compaction layer is your responsibility
+
+FileSink writes finished files, но NOT compacts them. Production lakehouse needs separate compaction job (Iceberg `RewriteDataFilesAction`, Spark compaction, etc.).
+
+---
+
+## Key takeaways
+
+- **FileSource** (FLIP-27) — bulk (Parquet/ORC/Avro) или record-wise (CSV/JSON), supports `monitorContinuously` для CONTINUOUS_UNBOUNDED.
+- **FileSink** (SinkV2) — exactly-once via in-progress → pending → finished lifecycle.
+- **Bucketing** — `DateTimeBucketAssigner` стандартно, custom для Hive-style partitioning.
+- **Rolling policies**: `OnCheckpointRollingPolicy` для bulk (Parquet/ORC), `DefaultRollingPolicy` (time + size + inactivity) для record format.
+- **Recovery exactly-once** через pending file rename idempotency.
+- **Production: target 100-512MB per file**, beware small file problem on S3.
+
+---
+
+<KnowledgeCheck
+  question="Какая разница между OnCheckpointRollingPolicy и DefaultRollingPolicy, и почему bulk format (Parquet) использует первый?"
+  answer="OnCheckpointRollingPolicy: roll (close in-progress, mark pending) только на checkpoint barrier — никаких time/size triggers. Default для bulk formats. DefaultRollingPolicy: roll на любой combination — rolloverInterval (time-based), maxPartSize (size-based), inactivityInterval (idle-based). Используется для record formats (CSV, JSON). Причина для bulk: Parquet/ORC файлы должны быть self-describing — содержат footer с metadata (schema, row group offsets, statistics). Footer written ТОЛЬКО на close — частичный (open) Parquet file не valid. Если roll mid-checkpoint — invalid file. OnCheckpointRollingPolicy guarantees что close happens только при barrier sync = exactly-once compatible. Record formats append-able — можно close anytime. Trade-off: OnCheckpoint означает file size зависит от checkpoint interval × throughput — tune carefully для целевого file size (100-512MB на S3)."
+/>

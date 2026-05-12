@@ -1,0 +1,315 @@
+---
+title: "Time semantics в CEP: event time, watermarks, AFTER MATCH SKIP, late events"
+description: "Event time vs processing time в CEP, AFTER MATCH SKIP semantics, late events handling, partial matches на window expiry. Как watermark progression управляет match emission"
+order: 6
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Event Time", "Processing Time", "Watermarks", "AFTER MATCH SKIP", "Late Events", "Within Expiry"]
+---
+
+# Time semantics в CEP — когда и в каком порядке матчить
+
+CEP critically depends на time. `within(Duration)` — это bound по времени, `next` подразумевает order, late events могут нарушить matching. В этом уроке разбираем: event time vs processing time mode, как watermark progression управляет match emission, behaviour late events, и как partial matches expire.
+
+Без понимания time semantics CEP даёт false positives, false negatives, или нелинейную latency. Большинство production CEP issues — это time-related.
+
+---
+
+## Event time vs Processing time mode
+
+CEP supports оба mode через `WatermarkStrategy`:
+
+### Event time mode (production default)
+
+```java
+WatermarkStrategy<Event> wms = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((e, ts) -> e.getEventTime());
+
+PatternStream<Event> ps = CEP.pattern(
+    input.assignTimestampsAndWatermarks(wms).keyBy(Event::getUserId),
+    pattern
+);
+```
+
+В event time mode:
+- Events ordered by **event time** (their timestamp), не arrival order.
+- `within(Duration)` measures по event time delta.
+- **Match emit только когда watermark проходит** `first_event_timestamp + within`.
+- Out-of-order events tolerated (до watermark bound).
+
+Это **production default** — даёт correctness даже при out-of-order ingestion.
+
+### Processing time mode
+
+```java
+PatternStream<Event> ps = CEP.pattern(input.keyBy(...), pattern)
+    .inProcessingTime();
+```
+
+В processing time mode:
+- Events ordered by **arrival time** в operator (wall clock).
+- `within(Duration)` measures wall clock.
+- Matches emit **immediately** по wall clock.
+- Out-of-order по event time ломает matching.
+
+Используется когда:
+- Source не имеет meaningful event timestamps
+- Сверхнизкая latency нужна и event-time correctness не критична
+- Patterns simple, в один partition arrival order = event order
+
+---
+
+## Watermark progression управляет match emission
+
+В event time mode pattern matches stuck в state пока watermark не проходит `within()` границу:
+
+<DiagramContainer title="Match emission по watermark progression" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Events приходят (event time)"
+        tooltip="Events со своими timestamps. Они могут быть out-of-order — приходят в processing time order разных от event time order."
+      >
+        e1(t=10), e2(t=15), e3(t=12)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="forBoundedOutOfOrderness(20s)" />
+    <FlowRow>
+      <DataBox
+        label="Watermark generation"
+        tooltip="W = max(event time) - bound = max(15) - 20 = -5. Реалистично watermark отстаёт на 20s от наибольшего seen event time. Это значит что NFA знает: больше events с time < W не придут."
+      >
+        Watermark W = max_seen_ts - 20s
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="NFA matches partial sequences" />
+    <FlowRow>
+      <DataBox
+        label="Partial matches accumulate"
+        tooltip="NFA создаёт ComputationStates per matching event. До тех пор пока match не завершён или within() не прошёл, partial matches не emit-ятся и не purged."
+      >
+        Stored in state до W &gt; first_ts + within
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="W пересекает first_ts + within" />
+    <FlowRow>
+      <DataBox
+        label="Match emit (или discard)"
+        tooltip="Когда watermark проходит границу within() — Flink знает что no more events arrive that could complete this match. Если completed → emit. Если incomplete → discard (или timeout side output)."
+      >
+        Final emit / timeout / discard
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Latency implication
+
+Match с `within(5 min)` and out-of-order bound 20s emit-ится через **5 min + 20s** после первого event-а. Это **inherent latency** event time semantics. Если нужна real-time emission (sub-second) — нужен processing time или отдельный low-latency path.
+
+---
+
+## AFTER MATCH SKIP — temporal semantics
+
+В Pattern API эквивалент `AFTER MATCH SKIP` — `AfterMatchSkipStrategy`:
+
+```java
+AfterMatchSkipStrategy skipStrategy = AfterMatchSkipStrategy.skipPastLastEvent();
+Pattern.<Event>begin("a", skipStrategy).where(...)...
+```
+
+Варианты:
+
+| Pattern API | SQL MATCH_RECOGNIZE | Semantics |
+|---|---|---|
+| `skipPastLastEvent()` | `SKIP PAST LAST ROW` | Default. Continue после last matched event. Non-overlapping. |
+| `noSkip()` | `SKIP TO NEXT ROW` | Continue с next event after first matched. Overlapping. |
+| `skipToFirst(name)` | `SKIP TO FIRST var` | Continue at first row of variable. |
+| `skipToLast(name)` | `SKIP TO LAST var` | Continue at last row of variable. |
+
+Temporal интерпретация: каждый skip variant определяет **temporal cursor** где начинаем looking for next match. Это управляет multiplicity matches per time range.
+
+### Implications для emission latency
+
+`skipPastLastEvent` — после match-а NFA reset, начинаем with следующего event. Это значит partial matches которые включали bored events очищаются. Меньше state.
+
+`noSkip` (`SKIP TO NEXT ROW`) — overlapping matches могут share events. State может расти быстрее, multiple matches emit per logical time window.
+
+---
+
+## Late events handling
+
+«Late event» — event с timestamp **меньше** current watermark. NFA по умолчанию **dropped** такие events:
+
+```java
+input.assignTimestampsAndWatermarks(wms)    // watermark = max_seen - 20s
+     .keyBy(...)
+     // event с ts < watermark не reach CEP — dropped during watermark op
+```
+
+Реально dropping происходит в watermark assigner: events behind watermark проходят дальше, но `Time.now()` based windows / CEP treat их как fired. Поведение per operator может differ.
+
+### Configurable late events handling
+
+Pattern API не имеет explicit `allowedLateness` (как у Windows). Есть workarounds:
+
+1. **Relaxed watermark bound** — `forBoundedOutOfOrderness(Duration.ofMinutes(2))` instead of 20s. Trade-off: latency.
+
+2. **Side output для late events** — через `ProcessFunction` upstream от CEP:
+
+```java
+SingleOutputStreamOperator<Event> mainAndLate = input
+    .process(new ProcessFunction<Event, Event>() {
+        @Override
+        public void processElement(Event e, Context ctx, Collector<Event> out) {
+            if (e.getEventTime() < ctx.timerService().currentWatermark()) {
+                ctx.output(lateTag, e);   // side output
+            } else {
+                out.collect(e);
+            }
+        }
+    });
+
+DataStream<Event> lateEvents = mainAndLate.getSideOutput(lateTag);
+// Process lateEvents с separate logic — re-CEP или alert
+```
+
+3. **`MATCH_RECOGNIZE` в SQL** — нет explicit late handling, ту же strategy: relaxed bound или side output.
+
+### Реальный case: late event delivers match
+
+Sequence: LOGIN_FAIL × 2 already matched, ждём 3rd FAIL для `times(3)`. Третий FAIL приходит late (ts < watermark). NFA не applies его → match not emitted → false negative.
+
+**Mitigation:** для CEP с пограничной latency используйте relaxed `forBoundedOutOfOrderness` (2-5 min). Cost — increased emission latency. Trade-off explicit.
+
+---
+
+## Partial matches expiry
+
+Когда watermark пересекает `first_event_timestamp + within(Duration)`, partial match expires:
+
+```
+T=0:   match started (first event A at t=0)
+T=4m:  some matching events, но pattern not complete
+T=5m:  watermark > 0 + 5min → partial match expires
+```
+
+Поведение по expiry:
+
+1. **С `.select(SelectFunction)`** — partial match просто discarded.
+2. **С `.flatSelect(PatternFlatSelectFunction)`** — same, discarded.
+3. **С `.process(PatternProcessFunction)`** + `processTimedOutMatch` — Flink calls `processTimedOutMatch(match, ctx)` чтобы emit timeout alert.
+
+```java
+patternStream.process(new PatternProcessFunction<Event, Alert>() {
+    @Override
+    public void processMatch(Map<String, List<Event>> match, Context ctx,
+                             Collector<Alert> out) {
+        out.collect(new Alert("Full match", match));
+    }
+    
+    @Override
+    public void processTimedOutMatch(Map<String, List<Event>> partial, Context ctx) {
+        // partial — события, успевшие match до expiry
+        out.collect(new Alert("Pattern timed out, partial: " + partial.size()));
+    }
+});
+```
+
+`processTimedOutMatch` критичен для use cases типа cart abandonment: «user added to cart но не сделал checkout within 30 min».
+
+---
+
+## Сравнительная таблица: time mode trade-offs
+
+| Aspect | Event time | Processing time |
+|---|---|---|
+| Correctness под out-of-order | Native, via watermark | Broken (matches могут miss) |
+| Emission latency | first_ts + within + ws_bound | Wall clock immediate |
+| Late event handling | Configurable bound + side output | Implicit (по arrival) |
+| Replay-able | Yes (deterministic с tagged timestamps) | No (depends on processing speed) |
+| Production default | **Yes** | Только для special cases |
+| Use case | Fraud detection, audit, joins | Heartbeat detection, IoT alarm cascade |
+
+---
+
+## Multi-source watermark alignment
+
+В CEP с joins или multiple sources watermarks могут differ. Watermark Alignment (FLIP-217) синхронизирует:
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withWatermarkAlignment("alignment-group-1", Duration.ofMinutes(1), Duration.ofSeconds(5));
+```
+
+Параметры:
+- `alignmentGroup` — name группы sources, которые синхронизируются
+- `maxAllowedWatermarkDrift` — max разница между watermarks в группе
+- `updateInterval` — как часто check
+
+Это критично когда CEP joins streams: если один source 5 min ahead другого, CEP может never match patterns spanning both.
+
+<Callout type="warning">
+Без watermark alignment в multi-source CEP — typical bug: pattern works в unit test (single source), но не в production (joined sources с different watermarks). Watermark = min(all source watermarks), и если один source idle/slow — overall watermark stuck → no emissions.
+</Callout>
+
+---
+
+## Production gotchas
+
+### 1. Idle source → frozen watermark → no emissions
+
+Если Kafka partition не получает events — её watermark stuck в last seen timestamp. Min watermark across partitions stuck → CEP не emits.
+
+**Fix:** `withIdleness(Duration.ofMinutes(1))` для marking partitions idle.
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withTimestampAssigner(...)
+    .withIdleness(Duration.ofMinutes(1));
+```
+
+### 2. Out-of-order bound слишком small → false negatives
+
+`forBoundedOutOfOrderness(Duration.ofSeconds(1))` для source с 30s out-of-order events — большинство events будут late → dropped. Без визуальных feedback — patterns just не match.
+
+**Detect:** monitor `numLateRecordsDropped` metric в Flink Web UI.
+
+### 3. Pattern с `within(short)` но slow watermark → high latency
+
+`within(Duration.ofSeconds(5))` + watermark progresses every 30s ⇒ match emit-ся ~25s later. Это **inherent** behaviour. Если нужна sub-second latency:
+- Tight `withBoundedOutOfOrderness`
+- Single-partition source (no aggregation watermark)
+- Или переключиться на processing time
+
+### 4. `processTimedOutMatch` забыли — silent timeouts
+
+Если в use case important detect «pattern не завершился» (например cart abandonment), но не использовали `PatternProcessFunction` с `processTimedOutMatch` — timed out patterns silently dropped. Important alerts не emit-ятся.
+
+**Fix:** always use `.process(...)` если timeout semantics needed.
+
+### 5. State expiry race с late events
+
+Late event для already-expired partial match не reactivates его. Если late event «would have completed» match — это already too late, NFA уже discarded state.
+
+**Mitigation:** generous `forBoundedOutOfOrderness` bound + tight `within(Duration)`. Trade-off explicit: больше latency, fewer missed matches.
+
+---
+
+## Key takeaways
+
+- **Event time mode** — production default, correctness под out-of-order.
+- Match **emit-ся когда watermark пересекает `first_ts + within`** — inherent latency.
+- `AfterMatchSkipStrategy` (Java) / `AFTER MATCH SKIP` (SQL) определяет overlapping matches и state size.
+- **Late events dropped** по умолчанию — relax watermark bound или используйте side outputs для re-processing.
+- `processTimedOutMatch` — для **explicit timeout semantics** (cart abandonment, SLA breach).
+- **Watermark alignment** обязателен для multi-source CEP — иначе stuck watermarks.
+- **Idle source** — typical production bug, `withIdleness` обязателен.
+
+---
+
+<KnowledgeCheck
+  question="У вас CEP pattern 'Пользователь добавил товар в корзину, не сделал checkout within 30 минут' для cart abandonment. Какой select function и какая watermark strategy?"
+  answer="Используйте PatternProcessFunction с processTimedOutMatch (НЕ просто .select() — оно discard-ит timeouts). PatternStream.process(new PatternProcessFunction<>() { processMatch — для completed (рарно если checkout произошёл), processTimedOutMatch — для cart abandonment (это собственно target event). Watermark strategy: forBoundedOutOfOrderness с разумным bound (1-2 минуты для consumer events с network jitter) + withIdleness(1 min) для idle user sessions + withTimestampAssigner на event time. Pattern: begin('add').where(type==ADD_TO_CART).followedBy('checkout').where(type==CHECKOUT).within(Duration.ofMinutes(30)). Цель — processTimedOutMatch вызовется через 30min + watermark bound после ADD_TO_CART если CHECKOUT не пришёл."
+/>

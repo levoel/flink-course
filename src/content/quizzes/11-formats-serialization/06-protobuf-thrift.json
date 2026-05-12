@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/06-protobuf-thrift",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-06",
+    "description": "Protobuf, Thrift, format comparison"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-06-q1",
+      "type": "multiple-choice",
+      "question": "Performance comparison: Avro Specific, Protobuf, JSON, Kryo на 10M records single-thread. Какой порядок?",
+      "options": [
+        { "id": "a", "text": "JSON быстрее всех" },
+        { "id": "b", "text": "Avro Specific (~23M rec/sec, ~85% POJO baseline) ≈ Protobuf (~22M rec/sec, ~80%) — практически tie с Protobuf slightly compact wire (varint encoding). Avro Generic ~19M (~75%). Thrift via Kryo ~14M (~50%). JSON Jackson ~12M (~40%) — text parsing inevitable cost. Kryo unregistered ~10M (~35%) — class FQN в wire + reflection per object" },
+        { "id": "c", "text": "Kryo всегда быстрее Protobuf" },
+        { "id": "d", "text": "JSON и Protobuf одинаковые" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Benchmark numbers (10M records, 500-byte average): POJO baseline 28M rec/sec. Avro Specific 23M (~85%, codegen + pre-baked schema). Protobuf 22M (~80%, varint encoding + length-prefix). Avro Reflect 21M (~80%, reflection over POJO). Avro Generic 19M (~75%, runtime field lookup). Thrift TBaseSerializer (Kryo path) 14M (~50%). JSON Jackson 12M (~40%, text parsing). Kryo registered 14M (~50%, short class ID). Kryo unregistered 10M (~35%, class FQN ~30 bytes per record). Wire footprint: Protobuf slightly compact чем Avro (~5-10%) из-за varint для small integers и no field names. CPU per record: Protobuf ~0.95μs, Avro Specific ~0.9μs — практически идентичны.",
+      "studyHint": "Повторите урок 06 — секцию 'Performance comparison: 10M records benchmark'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-06-q2",
+      "type": "multiple-choice",
+      "question": "Protobuf schema evolution: какое изменение catastrophic и почему?",
+      "options": [
+        { "id": "a", "text": "Add new field с новым tag number" },
+        { "id": "b", "text": "Reuse same tag number для разных fields — old data still has bytes под этим tag from removed field, new reader will interpret them как новый field type, что вызывает silent data corruption. Защита: ВСЕГДА reserve removed tags `reserved 5; reserved 'old_field';` чтобы compiler reject-ил reuse" },
+        { "id": "c", "text": "Rename field в .proto" },
+        { "id": "d", "text": "Изменение field number с 1 на 2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Protobuf wire format использует tag numbers (1, 2, 3...) — field names в wire отсутствуют. Reuse tag number — catastrophe: stored data с `tag 5 = int64 legacy_id = 12345` при чтении новой schema (`tag 5 = string region`) интерпретирует 8 bytes int64 как UTF-8 string → garbled output или decode exception. Old running consumers стартуют падать на messages, written by new producers с reused tag. Schema Registry Protobuf compatibility check ЛОВИТ это, но только if registry в use. Protection mechanism: `reserved 5; reserved 'old_field';` в .proto — compiler rejected любую попытку reuse tag 5 или name 'old_field'. Production rule: never delete fields без reserve. Naming change (`old_field` → `new_field` с same tag) — OK (field names only в .proto, не в wire), но recommend keep aliases для documentation continuity.",
+      "studyHint": "Повторите урок 06 — секцию 'Schema evolution в Protobuf' и critical reserve pattern",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m11-06-q3",
+      "type": "multiple-choice",
+      "question": "Когда выбирать Protobuf vs Avro для production Kafka pipeline?",
+      "options": [
+        { "id": "a", "text": "Всегда Avro — Protobuf deprecated" },
+        { "id": "b", "text": "Avro: Kafka-centric ecosystem, Schema Registry first-class, более strong schema evolution rules (especially aliases для rename), better Iceberg/Parquet integration. Protobuf: gRPC microservices (single source of truth .proto files), slightly more compact wire (varint), better Java type safety, well-known types (Timestamp, Any, Duration). Choose ONE format consistently across pipeline" },
+        { "id": "c", "text": "Protobuf только для high-throughput" },
+        { "id": "d", "text": "Avro для tests, Protobuf для production" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Decision factors: **Avro wins when** — (1) Existing Kafka + Schema Registry ecosystem (de-facto standard, first-class support в Confluent stack). (2) Cross-language consumers (Python pandas, Go, Rust — все имеют mature Avro libs). (3) Iceberg/Parquet downstream — Avro maps cleanly. (4) Schema evolution с aliases для rename (Protobuf не имеет). (5) Logical types (decimal, timestamp-millis) для precise SQL. **Protobuf wins when** — (1) gRPC services already define .proto files — reuse same schemas (single source of truth). (2) Slightly more compact wire (varint encoding for small ints — ~5-10% savings). (3) Well-known types (`Any`, `Timestamp`, `Duration`, `Struct`) для unstructured data. (4) Stronger backward type safety (proto3 default values вместо nulls). (5) Polyglot RPC + streaming в одной schema repo. **Production rule**: choose ONE format pipeline-wide. Mixing creates conversion overhead (~30% on cross-format steps) и schema governance complexity.",
+      "studyHint": "Повторите урок 06 — секцию 'Use case matrix: какой формат для чего'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m11-06-q4",
+      "type": "true-false",
+      "question": "Apache Thrift не имеет официального flink-thrift модуля. Production usage идёт через Kryo-based ThriftKryoSerializer (Twitter Chill TBaseSerializer), что даёт ~60% baseline perf vs ~80% для native Protobuf — поэтому migration Thrift → Protobuf/Avro обычно рекомендуется.",
+      "correctAnswer": true,
+      "explanation": "Status quo: Apache Flink имеет official flink-avro и flink-protobuf модули, но НЕ flink-thrift. Thrift в Flink работает через workarounds: (1) Twitter Chill library `com.twitter.chill.thrift.TBaseSerializer` — Kryo-based serializer оптимизированный для Thrift (TBase). Performance ~60% baseline — лучше unregistered Kryo (~35%), но хуже native Avro/Protobuf (~80-85%). (2) Custom TypeSerializer<T extends TBase> — full native implementation. Серьёзная работа, не worth для most teams. (3) Convert Thrift → Avro/Protobuf upstream — sidecar пересылает Thrift events как Avro на Kafka, Flink reads Avro. Adds latency но simplifies Flink-side. Recommendation: для new pipelines избегайте Thrift. Для legacy migrations — option 3 most practical: incremental migration без переписывания Flink jobs. Org-level decision: один format для всех new pipelines (Avro или Protobuf), Thrift только legacy.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

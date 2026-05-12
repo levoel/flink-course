@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/05-predefined-options",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-05",
+    "description": "Quiz for PredefinedOptions lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-05-q1",
+      "type": "multiple-choice",
+      "question": "Production deployment, NVMe SSD. Какой PredefinedOptions profile использовать?",
+      "options": [
+        { "id": "a", "text": "DEFAULT — он автоматически адаптируется" },
+        { "id": "b", "text": "FLASH_SSD_OPTIMIZED — optimized для SSD: smaller SST (parallel compaction), more background jobs, LZ4 compression, max_open_files=-1" },
+        { "id": "c", "text": "SPINNING_DISK_OPTIMIZED" },
+        { "id": "d", "text": "SPINNING_DISK_OPTIMIZED_HIGH_MEM" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLASH_SSD_OPTIMIZED specifically tuned для NVMe SSD: (1) target_file_size_base 64MB — smaller SST позволяют parallel compaction; (2) max_background_jobs 4 — больше parallelism для SSD throughput; (3) LZ4 compression — faster чем Snappy для SSD I/O speeds; (4) max_open_files -1 — SSD random access cheap, OK держать все open. DEFAULT — conservative для unknown hardware, не optimized. SPINNING profiles — для HDD: bigger SST (256MB) для уменьшения seeks, snappy compression. 95% of production NVMe deployments — FLASH_SSD_OPTIMIZED.",
+      "studyHint": "Повторите урок — Compare PredefinedOptions table",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m04-05-q2",
+      "type": "multiple-choice",
+      "question": "Нужен custom tweak (max_background_jobs=8). Какой подход безопаснее?",
+      "options": [
+        { "id": "a", "text": "Написать custom RocksDBOptionsFactory, override createDBOptions с new DBOptions().setMaxBackgroundJobs(8)" },
+        { "id": "b", "text": "Использовать flink-conf property: state.backend.rocksdb.thread.num: 8. Это preserves PredefinedOptions, WriteBufferManager и Block Cache. НЕ риск OOM" },
+        { "id": "c", "text": "Изменить FRocksDB source code" },
+        { "id": "d", "text": "Использовать JVM system property" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "flink-conf property — safe approach. state.backend.rocksdb.thread.num: 8 устанавливает background jobs preserving все остальное (PredefinedOptions, WriteBufferManager, Block Cache injection). Custom factory (option a) — dangerous: new DBOptions() без super.createDBOptions() = WBM лост = OOM через часы. Если нужен custom factory — ALWAYS extend DefaultConfigurableOptionsFactory и call super first. Best practice: 95% of customizations через flink-conf properties — custom factory only для extreme cases с specific RocksDB internals access (rare).",
+      "studyHint": "Повторите урок — Programmatic option override",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-05-q3",
+      "type": "multiple-choice",
+      "question": "Что PredefinedOptions НЕ устанавливают?",
+      "options": [
+        { "id": "a", "text": "Compaction style" },
+        { "id": "b", "text": "Memory management (WriteBufferManager, Block Cache injection). Это separate config: taskmanager.memory.managed.fraction, state.backend.rocksdb.memory.managed, write-buffer-ratio. PredefinedOptions говорит 'как организовать', Memory management говорит 'сколько памяти'" },
+        { "id": "c", "text": "Compression" },
+        { "id": "d", "text": "Bloom filter" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "PredefinedOptions устанавливают per-CF settings (writebuffer size, target_file_size_base), compaction options, compression per level, bloom filter settings. НО не memory budget itself. Memory management через separate config namespace: taskmanager.memory.managed.fraction (общий managed budget), state.backend.rocksdb.memory.managed: true (enables shared resources), write-buffer-ratio (WBM share), high-prio-pool-ratio (BC). Это separation позволяет deploy PredefinedOptions consistently across different hardware sizes — memory adjusts через fractions, не через profile change.",
+      "studyHint": "Повторите урок — Что PredefinedOptions НЕ устанавливают",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-05-q4",
+      "type": "true-false",
+      "question": "flink-conf overrides specific RocksDB options и могут coexist с PredefinedOptions — конкретные keys override profile defaults.",
+      "correctAnswer": true,
+      "explanation": "True. Inheritance + customization: PredefinedOptions provides baseline, flink-conf state.backend.rocksdb.* keys override specific settings. Example: predefined-options: FLASH_SSD_OPTIMIZED (sets MemTable size 64MB) + state.backend.rocksdb.writebuffer.size: 256mb (overrides к 256MB). Final config: 256MB MemTable plus все другие FLASH_SSD settings. Это correct inheritance behavior. Allow granular tuning without breaking profile or losing memory management. Best practice: start с profile, measure, override только specific bottlenecks. Profile updates с Flink upgrades — your overrides preserved.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

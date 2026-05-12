@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/08-file-merging-1.20",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-08",
+    "description": "Quiz for file merging FLIP-306 lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-08-q1",
+      "type": "multiple-choice",
+      "question": "Какую проблему решает FLIP-306 File Merging?",
+      "options": [
+        { "id": "a", "text": "Размер state файлов" },
+        { "id": "b", "text": "Small files problem в DFS (S3) для большие installations. На 2000 subtasks × 10 files/checkpoint × 2880 checkpoints/day = 57M files/day. S3 PUT throttles 3.5K/sec, listings minutes, manifest hundreds of MB, $200/day request costs. FLIP-306 merges small state files (< 32MB) в bigger physical files, StateHandle references portion (offset+length). 50-100x reduction в file count" },
+        { "id": "c", "text": "Compression checkpoint files" },
+        { "id": "d", "text": "Encryption на S3" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Small files problem — operational issue для large Flink installations. На high parallelism (1000+ subtasks) каждый checkpoint generates много мелких files. На 2000 subtasks × 10 state files × 2880 checkpoints/day = 57M files/day generation. Consequences: (1) S3 PUT throttling — limits 3.5K/sec per prefix exceeded; (2) Bucket listing — minutes for 50M files (operational pain); (3) Manifest bloat — hundreds of MB for many StateHandles; (4) Cost — charged per S3 request. FLIP-306 solution: merge small files (< 32MB threshold) в bigger physical files. StateHandle становится RangeStateHandle с offset+length. Recovery uses S3 Range GET. 50-100x file count reduction → throttling resolved, listings fast, costs drop. Configuration: state.checkpoints.file-merging.enabled: true.",
+      "studyHint": "Повторите урок — раздел 'Small files problem'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-08-q2",
+      "type": "multiple-choice",
+      "question": "Как работает recovery с merged files?",
+      "options": [
+        { "id": "a", "text": "Download all merged files в whole" },
+        { "id": "b", "text": "StateHandle references path + offset + length. TaskManager делает S3 Range GET — downloads только needed portion. Smart batching — multiple ranges из same file могут merge в single GET. Range GETs быстрые на S3, но если merged file fragmented (intermixed subtasks state) recovery не perfect sequential read" },
+        { "id": "c", "text": "Recovery не supported с merged files" },
+        { "id": "d", "text": "Flink decompresses merged files в RAM" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Recovery mechanics: StateHandle stored as RangeStateHandle с {path, offset, length}. На recovery TaskManager делает HTTP Range request: GET /file Range: bytes=offset-end. Только needed portion downloaded. Multiple RangeStateHandles ссылающихся на same physical file могут batch в single request — Flink internally optimizes. Performance characteristics: (a) Range GETs быстрые на S3 (same latency как regular GET); (b) Если merged file logically ordered (per-key-group blocks) — sequential read; (c) Если fragmented (random subtasks intermixed) — multiple partial reads, slower. Trade-off file merging - file structure: optimize for write throughput (just append) vs read locality. Flink balances через max-merged-file-size cap (default 1GB).",
+      "studyHint": "Повторите урок — раздел 'How recovery works'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-08-q3",
+      "type": "multiple-choice",
+      "question": "Когда FLIP-306 file merging имеет смысл и когда skip?",
+      "options": [
+        { "id": "a", "text": "Always enable" },
+        { "id": "b", "text": "Use if: parallelism > 200, sub-minute checkpoint intervals, S3 throttling observed, long bucket listings, many state primitives per operator. Skip if: small parallelism (< 50), state per subtask already large (files > 32MB naturally), HDFS storage (different limits), simpler ops/debugging preferred (отдельные SSTs easier к explore)" },
+        { "id": "c", "text": "Never enable — bug-prone" },
+        { "id": "d", "text": "Only для batch jobs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Selection criteria. Use FLIP-306 file merging если: (1) High parallelism (>200 subtasks) — generates много files per checkpoint; (2) Sub-minute checkpoint intervals — high file creation rate; (3) Many state primitives per operator — каждый primitive separate file; (4) S3 throttling observed (503 SlowDown errors, slow checkpoints); (5) Bucket listings slow (operations painful); (6) Cost reduction needed (charged per S3 request). Maybe skip если: (1) Small parallelism (<50) — natural file count manageable; (2) Large state per subtask — files already > 32MB threshold, no merging beneficial; (3) HDFS storage — different limits than S3, less pressure; (4) Debugging clarity preferred — separate SSTs easier explore с aws s3 cp; (5) Simple ops setup. Production large-scale (2000 subtasks, TB state): mandatory. Small jobs: optional.",
+      "studyHint": "Повторите урок — раздел 'Когда использовать'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-08-q4",
+      "type": "true-false",
+      "question": "FLIP-306 file merging уменьшает manifest size proportionally к file count reduction.",
+      "correctAnswer": false,
+      "explanation": "False. Manifest size не уменьшается proportionally. Reasoning: manifest contains StateHandle для каждого piece state — RangeStateHandle (с file_path + offset + length) vs FileStateHandle (с file_path only). Size почти same. Manifest size proportional к NUMBER OF STATE PRIMITIVES, not number of physical files. 1000 subtasks × 10 state primitives = 10K StateHandles в manifest regardless of file merging. File merging уменьшает: physical file count (S3 throttling, listings, costs). Не уменьшает: manifest parsing time, metadata operations on coordinator. Для manifest bloat — separate optimizations: reduce state primitives count, use composite state objects, share state across operators. File merging — specific fix для small-files DFS issues, не silver bullet для metadata overhead.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

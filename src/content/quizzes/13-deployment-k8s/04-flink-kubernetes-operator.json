@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/04-flink-kubernetes-operator",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-04",
+    "description": "Quiz for Flink Kubernetes Operator lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-04-q1",
+      "type": "multiple-choice",
+      "question": "Какие два CRD определяет Flink Kubernetes Operator?",
+      "options": [
+        { "id": "a", "text": "FlinkJob и FlinkCluster" },
+        { "id": "b", "text": "FlinkDeployment и FlinkSessionJob" },
+        { "id": "c", "text": "FlinkApp и FlinkPipeline" },
+        { "id": "d", "text": "FlinkOperator и FlinkRuntime" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator определяет два CRD: (1) FlinkDeployment — описывает Flink cluster + optionally job (если spec.job указан — Application mode, иначе — Session cluster); (2) FlinkSessionJob — описывает job ВНУТРИ существующего Session cluster, через ссылку spec.deploymentName. Это позволяет одной Session кластером управлять multiple jobs декларативно.",
+      "studyHint": "Повторите урок — CRDs: FlinkDeployment и FlinkSessionJob",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-04-q2",
+      "type": "multiple-choice",
+      "question": "PR меняет одновременно `spec.image: v1.42 → v1.43` и `spec.job.parallelism: 8 → 16`. Что operator делает?",
+      "options": [
+        { "id": "a", "text": "Apply image и parallelism одновременно без savepoint" },
+        { "id": "b", "text": "Single reconciliation: trigger savepoint → cancel job → update JM Deployment с новым image → submit job с parallelism=16, restore from savepoint" },
+        { "id": "c", "text": "Reject как conflict" },
+        { "id": "d", "text": "Только image apply, parallelism игнорируется" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator делает атомарную reconciliation, но execution sequential. Шаги: trigger savepoint (canonical если cross-backend, иначе native) → wait DONE → cancel job → update JM Deployment с image=v1.43 → wait JM pod ready → submit job с parallelism=16 → restore from savepoint. Savepoint canonical format → parallelism rescale работает (state перераспределяется по новым key groups). Critical: проверьте maxParallelism (см. урок 14.5) — если default 128, scale до 200+ fail. Best practice: разделять concerns на два PR.",
+      "studyHint": "Повторите урок — Lifecycle: что operator делает при изменении CR",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-04-q3",
+      "type": "multiple-choice",
+      "question": "spec.job.upgradeMode: stateless установлен для stateful job. Что произойдёт при image bump?",
+      "options": [
+        { "id": "a", "text": "Operator делает savepoint и restore — state preserved" },
+        { "id": "b", "text": "Operator cancel job и стартует новый из main() БЕЗ savepoint. State потерян. Operator не предупредит — silent data loss" },
+        { "id": "c", "text": "Operator reject deploy с ошибкой" },
+        { "id": "d", "text": "Operator делает full snapshot вместо savepoint" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "upgradeMode: stateless означает 'не сохранять state'. Operator делает: cancel job → update image → start fresh job. State полностью потерян. Operator НЕ проверяет реально ли job stateless — он доверяет конфигу. Это silent data loss. **Always 'savepoint'** для любого job со state. Code review должен ловить случайный 'stateless'. last-state — middle ground (использует last checkpoint, не savepoint), приемлем при tolerable 30-60s data loss.",
+      "studyHint": "Повторите урок — upgradeMode: важная декларация",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-04-q4",
+      "type": "true-false",
+      "question": "Flink Kubernetes Operator делает периодические savepoints автоматически по declarative конфигу autoSavepointSeconds, без external cron/scripts.",
+      "correctAnswer": true,
+      "explanation": "True. spec.job.autoSavepointSeconds: 3600 → savepoint каждый час. spec.job.savepointHistory.maxCount/maxAgeHours — retention. Operator делает это сам, нет нужды в cron jobs или scripts. Без operator-а вам пришлось бы написать cron + REST API call + cleanup. Это одна из главных value propositions Operator-а — declarative ops.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

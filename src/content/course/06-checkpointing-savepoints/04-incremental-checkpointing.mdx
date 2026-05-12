@@ -1,0 +1,355 @@
+---
+title: "Incremental Checkpointing: SharedStateRegistry и SST file sharing"
+description: "RocksDB incremental checkpoints: SST files immutable (LSM), SharedStateRegistry maps SST → checkpoints, upload только new SSTs, reference counting cleanup. Comparison vs full."
+order: 4
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Incremental Checkpoints", "SharedStateRegistry", "SST Files", "Reference Counting", "RocksDB", "LSM"]
+---
+
+# Incremental Checkpointing: SST file sharing
+
+Без incremental checkpoints каждый checkpoint загружает **полное состояние** к DFS. На 1TB state это означает 1TB upload каждые 60 секунд — 17GB/sec network. Реальные jobs не могут так. Incremental checkpoints решают это эксплуатируя fundamental property LSM-tree: **SST files immutable**. Между checkpoints большая часть SST files та же — Flink upload-ит только new SSTs.
+
+Этот урок: алгоритм incremental checkpoint, SharedStateRegistry, reference counting для cleanup, сравнение с full checkpoints, и production tuning.
+
+---
+
+## Foundation: SST файлы immutable
+
+В RocksDB (см. модуль 04) LSM-tree состоит из MemTable (in-memory) + SSTable files на диске. **SST files immutable** — once written, никогда не modified. Compaction создаёт new SSTs, deletes old ones — но never modifies existing.
+
+Это property — основа incremental checkpoints:
+
+```
+Checkpoint N:    SST_001  SST_002  SST_003  SST_004
+Checkpoint N+1:  SST_001  SST_002  SST_003  SST_004  SST_005  (new MemTable flush)
+Checkpoint N+2:  SST_001  SST_002  SST_006           SST_005  (compaction 003+004→006)
+```
+
+Между checkpoints большинство SSTs **те же самые**. Если они immutable, можно **share** их между checkpoints — upload SST_001..004 один раз, на checkpoint N+1 upload только SST_005, на N+2 только SST_006 (старые 003+004 уже в DFS, можно reference, потом cleanup когда не нужны).
+
+---
+
+## Алгоритм incremental checkpoint
+
+<DiagramContainer title="Incremental checkpoint flow" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Local RocksDB на TM"
+        tooltip="SST files на local NVMe. После flush MemTable / compaction появляются new SSTs. RocksDB native snapshot создаёт hardlinks (immutable view) для checkpoint."
+      >
+        SSTs: 001, 002, 003, 005, 006
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="diff с previous checkpoint" />
+    <FlowRow>
+      <DataBox
+        label="Diff calculation"
+        tooltip="Flink сравнивает current SST list с previous checkpoint manifest. Difference: какие SSTs new (нужно upload), какие same (reference), какие removed (можно cleanup из DFS если no references)."
+      >
+        New: 006 | Reused: 001,002,003,005
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="upload только new SSTs" />
+    <FlowRow>
+      <DataBox
+        label="DFS upload"
+        tooltip="Only new SSTs (006) uploaded. Existing SSTs (001-005) already в DFS — reference через path. Это часто 1-5% от full state size."
+      >
+        Upload SST_006 (50MB vs full 100GB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Manifest: SST → DFS paths + metadata"
+        tooltip="Checkpoint manifest — JSON-like структура, mapping каждого SST к его DFS location. На recovery TM downloads SSTs based on manifest. SharedStateRegistry на JM tracks references — same SST shared между multiple checkpoints."
+      >
+        SST_001 → s3://.../shared/001.sst
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Detailed steps
+
+```java
+// Pseudocode для incremental snapshot
+public IncrementalSnapshotResult snapshot(long checkpointId) {
+    // 1. RocksDB native snapshot — hardlinks для immutability
+    RocksDBSnapshot rocksSnapshot = rocksDB.createCheckpoint(localCheckpointDir);
+    List<File> currentSSTs = listSSTFiles(localCheckpointDir);
+
+    // 2. Get previous checkpoint manifest (для diff)
+    Map<String, StateHandle> previousSSTs = previousCheckpointManifest.getShared();
+
+    // 3. Diff: new vs reused
+    List<File> newSSTs = currentSSTs.stream()
+        .filter(f -> !previousSSTs.containsKey(f.getName()))
+        .collect(toList());
+
+    Map<String, StateHandle> reusedSSTs = currentSSTs.stream()
+        .filter(f -> previousSSTs.containsKey(f.getName()))
+        .collect(toMap(
+            File::getName,
+            f -> previousSSTs.get(f.getName())   // existing handle
+        ));
+
+    // 4. Async upload only new
+    Map<String, StateHandle> uploadedSSTs = asyncWriter.uploadFiles(newSSTs);
+
+    // 5. Combine: reused + new = full state manifest
+    Map<String, StateHandle> allSSTs = combine(reusedSSTs, uploadedSSTs);
+
+    // 6. Snapshot MemTable (always new, in-memory)
+    StateHandle memtableHandle = snapshotMemTable();
+
+    return new IncrementalSnapshotResult(allSSTs, memtableHandle);
+}
+```
+
+---
+
+## SharedStateRegistry: reference counting
+
+`SharedStateRegistry` живёт на **JobManager** (per-job). Tracks: какие SST files referenced какими checkpoints. Key для **cleanup** — нельзя удалить SST из DFS пока он ещё referenced.
+
+```java
+public class SharedStateRegistry {
+    // SST identifier → set of checkpoints, что reference его
+    private Map<String, Set<Long>> sstReferences;
+
+    public void registerReference(String sstKey, long checkpointId) {
+        sstReferences.computeIfAbsent(sstKey, k -> new HashSet<>()).add(checkpointId);
+    }
+
+    public void unregisterReference(String sstKey, long checkpointId) {
+        Set<Long> refs = sstReferences.get(sstKey);
+        if (refs != null) {
+            refs.remove(checkpointId);
+            if (refs.isEmpty()) {
+                // No more references — safe to delete from DFS
+                dfsCleanupQueue.add(sstKey);
+            }
+        }
+    }
+}
+```
+
+### Жизненный цикл SST в registry
+
+```
+Checkpoint 1: SST_001 created → register(SST_001, ckpt=1)  → refs={1}
+Checkpoint 2: SST_001 reused  → register(SST_001, ckpt=2)  → refs={1, 2}
+Checkpoint 3: SST_001 reused  → register(SST_001, ckpt=3)  → refs={1, 2, 3}
+Checkpoint 4: SST_001 compacted into SST_010
+              SST_010 created → register(SST_010, ckpt=4)
+              SST_001 not in manifest → unregister на ckpt=4 cleanup
+                                       → refs={1, 2, 3} (still in older checkpoints)
+Eventually checkpoints 1,2,3 expire → unregister(SST_001, ckpt=1,2,3)
+                                       → refs={} → delete from DFS
+```
+
+### Где SST хранятся в DFS
+
+```
+s3://my-bucket/checkpoints/
+├── job-abc-123/
+│   ├── chk-100/
+│   │   ├── _metadata          ← checkpoint metadata
+│   │   └── exclusive/         ← state частный для этого checkpoint
+│   ├── chk-101/
+│   │   ├── _metadata
+│   │   └── exclusive/
+│   └── shared/                ← shared SST files (через registry)
+│       ├── SST_001.sst
+│       ├── SST_002.sst
+│       └── ...
+```
+
+`shared/` directory — для SSTs, shared между checkpoints. `exclusive/` — для files specific к одному checkpoint (MemTable snapshots, operator state non-RocksDB).
+
+---
+
+## Configuration
+
+### Включить incremental
+
+```yaml
+state.backend.incremental: true   # default false для legacy совместимости
+# В Flink 2.x: для RocksDB и ForSt incremental по default true
+```
+
+Или programmatically:
+```java
+EmbeddedRocksDBStateBackend backend = new EmbeddedRocksDBStateBackend(true);  // incremental
+env.setStateBackend(backend);
+```
+
+### Storage settings
+
+```yaml
+state.backend.type: rocksdb
+state.checkpoints.dir: s3://my-bucket/checkpoints
+state.backend.incremental: true
+
+# Retain checkpoints на cancel (default DELETE_ON_CANCELLATION)
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+
+# Number of retained checkpoints (default 1, увеличить для recovery options)
+state.checkpoints.num-retained: 5
+```
+
+### Per-checkpoint vs per-savepoint
+
+| | Checkpoint | Savepoint |
+|---|---|---|
+| Incremental | ✅ Yes | ❌ No (always full) |
+| Format | Native | Native or canonical |
+| Owned by | Flink | User |
+
+Savepoints — always full snapshot, чтобы быть self-contained (можно delete checkpoints, savepoint independent). Это why savepoints больше и дольше.
+
+---
+
+## Performance numbers
+
+| State size | Full checkpoint | Incremental (typical 5% diff) | Speedup |
+|---|---|---|---|
+| 1GB | 5s | 0.5s | 10x |
+| 100GB | 5min | 30s | 10x |
+| 1TB | 50min | 5min | 10x |
+| 10TB | infeasible | 30min | — |
+
+Real production speedup: 10-50x для steady-state jobs (компакции редкие). Под heavy compaction (after rescale, state migration) — меньше benefit, но still 2-5x.
+
+---
+
+## Recovery process
+
+### Restoring from incremental checkpoint
+
+```java
+public void restoreFromCheckpoint(CheckpointMetadata metadata) {
+    // 1. Read checkpoint manifest
+    Map<String, StateHandle> sharedSSTs = metadata.getSharedStateHandles();
+    StateHandle memtableHandle = metadata.getMemtableHandle();
+
+    // 2. Download SSTs from DFS to local
+    for (StateHandle handle : sharedSSTs.values()) {
+        dfs.download(handle.getPath(), localCheckpointDir);
+    }
+
+    // 3. Restore MemTable
+    restoreMemTable(memtableHandle);
+
+    // 4. Open RocksDB pointing к local SST files
+    rocksDB = openRocksDB(localCheckpointDir);
+}
+```
+
+Recovery time зависит от **total state size**, не от incremental diff. Это потому что **all SSTs** должны быть downloaded (не только last incremental).
+
+### Local recovery optimization
+
+```yaml
+state.backend.local-recovery: true
+```
+
+После restart **на том же TaskManager** Flink keeps local SST files. На recovery — local copy uses, не нужно DFS download. **Огромная speedup** — recovery time от minutes к seconds. Однако:
+- Только если TM не died (rescheduled to same physical node)
+- Disk usage doubles (RocksDB live + local recovery copies)
+
+---
+
+## Comparison: full vs incremental
+
+| Aspect | Full | Incremental |
+|---|---|---|
+| Upload per checkpoint | Full state | Diff (new SSTs) |
+| Bandwidth | High (full state / interval) | Low (5-20% of full) |
+| DFS storage | 1× state per checkpoint | Shared SSTs across checkpoints |
+| Recovery time | full state / DFS bandwidth | Same (need all SSTs) |
+| Cleanup | Delete checkpoint dir | Reference counting, complex |
+| Default in 2.x | — | Yes (RocksDB/ForSt) |
+
+---
+
+## Production gotchas
+
+### 1. Compaction storms — incremental benefit drops
+
+После heavy compaction (e.g., trigger compaction после rescale, schema migration) много SSTs rewritten. New SSTs все need upload — incremental diff может быть 50-80% от full. Temporary spike в upload bandwidth.
+
+**Mitigation**: schedule heavy ops на off-peak, allow longer checkpoint duration during transition.
+
+### 2. SharedStateRegistry leak
+
+Bug: SST registered, но никогда unregister'ит. Refs неограниченно растут, SST не удаляется из DFS. На long-running jobs DFS storage grows linearly.
+
+**Diagnose**: monitor S3 bucket size. Sudden growth — leak. Check `state.backend.rocksdb.compaction.shared-state-registry-cleanup` settings.
+
+### 3. Recovery wave — все SSTs download одновременно
+
+После restart 100 subtasks одновременно download SSTs из S3. На large state и slow S3 — minutes wait. Plus S3 PUT/GET throttling.
+
+**Mitigation**:
+- `state.backend.local-recovery: true` — local copy if TM same
+- S3 transfer acceleration или S3 prefix sharding
+- Reduce parallelism temporarily для recovery (через rescale)
+
+### 4. Network bandwidth bottleneck
+
+Upload SSTs requires network. На 1TB state, 60s interval, 5% diff = 50GB diff, 60s interval = ~830MB/s sustained. На smaller network (1 Gbps = 125 MB/s) — falls behind, checkpoints fail.
+
+**Mitigation**: GIC (DSTL) — much less DFS bandwidth needed (append-only log).
+
+### 5. Hash-based partitioning ломает SST reuse
+
+При changing key groups (rescaling от parallelism 100 к 200), SSTs reshuffle между subtasks. After rescale **all SSTs are new** — incremental benefit lost для first checkpoint после rescale.
+
+**Mitigation**: meh — это inherent при rescaling, нет workaround. Just expect spike в bandwidth.
+
+### 6. Сравнение incremental + GIC
+
+GIC (FLIP-158) — fundamentally different approach. Incremental — diff SSTs. GIC — append-only log + periodic materialization.
+
+| Pattern | Incremental | GIC |
+|---|---|---|
+| Steady state | 5-20% upload | ~constant (small log flushes) |
+| Heavy compaction | Spike to 50-80% upload | Stable (log unchanged) |
+| Backpressure | Possible delay | Stable |
+
+GIC strictly better для stable checkpoint latency. Trade-off: extra DFS bandwidth для DSTL writes (всегда, не только при checkpoint), periodic materialization overhead.
+
+### 7. Incremental без RocksDB — n/a
+
+Incremental works только с RocksDB и ForSt (LSM backends). Heap state backend (deprecated в 2.x для production) — only full. **Production**: always use RocksDB/ForSt.
+
+---
+
+## Cheat sheet
+
+```yaml
+# Production incremental setup
+state.backend.type: rocksdb
+state.backend.incremental: true
+state.checkpoints.dir: s3://my-bucket/checkpoints
+state.checkpoints.num-retained: 5
+
+execution.checkpointing.interval: 60s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 10min
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+
+state.backend.local-recovery: true   # speed up recovery on same TM
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: RocksDB state 1TB, checkpoint interval 60s, incremental enabled. Normally upload ~50GB per checkpoint (5% diff). Iскрит — после migration job rescaled from parallelism 100 to 200. Сейчас каждый checkpoint uploads 800GB+ (80% of state), checkpoint duration 15min, чексткпойнты fail. Что произошло и как mitigate?"
+  answer="После rescale incremental benefit временно lost. Reasoning: при changing parallelism (100 → 200) Flink redistributes key groups между subtasks. Каждый subtask получает другой subset key groups → RocksDB на каждом subtask теперь содержит different keys → SSTs полностью отличаются от previous checkpoint. SharedStateRegistry diff = ~100% (всё новое), incremental эквивалентно full checkpoint. Plus heavy RocksDB compaction после rescale (reorganize SSTs by new key distribution) генерирует много new SSTs. Это inherent property rescale + incremental — нет magic fix, только mitigation. Mitigations: (1) Temporary increase execution.checkpointing.timeout до 30-60min — позволяет долгим checkpoints succeed без abort; (2) Temporary increase execution.checkpointing.interval до 5-10min — fewer checkpoint attempts, меньше overhead; (3) Wait period — после ~5-10 checkpoints incremental benefit returns (SSTs stabilize after rescale); (4) Pre-bake state через State Processor API — bootstrap state в new layout offline через batch job, потом start streaming job from this state (no rescale spike); (5) ENABLE GIC до rescale — state.backend.changelog.enabled: true. GIC не affected rescale так sharply — DSTL log не зависит от SST layout. Checkpoint = flush DSTL (constant time independent of compaction). Это game changing для recovery scenarios с frequent rescale; (6) ENABLE ForSt вместо RocksDB — disaggregated state на S3, no local SST upload needed на checkpoint (state already в S3, checkpoint = metadata-only). Rescale не requires re-upload — just remapping metadata. Это для cloud-native deployments; (7) Increase async upload threads: state.backend.rocksdb.checkpoint.transfer.thread.num: 8 — parallelize upload к S3, speeding up большие incremental diffs; (8) S3 transfer acceleration или multi-region replication для bandwidth; (9) Если rescale frequent (e.g., autoscaling), consider Adaptive Scheduler (FLIP-291) in-place rescaling — может minimize disruption через partial reuse; (10) Monitor lastCheckpointAlignmentDuration и lastCheckpointAsyncDuration — async growing means upload bottleneck, alignment growing means backpressure. Production rule: для jobs с frequent rescale ENABLE GIC + consider ForSt. Incremental checkpoints — great optimization для stable jobs, но fragile under rescale/compaction storms."
+/>

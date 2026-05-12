@@ -1,0 +1,397 @@
+---
+title: "maxParallelism: immutable trap и rebootstrap"
+order: 5
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["maxParallelism", "Key Groups", "State Processor API", "Rebootstrap", "Production Trap"]
+---
+
+# maxParallelism — KILLER LESSON
+
+`maxParallelism` — это одна из самых coварных gotchas production Flink. Это **immutable** после старта job. Default = 128. Если когда-нибудь захотите scale operator выше 128 parallelism — нельзя. Никаким способом изменить нельзя на running job или через savepoint restore. Единственный workaround — **offline rebootstrap state через State Processor API**, что для multi-TB state занимает часы. Этот урок — production lesson: set maxParallelism generously с самого начала.
+
+В этом уроке: что такое maxParallelism, почему он immutable (math behind key groups), как trap проявляется в production, rebootstrap workflow, и единственная правильная стратегия — set generously upfront.
+
+---
+
+## Что такое maxParallelism
+
+В Flink каждый keyed stream разбивается на **key groups** — атомарные unit-ы state distribution. Number of key groups = `maxParallelism`. По default 128.
+
+Когда event с key `userId="user123"` приходит на keyed operator:
+
+```text
+keyGroupId = computeKeyGroupForKey(userId, maxParallelism)
+           = MathUtils.murmurHash(userId.hashCode()) % maxParallelism
+
+# Например maxParallelism=128:
+# Может быть 0..127
+
+subtaskIndex = keyGroupId * currentParallelism / maxParallelism
+             = (например) 47 * 8 / 128 = 2.93 → subtask 2
+
+# Subtask 2 владеет keyGroups 32-47 (128/8 = 16 key groups per subtask)
+```
+
+Это математика **state distribution**. Subtasks владеют contiguous ranges of key groups.
+
+<DiagramContainer title="Key groups: атомарные units state distribution" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="maxParallelism = 128"
+        tooltip="128 key groups numbered 0-127. Это упомянутый ceiling для state distribution. immutable после установки."
+      >
+        128 key groups
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="parallelism = 8" />
+    <FlowRow>
+      <DataBox
+        label="Subtask 0 owns KGs 0-15"
+        tooltip="16 key groups (128/8). Each KG имеет own SST files в RocksDB, own state directory."
+      >
+        KGs 0-15
+      </DataBox>
+      <DataBox
+        label="Subtask 1 owns KGs 16-31"
+        tooltip="Каждый subtask владеет contiguous range."
+      >
+        KGs 16-31
+      </DataBox>
+      <DataBox
+        label="..."
+        tooltip="И так далее."
+      >
+        ...
+      </DataBox>
+      <DataBox
+        label="Subtask 7 owns KGs 112-127"
+        tooltip="Last subtask owns остатки. Distribution максимально even."
+      >
+        KGs 112-127
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rescale to parallelism = 16" />
+    <FlowRow>
+      <DataBox
+        label="Subtask 0 owns KGs 0-7"
+        tooltip="Теперь 8 KGs per subtask (128/16). Subtask 0 теперь owns только 0-7, не 0-15."
+      >
+        KGs 0-7
+      </DataBox>
+      <DataBox
+        label="..."
+        tooltip="Redistribution: state files reorganize между subtasks. Все ОК пока parallelism <= maxParallelism."
+      >
+        ...
+      </DataBox>
+      <DataBox
+        label="Subtask 15 owns KGs 120-127"
+        tooltip="Last KGs. 16 subtasks × 8 KGs each = 128 KGs total. OK."
+      >
+        KGs 120-127
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rescale to parallelism = 200" />
+    <FlowRow>
+      <DataBox
+        label="PROBLEM: 128 / 200 < 1 KG per subtask"
+        tooltip="Невозможно. Нужно минимум 1 KG per subtask. 128 max parallelism = max 128 subtasks. Restore с parallelism > maxParallelism = FAIL."
+      >
+        IMPOSSIBLE
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Почему immutable
+
+Изменить `maxParallelism` означает **изменить number of key groups**. Каждый существующий entry в state имеет:
+
+```text
+keyGroupId = murmurHash(key) % old_maxParallelism
+```
+
+Если изменить `maxParallelism`, формула выдаст другой результат:
+
+```text
+new_keyGroupId = murmurHash(key) % new_maxParallelism
+              ≠ old_keyGroupId
+```
+
+Все existing state entries будут assigned **wrong key groups**. State distribution полностью destroyed. Subtasks не найдут свои entries. State потерян.
+
+Это не bug, это математика. `maxParallelism` встроен в hash distribution function. Изменить = invalidate каждый key.
+
+---
+
+## Production trap
+
+Сценарий:
+
+```text
+Day 1: новая job. setParallelism(4) при submit. maxParallelism не set явно
+        → Flink default 128. Savepoint содержит maxParallelism = 128.
+
+Month 6: traffic grew, нужен parallelism=16. 16 < 128 → OK. Rescale works.
+
+Month 12: traffic continues growing. Need parallelism=200.
+         200 > 128 → restore FAIL с error:
+         "Cannot restore from savepoint. Max parallelism = 128 in savepoint,
+          but requested parallelism = 200 — must be <= max parallelism."
+```
+
+**В этот момент team в panic mode.** Job не запускается. Options:
+
+1. Scale до 128 (max возможный) — может не хватить для load
+2. **Offline rebootstrap state через State Processor API** — единственное решение
+
+---
+
+## Rebootstrap workflow
+
+Полный workflow (см. урок 14.2 для State Processor API basics):
+
+```text
+1. Stop current job CANONICAL savepoint
+   flink stop --type canonical --savepointPath s3://migration/sp-old/ <jobid>
+
+2. Write State Processor API batch job:
+   - Read state с old maxParallelism=128
+   - Bootstrap new savepoint с new maxParallelism=1024
+   - Same state values, redistributed по new key groups
+
+3. Run rebootstrap job
+   - 500GB state ~ 30-60 минут
+   - 5TB state ~ 6-12 часов
+
+4. Verify new savepoint:
+   - Sample reads — keys returnable
+   - State Processor API again на new savepoint для validation
+
+5. Restart streaming job с new savepoint:
+   flink run-application -s s3://migration/sp-new/ ...
+
+6. Verify production:
+   - throughput acceptable
+   - state size matches (no entries lost)
+
+7. После 24h stability — удалить old savepoint
+```
+
+Code skeleton:
+
+```java
+import org.apache.flink.state.api.*;
+import org.apache.flink.state.api.functions.*;
+
+public class MaxParallelismMigration {
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
+
+        String oldSavepointPath = "s3://migration/sp-old/";
+        String newSavepointPath = "s3://migration/sp-new/";
+
+        SavepointReader oldSavepoint = SavepointReader.read(
+            env, oldSavepointPath, new EmbeddedRocksDBStateBackend()
+        );
+
+        // Read all state с old maxParallelism=128
+        DataStream<Tuple2<String, UserState>> allStates = oldSavepoint.readKeyedState(
+            OperatorIdentifier.forUid("fraud-detector"),
+            new UserStateReader(),
+            Types.STRING,
+            TypeInformation.of(UserState.class)
+        ).map(state -> Tuple2.of(state.getUserId(), state));
+
+        // Bootstrap new savepoint с maxParallelism=1024
+        BootstrapTransformation<Tuple2<String, UserState>> bootstrap =
+            OperatorTransformation
+                .bootstrapWith(allStates)
+                .keyBy(t -> t.f0)
+                .transform(new UserStateBootstrapper());
+
+        SavepointWriter.newSavepoint(env, new EmbeddedRocksDBStateBackend(), 1024)
+            .withOperator(OperatorIdentifier.forUid("fraud-detector"), bootstrap)
+            .write(newSavepointPath);
+
+        env.execute("Max parallelism migration");
+    }
+}
+```
+
+---
+
+## Set maxParallelism upfront — единственная правильная стратегия
+
+С самого начала job set generously:
+
+```java
+StreamExecutionEnvironment env = ...
+
+env.setMaxParallelism(1024);   // или 4096, headroom щедрый
+```
+
+Или per-operator:
+
+```java
+stream
+    .keyBy(...)
+    .process(new FraudDetector())
+    .setMaxParallelism(1024)
+    .uid("fraud-detector");
+```
+
+Или global config:
+
+```yaml
+flinkConfiguration:
+  pipeline.max-parallelism: "1024"
+```
+
+### Cost of higher maxParallelism
+
+Some overhead:
+- **State distribution metadata** — больше key groups = больше files в RocksDB
+- **Per-subtask state init** — каждый subtask должен open files for owned key groups
+- **Slower checkpoint serialization** для very high values
+
+В практике:
+- 128 → 1024: ~1% overhead, незаметно
+- 1024 → 4096: ~2-3% overhead, OK для most cases
+- 4096 → 32768 (max): noticeable overhead, only для truly massive scale (10000+ subtasks)
+
+**Sweet spot для most production: 1024**. Даёт scale headroom до 1024 subtasks с минимальным overhead.
+
+---
+
+## Math: правильный maxParallelism
+
+Rules of thumb:
+
+```text
+1. maxParallelism должен быть >= max planned parallelism × 4-8x headroom
+   Plan 100 parallelism eventually → maxParallelism 512-1024 minimum
+
+2. Round до power-of-2 или multiples of common factors
+   Reasonable: 128, 256, 512, 1024, 2048, 4096
+
+3. Higher better if uncertain
+   Default 128 too low. 1024 — sensible production default.
+
+4. Per-operator may differ
+   Source может иметь low maxParallelism (limited Kafka partitions)
+   Heavy state operator — high maxParallelism
+
+5. Maximum allowed: 32768
+   Realistic cap. Beyond — overhead noticeable.
+```
+
+---
+
+## Detection: проверьте current maxParallelism
+
+```bash
+# Read savepoint metadata
+flink savepoint --inspect s3://.../savepoint-xyz/
+
+Output:
+   maxParallelism: 128
+   parallelism: 8
+   operators:
+     - uid: fraud-detector
+       maxParallelism: 128
+       parallelism: 8
+       state: 12.5 GB
+```
+
+Или через Flink Web UI: Jobs → Job Details → Configuration → maxParallelism.
+
+В production audit регулярно — если видите 128 default на critical jobs, plan миграцию.
+
+---
+
+## Per-operator maxParallelism
+
+Каждый operator может иметь свой maxParallelism. Иногда полезно:
+
+```java
+// Source — bounded by Kafka partitions (e.g., 32)
+KafkaSource<Event> source = ...
+env.fromSource(source, ...)
+    .setMaxParallelism(32)
+    .uid("source");
+
+// Stateless transform — no state, max parallelism irrelevant
+stream.map(...)
+    .setMaxParallelism(128)
+    .uid("transform");
+
+// Heavy state — high max parallelism
+stream.keyBy(...).process(...)
+    .setMaxParallelism(2048)
+    .uid("heavy-state");
+
+// Sink — bounded by Kafka topic partitions
+stream.sinkTo(kafkaSink)
+    .setMaxParallelism(32)
+    .uid("sink");
+```
+
+Different operators могут иметь different scaling characteristics. maxParallelism for source bounded by partitions (rescaling source выше partitions бесполезно — extra subtasks idle). State-heavy operator может scale much higher.
+
+---
+
+## Production gotchas
+
+- **Default 128 = production landmine** — easy to miss при initial deploy. After year operation discover too late.
+- **maxParallelism set но late** — если в month 6 sets first time, savepoint всё ещё содержит 128 (от старого job). Need rebootstrap.
+- **Adaptive Scheduler max-parallelism != maxParallelism** — `jobmanager.adaptive-scheduler.max-parallelism` это scheduler upper bound (different config). maxParallelism — key groups count (immutable). Two separate concepts.
+- **Autoscaler hitting ceiling** — autoscaler may want scale higher but limited by maxParallelism. Logs: «Cannot scale beyond maxParallelism=128».
+- **Restore с parallelism > maxParallelism = FAIL** — clear error message, but at this point team scrambling. Test scaling upfront on staging.
+- **Per-operator inconsistency** — setMaxParallelism per operator inconsistent → confusing scaling. Document choices.
+- **State Processor API output maxParallelism** — explicitly set при `SavepointWriter.newSavepoint(env, backend, NEW_MAX)`. Easy to keep default.
+- **maxParallelism + state size = work** — 1024 maxParallelism × 1TB state = больше overhead than 128 × 1TB. Tune для balance.
+
+<Callout type="warning">
+**Если у вас production job с default maxParallelism=128 и хотите когда-нибудь scale выше — plan rebootstrap migration NOW**, не когда traffic уже за 128 parallelism capacity. Multi-TB rebootstrap может занять день и требует careful coordination. Лучше делать proactively во время low traffic window, чем reactively во время crisis.
+</Callout>
+
+<Callout type="tip">
+**Production rule 2026**: при every new Flink job submission в production, FIRST CHECK: установлен ли maxParallelism explicitly? Если default — bump к 1024 минимум перед initial savepoint. Это бесплатная страховка против future scaling needs. Один minor config line saves часы / дни migration work later.
+</Callout>
+
+---
+
+## maxParallelism vs scheduler max-parallelism: clarification
+
+Часто путают:
+
+| Config | What |
+|---|---|
+| **`pipeline.max-parallelism`** (or `setMaxParallelism()`) | Number of key groups. IMMUTABLE после старта. Default 128. |
+| **`jobmanager.adaptive-scheduler.max-parallelism`** | Scheduler upper bound. Can change. Не влияет на key groups. |
+| **`parallelism.default`** (or `setParallelism()`) | Current parallelism — mutable, может rescale в [1, maxParallelism]. |
+
+Set все три explicitly для clarity:
+
+```yaml
+flinkConfiguration:
+  pipeline.max-parallelism: "1024"                       # key groups
+  jobmanager.adaptive-scheduler.max-parallelism: "200"   # scheduler upper bound
+  parallelism.default: "8"                               # current
+```
+
+Можно scheduler.max-parallelism < pipeline.max-parallelism (e.g., 200 < 1024). Это говорит: «key groups support до 1024 subtasks, но сейчас не хочу scheduler scale выше 200». Гибко.
+
+---
+
+<KnowledgeCheck
+  question="Production job stateful 1.5TB state, текущий parallelism=32, maxParallelism=128 (default). Autoscaler в logs: 'Cannot scale beyond maxParallelism=128'. Traffic вырос 5x за полгода, нужен parallelism=256. Что делать?"
+  answer="Need full rebootstrap state через State Processor API. Workflow: (1) Trigger CANONICAL savepoint на current job — `flink stop --type canonical --savepointPath s3://migration/sp-old/ <jobid>`. Canonical обязателен для State Processor API. (2) Plan downtime window — для 1.5TB state rebootstrap ожидается 2-4 часа. Schedule low-traffic period. (3) Write State Processor API batch job: SavepointReader.read(oldPath) → readKeyedState на main operator → map к Tuple<key, state> → BootstrapTransformation → SavepointWriter.newSavepoint(env, backend, NEW_MAX_PARALLELISM=2048).withOperator(...).write(newPath). Set new maxParallelism = 2048 для headroom (не just 256+ — future-proof). (4) Run в isolated cluster с big resources — 16+ TaskManagers, large disks для intermediate shuffle. 1.5TB через 16 parallelism ~ 3 hours. (5) Validate new savepoint: sample reads, state size matches. (6) Restart streaming job с new savepoint — теперь maxParallelism=2048, autoscaler unblocked. Scale до 256. (7) Keep old savepoint 7 days for emergency rollback. Lessons learned: (a) ВСЕГДА setMaxParallelism(1024+) при first deploy — free insurance, ~1% overhead, saves hours of migration work later; (b) Audit production jobs для default maxParallelism — if found, plan proactive migration during low-traffic window, не reactively. Cost of this migration: ~4 hours downtime + engineering time. Cost of setting 1024 upfront: zero. This is THE production lesson — maxParallelism set generously OR pay heavy price later."
+/>

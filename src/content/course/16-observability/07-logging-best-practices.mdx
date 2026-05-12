@@ -1,0 +1,669 @@
+---
+title: "Logging best practices: structured logs, no per-record, aggregation"
+description: "NO per-record logging (logs flood), structured JSON logs (2.3+), log aggregation (S3/Elasticsearch), log4j vs logback, production configuration"
+order: 7
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Logging", "Structured Logs", "Log Aggregation", "log4j", "logback", "Production"]
+---
+
+# Logging best practices
+
+Logging — последняя линия observability. Metrics показывают «что», traces — «почему», logs — «что именно случилось в этой записи в эту миллисекунду». Но logging в streaming контексте имеет свои pitfalls: per-record logging убивает production performance, неструктурированные logs делают search невозможным, и log retention быстро blows up storage budget.
+
+В этом уроке препарируем production logging для Flink: что НЕ логировать (главное правило), structured JSON logs (2.3+), log aggregation pipelines, log4j vs logback choice, и production gotchas.
+
+---
+
+## Главное правило: NO per-record logging
+
+```java
+// АНТИПАТТЕРН — категорически НЕТ:
+public Result map(Event e) {
+    LOG.info("Processing event: {}", e);    // ← logs flood
+    return process(e);
+}
+```
+
+На 100k records/sec это 100k log lines per second. Last:
+- Disk I/O saturation на TM host.
+- Log aggregation pipeline overload.
+- $$$$ storage cost.
+- Useless data (нельзя searched effectively at this volume).
+
+**Правило**: per-record logging — НИКОГДА в production. Только:
+
+1. **Sampled logging** (e.g., 1 of 10000):
+   ```java
+   if (counter.incrementAndGet() % 10000 == 0) {
+       LOG.info("Sample processed: {}", e);
+   }
+   ```
+
+2. **Error-only logging** (errors rare):
+   ```java
+   try {
+       return process(e);
+   } catch (Exception ex) {
+       LOG.error("Failed to process event id={}: {}", e.getId(), ex);
+       errorCounter.inc();
+       throw ex;
+   }
+   ```
+
+3. **Event-driven logging** (rare events: state transitions, config changes):
+   ```java
+   if (e.getType() == EventType.FRAUD_ALERT) {
+       LOG.warn("Fraud alert: user={} amount={}", e.getUserId(), e.getAmount());
+   }
+   ```
+
+Volume rule: **< 100 log lines/sec per TaskManager в steady state**. Если больше — re-evaluate.
+
+---
+
+## Structured logging (JSON)
+
+До Flink 2.3 logs — plain text:
+
+```
+2026-05-12 14:23:15 INFO org.apache.flink.runtime.checkpoint.CheckpointCoordinator - Triggering checkpoint 123 (type=CHECKPOINT) @ 1715526195000 for job a1b2c3d4.
+```
+
+Grep-friendly но search hard: «найти все checkpoint triggers где duration > 60s» — невозможно без custom parsers.
+
+Flink 2.3 добавил **structured JSON logging**:
+
+```yaml
+# log4j2.properties (или log4j2-cli.properties для standalone)
+rootLogger.level = INFO
+rootLogger.appenderRef.file.ref = JsonFileAppender
+
+appender.json.name = JsonFileAppender
+appender.json.type = RollingFile
+appender.json.fileName = ${sys:log.file}
+appender.json.filePattern = ${sys:log.file}.%i
+appender.json.layout.type = JsonTemplateLayout
+appender.json.layout.eventTemplateUri = classpath:LogstashJsonEventLayoutV1.json
+```
+
+Output:
+
+```json
+{
+  "@timestamp": "2026-05-12T14:23:15.123Z",
+  "level": "INFO",
+  "logger": "org.apache.flink.runtime.checkpoint.CheckpointCoordinator",
+  "message": "Triggering checkpoint",
+  "thread": "Checkpoint-Coordinator",
+  "checkpoint_id": 123,
+  "checkpoint_type": "CHECKPOINT",
+  "trigger_timestamp": 1715526195000,
+  "job_id": "a1b2c3d4"
+}
+```
+
+Каждое поле — search-able key. В Elasticsearch / Loki:
+
+```
+checkpoint_id:123 AND duration_ms:>60000
+```
+
+---
+
+## Adding structured context
+
+Используйте **MDC (Mapped Diagnostic Context)** или **slf4j key-value pairs**:
+
+### MDC pattern
+
+```java
+public class FraudDetector extends KeyedProcessFunction<...> {
+    private static final Logger LOG = LoggerFactory.getLogger(FraudDetector.class);
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Alert> out) {
+        MDC.put("user_id", e.getUserId());
+        MDC.put("event_id", e.getId());
+        try {
+            // ... business logic
+            if (isFraud(e)) {
+                LOG.warn("Fraud detected: amount={}, rule={}",
+                    e.getAmount(), matchedRule.getName());
+            }
+        } finally {
+            MDC.clear();
+        }
+    }
+}
+```
+
+Result log:
+
+```json
+{
+  "@timestamp": "...",
+  "level": "WARN",
+  "message": "Fraud detected: amount=12999, rule=high-value-velocity",
+  "user_id": "u_481923",
+  "event_id": "evt_19283747",
+  "amount": 12999,
+  "rule": "high-value-velocity"
+}
+```
+
+`user_id` и `event_id` automatically attached к каждому log line внутри MDC scope.
+
+### Key-value pairs (slf4j 2.x)
+
+```java
+LOG.atWarn()
+    .setMessage("Fraud detected")
+    .addKeyValue("user_id", e.getUserId())
+    .addKeyValue("amount", e.getAmount())
+    .addKeyValue("rule", matchedRule.getName())
+    .log();
+```
+
+Modern API, более explicit.
+
+---
+
+## Logging frameworks: log4j2 vs logback
+
+Flink использует **log4j2** by default. Modern, fast, supports JSON layouts.
+
+Alternative: **logback** — также popular, similar features. Slf4j → logback bindings.
+
+Choice:
+- **log4j2** — Flink default, well-tested. Stay if no specific reason.
+- **logback** — если ваш ecosystem уже на logback (Spring Boot apps), consistency.
+
+Switching:
+
+```xml
+<!-- pom.xml — exclude log4j, add logback -->
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-streaming-java</artifactId>
+    <version>2.2.0</version>
+    <exclusions>
+        <exclusion>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j-impl</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+<dependency>
+    <groupId>ch.qos.logback</groupId>
+    <artifactId>logback-classic</artifactId>
+    <version>1.5.0</version>
+</dependency>
+```
+
+И `logback.xml`:
+
+```xml
+<configuration>
+    <appender name="JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${log.file}</file>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="JSON"/>
+    </root>
+</configuration>
+```
+
+---
+
+## Log levels: strategy
+
+| Level | Use case | Frequency in production |
+|---|---|---|
+| ERROR | Unrecoverable errors, alerts | < 1 / hour |
+| WARN | Recoverable issues, anomalies | < 100 / hour |
+| INFO | Lifecycle events (job start, checkpoint complete) | < 1000 / hour |
+| DEBUG | Detailed flow, NOT in production | OFF |
+| TRACE | Per-record, NEVER in production | OFF |
+
+Production config:
+
+```properties
+# log4j2.properties
+rootLogger.level = INFO
+
+# Flink internals — INFO
+logger.flink.name = org.apache.flink
+logger.flink.level = INFO
+
+# Akka / Pekko (noisy) — WARN
+logger.akka.name = akka
+logger.akka.level = WARN
+logger.pekko.name = org.apache.pekko
+logger.pekko.level = WARN
+
+# Kafka client (noisy) — WARN
+logger.kafka.name = org.apache.kafka
+logger.kafka.level = WARN
+
+# Hadoop (noisy) — WARN
+logger.hadoop.name = org.apache.hadoop
+logger.hadoop.level = WARN
+
+# Your business logic — INFO with override option
+logger.myapp.name = com.mycompany.fraud
+logger.myapp.level = INFO
+```
+
+---
+
+## Log aggregation pipelines
+
+Logs в файлах TaskManager — useless для search и retention. Production aggregation:
+
+### Option 1: Fluentd → Elasticsearch + Kibana
+
+```yaml
+# fluentd config
+<source>
+  @type tail
+  path /flink/logs/*.log
+  pos_file /var/log/td-agent/flink.pos
+  tag flink.*
+  <parse>
+    @type json
+  </parse>
+</source>
+
+<match flink.**>
+  @type elasticsearch
+  host elasticsearch.observability.svc
+  port 9200
+  index_name flink-${tag}
+  type_name _doc
+</match>
+```
+
+Pros: full-text search, Kibana visualizations.
+Cons: ES expensive для high-volume.
+
+### Option 2: Promtail → Loki → Grafana
+
+```yaml
+# promtail config
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: flink
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: flink
+          __path__: /flink/logs/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            logger: logger
+            checkpoint_id: checkpoint_id
+      - labels:
+          level:
+          logger:
+```
+
+Pros: cheaper than ES (object storage), Grafana integration.
+Cons: less powerful search.
+
+### Option 3: OpenTelemetry Logs (unified)
+
+```yaml
+# OTel Collector
+receivers:
+  filelog:
+    include: [/flink/logs/*.log]
+    operators:
+      - type: json_parser
+
+exporters:
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [batch]
+      exporters: [otlphttp/loki]
+```
+
+Pros: unified observability stack (metrics + traces + logs).
+
+---
+
+## Log retention strategy
+
+Production tiers:
+
+| Tier | Retention | Storage |
+|---|---|---|
+| Hot (real-time search) | 7-14 days | Elasticsearch SSD |
+| Warm (occasional access) | 30-90 days | S3 + Athena queryable |
+| Cold (compliance / archive) | 1-7 years | S3 Glacier |
+
+Lifecycle policies automate transitions:
+
+```yaml
+# Elasticsearch ILM policy
+"phases": {
+  "hot": { "min_age": "0ms", "actions": { "rollover": { "max_age": "7d" } } },
+  "warm": { "min_age": "7d", "actions": { "shrink": {...} } },
+  "cold": { "min_age": "30d", "actions": { "freeze": {} } },
+  "delete": { "min_age": "90d", "actions": { "delete": {} } }
+}
+```
+
+Без lifecycle policies — log storage растёт линейно forever. $$$$$ billing pain.
+
+---
+
+## Production patterns
+
+### Pattern 1: Job lifecycle logging
+
+```java
+public class MyJob {
+    private static final Logger LOG = LoggerFactory.getLogger(MyJob.class);
+
+    public static void main(String[] args) throws Exception {
+        LOG.info("Job starting: version={}, config={}",
+            VERSION, sanitize(args));
+
+        StreamExecutionEnvironment env = ...;
+        env.execute("MyJob");
+
+        LOG.info("Job execute returned");
+    }
+}
+```
+
+Single line per job lifecycle event. Critical для troubleshooting "did job actually start?"
+
+### Pattern 2: Operator open/close logging
+
+```java
+public class MyMapper extends RichMapFunction<...> {
+    private static final Logger LOG = LoggerFactory.getLogger(MyMapper.class);
+
+    @Override
+    public void open(Configuration cfg) {
+        LOG.info("Mapper opened: subtask={}, parallelism={}",
+            getRuntimeContext().getIndexOfThisSubtask(),
+            getRuntimeContext().getNumberOfParallelSubtasks());
+        // ...
+    }
+
+    @Override
+    public void close() {
+        LOG.info("Mapper closing");
+    }
+}
+```
+
+Один log line per subtask startup/shutdown. Confirms deployment.
+
+### Pattern 3: Error logging с context
+
+```java
+@Override
+public Result map(Event e) {
+    try {
+        return process(e);
+    } catch (Exception ex) {
+        // Skip happy path logging, but error always logged:
+        LOG.error("Failed to process event id={}, user={}: {}",
+            e.getId(), e.getUserId(), ex.getMessage(), ex);
+        errorCounter.inc();
+        throw ex;
+    }
+}
+```
+
+Include relevant attrs в error context. Stack trace через {}.
+
+### Pattern 4: Sampled flow logging (rare debug)
+
+```java
+private static final int SAMPLE_RATE = 100_000;
+private final AtomicLong counter = new AtomicLong();
+
+@Override
+public Result map(Event e) {
+    if (counter.incrementAndGet() % SAMPLE_RATE == 0) {
+        LOG.info("Sample event processed: {}", e);
+    }
+    return process(e);
+}
+```
+
+1 of 100k records logged → 10 lines/sec на 1M throughput. Sample distribution.
+
+### Pattern 5: Configuration logging on startup
+
+```java
+@Override
+public void open(Configuration cfg) {
+    LOG.info("Configuration loaded: " +
+        "stateTTL={}, batchSize={}, externalUrl={}",
+        getStateConfig().getTtl(),
+        getBatchSize(),
+        sanitize(getExternalUrl()));
+}
+```
+
+Effective config logged on startup. Critical для troubleshooting "is right config deployed?"
+
+---
+
+## Production gotchas
+
+### Gotcha 1: log.file path в K8s tmpfs
+
+```yaml
+# K8s default emptyDir может быть tmpfs (memory):
+volumeMounts:
+  - name: log-volume
+    mountPath: /flink/logs
+volumes:
+  - name: log-volume
+    emptyDir:
+      medium: Memory   # ← tmpfs! eats RAM
+```
+
+Logs writing → pod memory grows → OOMKill.
+
+**Fix**: emptyDir без medium=Memory, или PersistentVolumeClaim для logs.
+
+### Gotcha 2: Sync IO logging blocks mailbox
+
+By default log4j2 writes synchronously. На high write rate — disk I/O blocks producer thread.
+
+**Fix**: async appender:
+
+```properties
+appender.async.name = AsyncFile
+appender.async.type = Async
+appender.async.appenderRef.ref = JsonFileAppender
+appender.async.queueSize = 1024
+appender.async.includeLocation = false
+```
+
+Async wrapper offloads IO к dedicated thread. Critical для high-throughput jobs.
+
+### Gotcha 3: Log line с PII
+
+```java
+LOG.info("Processing payment: card={}", payment.getCardNumber());   // PII!
+```
+
+PII в logs = compliance violation.
+
+**Fix**: redact или omit PII:
+
+```java
+LOG.info("Processing payment: cardLast4={}",
+    payment.getCardNumber().substring(payment.getCardNumber().length() - 4));
+```
+
+Better — never log PII at all.
+
+### Gotcha 4: Stack trace flood
+
+```java
+catch (RetryableException ex) {
+    LOG.error("Retry: " + ex.getMessage(), ex);   // полная trace на каждом retry
+    retry();
+}
+```
+
+Если retry 1000x/sec → 1000 stack traces. Megabytes per second.
+
+**Fix**: log trace once, count retries:
+
+```java
+catch (RetryableException ex) {
+    if (firstError) {
+        LOG.error("Retry initiated", ex);
+        firstError = false;
+    }
+    retryCounter.inc();
+    retry();
+}
+```
+
+### Gotcha 5: Log rotation на small disk
+
+```properties
+appender.json.policies.size.size = 100MB
+appender.json.strategy.max = 10
+```
+
+Total 1GB. On TM с 10GB disk, plus state local dir, plus tmpfs → disk full.
+
+**Fix**: aggressive rotation + immediate shipping:
+
+```properties
+appender.json.policies.size.size = 50MB
+appender.json.strategy.max = 3
+```
+
+Plus Promtail/Fluentd ships в реальном времени.
+
+### Gotcha 6: JSON parsing fails в pipeline
+
+Если log line — multiline (stack trace), JSON parser fails. Each frame — separate line, не valid JSON.
+
+**Fix**: enable multiline в parser:
+
+```yaml
+# Promtail multiline:
+pipeline_stages:
+  - multiline:
+      firstline: '^\{'   # JSON starts with {
+      max_wait_time: 3s
+```
+
+Или log layout с single-line JSON (escape newlines внутри):
+
+```properties
+appender.json.layout.eventTemplate = {"timestamp":"%date{ISO8601}",...,"message":"%enc{%msg}{JSON}"}
+```
+
+### Gotcha 7: Logback async + bounded queue
+
+Logback's `<appender-name>AsyncAppender</appender-name>` с bounded queue — на overflow drops messages OR blocks.
+
+**Fix**: monitor queue depth, alert if approaching capacity. Disk-backed queue для critical logs.
+
+---
+
+## Configuration template (production K8s)
+
+### log4j2.properties
+
+```properties
+# Root logger:
+rootLogger.level = INFO
+rootLogger.appenderRef.async.ref = AsyncFile
+
+# Quiet noisy libraries:
+logger.pekko.name = org.apache.pekko
+logger.pekko.level = WARN
+logger.kafka.name = org.apache.kafka
+logger.kafka.level = WARN
+logger.hadoop.name = org.apache.hadoop
+logger.hadoop.level = WARN
+logger.zookeeper.name = org.apache.zookeeper
+logger.zookeeper.level = WARN
+
+# Custom business logic:
+logger.myapp.name = com.mycompany
+logger.myapp.level = INFO
+
+# Async wrapper:
+appender.async.name = AsyncFile
+appender.async.type = Async
+appender.async.appenderRef.ref = JsonFile
+appender.async.queueSize = 4096
+appender.async.includeLocation = false
+
+# JSON file appender:
+appender.json.name = JsonFile
+appender.json.type = RollingFile
+appender.json.fileName = ${sys:log.file}
+appender.json.filePattern = ${sys:log.file}.%i
+appender.json.layout.type = JsonTemplateLayout
+appender.json.layout.eventTemplateUri = classpath:LogstashJsonEventLayoutV1.json
+appender.json.layout.charset = UTF-8
+
+appender.json.policies.type = Policies
+appender.json.policies.size.type = SizeBasedTriggeringPolicy
+appender.json.policies.size.size = 100MB
+
+appender.json.strategy.type = DefaultRolloverStrategy
+appender.json.strategy.max = 5
+```
+
+### Kubernetes volume mount
+
+```yaml
+volumes:
+  - name: log-volume
+    emptyDir: {}   # NOT tmpfs
+
+volumeMounts:
+  - name: log-volume
+    mountPath: /flink/logs
+```
+
+Promtail или Fluentd sidecar ships logs к Loki/ES.
+
+---
+
+<Callout type="warning">
+Per-record logging — main cause of «logs flood production incident». Один разработчик добавил `LOG.info("Processing: " + record)` в hot path → 1M records/sec × 1KB log line = 1GB/sec log volume → disk full, ELK overload, pager goes off. Code reviews должны explicitly catch это.
+</Callout>
+
+---
+
+<Callout type="note">
+Structured JSON logs (2.3+) — must-have для production. Plain text logs не searchable, не aggregate-able. JSON + MDC context + log aggregation pipeline (Loki/ES) — стандарт modern observability. Не оставайтесь на plain text, даже если «всегда так делали».
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink incident: один TaskManager OOMKilled, остальные работают. Investigation: disk full на TM host. Flink logs directory занимает 9GB (на 10GB disk + 1GB state). Latest deployment включал new fraud detection rule с verbose logging. Какие шаги immediate fix + long-term log hygiene?"
+  answer="Immediate fix (последующие минуты): (1) Identify offending log source. SSH к TM (или kubectl exec), find /flink/logs -name '*.log' -size +100M — locate huge log files. Likely одно из: (a) Очень verbose business logic в hot path; (b) Stack trace flood (retry loop); (c) Library debug log accidentally enabled. (2) Check log content. tail -100 /flink/logs/taskmanager.log — что именно logged thousand-кратно? Identify pattern. (3) Emergency log rotation: truncate the big file. > /flink/logs/taskmanager.log (preserve file descriptor для appender — careful, may need restart). Alternative: kubectl delete pod <tm-pod> (deployment recreates, fresh logs). (4) Stop bleeding: disable verbose source. Если можно identify конкретный logger от offending code — submit config override через JobManager. Иначе rollback deployment. (5) Verify cluster recovers. После cleanup TM should be back to normal, watch для recurrence first 30 minutes. Root cause analysis (через час): (1) Diff между prior deployment and current: новый log statements в FraudDetector code. Probably patterns: LOG.info('Processing event: ' + e) в processElement → per-record logging anti-pattern, 100k events/sec × 1KB log = 100MB/sec disk write. (2) Code review failure — should have caught. Add to PR checklist: 'No log statements в hot path (processElement, map, flatMap)'. Long-term log hygiene (this и следующие incidents prevention): (1) Log level discipline. processElement, map, etc. — only WARN/ERROR, never INFO для per-record events. Add Checkstyle / SpotBugs rules to fail build if INFO+ logger called в hot methods. (2) Logger config defaults restrictive. logger.business.level = WARN — by default, only escalate locally for debugging. (3) Sampled logging pattern в codebase docs. Provide helper class: SampledLogger.log(LOG, e, 100_000) — 1 of 100k. Make easy to do right thing. (4) Disk-based safeguards. (a) Aggressive log rotation: max 5 files × 50MB = 250MB total. (b) Async appender с bounded queue (drop messages if overflow, не blocks). (c) Monitor disk usage в production — alert at 70% used. Alert action: investigate (не wait for 100% OOM). (5) Logs к external storage early. Promtail/Fluentd shipping в реальном времени к Loki/ES — TM disk doesn't need long retention. Reduces disk pressure. (6) Structured JSON + key-value logging. Force pattern through LOG.atInfo().setMessage().addKeyValue() — explicit fields, no implicit string concat. (7) PR template question: 'Did you add logging? If yes, is it in hot path? What's the expected volume?'. Make this explicit conversation in code review. (8) Observability strategy clarity. Metrics for high-volume aggregate behavior. Traces for sampled per-record visibility (FLIP-570 Runtime Sampling — better tool than verbose logs). Logs для rare events: errors, lifecycle, configuration changes. (9) Disk sizing planning. Production TaskManager disk = state local dir (sized for state) + log buffer (250MB) + OS overhead (1GB) + headroom (20%). Don't allocate exact minimum — leave room. (10) Add SLO / alert: log volume per TM > 100 MB/min sustained → alert. Catches verbose deployments before disk full. Critical lesson: in streaming systems с millions of events/sec, basic logging principles от batch systems don't transfer. Each log line = 1M lines/sec потенциально. Treat logs as scarce resource — only ERROR/WARN by default, INFO для rare lifecycle events, NEVER per-record. Use sampling + metrics + traces для what you wanted to learn from verbose logs."
+/>

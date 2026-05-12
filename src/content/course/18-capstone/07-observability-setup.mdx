@@ -1,0 +1,402 @@
+---
+title: "Capstone — observability: OpenTelemetry, Grafana, alerting"
+description: "Production observability: OpenTelemetry metrics + distributed traces из Flink, Prometheus scraping, Grafana dashboards (top 12 charts), alerting playbook с severity routing."
+order: 7
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Observability", "OpenTelemetry", "Prometheus", "Grafana", "Alerting"]
+---
+
+# Capstone — observability: OpenTelemetry, Grafana, alerting
+
+Phase 5: production observability. Без proper observability streaming pipeline — black box. Когда что-то ломается (а ломается часто на scale), нужна visibility в каждый слой: source lag, network buffers, state size, checkpoint duration, sink throughput, downstream impact.
+
+Capstone использует **OpenTelemetry** для metrics + traces (Flink 2.x has native OTel exporter), **Prometheus** для metrics storage, **Grafana** для visualization, **AlertManager** для routing.
+
+---
+
+## Observability stack architecture
+
+<DiagramContainer title="Observability data flow" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink job"
+        tooltip="Capstone pipeline. Embedded OTel exporter sends metrics + traces к collector. Also Prometheus scrape endpoint на :9249 для legacy fallback."
+      >
+        Flink TM + JM
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="OTLP/gRPC" />
+    <FlowRow>
+      <DataBox
+        label="OTel Collector"
+        tooltip="Central aggregator. Receives OTLP, processes (batching, sampling, filtering), exports to Prometheus + Jaeger. Deployed как DaemonSet или Deployment в K8s."
+      >
+        OTel Collector
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="" />
+    <FlowRow>
+      <DataBox
+        label="Prometheus"
+        tooltip="Time series DB. Pull-based scrape + OTLP push receiver. Retention 30 days для high-resolution metrics, downsampled 1 year для long-term trends."
+      >
+        Prometheus
+      </DataBox>
+      <DataBox
+        label="Jaeger / Tempo"
+        tooltip="Distributed tracing storage. Receives traces из OTel. Sampling configured (1% по default, 100% для error traces)."
+      >
+        Tempo
+      </DataBox>
+      <DataBox
+        label="Loki"
+        tooltip="Logs aggregation. Flink TM logs через Promtail/Vector. Correlated с traces через trace_id."
+      >
+        Loki
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="" />
+    <FlowRow>
+      <DataBox
+        label="Grafana"
+        tooltip="Unified UI. Data sources: Prometheus, Tempo, Loki. Dashboards для capstone, alerting rules, drilldowns."
+      >
+        Grafana
+      </DataBox>
+      <DataBox
+        label="AlertManager"
+        tooltip="Routes alerts. Severity routing: critical → PagerDuty, warning → Slack channel, info → dashboard only. Deduplication, silencing, escalation."
+      >
+        AlertManager
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Flink OTel configuration
+
+```yaml
+# flink-conf.yaml (через FlinkDeployment)
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OpenTelemetryReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector.observability.svc.cluster.local:4317
+metrics.reporter.otel.interval: 30s
+metrics.reporter.otel.protocol: grpc
+metrics.reporter.otel.compression: gzip
+metrics.reporter.otel.resource.service.name: capstone-pipeline
+metrics.reporter.otel.resource.service.namespace: streaming
+metrics.reporter.otel.resource.deployment.environment: production
+
+# Tracing (Flink 2.x experimental traces)
+traces.reporter.otel.factory.class: org.apache.flink.traces.otel.OpenTelemetryTraceReporterFactory
+traces.reporter.otel.endpoint: http://otel-collector.observability.svc.cluster.local:4317
+traces.reporter.otel.sample.ratio: 0.01   # 1% sampling
+
+# Legacy Prometheus fallback
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249-9260   # port range для TM pods
+```
+
+---
+
+## Top 12 charts в capstone dashboard
+
+| # | Panel | Metric / Query | Why critical |
+|---|---|---|---|
+| 1 | **Input throughput** | `rate(flink_taskmanager_job_task_operator_numRecordsInPerSecond{operator="source"}[1m])` | Pipeline health primary indicator |
+| 2 | **End-to-end latency** | event_time vs current_processing_time delta | SLO compliance |
+| 3 | **Watermark lag** | `time() - flink_taskmanager_job_task_operator_currentInputWatermark / 1000` | Event time progress |
+| 4 | **Backpressure heatmap** | `flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond` per subtask | Bottleneck localization |
+| 5 | **Checkpoint duration** | `flink_jobmanager_job_lastCheckpointDuration` | EOS health |
+| 6 | **State size** | `flink_taskmanager_job_task_operator_state_size_in_bytes` | Capacity planning |
+| 7 | **TaskManager memory** | JVM heap + managed + network | OOM detection |
+| 8 | **Failed checkpoints** | `flink_jobmanager_job_numFailedCheckpoints` | Pipeline stability |
+| 9 | **Late events** | `flink_taskmanager_job_task_operator_numLateRecordsDropped` | Data drift indicator |
+| 10 | **Sink commit duration** | Paimon commit time | Sink performance |
+| 11 | **Postgres replication slot lag** | Custom exporter querying pg_replication_slots | CDC source health |
+| 12 | **K8s autoscaler decisions** | Custom — TM replica count over time + scaling events | Capacity management |
+
+---
+
+## Dashboard JSON примерfragment
+
+```json
+{
+  "title": "Capstone — End-to-End",
+  "panels": [
+    {
+      "title": "Throughput (records/sec)",
+      "type": "timeseries",
+      "targets": [{
+        "expr": "sum by (operator) (rate(flink_taskmanager_job_task_operator_numRecordsInPerSecond[1m]))",
+        "legendFormat": "{{operator}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Watermark Lag (seconds)",
+      "type": "timeseries",
+      "targets": [{
+        "expr": "max by (operator) (time() - flink_taskmanager_job_task_operator_currentInputWatermark / 1000)",
+        "legendFormat": "{{operator}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "alert": {
+        "conditions": [{"evaluator": {"type": "gt", "params": [60]}}],
+        "executionErrorState": "alerting",
+        "frequency": "1m",
+        "handler": 1,
+        "name": "watermark_lag_high"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Alerting rules
+
+```yaml
+groups:
+- name: capstone-streaming
+  interval: 30s
+  rules:
+
+  # CRITICAL — page on-call
+  - alert: PipelineJobDown
+    expr: up{job="flink-capstone"} == 0
+    for: 1m
+    labels:
+      severity: critical
+      team: streaming
+    annotations:
+      summary: "Capstone pipeline JobManager down"
+      runbook: "https://wiki/runbooks/capstone-jm-down"
+
+  - alert: CheckpointFailureRate
+    expr: increase(flink_jobmanager_job_numFailedCheckpoints[10m]) > 3
+    for: 5m
+    labels: { severity: critical }
+    annotations:
+      summary: "Multiple checkpoint failures detected"
+
+  - alert: WatermarkSeverelyLagging
+    expr: |
+      max(time() - flink_taskmanager_job_task_operator_currentInputWatermark{operator="UserAggregator"} / 1000) > 300
+    for: 5m
+    labels: { severity: critical }
+    annotations:
+      summary: "Watermark lag > 5 minutes — data freshness impact"
+
+  - alert: PostgresReplicationSlotLag
+    expr: pg_replication_slot_lag_bytes > 50e9   # 50 GB
+    for: 5m
+    labels: { severity: critical }
+    annotations:
+      summary: "Postgres replication slot > 50 GB lag — risk of disk fill"
+
+  # WARNING — Slack channel
+  - alert: BackpressureHigh
+    expr: |
+      avg(flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond) > 700
+    for: 10m
+    labels: { severity: warning }
+    annotations:
+      summary: "Sustained backpressure > 70% — possible bottleneck"
+
+  - alert: LateEventsHigh
+    expr: |
+      rate(flink_taskmanager_job_task_operator_numLateRecordsDropped[5m]) > 100
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "Late events rate elevated — investigate source lag"
+
+  - alert: StateSizeGrowth
+    expr: |
+      predict_linear(flink_taskmanager_job_task_operator_state_size_in_bytes[1h], 86400 * 7) > 1e12
+    for: 1h
+    labels: { severity: warning }
+    annotations:
+      summary: "State projected to exceed 1TB в 7 дней — TTL not effective?"
+
+  - alert: SinkCommitSlow
+    expr: paimon_snapshot_commit_duration_seconds{quantile="0.99"} > 60
+    for: 15m
+    labels: { severity: warning }
+    annotations:
+      summary: "Paimon commit P99 > 60s — compaction tuning needed"
+
+  # INFO — dashboard only
+  - alert: AutoscalerScaleUp
+    expr: changes(flink_jobmanager_taskmanager_count[30m]) > 2
+    labels: { severity: info }
+    annotations:
+      summary: "Multiple autoscaler events — workload changed"
+```
+
+---
+
+## AlertManager routing
+
+```yaml
+route:
+  receiver: default
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: pagerduty
+      continue: true
+    - matchers:
+        - severity = "warning"
+      receiver: slack-streaming
+    - matchers:
+        - severity = "info"
+      receiver: dashboard-only
+
+receivers:
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: ${PD_SERVICE_KEY}
+        details:
+          team: streaming
+          runbook: '{{ .GroupLabels.runbook }}'
+
+  - name: slack-streaming
+    slack_configs:
+      - api_url: ${SLACK_WEBHOOK_URL}
+        channel: "#streaming-alerts"
+        title: '[{{ .GroupLabels.severity | toUpper }}] {{ .GroupLabels.alertname }}'
+
+  - name: dashboard-only
+    webhook_configs:
+      - url: http://dashboard-webhook/alerts
+```
+
+---
+
+## Distributed tracing
+
+Flink 2.x has experimental traces support. Each record can carry trace context, propagated через operators.
+
+```java
+// В custom operator emit trace span
+public void processElement(EnrichedOrder order, Context ctx, Collector<UserEvent> out) {
+    Span span = openTelemetry.getTracer("capstone")
+        .spanBuilder("UserAggregator.processElement")
+        .setAttribute("user_id", order.userId())
+        .setAttribute("order_id", order.orderId())
+        .startSpan();
+    try (Scope scope = span.makeCurrent()) {
+        // ... business logic
+        out.collect(...);
+    } finally {
+        span.end();
+    }
+}
+```
+
+Use cases:
+- Trace single event через pipeline (source → aggregator → sink) для debugging.
+- Identify slow stages — span duration breakdown.
+- Correlate logs (через trace_id) with metrics for postmortems.
+
+Sampling: 1% по default (cost). 100% sampling для error spans.
+
+---
+
+## Логирование
+
+Structured logging через SLF4J + Logback.
+
+```java
+// Configurations через FlinkDeployment podTemplate:
+// logback-spring.xml mounted as ConfigMap
+```
+
+```xml
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+      <providers>
+        <timestamp/>
+        <message/>
+        <logLevel/>
+        <loggerName/>
+        <threadName/>
+        <stackTrace/>
+        <mdc/>     <!-- includes trace_id, span_id если ставите -->
+      </providers>
+    </encoder>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="STDOUT"/>
+  </root>
+</configuration>
+```
+
+Logs collected через Vector/Promtail в Loki. Grafana correlates traces ↔ logs через trace_id.
+
+---
+
+## Runbooks
+
+Critical: каждый alert должен иметь linked runbook. Without runbook — on-call helpless.
+
+```markdown
+# Runbook: WatermarkSeverelyLagging
+
+## Symptoms
+Alert fires when watermark lag > 5 minutes for sustained 5 min period.
+Real impact: window emits delayed, downstream metrics stale, billing/anomaly detection compromised.
+
+## Diagnostic steps
+1. Open Grafana "Capstone End-to-End" dashboard.
+2. Identify which operator has lag — check "Watermark Lag" panel by operator.
+3. Check "Backpressure heatmap" — is there bottleneck causing slow processing?
+4. Check Postgres replication slot lag — is source behind?
+5. Check Kafka consumer lag (if applicable).
+6. Check Flink job manager logs for restart events.
+
+## Likely causes & fixes
+- **Source lag**: Check Postgres replication slot lag. If > 5GB, may indicate Flink CDC was paused. Restart pipeline if needed.
+- **Bottleneck on UserAggregator**: scale up parallelism. `kubectl patch flinkdeployment ... '{"spec":{"job":{"parallelism": <N+8>}}}'`. Autoscaler should pick up too.
+- **Bottleneck on Paimon sink**: Check compaction lag. Manual compact if behind.
+- **Bottleneck on RocksDB compaction**: Tune `state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED`.
+
+## Escalation
+If not resolved in 30 minutes, escalate to streaming-team Slack.
+```
+
+---
+
+## Production gotchas
+
+- **Cardinality explosion в Prometheus labels** — `user_id` as label = millions of series. Strip high-cardinality labels at collector level.
+- **OTel collector OOM** — if Flink emits too many metrics, collector overload. Configure batching, sampling.
+- **Tempo storage** — traces volume огромный. Tail-based sampling — keep only errors + slow.
+- **Loki query cost** — full-text search expensive. Index by labels, use structured logs для queries.
+- **Alert fatigue** — too many warnings → ignored. Tune thresholds based на actual SLO violations, not arbitrary.
+- **Dashboard sprawl** — каждый team создаёт свои dashboards, hard to find canonical. Maintain one «golden» dashboard per service.
+- **Runbook drift** — runbooks становятся stale. Periodic review (quarterly) обязателен.
+- **Metric retention** — high-resolution (10s) для 30 days, downsampled (5min) для year. Cost-effective.
+- **AlertManager grouping** — без grouping каждый instance gets alert → notification storm. `group_by: [alertname]` minimum.
+
+<Callout type="warning">
+**Observability — не «set and forget»**. Dashboards stale, alerts no longer relevant, runbooks outdated — это normal entropy. Schedule quarterly observability review: are dashboards used? Are alerts firing correctly (false positives, false negatives)? Are runbooks accurate? Treat observability как ongoing investment, не one-time setup.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Observability review: capstone pipeline live in production. On-call gets alert 'WatermarkSeverelyLagging' at 3 AM. Walk through diagnosis flow using observability stack: which dashboards, which traces/logs, what queries? Then provide remediation steps."
+  answer="Step-by-step on-call response. **(1) Acknowledge alert** в AlertManager (stop pages, mark as 'investigating'). Note: SEV — critical, runbook linked. **(2) Open Grafana 'Capstone End-to-End' dashboard** — primary diagnostic. Look at: (a) Throughput panel — is it dropped? May indicate source down. (b) Watermark lag panel — identify which operator has lag. Is it source watermark (CDC behind) or downstream (processing slow)? (c) Backpressure heatmap — colored cells show bottleneck operator. If sustained red (bp > 800ms/s) — found bottleneck. **(3) Check source health**: (a) Postgres replication slot lag query — `SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots WHERE slot_name = 'flink_cdc'`. If > 5GB — Flink CDC source behind. (b) Custom exporter metric `pg_replication_slot_lag_bytes` в Grafana. **(4) Check resource health**: (a) `flink_taskmanager_job_task_operator_memoryHeapUsed` — TM heap saturation? (b) Pod restart count K8s — `kubectl get pods -n flink` — recent restarts indicate crashes. (c) RocksDB stats — `flink_taskmanager_job_task_operator_state_size_in_bytes` growing rapidly? Compaction backlog? **(5) Check checkpoint health**: (a) Last successful checkpoint time — `flink_jobmanager_job_lastCheckpointTime`. If > 10 min — checkpoint stuck, recovery impossible without manual intervention. (b) Checkpoint duration trend — slow checkpoints == backpressure × buffer debloating not effective. **(6) Drill into traces** через Tempo (if integrated): trace single recent event через pipeline. Span durations show where time spent. **(7) Logs via Loki**: query `{namespace=\"flink\"} |~ \"ERROR\"` для recent errors. Correlate с trace_id если span identified slow operation. **(8) Common root causes & remediation**: (a) Source lag — check Postgres health, replica replication, network. Fix Postgres → wait. (b) Bottleneck operator (CPU-bound) — scale up parallelism (`kubectl patch flinkdeployment ... parallelism: N+8`). Autoscaler may do it, but on-call accelerates. (c) Checkpoint stuck — kill TM pod with stuck task (forces redistribution). Last resort: restart from latest checkpoint. (d) RocksDB compaction backlog — temporary CPU/disk spike normal after burst; verify monitoring. (e) Sink slow (Paimon commit > 60s) — check S3 latency, compaction config. **(9) Mitigation while investigating**: (a) Enable temporary throttling at source if pipeline cannot keep up (acceptable degradation > pipeline failure). (b) Increase autoscaler max temporarily. **(10) Document in incident channel**: timeline, observations, actions taken, root cause, follow-ups. **(11) Post-incident**: update runbook with new findings, adjust alert thresholds if false-positive, file ticket for any tech debt revealed. Lesson: structured observability + runbooks + practice = on-call success. Without it — 3 AM panic, longer outage."
+/>

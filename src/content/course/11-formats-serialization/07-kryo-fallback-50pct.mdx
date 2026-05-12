@@ -1,0 +1,444 @@
+---
+title: "Kryo fallback — 50% perf hit"
+description: "Почему Kryo fallback катастрофичен. pipeline.generic-types: false для fail-fast. Lambdas + generics erasure → Kryo. .returns(TypeInformation) discipline."
+order: 7
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Kryo", "GenericTypeInfo", "pipeline.generic-types", "fail-fast"]
+---
+
+# Kryo fallback — 50% perf hit
+
+Каждый раз, когда Flink не может вывести правильный TypeInformation, он откатывается на `GenericTypeInfo<T>`, который внутри использует Kryo serializer. Kryo — universal Java serializer библиотека, работает для практически любых классов через reflection. Это convenient escape hatch, но в production он **тихо съедает 50% производительности**, ломает schema evolution и приводит к state corruption при upgrade Flink версий.
+
+Этот урок — о том, почему Kryo fallback так разрушителен, как Flink тихо к нему скатывается, и как настроить fail-fast поведение через `pipeline.generic-types: false`. **Каждый production deployment должен иметь этот config.** Если у вас его нет — у вас Kryo fallback где-то в pipeline, вы просто не знаете где.
+
+---
+
+## Что такое Kryo и почему он медленный
+
+Kryo (Esoteric Software) — Java serialization library с фокусом на скорость и compact wire format. По сравнению с Java built-in `ObjectOutputStream`, Kryo в 5-10x быстрее. **Но Kryo медленнее любого schema-aware serializer**, потому что:
+
+1. **Class FQN или ID в wire** — каждая запись пишет либо полное class name, либо short class ID (если registered). FQN — typically 30-50 bytes overhead per record.
+2. **Reflection-based field discovery** — Kryo не имеет pre-built schema, проходит fields через reflection per object.
+3. **No structural validation** — на deserialize Kryo пытается заполнить fields в whatever class found by FQN. Если class изменился — silent corruption.
+4. **Per-instance generic reasoning** — для generic collections Kryo пишет component type FQN per element.
+
+```
+POJO baseline:       1 μs per record, 24 bytes
+Avro Specific:      1.2 μs per record, 22 bytes
+Kryo registered:    1.5 μs per record, 32 bytes  (with short class ID)
+Kryo unregistered:  2.5 μs per record, 60+ bytes (with class FQN)
+```
+
+В numbers: для 100k events/sec/subtask и 8 parallelism = 800k events/sec total → Kryo cost ~1500 CPU ms/sec vs ~700 ms для POJO. Это **2x CPU** просто на serialization.
+
+---
+
+## Как Flink скатывается на Kryo
+
+<DiagramContainer title="Code paths к Kryo fallback" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="User defines DataStream<T>"
+        tooltip="API call: env.fromSource, .map, .keyBy, etc. Flink ищет TypeInformation<T> через TypeExtractor.getForClass или из generic signatures."
+      >
+        TypeExtractor entry
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Что-то идёт не так" />
+    <FlowRow>
+      <DataBox
+        label="Trigger 1: lambda + generics"
+        tooltip="map(v -> Tuple2.of(...)) без .returns() — lambda generic info стёрта → InvalidTypesException ИЛИ GenericTypeInfo (зависит от Flink version, allowMissing flag)."
+      >
+        lambda erasure
+      </DataBox>
+      <DataBox
+        label="Trigger 2: POJO violation"
+        tooltip="Класс без no-arg ctor (Lombok @Builder без @NoArgsConstructor), final fields, inner non-static class, private fields без getters → PojoTypeInfo detection fails → GenericTypeInfo."
+      >
+        POJO rules broken
+      </DataBox>
+      <DataBox
+        label="Trigger 3: non-Flink type"
+        tooltip="java.time.Instant (no no-arg ctor), java.util.Optional, scala.Option, sealed interfaces, generic Map<K, Object> — все становятся GenericTypeInfo."
+      >
+        unsupported type
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="GenericTypeInfo<T>"
+        tooltip="TypeInformation, который под капотом использует KryoSerializer (создаётся в createSerializer(ExecutionConfig)). Этот serializer работает для практически чего угодно."
+      >
+        Kryo serializer
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Default behavior: silent"
+        tooltip="По default pipeline.generic-types: true — Flink логирует WARN (легко пропустить в noise) и продолжает работу с Kryo. Job стартует, throughput на 50% ниже expected. Production discovers через monitoring weeks later."
+      >
+        WARN logged, job runs
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Six common ways к Kryo
+
+### Way 1: Lambda без `.returns()`
+
+```java
+DataStream<Tuple2<String, Long>> stream = input
+    .map(v -> Tuple2.of(v.userId, 1L));   // ← НЕТ .returns()
+// → InvalidTypesException или GenericTypeInfo<Tuple2>
+```
+
+Fix:
+
+```java
+.map(v -> Tuple2.of(v.userId, 1L))
+.returns(Types.TUPLE(Types.STRING, Types.LONG));
+```
+
+### Way 2: Lombok без `@NoArgsConstructor`
+
+```java
+@Data @Builder    // ← @NoArgsConstructor отсутствует
+public class FraudAlert {
+    private long alertId;
+    private String userId;
+    private Instant detectedAt;
+}
+// → GenericTypeInfo<FraudAlert> → Kryo
+```
+
+Fix:
+
+```java
+@Data @Builder @NoArgsConstructor @AllArgsConstructor
+public class FraudAlert { ... }
+```
+
+### Way 3: Non-Flink field type внутри POJO
+
+```java
+public class Order {
+    public long id;
+    public String customer;
+    public Instant orderTime;     // ← не POJO type
+    public Optional<String> note; // ← не POJO type
+    public Order() {}
+}
+// PojoTypeInfo<Order>, но per-field:
+//   id: Long (BasicTypeInfo, fast)
+//   customer: String (BasicTypeInfo, fast)
+//   orderTime: GenericType<Instant> ← Kryo
+//   note: GenericType<Optional> ← Kryo
+```
+
+Класс **сам** распознан как POJO, но **fields внутри** — Kryo. Это самый коварный случай: throughput не падает на 50%, а зависит от какие fields hot.
+
+Fix: replace `Instant orderTime` с `long orderTimeMs`, replace `Optional<String> note` с `@Nullable String note`.
+
+### Way 4: Inner non-static class
+
+```java
+public class Outer {
+    public class BadInner {        // ← non-static
+        public long id;
+        public BadInner() {}
+    }
+}
+// BadInner имеет synthetic this$0 reference на Outer → не POJO
+```
+
+Fix: `public static class GoodNested { ... }`.
+
+### Way 5: Generic POJO
+
+```java
+public class Wrapper<T> {
+    public T value;
+    public long timestamp;
+    public Wrapper() {}
+}
+
+DataStream<Wrapper<String>> stream = ...;
+// T параметр generic — TypeExtractor не может разрешить → Kryo
+```
+
+Fix: либо конкретные subclasses (`StringWrapper extends Wrapper<String>`), либо `.returns(new TypeHint<Wrapper<String>>(){})`.
+
+### Way 6: Scala collections / Kotlin Pair
+
+```java
+import scala.Tuple2;
+
+DataStream<Tuple2<String, Long>> stream = ...;  // ← Scala Tuple, не Flink Tuple
+// → Kryo path
+```
+
+```kotlin
+val stream: DataStream<Pair<String, Long>> = ...  // Kotlin Pair → Kryo
+```
+
+Fix: используйте Flink `org.apache.flink.api.java.tuple.Tuple2`, не language-native tuples.
+
+---
+
+## Fail-fast: `pipeline.generic-types: false`
+
+Single config setting, превращающий silent fallback в loud failure:
+
+```yaml
+# config.yaml
+pipeline:
+  generic-types: false
+```
+
+В Java code:
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.getConfig().disableGenericTypes();   // эквивалент
+```
+
+После этого любая попытка использовать `GenericTypeInfo<T>` в pipeline вызывает:
+
+```
+java.lang.IllegalArgumentException: 
+Generic types have been disabled in the ExecutionConfig and type 
+com.example.SomeClass is treated as a generic type.
+```
+
+Job **не стартует**. Видно сразу. Видно в CI integration tests. Видно локально при `mvn test`.
+
+### Behavior после disableGenericTypes()
+
+| Type | Без config | С `generic-types: false` |
+|---|---|---|
+| Flink POJO | OK (PojoTypeInfo) | OK |
+| Tuple с `.returns()` | OK | OK |
+| Tuple без `.returns()` (lambda) | InvalidTypesException | InvalidTypesException |
+| Lombok без `@NoArgsConstructor` | Silent Kryo | **IllegalArgumentException** |
+| POJO с `Instant` field | Silent Kryo для Instant | **IllegalArgumentException** |
+| Avro Specific | OK (AvroTypeInfo) | OK |
+| Protobuf (flink-protobuf) | OK (PbTypeInfo) | OK |
+| Lambda через `Types.GENERIC(MyClass.class)` | OK Kryo | **IllegalArgumentException** (explicit Generic) |
+
+Каждый break — early signal что нужно fix type info.
+
+---
+
+## Production migration story
+
+Реальный кейс из production (anonymized):
+
+**Симптом**: Fraud detection pipeline на 100k events/sec/subtask начал показывать backpressure после добавления нового event type `FraudAlert` с Lombok `@Data @Builder`. Throughput упал с 90M events/sec total на 12 TM до 55M (~40% degradation).
+
+**Investigation**:
+
+1. JobManager UI → Tasks → видим high backpressure на ProcessFunction после нового MapFunction.
+2. TaskManager logs grep `"Falling back"`: десятки WARN записей `class FraudAlert ... falling back to GenericType`.
+3. `javap -p FraudAlert.class` — подтверждаем что нет no-arg constructor (только `<init>(long, String, Instant)` от `@Builder`).
+
+**Fix**:
+
+```diff
+-@Data @Builder
++@Data @Builder @NoArgsConstructor @AllArgsConstructor
+ public class FraudAlert { ... }
+```
+
+Также:
+
+```diff
+ public class FraudAlert {
+   private long alertId;
+   private String userId;
+-  private Instant detectedAt;        // ← Kryo для этого field
++  private long detectedAtMs;         // ← BasicTypeInfo
+ }
+```
+
+После redeploy throughput вернулся к 90M.
+
+**Prevention going forward**:
+
+```yaml
+# config.yaml
+pipeline:
+  generic-types: false
+```
+
+Plus integration test:
+
+```java
+@Test
+public void noKryoFallbackInPipeline() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+    env.getConfig().disableGenericTypes();   // explicit для теста
+    buildPipeline(env);                       // та же логика что в production main
+    env.getStreamGraph();                     // forces TypeInformation resolution
+    // Если есть Kryo fallback, getStreamGraph() throws
+}
+```
+
+После этих изменений за 6 месяцев zero Kryo regressions в production.
+
+---
+
+## Configuration deep dive
+
+```yaml
+# config.yaml — exhaustive Kryo-related settings
+pipeline:
+  generic-types: false               # FAIL-FAST на Kryo fallback (production must-have)
+
+  # Force-flags — debugging only, не для production
+  force-avro: false                  # Если true, Flink использует Avro для всего, даже для POJO
+  force-kryo: false                  # Если true, Flink использует Kryo для всего (debug only)
+
+  # Auto-registration
+  auto-type-registration: true       # Регистрирует known types proactively
+  auto-watermark-interval: 200ms     # unrelated, но часто в том же файле
+
+execution:
+  generic-type-info:
+    disable-class-registration: false  # Allow registering custom Kryo serializers
+```
+
+### Когда хотите Kryo (rare, debug)
+
+Иногда для prototyping вам не хочется fixing types — quick demo, sandbox:
+
+```java
+// Локальный dev — позволить Kryo
+env.getConfig().enableGenericTypes();   // explicit re-enable
+```
+
+Production — никогда. Stage / staging — debug only.
+
+---
+
+## Registering Kryo serializers (когда Kryo неизбежен)
+
+Очень редко, но иногда class из third-party library не POJO-compatible и нет Avro alternative. Например, geo types from Esri, ML model types from Mahout. В таких случаях register custom Kryo serializer для **better Kryo performance**:
+
+```java
+import com.esotericsoftware.kryo.Serializer;
+
+env.getConfig().registerTypeWithKryoSerializer(
+    GeoPolygon.class,
+    GeoPolygonKryoSerializer.class);
+
+env.getConfig().registerKryoType(GeoPolygon.class);  // short ID, не FQN
+```
+
+```java
+public class GeoPolygonKryoSerializer extends Serializer<GeoPolygon> {
+    @Override
+    public void write(Kryo kryo, Output output, GeoPolygon polygon) {
+        output.writeInt(polygon.numVertices());
+        for (Point p : polygon.vertices()) {
+            output.writeDouble(p.lat());
+            output.writeDouble(p.lng());
+        }
+    }
+
+    @Override
+    public GeoPolygon read(Kryo kryo, Input input, Class<? extends GeoPolygon> type) {
+        int n = input.readInt();
+        Point[] pts = new Point[n];
+        for (int i = 0; i < n; i++) {
+            pts[i] = new Point(input.readDouble(), input.readDouble());
+        }
+        return new GeoPolygon(pts);
+    }
+}
+```
+
+Registered Kryo с custom serializer достигает ~70% baseline (vs ~50% для unregistered). Это compromise, но **только когда альтернативы (POJO conversion, Avro wrapper) impossible**.
+
+Также — registered Kryo с short class ID вместо FQN экономит ~30 bytes/record на wire.
+
+---
+
+## State considerations
+
+Kryo serializer **не имеет schema evolution** в смысле Avro/POJO. State, written с Kryo, на upgrade может быть unreadable:
+
+- Class FQN changed (rename, package move) → state unreadable, fail на recovery.
+- New field added → Kryo пытается прочитать, видит EOF, fail или corrupt.
+- Removed field → Kryo читает bytes, не находит куда положить, fail.
+
+В contrast, POJO `PojoSerializer` имеет `PojoSerializerSnapshot` с reconciliation logic — добавление nullable field handled gracefully. Avro имеет full schema evolution. Kryo — ничего.
+
+> **State + Kryo = upgrade trap.** При первой попытке upgrade Flink или refactor classes, ваш savepoint становится unreadable.
+
+---
+
+## Performance comparison
+
+10M records single-thread bench:
+
+```
+Type                        Throughput      Bytes/record    CPU per record
+─────────────────────────────────────────────────────────────────────────
+POJO Flink                  28M rec/sec    ~24 bytes       0.7 μs
+Avro Specific               23M rec/sec    ~22 bytes       0.9 μs
+Tuple2                      30M rec/sec    ~16 bytes       0.65 μs
+Protobuf native             22M rec/sec    ~20 bytes       0.95 μs
+Kryo registered             14M rec/sec    ~30 bytes       1.5 μs
+Kryo unregistered           10M rec/sec    ~60 bytes       2.0 μs
+JSON (Jackson)              12M rec/sec    ~80 bytes       1.7 μs
+```
+
+Kryo unregistered — **3x slower** чем POJO, **6x larger** wire footprint. Production cost: 3x более dorogие TaskManager pods, 3x bigger network bandwidth, 3x slower state recovery.
+
+---
+
+## Production gotchas
+
+- **`pipeline.generic-types: false` ломает существующие pipelines** — если вы deploy-ите этот config на legacy job, он failed на startup. Audit + fix всех types ПЕРЕД flipping.
+- **WARN logs about fallback теряются в noise** — Flink логирует на INFO/WARN level, заглушаемые typical log filters. Без monitoring это invisible.
+- **Lambda capture закрывает Kryo класс** — если lambda capture-ит non-Serializable instance, Flink сериализует closure через Kryo. Решение: capture только simple values, или make field static.
+- **`ClosureCleaner` ошибки** — Flink имеет ClosureCleaner который nullifies unnecessary outer references. Если ClosureCleaner не справляется — instance передаётся через Kryo. См. WARN logs.
+- **State Processor API не работает на Kryo state** — миграция Kryo → POJO для state requires manual ETL: write бывший Kryo state в external, восстановить как POJO.
+- **`KryoSerializer` versioning** — Kryo lib upgrades между Flink versions могут break compatibility. Production rule: pin Kryo version и test savepoint compatibility before Flink upgrade.
+- **Lombok `@With`** — генерирует withers (creates new instance с changed field), не нарушает POJO requirements, но не помогает с no-arg ctor.
+- **Jackson `@JsonIgnore` fields** — не игнорируются Flink. Используйте `transient` modifier если хотите skip.
+- **Concurrent classloading bugs** — Kryo внутри hot path может trigger classloader contention в high-parallelism deployments. Native POJO/Avro избегают этого.
+- **JEP 411 (Security Manager) deprecation** — некоторые Kryo features (ReflectionFactory) могут не работать на JDK 17+ без `--add-opens`. Native serializers без проблем.
+
+<Callout type="warning">
+**Production checklist для preventing Kryo regression**:
+
+1. `pipeline.generic-types: false` в production config.yaml.
+2. `env.getConfig().disableGenericTypes()` в каждом Java main() для defense-in-depth.
+3. Integration test `noKryoFallbackInPipeline()` который calls `env.getStreamGraph()`.
+4. CI lint: search `.map(...)` без следующего `.returns(...)` — heuristic, ловит lambdas без type hints.
+5. Code review checklist: новые types annotation-документировано как POJO.
+6. Monitoring: alert на WARN log `Falling back to GenericType` (но это backstop, должно быть невозможно при config).
+
+Это "defense in depth" — multiple layers ensure нет Kryo silently вкрадётся.
+</Callout>
+
+<Callout type="tip">
+Если ваш existing codebase глубоко polluted Kryo, миграция incremental: (1) добавить `disableGenericTypes()` в новые job-ы, (2) для old job-ов добавить allow-list через `pipeline.allowed-generic-types: [GeoPolygon, LegacyType]` — fail для всех новых, allow listed. Постепенно сокращайте list. (3) Final step: remove allow-list, full ban.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job обрабатывает 50k events/sec в одном TaskManager. Метрики показывают что CPU на 95%, но throughput не растёт при увеличении parallelism. Profiler показывает 60% времени в `KryoSerializer.serialize()`. Опишите систематический debugging plan и full remediation."
+  answer="**Phase 1 — Diagnosis (15 минут)**: (1) Найти все Kryo paths. JobManager logs → grep `Falling back to GenericType` или `treated as a generic type`. Это list классов в Kryo. Альтернатива: открыть TaskManager flame graph (через async-profiler), искать `KryoSerializer.serialize/deserialize` stacks — backtrack к operator names. (2) Map operator → stream type. Через `env.getStreamGraph()` или JobManager UI / job graph → identify какой stream использует Kryo. (3) Inspect type. `TypeExtractor.getForClass(MyClass.class)` локально → output показывает GenericTypeInfo или PojoTypeInfo с GenericType fields. **Phase 2 — Root cause categorization**. Каждый Kryo path попадает в одну из шести типичных категорий: (a) lambda без `.returns()` — code grep `.map(.*->.*)` без `.returns()` следом; (b) Lombok без `@NoArgsConstructor`; (c) non-POJO field internal (Instant, BigDecimal, Optional, Map<K, Object>); (d) inner non-static class; (e) generic POJO без resolved type; (f) Scala/Kotlin native tuple. **Phase 3 — Fix per category**. (a) Add `.returns(Types.TUPLE(...))` или `.returns(new TypeHint<...>(){})`. (b) Add `@NoArgsConstructor @AllArgsConstructor` к Lombok. (c) Replace Instant → long epochMillis, Optional → @Nullable field, Map<K, Object> → Map<K, String> или typed value. (d) Make nested classes `static`. (e) Concrete subclasses или TypeHint. (f) Use Flink `org.apache.flink.api.java.tuple.Tuple2`. **Phase 4 — Prevent regression**. (1) Production config.yaml: `pipeline.generic-types: false`. (2) Integration test bootstrap: `env.getConfig().disableGenericTypes()` + `env.getStreamGraph()` (forces type resolution, throws при Kryo). (3) Add to PR template checklist: 'все new types — PojoTypeInfo or AvroTypeInfo, не GenericTypeInfo'. (4) Add monitoring alert на TaskManager метрику `flink_taskmanager_job_task_operator_KryoSerializer_count` > 0 (если такая метрика exposed) — backstop. **Phase 5 — Validate fix**. (1) Local: `mvn test` integration tests passing. (2) Staging: deploy, observe JobManager logs — no `Falling back` WARN. (3) Production: rolling update, monitor CPU per TaskManager — expected drop с 95% до 40-50%, throughput growth as parallelism scales. **Phase 6 — Long-term hygiene**. (a) Documented coding standards: Lombok-pattern + POJO checklist. (b) State migration plan: после fix старые savepoints с Kryo state становятся unreadable. Используйте State Processor API для read-rewrite migration, либо start с fresh savepoint (если business allows). (c) Quarterly audit: scan job classes для `@TypeInfo` annotations, ensure все critical event types — typed properly. **Expected outcomes**: 2x throughput improvement при same parallelism, 2x lower CPU per record, state portable между Flink versions, schema evolution working для POJO/Avro fields."
+/>

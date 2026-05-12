@@ -1,0 +1,473 @@
+---
+title: "Managed Memory integration: WriteBufferManager и Block Cache"
+description: "FLIP-49 managed memory → RocksDB native memory off-heap. Shared WriteBufferManager и Block Cache. Почему custom RocksDBOptionsFactory ломает managed memory → OOM"
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Managed Memory", "WriteBufferManager", "Block Cache", "Native Memory", "FLIP-49", "OOM"]
+---
+
+# Managed Memory integration
+
+Если есть один topic в Flink, который провоцирует most production-проблем — это integration RocksDB с Flink managed memory. Native memory (вне JVM heap) исторически был «дикий запад»: каждый компонент гребёт сколько хочет, контроля нет. FLIP-49 (Memory Configuration, Flink 1.10) поставил порядок.
+
+В этом уроке препарируем механику: как Flink выделяет budget RocksDB через WriteBufferManager и Block Cache, и почему один неверный custom factory может убить TaskManager через несколько часов после deploy.
+
+---
+
+## TaskManager memory model (Flink 2.x)
+
+<DiagramContainer title="TaskManager process memory layout" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Total Process Memory"
+        tooltip="Total memory available for TaskManager process. K8s pod limit. Configurable: taskmanager.memory.process.size: 4gb."
+      >
+        e.g. 4GB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="разбивается на:" />
+    <FlowRow>
+      <DataBox
+        label="Framework Heap"
+        tooltip="Внутренние data structures Flink framework: JobManager RPC clients, metric reporters, network buffers JVM-side. Не для user code. Default ~128MB."
+      >
+        Framework heap (128MB)
+      </DataBox>
+      <DataBox
+        label="Framework Off-Heap"
+        tooltip="Direct/Native memory для Flink framework. Network buffers, кодек buffers. Default ~128MB."
+      >
+        Framework off-heap (128MB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Task Heap"
+        tooltip="JVM heap для user code (operators, functions, user state на heap backend). Не для RocksDB native memory. Default: Flink Memory × (1 - fraction)."
+      >
+        Task Heap (e.g. 1.5GB)
+      </DataBox>
+      <DataBox
+        label="Managed Memory"
+        tooltip="Off-heap memory pool, managed by Flink. Used by RocksDB (через WriteBufferManager+Block Cache), Python (для PyFlink), batch sort/join algorithms. taskmanager.memory.managed.fraction default 0.4."
+      >
+        Managed memory (40% = 1.6GB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="JVM Metaspace"
+        tooltip="Class metadata. Default 256MB. Не часто tuned."
+      >
+        Metaspace (256MB)
+      </DataBox>
+      <DataBox
+        label="JVM Overhead"
+        tooltip="JIT, compiler, thread stacks, GC structures. Default 10% process size."
+      >
+        JVM overhead (400MB)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Конфигурация
+
+```yaml
+taskmanager.memory.process.size: 4gb       # total
+taskmanager.memory.managed.fraction: 0.4   # 40% Flink memory → managed
+taskmanager.memory.flink.size:            # optional explicit Flink memory
+taskmanager.memory.network.fraction: 0.1  # network buffers
+```
+
+С `process.size: 4gb` и `managed.fraction: 0.4`:
+- Framework heap+off-heap: ~256MB
+- Task Heap: ~1.5GB
+- Managed memory: ~1.6GB
+- Metaspace: 256MB
+- JVM overhead: 400MB
+
+---
+
+## Managed Memory распределение
+
+Managed memory доступна **per-slot** или **shared** (с `memory.managed: true`):
+
+```yaml
+state.backend.rocksdb.memory.managed: true       # shared между slots (default true)
+# или
+state.backend.rocksdb.memory.fixed-per-slot: 256mb   # fixed per-slot
+```
+
+С `managed: true` (recommended):
+- Total RocksDB budget = managed memory (от **всех** slots)
+- Divided через shared resources (WBM, Block Cache)
+- Each slot pulls/releases dynamically
+
+С `fixed-per-slot`:
+- Each slot gets fixed budget
+- Predictable, но less efficient
+
+---
+
+## WriteBufferManager (WBM)
+
+WBM — RocksDB feature для shared MemTable budget между Column Families.
+
+### Без WBM (naive)
+
+```
+Slot 1, RocksDB instance:
+  CF "state-A": MemTable 64MB
+  CF "state-B": MemTable 64MB
+  CF "state-C": MemTable 64MB
+  ...
+  Total: 10 CFs × 64MB = 640MB per slot
+
+4 slots на TaskManager: 4 × 640MB = 2.5GB just for MemTables.
+Plus immutable MemTables awaiting flush.
+Plus Block Cache (8MB × 10 CF × 4 slots = 320MB).
+Total native: 2.8GB+ — exceeds managed budget → OOM-Killed.
+```
+
+### С WBM
+
+```
+WriteBufferManager budget: 800MB (shared across all slots, all CFs)
+
+When any CF's MemTable approaches its limit, WBM evaluates:
+  - Is total budget exceeded?
+  - If yes → trigger flush of largest MemTable (any CF, any slot)
+  - Frees memory dynamically
+
+Result: total MemTable usage capped at 800MB (deterministic).
+```
+
+WBM injected by Flink:
+
+```yaml
+state.backend.rocksdb.memory.managed: true   # creates shared WBM
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5   # 50% managed → WBM
+```
+
+С `managed: true` и default `write-buffer-ratio: 0.5`, 50% managed memory dedicated к WBM, остальное (50%) — Block Cache.
+
+---
+
+## Block Cache (BC)
+
+Block Cache — LRU cache для disk blocks. Shared между всеми CFs.
+
+```yaml
+state.backend.rocksdb.memory.managed: true   # injects shared BC
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1   # 10% reserved для index/filter
+```
+
+`high-prio-pool-ratio: 0.1` reserves 10% Block Cache для filter и index blocks. Эти blocks critical для read performance (Bloom filter check, index lookup) — without protection LRU could evict them, causing read latency cliff.
+
+### How sharing works
+
+```
+Slot 1 reads block from SST → cached in shared BC
+Slot 2 reads SAME block → cache hit (no disk I/O)
+Slot 3 evicts old block to make room — LRU eviction
+```
+
+Cache hit rate depends on:
+- Working set size (hot data) vs cache size
+- Access pattern (random vs sequential)
+- Number of CFs sharing budget
+
+Healthy cache hit rate: >90%. <50% = badly undersized cache.
+
+---
+
+## Default распределение
+
+```yaml
+# Default values:
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5   # 50% managed → WBM
+# Implicitly: 50% managed → Block Cache
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1 # 10% BC → high prio
+```
+
+С managed memory = 1.6GB, on TaskManager:
+- WBM: 800MB total (shared across slots+CFs)
+- Block Cache: 800MB total
+- High-prio pool: 80MB (within BC)
+
+---
+
+## What custom RocksDBOptionsFactory breaks
+
+```java
+public class BadFactory implements RocksDBOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        return new DBOptions()          // ❌ FRESH options, no WBM!
+            .setMaxOpenFiles(-1)
+            .setMaxBackgroundJobs(8);
+    }
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        return new ColumnFamilyOptions()  // ❌ no Block Cache injection
+            .setWriteBufferSize(64 * 1024 * 1024);
+    }
+}
+```
+
+What's lost:
+- `opts.setWriteBufferManager(sharedWBM)` — WBM not assigned to DBOptions
+- `tableConfig.setBlockCache(sharedBC)` — Block Cache not assigned to CF
+- Result: each CF allocates own MemTable (64MB), own Block Cache (8MB)
+
+**Math на typical job**:
+- 10 state primitives = 10 CF
+- 4 slots per TaskManager
+- 64MB MemTable per CF + 8MB Block Cache per CF
+- Per-slot: 10 × (64 + 8) = 720MB
+- Per-TaskManager: 4 × 720 = 2.88GB native memory
+
+С 1.6GB managed budget — exceeds by 1.3GB. JVM Direct memory tracking shows huge values, eventually OS OOM-Killer terminates TaskManager.
+
+### Right way: extend DefaultConfigurableOptionsFactory
+
+```java
+public class GoodFactory extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        opts = super.createDBOptions(opts, handles);   // ← preserves WBM!
+        // Override specific settings:
+        return opts.setMaxBackgroundJobs(8);
+    }
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        opts = super.createColumnOptions(opts, handles);
+        return opts.setWriteBufferSize(128 * 1024 * 1024);   // 128MB
+        // WBM still applied — fine
+    }
+}
+```
+
+`super.createXxx` calls inject WBM и Block Cache from Flink shared resources. Your overrides apply on top, preserving memory management.
+
+---
+
+## Monitoring native memory
+
+Metrics для tracking:
+
+```
+flink_taskmanager_Status_JVM_Memory_Direct_Count   # number of buffers
+flink_taskmanager_Status_JVM_Memory_Direct_MemoryUsed  # current bytes
+flink_taskmanager_Status_JVM_Memory_Direct_TotalCapacity  # max
+flink_taskmanager_<state>_rocksdb_size_all_mem_tables  # MemTable size
+flink_taskmanager_<state>_rocksdb_block_cache_usage   # BC current usage
+```
+
+В Grafana dashboard:
+- `direct_memory_used` should plateau, not grow linearly
+- `size-all-mem-tables` should be < write-buffer-ratio × managed
+- `block_cache_usage` should be ~ (1 - write-buffer-ratio) × managed
+
+Если `direct_memory_used` keeps growing = memory leak (often custom factory без WBM).
+
+---
+
+## Tuning recommendations
+
+### Right managed.fraction
+
+```yaml
+taskmanager.memory.managed.fraction: 0.4    # default
+```
+
+For state-heavy workloads (RocksDB-only TaskManager): bump to 0.5-0.6.
+
+For mixed workloads (state + heavy user code): keep 0.4 or lower.
+
+For non-state TaskManager (e.g. stateless transform): 0.1 (still need managed for batch sort).
+
+### Right write-buffer-ratio
+
+```yaml
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5    # default
+```
+
+For write-heavy (50%+ writes): bump к 0.6-0.7. Bigger MemTables absorb writes, fewer L0 files.
+
+For read-heavy (<10% writes): drop к 0.3. More memory к Block Cache.
+
+For balanced: stay at 0.5.
+
+### Right high-prio-pool-ratio
+
+```yaml
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1   # default
+```
+
+Bump to 0.2 if читаете много random keys (filter blocks more often accessed).
+
+Drop к 0.05 if mostly sequential reads (range scans).
+
+---
+
+## Slot sharing implications
+
+С `memory.managed: true`, memory **shared across slots**. Это significant: один slot's CF может использовать всю managed memory если другие slots idle.
+
+Pro: efficient memory usage.
+
+Con: no isolation. Heavy state в slot 0 can crowd out slot 1.
+
+**Slot sharing groups** позволяют isolate:
+
+```java
+stream
+    .map(...).slotSharingGroup("light")
+    .keyBy(...)
+    .process(...).slotSharingGroup("heavy");  // own slot
+```
+
+В separate slot sharing groups — separate RocksDB instances — separate budgets. Иногда правильное design для heavy state operators.
+
+---
+
+## Production gotchas
+
+### 1. Custom factory без WBM = OOM (most common)
+
+Symptoms: TaskManager OOM-Killed within hours of deploy. `Status.JVM.Memory.Direct.MemoryUsed` grows linearly.
+
+Fix: extend `DefaultConfigurableOptionsFactory` или explicitly set WBM/BC.
+
+### 2. `memory.managed: false` без proper budgeting
+
+```yaml
+state.backend.rocksdb.memory.managed: false
+```
+
+Falls back to per-CF defaults (64MB MemTable, 8MB Block Cache). С 10 CF × 4 slots = 2.8GB. Need explicit budget calc.
+
+**Fix**: stay with `managed: true` if no specific reason.
+
+### 3. Mixed Java heap state + RocksDB
+
+```yaml
+# Some job: state.backend.type: hashmap (heap)
+# Other: state.backend.type: rocksdb
+```
+
+If both на same TaskManager (different jobs in session cluster), managed memory still shared. Heap state не uses managed → wasted budget for that job. RocksDB still gets full budget.
+
+For session cluster — set `state.backend.rocksdb.memory.managed: true` globally; heap-only jobs не impact RocksDB.
+
+### 4. ForSt и managed memory
+
+ForSt has own memory model — separate config:
+
+```yaml
+state.backend.forst.cache.size: 4gb
+state.backend.forst.io.parallelism: 16
+# state.backend.rocksdb.* keys ignored для ForSt
+```
+
+ForSt cache size — explicit number, не fraction. Plan separately.
+
+### 5. JIT and class loading affects direct memory
+
+RocksDB через JNI allocates native memory. JIT compilation, class loading also use native (Metaspace). Total native memory budget = Managed + Framework off-heap + JVM overhead. Don't max-out managed = leave room for others.
+
+### 6. K8s memory cgroup vs JVM direct
+
+K8s pods enforce memory limit on **total** process memory (RSS). If RocksDB native allocates > managed budget, exceeds pod limit → K8s OOMKill (different from JVM OOM).
+
+Diagnose: K8s pod events show «OOMKilled», not Java exception. Logs show нормальный shutdown. RAM usage prior to kill exceeds pod limit.
+
+Fix: ensure managed.fraction × process.size leaves margin для overheads.
+
+### 7. Memory tuning без profiling
+
+Premature tuning fractions без measuring → guessing. Always:
+1. Run with defaults.
+2. Measure direct memory, cache hit rate, write stall events.
+3. Tune fractions based on data.
+
+---
+
+## Diagnostic checklist для memory issues
+
+1. **`Status.JVM.Memory.Direct.MemoryUsed`** trend:
+   - Plateau → healthy
+   - Linear growth → leak (likely custom factory)
+   - Spikes coinciding с restart → checkpoint memory pressure
+
+2. **`size-all-mem-tables`** per CF:
+   - Sum < write-buffer-ratio × managed → OK
+   - Sum > budget → WBM not enforcing
+
+3. **`block-cache-hit / (hit+miss)`** ratio:
+   - >90% → cache adequate
+   - <50% → cache too small, increase managed.fraction
+
+4. **K8s pod memory usage**:
+   - Stable below limit → OK
+   - Slowly approaches limit → drift, leak
+
+5. **Compile state.backend.* config**:
+   - `memory.managed: true` set?
+   - PredefinedOptions specified?
+   - Custom factory extends DefaultConfigurableOptionsFactory?
+
+---
+
+## Recommended baseline config
+
+```yaml
+# Process memory:
+taskmanager.memory.process.size: 4gb
+
+# Memory fractions:
+taskmanager.memory.managed.fraction: 0.4
+taskmanager.memory.network.fraction: 0.1
+
+# RocksDB:
+state.backend.type: rocksdb
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1
+
+# Metrics:
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-usage: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+```
+
+С таким baseline 95% of jobs работают без issues. Tuning только с metric-driven evidence.
+
+---
+
+<Callout type="warning">
+Helpful mental model: RocksDB native memory — это «дикая» off-heap память, не tracked JVM. Если не assigned WriteBufferManager, RocksDB allocates **anything**, без backpressure. JVM не знает об этой памяти, GC не помогает. Только OS OOM-Killer останавливает growth. Managed memory + WBM делают эту память civilized — bounded, shared, observable.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production TaskManager (8GB process.size, managed.fraction=0.4 = 3.2GB managed). Logs показывают TaskManager постепенно растёт по memory, через 4 часа K8s OOMKill. Status.JVM.Memory.Direct.MemoryUsed = 4.5GB перед kill. state.backend.rocksdb.metrics.size-all-mem-tables показывает 3.8GB. Что произошло и как fix?"
+  answer="Multiple symptoms point к single root cause: WriteBufferManager не enforcing budget. Total MemTable budget should be ~1.6GB (50% of 3.2GB managed × write-buffer-ratio default 0.5). Actual: 3.8GB MemTables. Это в 2.4x превышает budget. Diagnosis: либо (1) custom RocksDBOptionsFactory не extends DefaultConfigurableOptionsFactory, либо (2) state.backend.rocksdb.memory.managed: false установлено (старый legacy config), либо (3) custom factory создаёт fresh DBOptions без super.createDBOptions(). Probable scenario: Some recent deploy added custom factory для slight tweak (e.g., max_background_jobs=8) but did не extends Default. Без super() call, WriteBufferManager инжекция skipped → каждая CF allocates own 64-128MB MemTable без shared budget. На 10 CF × 4 slots = 2.5-5GB pure MemTable memory, plus Block Cache (separately broken), immutable MemTables awaiting flush. Direct memory continuously grows until pod limit. Fix steps: (1) Audit state.backend.rocksdb.options-factory — if present, verify класс extends DefaultConfigurableOptionsFactory; (2) Если можно — REMOVE custom factory, заменить tweaks через flink-conf properties (state.backend.rocksdb.thread.num: 8 instead of factory); (3) Verify state.backend.rocksdb.memory.managed: true (default true since 1.10, но some legacy configs may have false); (4) Post-fix monitoring: direct_memory_used should plateau ~ 3.2GB total, size-all-mem-tables < 1.6GB. Prevention: in CI, add check для RocksDBOptionsFactory subclassing — auto-fail PR if not extends DefaultConfigurableOptionsFactory."
+/>

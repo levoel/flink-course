@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/02-web-ui-deep",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-02",
+    "description": "Quiz for Flink Web UI deep lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-02-q1",
+      "type": "multiple-choice",
+      "question": "Какая страница Web UI — главная диагностическая поверхность и почему?",
+      "options": [
+        { "id": "a", "text": "Configuration tab" },
+        { "id": "b", "text": "Job → Running → <Job ID> с DAG view. Color coding operator-боксов по busyTimeMsPerSecond (зелёный <50%, жёлтый 50-90%, красный >90%) и backpressure status. Diagnostic flow: red operator = bottleneck CPU/state, black backpressured = bottleneck downstream. Click operator → drill-down к watermarks, checkpoints, subtasks, flame graph" },
+        { "id": "c", "text": "Task Managers list" },
+        { "id": "d", "text": "Overview dashboard" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "DAG view с color coding — single most important debugging surface. 80% production проблем диагностируются за 60 секунд через это view. Hover на operator показывает breakdown: busy/idle/backpressured %. Click drilling: Overview (records, parallelism), Watermarks (per-subtask progression), Checkpoints (per-operator metrics), Backpressure (per-subtask status), Metrics (custom + built-in), Flame Graph (sampling stack traces, FLIP-165). Это live diagnostic tool, complement Grafana historical trends.",
+      "studyHint": "Повторите урок — DAG view с color coding",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-02-q2",
+      "type": "multiple-choice",
+      "question": "Какой алгоритм debug 'job медленный, throughput 50% expected' через Web UI?",
+      "options": [
+        { "id": "a", "text": "Look at logs первым" },
+        { "id": "b", "text": "(1) DAG view colors — найти red operator. (2) Click red → Backpressure tab — все subtasks busy без backpressure = CPU-bound. (3) Flame Graph subtask → identify CPU hotspot (e.g., compression, serialization). (4) Apply targeted fix (e.g., switch compression codec). Total time: 5-10 minutes. Without Web UI: blind tuning 1+ hour" },
+        { "id": "c", "text": "Сразу increase parallelism" },
+        { "id": "d", "text": "Restart с другим backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Structured diagnostic flow — Web UI guides к root cause. Step 1: DAG colors quickly identify suspect operator. Step 2: subtask-level metrics confirm hypothesis. Step 3: Flame Graph (FLIP-165, sampling stack traces) shows exactly where CPU goes. Step 4: targeted fix. Example: 80% time в KafkaProducer.send.compress → switch к lz4 → throughput recovers. Без этого flow — guessing game. Critical skill: знать Web UI до автоматизма. Training юнioр on-call на этом flow возвращает значительный ROI.",
+      "studyHint": "Повторите урок — Real debugging walkthrough",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-02-q3",
+      "type": "multiple-choice",
+      "question": "Production gotcha: completed jobs исчезают через 5 минут после finish/cancel. Какой config критичен для post-mortem analysis?",
+      "options": [
+        { "id": "a", "text": "Это normal — use logs" },
+        { "id": "b", "text": "jobmanager.archive.fs.dir и historyserver.archive.fs.dir к durable storage (S3). Deploy Flink history server как отдельный process. Без archive — нет history для post-mortem (5min default retention). Critical для production: failed jobs investigation, capacity planning, compliance. Default retention абсолютно недостаточен" },
+        { "id": "c", "text": "Increase rest.cache-size" },
+        { "id": "d", "text": "Disable cleanup" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Главный production pitfall. Стандартный setup: jobmanager.archive.fs.dir: s3://bucket/flink/archive, historyserver.archive.fs.dir: same, historyserver.archive.fs.refresh-interval: 10000. Deploy flink-history-server как отдельный pod, scrape S3 archive каждые 10s. URL https://history-server:8082 — все completed jobs (limited только S3 retention, обычно месяцы). После production incident у вас 5 minutes без archive прежде чем job исчезнет. Post-mortem analysis невозможна — это major gotcha new Flink production teams.",
+      "studyHint": "Повторите урок — Filtering и time ranges + Production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-02-q4",
+      "type": "true-false",
+      "question": "Web UI и Grafana — взаимозаменяемы, нужен один из них.",
+      "correctAnswer": false,
+      "explanation": "False. Они дополняют друг друга. Web UI: live ad-hoc diagnostic, DAG visualization, drill into specific operator, flame graph, watermarks per subtask. Не показывает historical trends, не для alerting. Grafana: historical trends, capacity planning, alerting, multi-job aggregate view. Не показывает live DAG, не позволяет ad-hoc subtask inspection. Production needs оба: Grafana для proactive (alerts + trends), Web UI для reactive (когда alert fires — open Web UI для live debug). FLIP-570 Runtime Data Sampling добавляет ещё один layer — sample реальные records в Web UI.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

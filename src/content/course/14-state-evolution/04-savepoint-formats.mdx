@@ -1,0 +1,354 @@
+---
+title: "Savepoint formats: canonical vs native + restore modes"
+order: 4
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Savepoint Format", "Canonical", "Native", "Restore Modes", "CLAIM", "NO_CLAIM"]
+---
+
+# Savepoint formats и restore modes
+
+В Flink 1.15+ savepoint может быть в одном из двух форматов: **native** (default, fast, backend-specific) или **canonical** (cross-backend, slower). Plus у Flink есть три **restore modes** — CLAIM, NO_CLAIM, LEGACY — которые влияют на ownership savepoint data и cleanup behavior. Это четыре дисьотных решения, которые имеют конкретные последствия для production operations.
+
+В этом уроке: что такое каждый format, когда выбирать, restore modes mechanics и trade-offs, command-line examples, gotchas.
+
+---
+
+## Savepoint vs Checkpoint: quick recap
+
+Прежде чем углубляться в formats, напомним различие:
+
+| Aspect | Checkpoint | Savepoint |
+|---|---|---|
+| Trigger | Автоматически Flink (interval) | Manual (CLI/REST/Operator) |
+| Purpose | Recovery from failures | Operational tasks (upgrade, migration) |
+| Lifecycle | Owned Flink (auto-cleanup) | Owned by user |
+| Format | Native (incremental в RocksDB/ForSt) | Native or Canonical |
+| Ownership | Internal | External |
+
+Savepoint — **portable, user-owned snapshot**. Checkpoint — internal Flink mechanism. Savepoints используются для upgrades, migrations, blue/green deploys.
+
+---
+
+## Native format
+
+**Native** — default savepoint format с Flink 1.15+. Идея: использовать тот же binary format что checkpoints, для **скорости**.
+
+### Особенности native
+
+- **Fast** — 3-5x быстрее чем canonical (для RocksDB особенно — incremental SST file references)
+- **Backend-specific** — RocksDB native ≠ ForSt native ≠ HashMap native. Restore только на тот же backend type
+- **Smaller** — может быть incremental (только diff с последним checkpoint)
+- **Default с 1.15+**
+
+```bash
+# Create native savepoint (default)
+flink savepoint <jobid>
+flink stop --savepointPath s3://... <jobid>
+
+# Explicitly:
+flink savepoint --type native <jobid>
+```
+
+В Flink Kubernetes Operator:
+
+```yaml
+spec:
+  flinkConfiguration:
+    state.savepoints.type: native    # default, можно не указывать
+```
+
+### Use cases для native
+
+- **Regular operational savepoints** — daily/hourly snapshots для blue/green deploys, same backend
+- **Same Flink version upgrade** — patch level (2.2.0 → 2.2.1) или minor (2.2 → 2.3)
+- **Performance-critical** — для multi-TB state native экономит часы
+
+---
+
+## Canonical format
+
+**Canonical** — universal savepoint format. Идея: serialize state independent backend.
+
+### Особенности canonical
+
+- **Slow** — full reserialize state (RocksDB SST files → canonical bytes → DFS write)
+- **Cross-backend** — RocksDB → ForSt, RocksDB → HashMap, etc.
+- **Cross-version** — safer для major Flink version upgrades
+- **State Processor API** — ОБЯЗАТЕЛЕН для State Processor API (см. урок 14.2)
+
+```bash
+# Canonical savepoint
+flink savepoint --type canonical <jobid>
+flink stop --savepointPath s3://... --type canonical <jobid>
+```
+
+В FlinkDeployment:
+
+```yaml
+spec:
+  flinkConfiguration:
+    state.savepoints.type: canonical
+```
+
+### Use cases для canonical
+
+- **Backend migration** — RocksDB → ForSt (см. урок 14.7)
+- **Major Flink version upgrade** — 1.20 → 2.2 (breaking format changes возможны)
+- **State Processor API** — обязателен
+- **Cross-region DR** — defensive choice (если DR cluster имеет slightly different config)
+
+---
+
+## Comparison
+
+| Aspect | Native | Canonical |
+|---|---|---|
+| Speed | 3-5x faster | Slower (full reserialize) |
+| Size | Can be incremental | Always full |
+| Cross-backend | No | Yes |
+| Cross-version | Same major | Cross-major safer |
+| Default | Yes (1.15+) | No |
+| State Processor API | No | Required |
+| Use frequency | Regular ops | Major changes |
+
+### Performance numbers (production examples)
+
+| State size | Native time | Canonical time |
+|---|---|---|
+| 1 GB | 5-10 секунд | 15-30 секунд |
+| 100 GB | 30-60 секунд | 3-8 минут |
+| 1 TB | 5-10 минут | 30-60 минут |
+| 10 TB | 30-60 минут | 5-10 часов |
+
+Это рамочные числа — зависит от network bandwidth, DFS throughput, parallelism.
+
+---
+
+## Implications for production workflows
+
+### Daily blue/green deploys: native
+
+```bash
+# Каждый image bump → savepoint-based upgrade через Operator
+# upgradeMode: savepoint + spec.image change → savepoint created native
+# 3-5x faster чем canonical = меньше downtime в blue/green window
+```
+
+### Quarterly Flink version upgrade: canonical
+
+```bash
+# 2.2 → 2.3 minor upgrade obычно safe с native
+# Но 1.20 → 2.2 major — canonical safer
+# Один-два раза в год — extra time на canonical приемлем
+
+flink stop --savepointPath s3://upgrades/savepoints/ \
+           --type canonical \
+           <jobid>
+# Update Flink version
+# Restart с savepoint
+```
+
+### One-off backend migration: canonical
+
+```bash
+# Migrating RocksDB → ForSt — обязательно canonical
+# См. урок 14.7 для полного workflow
+```
+
+### State Processor API job: canonical
+
+```bash
+# Триггер savepoint canonical перед State Processor API processing
+flink stop --type canonical --savepointPath s3://migration/ <jobid>
+
+# State Processor API job reads canonical savepoint
+java -cp state-processor-job.jar com.example.MigrationJob \
+  --savepoint s3://migration/savepoint-xyz/ \
+  --output s3://migration/savepoint-migrated/
+```
+
+---
+
+## Restore modes
+
+При restore from savepoint Flink имеет три **restore modes** — определяют, кто owner savepoint files после restore:
+
+```bash
+flink run -s s3://.../savepoint-xyz/ \
+          --restoreMode <CLAIM | NO_CLAIM | LEGACY> \
+          job.jar
+```
+
+| Mode | Ownership после restore | Cleanup |
+|---|---|---|
+| **CLAIM** | Flink owns savepoint files | Flink удалит когда savepoint stale (новый checkpoint subsumes) |
+| **NO_CLAIM** (default) | User owns savepoint files | User responsible для cleanup |
+| **LEGACY** | Mixed (legacy 1.x behavior) | Deprecated, не использовать |
+
+### CLAIM mode
+
+```bash
+flink run -s s3://.../savepoint-xyz/ --restoreMode CLAIM job.jar
+```
+
+**Behavior**: Flink takes ownership savepoint files. Когда subsequent checkpoints supersede savepoint state, Flink удалит savepoint files.
+
+**Pros**:
+- Auto cleanup — не накапливать orphan savepoints в S3
+- Incremental restore — Flink может reuse savepoint files как basis for incremental checkpoints (выгодно для RocksDB)
+
+**Cons**:
+- **No rollback to this savepoint** — после CLAIM you can't restore этот specific savepoint снова, Flink might have удалил
+- **Shared savepoint cannot be CLAIM-ed** — если несколько jobs могут restore from same savepoint, CLAIM не подходит
+
+### NO_CLAIM mode (default)
+
+```bash
+flink run -s s3://.../savepoint-xyz/ --restoreMode NO_CLAIM job.jar
+```
+
+**Behavior**: Flink reads savepoint но НЕ takes ownership. Savepoint files остаются в DFS, user отвечает за их cleanup.
+
+**Pros**:
+- **Safe for rollback** — savepoint остаётся, can restore again если needed
+- Сharing — несколько jobs могут restore from same savepoint
+
+**Cons**:
+- Manual cleanup — savepoints накапливаются, нужно ручной retention policy
+- No incremental restore benefit для RocksDB — Flink copies savepoint files в checkpoint folder (extra storage cost)
+
+### LEGACY mode
+
+Old 1.x default behavior — deprecated, не используйте. Mixed ownership, ambiguous semantics.
+
+---
+
+## Когда какой restore mode
+
+### CLAIM — для one-way migrations
+
+После migration к новой версии / backend — не нужен rollback. Например:
+
+```bash
+# Migrating RocksDB → ForSt, one-way decision
+flink run -s s3://.../savepoint-canonical/ --restoreMode CLAIM job.jar
+# После 24h validation old savepoint useless — Flink cleanup сам
+```
+
+### NO_CLAIM — production default
+
+Daily blue/green, rollback capability critical:
+
+```bash
+# Daily image upgrade в blue/green
+flink run -s s3://.../savepoint-pre-upgrade/ --restoreMode NO_CLAIM job.jar
+# Savepoint остаётся для rollback если new version плохо
+# После validation + retention policy expires → manual delete
+```
+
+В Flink Kubernetes Operator:
+
+```yaml
+spec:
+  job:
+    upgradeMode: savepoint
+    savepointHistory:
+      maxCount: 10           # keep last 10
+      maxAgeHours: 168       # delete older than 7 дней
+    # NO_CLAIM implicit с savepoint history retention
+```
+
+---
+
+## Savepoint retention
+
+Без cleanup savepoints накапливаются в S3 bytes. Production strategy:
+
+```text
+Retention tiers:
+- Daily savepoints: keep 7 дней
+- Weekly savepoints (Sunday): keep 4 недели
+- Monthly savepoints (1st of month): keep 12 месяцев
+- Annual savepoints: keep forever (compliance/audit)
+```
+
+Implementation через S3 lifecycle policy:
+
+```yaml
+Rules:
+  - Id: savepoint-retention
+    Filter:
+      Prefix: savepoints/
+      Tag: { Key: tier, Value: daily }
+    Expiration:
+      Days: 7
+
+  - Id: savepoint-archive
+    Filter:
+      Prefix: savepoints/
+      Tag: { Key: tier, Value: weekly }
+    Transitions:
+      - Days: 30
+        StorageClass: GLACIER
+    Expiration:
+      Days: 365
+```
+
+Operator не делает это автоматически — нужна external policy. Или custom cron job + AWS CLI.
+
+---
+
+## Production gotchas
+
+- **Native + cross-backend = FAIL** — restore native RocksDB savepoint на ForSt deployment fails. Always canonical для backend migration.
+- **Default native, easy to forget** — для major Flink upgrade default native может work but risky. Explicit canonical для safety.
+- **Canonical + большой state = долго** — 1TB state canonical savepoint может занимать час. Plan window. Operator's reconciliation timeout должен accommodate.
+- **CLAIM mode lost savepoint** — после CLAIM Flink может удалить savepoint files. Если позже вам нужен rollback к этому specific savepoint — невозможно. NO_CLAIM safer для production.
+- **NO_CLAIM + RocksDB = extra storage** — Flink copies savepoint files в new checkpoint location. Double storage временно (до first checkpoint compaction).
+- **State Processor API + native = FAIL** — State Processor API requires canonical. Если у вас native — нужно re-savepoint canonical first.
+- **Migration RocksDB → ForSt + native = FAIL** — backend-specific format. Canonical обязателен (см. урок 14.7).
+- **`--type canonical` flag** — easy to forget в CLI. Set globally в Flink config: `state.savepoints.type: canonical` если default behavior должен быть safer.
+- **Savepoint metadata mismatch** — savepoint в одном S3 region, restore в другом — works но slow (cross-region read). Для DR multi-region replication critical.
+
+<Callout type="warning">
+**Restore mode confusion** — CLAIM, NO_CLAIM, LEGACY есть subtle differences которые легко не разобрать. Default NO_CLAIM safer для production. CLAIM только когда вы absolutely sure что rollback к этому savepoint никогда не понадобится. Documentation на restore modes evolves — check current Flink docs для каждой версии.
+</Callout>
+
+<Callout type="tip">
+Production strategy 2026: **native для regular daily operations, canonical для quarterly major changes**. Native savepoints — daily/weekly через operator's autoSavepointSeconds. Canonical — explicitly triggered для backend migrations, major version upgrades, State Processor API jobs. Restore mode по умолчанию NO_CLAIM для rollback safety. S3 lifecycle policy для retention. Это balances speed + safety + cost.
+</Callout>
+
+---
+
+## Format choice decision tree
+
+```text
+Нужно сохранить state для будущего use?
+├── Same Flink version, same backend, regular ops
+│   → native, NO_CLAIM
+│   Examples: daily blue/green, hourly automatic savepoints
+│
+├── Major Flink version upgrade (1.20 → 2.2)
+│   → canonical, CLAIM (one-way change)
+│   Defensive — format changes possible
+│
+├── Backend migration (RocksDB → ForSt)
+│   → canonical, CLAIM
+│   Native impossible cross-backend
+│
+├── State Processor API job
+│   → canonical (mandatory), savepoint kept (NO_CLAIM equivalent)
+│   Read-only access — original savepoint untouched
+│
+└── Long-term archive / compliance
+    → canonical (forward compat), keep forever
+    Future Flink versions can read canonical
+```
+
+---
+
+<KnowledgeCheck
+  question="Production job upgrade workflow: blue deployed на Flink 2.2.0 с RocksDB backend, daily savepoints native. Team хочет: (a) migrate к Flink 2.3.0 + (b) переключить с RocksDB на ForSt. Какой savepoint format использовать на каждом этапе, какой restore mode?"
+  answer="Это two simultaneous changes — Flink major bump + backend migration. Workflow: (1) Trigger CANONICAL savepoint на blue (2.2.0 + RocksDB) — обязательно canonical потому что (a) cross-backend RocksDB → ForSt, (b) cross-version safer. Команда: `flink stop --type canonical --savepointPath s3://upgrades/sp-pre-23-forst/ <jobid>`. Cost: canonical 100GB state ~ 3-8 минут vs native ~ 30-60 секунд. Once-off, приемлем. (2) Update FlinkDeployment: image на Flink 2.3.0, state.backend.type: forst, FlinkVersion v2_3, добавить ForSt configuration (primary-dir, cache-dir). (3) Restore с restoreMode CLAIM — one-way migration, не возвращаться к RocksDB. CLAIM позволяет Flink incremental reuse savepoint files. (4) Verify validation: state size correct, sampling reads work, throughput ОК через сутки. (5) Подвох: keep prior savepoint (NO_CLAIM-like) минимум 7 days для emergency rollback к 2.2 + RocksDB на случай unforeseen issue. Можно создать second canonical savepoint специально для rollback и hold его separately, чтобы не зависеть от CLAIM ownership. Production safety > speed для critical migrations like this. Quarterly DR drill should cover similar scenario."
+/>

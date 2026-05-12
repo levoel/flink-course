@@ -1,0 +1,145 @@
+{
+  "moduleId": "16-observability",
+  "title": "Module 16 Exam — Observability",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m16-exam",
+    "description": "Integrated exam for Module 16"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-exam-q1",
+      "type": "multiple-choice",
+      "question": "Flink Web UI: какой DAG colour означает 'operator не имеет idle time, CPU/state bottleneck здесь'?",
+      "options": [
+        { "id": "a", "text": "Зелёный" },
+        { "id": "b", "text": "Красный (busyTimeMsPerSecond > 90%). Bottleneck здесь — needs parallelism increase, hot path optimization, или migration к async. Не путать с чёрным (backpressured > 50% — bottleneck downstream) или синим (idle — bottleneck upstream)" },
+        { "id": "c", "text": "Жёлтый" },
+        { "id": "d", "text": "Чёрный" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Color decoding для diagnostic flow: зелёный busy<50% healthy; жёлтый 50-90% working с малой reserve; красный >90% CPU/state bottleneck; синий idle>50% bottleneck upstream (move к source); чёрный/розовый backpressured>50% bottleneck downstream (move к sink). Знайте до автоматизма — 80% production issues identified в первые 60 секунд через DAG colors.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-exam-q2",
+      "type": "multiple-choice",
+      "question": "Какие 4 типа метрик в Flink и их типичные use cases?",
+      "options": [
+        { "id": "a", "text": "Только sum/count" },
+        { "id": "b", "text": "Counter (accumulated monotonic: errors, processedRecords), Gauge (instantaneous: cacheSize, memoryUsed), Meter (events/sec — редко используется, Counter + rate() предпочтительнее), Histogram (distribution с percentiles: latencyMs, sizes). Critical: SlidingTimeWindowReservoir для sharp window histograms, не default ExponentiallyDecayingReservoir" },
+        { "id": "c", "text": "Only Counter" },
+        { "id": "d", "text": "Все типы equivalent" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Counter — accumulated, increment-only. Gauge — lambda evaluated на каждый scrape (cache calculation, don't put expensive logic). Meter — wrapper для rate, но Prometheus computes rate из counter (Meter redundant). Histogram — percentile distributions, choice of reservoir critical. SlidingTimeWindowReservoir(60s) — sharp 60-second window, нужно для time-bound alerting. ExponentiallyDecayingReservoir biased recent samples но не sharp.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-exam-q3",
+      "type": "multiple-choice",
+      "question": "Какие 12 топ-метрик нужны для production Flink Grafana dashboard?",
+      "options": [
+        { "id": "a", "text": "Только heap usage" },
+        { "id": "b", "text": "Checkpoint duration P95, state size, numberOfFailedCheckpoints, watermark lag, busyTime% per operator, backPressuredTime%, throughput, numLateRecordsDropped, GC time/min, Heap %, Direct memory, RocksDB compaction pending bytes" },
+        { "id": "c", "text": "Random selection" },
+        { "id": "d", "text": "Только business KPI" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Top 12 cover main production failure modes. Alert thresholds: ckpt duration > timeout/2 warning; FailedCheckpoints > 0 в 10min critical; Watermark lag > 5min high; backPressuredTime > 800ms/sec sustained 5min high; numLateRecordsDropped > 0 high; GC > 10s/min G1 medium; Heap > 90% sustained warning; Direct memory linear growth = leak; RocksDB compaction-pending растёт = write stall coming. Hierarchy: Fleet → Per-job → Operator → Backend-specific.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-exam-q4",
+      "type": "multiple-choice",
+      "question": "PrometheusReporter vs PushGateway — production decision?",
+      "options": [
+        { "id": "a", "text": "Всегда PushGateway" },
+        { "id": "b", "text": "PrometheusReporter (pull) — стандарт для long-running streaming. K8s service discovery через annotations (prometheus.io/scrape=true, prometheus.io/port=9249). PushGateway — ТОЛЬКО для short-lived batch jobs (Boundedness.BOUNDED), exit прежде чем Prometheus scrape. Streaming с PushGateway — антипаттерн" },
+        { "id": "c", "text": "Always OTel only" },
+        { "id": "d", "text": "Эквивалентны" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pull standard для streaming — Prometheus scrapes endpoint каждые 15s, K8s auto-discovery elastic. Push only batch. PushGateway accumulates metrics forever если не cleanup (TTL script). Cardinality считается главной проблемой Prometheus + Flink в large clusters — scope.variables.excludes: subtask_index reduces 10-50×. На 250k+ series consider VictoriaMetrics (high cardinality optimized, 5-10× less disk).",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-exam-q5",
+      "type": "multiple-choice",
+      "question": "OpenTelemetry в Flink 2.3 — что покрывает и какой trace structure для checkpoint?",
+      "options": [
+        { "id": "a", "text": "Только metrics" },
+        { "id": "b", "text": "Coverage 1.20+ checkpoint lifecycle, job submission, task lifecycle, async I/O (2.3 GA gRPC export). Checkpoint trace: root Checkpoint-N → barrier-injection → barrier-propagation (per-operator alignment slow visible) → async-snapshot (per-subtask) → dfs-upload → notify-complete. Tags: checkpoint_id, state_size, alignment_duration. Slow checkpoint debugging — 15min trace exploration vs hours blind tuning" },
+        { "id": "c", "text": "Только logs" },
+        { "id": "d", "text": "Performance profiling" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "OTel в Flink — emerging, GA gRPC export 2.3. Главный use case — slow checkpoint debugging. Trace структура показывает где время теряется: alignment (backpressure), async (state size), upload (DFS throughput). gRPC vs HTTP: ~30% less overhead binary protobuf, persistent connections. Production rule: sampling 1-5% для regular, always_on для checkpoint spans (rare events). Context propagation через Kafka headers — end-to-end traces через сервисы. Backend: Tempo (Grafana stack) или Jaeger (standalone).",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m16-exam-q6",
+      "type": "multiple-choice",
+      "question": "FLIP-570 Runtime Data Sampling (Flink 2.3+) — что даёт и какие use cases?",
+      "options": [
+        { "id": "a", "text": "Stack trace sampling" },
+        { "id": "b", "text": "Live sampling реальных records в Web UI без redeploy. 1-2 секунды от click. Use cases: data skew investigation (sample busy subtask, identify hot key), data quality issues (find null/malformed fields), schema evolution verification, deduplication check, watermark/event-time debug. Near-zero overhead (<1% throughput drop). Production rule: enable + access control + PII blocklist для sensitive operators" },
+        { "id": "c", "text": "Sampling метрик в Prometheus" },
+        { "id": "d", "text": "Performance benchmark tool" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Game changer для production debugging. До FLIP-570: per-record logging (flood), redeploy с debug code (slow), угадывание. FLIP-570: click 'Sample 100 records' на operator → live data. Sample size up to 1000, optional filter (userId='u_001', amount > 100). Lightweight wrapper на mailbox, fixed buffer, auto-detach. PII/compliance critical — production sampling раскрывает реальные данные. Required: access control, PII operator blocklist.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-exam-q7",
+      "type": "true-false",
+      "question": "Per-record logging в hot path (processElement, map) — best practice для production debugging.",
+      "correctAnswer": false,
+      "explanation": "False. Per-record logging — главный антипаттерн production logging. 100k records/sec × 1KB = 100MB/sec disk write → disk full, log pipeline overload, $$$$ storage cost. Used by inexperienced devs — code reviews must catch. Alternatives: (1) Sampled logging (counter % 100000 == 0 = 1 of 100k); (2) Error-only (errors rare); (3) Event-driven (state transitions, alerts). Volume rule: < 100 lines/sec per TM в steady state. Modern Flink 2.3+: используйте FLIP-570 Runtime Sampling для ad-hoc inspection — properly designed для это.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-exam-q8",
+      "type": "multiple-choice",
+      "question": "Structured JSON logging в Flink 2.3+ — что и зачем?",
+      "options": [
+        { "id": "a", "text": "Просто красивее" },
+        { "id": "b", "text": "Каждое поле — search-able key в Elasticsearch/Loki. Plain text: 'найти checkpoint duration > 60s' невозможно без custom parsers. JSON: query 'checkpoint_id:123 AND duration_ms:>60000' точно. Configuration: JsonTemplateLayout. Plus MDC context (user_id, event_id) автоматически attached внутри scope. Plus async appender обязателен — sync writing блокирует mailbox thread на high write rate" },
+        { "id": "c", "text": "Faster IO" },
+        { "id": "d", "text": "Compression" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production стандарт modern observability. JsonTemplateLayout (log4j2): eventTemplateUri=classpath:LogstashJsonEventLayoutV1.json. Async appender: appender.async.type = Async, queueSize=4096 — offloads IO к dedicated thread. Critical для high-throughput. MDC pattern: MDC.put('user_id', id) внутри try → automatic attachment. Modern slf4j 2.x: LOG.atWarn().addKeyValue('field', value).log() — explicit. Production: structured JSON + async + MDC = baseline modern Flink logging.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-exam-q9",
+      "type": "multiple-choice",
+      "question": "Tiered alert severity для Flink production — какие 4 tier и examples?",
+      "options": [
+        { "id": "a", "text": "Все alerts равны" },
+        { "id": "b", "text": "Critical (P0, page): job stopped, persistent ckpt failures, OOMKilled. High (P1, Slack mention): sustained backpressure >5min, watermark stuck >10min, duration spikes, late records. Medium (P2, daily digest): state growth, GC elevated, RocksDB compaction backlog. Info (P3, Slack channel no notify): throughput drop trend, heap > 80%. 'for' duration важен — 'for: 10m' для sustained issues eliminates transient noise" },
+        { "id": "c", "text": "Только critical и warning" },
+        { "id": "d", "text": "Critical всегда page" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Alert fatigue — главная угроза. 200+ alerts/week → on-call ignores all → real incidents lost. Tiered prevents этого. Critical = wake-up justified (rare, < 5/month). High = same-day attention. Medium = trend issues weekly review. Info = observability. Alertmanager routing: critical → PagerDuty, high → Slack mention, medium → daily digest. 'for: 10m' — eliminates transient backpressure spikes (90% noise). De-duplication: group_by job_name not subtask. Inhibition rules: silence correlated alerts. Quarterly review.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-exam-q10",
+      "type": "multiple-choice",
+      "question": "Production observability strategy для Flink — что должно быть в setup?",
+      "options": [
+        { "id": "a", "text": "Только Web UI" },
+        { "id": "b", "text": "Web UI (live ad-hoc diagnosis, DAG, flame graphs, FLIP-570 sampling) + Prometheus/VictoriaMetrics (historical metrics, alerting) + Grafana (dashboards, alerts) + OpenTelemetry Tempo/Jaeger (distributed tracing, slow checkpoint debugging) + Loki/Elasticsearch (log aggregation с structured JSON). Plus flink-history-server (post-mortem completed jobs). Не выбирайте one over other — production needs all" },
+        { "id": "c", "text": "Только metrics" },
+        { "id": "d", "text": "Только logs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Modern observability triangle: metrics (what), traces (why), logs (что именно случилось). + Web UI для live diagnosis, FLIP-570 sampling для ad-hoc record inspection, history server для post-mortem. Не silver bullet — each tool different strengths. Metrics historical trends + alerting. Traces для slow individual events / checkpoints. Logs для rare events: errors, lifecycle, config changes. Together = comprehensive production debugging capability. Without всех — blind spots в production.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

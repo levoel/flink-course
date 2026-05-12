@@ -1,0 +1,389 @@
+---
+title: "Backpressure anatomy: busy/idle/backpressured metrics"
+description: "busyTimeMsPerSecond, idleTimeMsPerSecond, backPressuredTimeMsPerSecond (1.13+). Web UI color coding, diagnosis flow, common scenarios"
+order: 3
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Backpressure", "busyTime", "idleTime", "Diagnosis", "Web UI", "Performance"]
+---
+
+# Backpressure anatomy
+
+Backpressure — это сигнал «downstream не справляется», который Flink runtime передаёт upstream через credit-based flow control. До Flink 1.13 диагностика backpressure была эзотерикой: «нажмите кнопку sample, посмотрите stack traces, угадайте». В 1.13 появились **точные metrics** (FLIP-179), которые превратили backpressure debugging из шаманства в детерминированный flow.
+
+В этом уроке препарируем эту тройку метрик, разберём color coding в Web UI и пройдём по реальным сценариям диагностики — от поверхностных «source busy» до тонких «RocksDB compaction stall every 30s».
+
+---
+
+## Тройка метрик: busy / idle / backpressured
+
+Каждый subtask Flink continuously находится в одном из трёх состояний:
+
+| Состояние | Что происходит |
+|---|---|
+| **busy** | Активная работа: обработка записи, вызов user code, state access, network output |
+| **idle** | Ждёт записи из upstream: нет данных в input buffer-ах |
+| **backpressured** | Хочет писать в output, но downstream не принимает (no credit) |
+
+Метрики (per-subtask, per-task, per-operator):
+
+```
+busyTimeMsPerSecond          — % времени subtask занят работой
+idleTimeMsPerSecond          — % времени ждёт upstream
+backPressuredTimeMsPerSecond — % времени блокирован downstream
+```
+
+**Сумма ≈ 1000 ms/sec** (с погрешностью ~30ms из-за scheduling overhead). Это полный «1-second budget» каждого subtask.
+
+Эти метрики появились в **Flink 1.13** через FLIP-179 «Expose Standardized Operator Metrics». До этого был только бинарный `isBackPressured: 0/1`, который врал в edge cases.
+
+---
+
+## Color coding в Web UI
+
+Web UI красит operator-боксы по этим метрикам:
+
+<DiagramContainer title="Color coding operator-боксов в Web UI" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="ЗЕЛЁНЫЙ"
+        tooltip="busyTime < 50% — operator не загружен. Это норма для большинства pipelines с reserve capacity. Не путать с idle — может быть mixed busy + idle 30/70."
+      >
+        busy 0-50% (healthy reserve)
+      </DataBox>
+      <DataBox
+        label="ЖЁЛТЫЙ"
+        tooltip="busyTime 50-90% — operator активно работает, малая reserve capacity. Это нормально для steady-state, но capacity headroom мал."
+      >
+        busy 50-90%
+      </DataBox>
+      <DataBox
+        label="КРАСНЫЙ"
+        tooltip="busyTime > 90% — operator практически не имеет idle time. Bottleneck здесь. Increase parallelism, optimize hot path."
+      >
+        busy > 90% (CPU-bound)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="СИНИЙ"
+        tooltip="idleTime > 50% — нет данных из upstream. Не bottleneck здесь, проблема выше по графу. Двигайтесь по DAG к источнику."
+      >
+        idle > 50% (waiting upstream)
+      </DataBox>
+      <DataBox
+        label="ЧЁРНЫЙ / РОЗОВЫЙ"
+        tooltip="backPressuredTime > 50% — operator не может писать вниз. Downstream slow. Двигайтесь по DAG вниз к sink."
+      >
+        backpressured > 50%
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+В Web UI hover на operator-боксе показывает breakdown: «Busy: 75%, Idle: 0%, Backpressured: 25%».
+
+---
+
+## Diagnosis flow
+
+Алгоритм диагностики идёт **от sink к source** (или наоборот, ищем «первого backpressured») и работает так:
+
+```
+1) Открыть Job в Web UI → DAG view с color coding.
+
+2) Найти первый красный (busy>90%) operator с конца DAG:
+     это main bottleneck.
+   ИЛИ найти первый чёрный (backpressured) от source:
+     downstream от него — bottleneck.
+
+3) Проверить tasks этого operator:
+   - Все subtasks busy? → нужно ↑ parallelism, или оптимизация hot path.
+   - Только некоторые subtasks busy? → data skew (keyBy distribution).
+   - Subtasks колеблются busy↔backpressured? → I/O wait
+     (sink, RocksDB compaction, async lookups).
+
+4) Если bottleneck — RocksDB:
+   - Metrics: rocksdb.compaction.pending-bytes растёт → write stall.
+   - Metrics: rocksdb.block-cache-hit / (hit+miss) < 50% → BC too small.
+
+5) Если bottleneck — network/sink:
+   - Sink async I/O latency высокая → batch or async sink wrapper.
+```
+
+---
+
+## Сценарии диагностики
+
+### Сценарий 1: source busy 100%, downstream idle
+
+```
+[Source 100% busy] → [Map 30% busy, 60% idle] → [Sink 5% busy, 95% idle]
+```
+
+**Диагноз**: source CPU-bound. Десериализация, парсинг, partition fetch — что-то здесь занимает все ресурсы.
+
+**Действия**:
+1. Увеличить source parallelism (если source поддерживает: Kafka — до min(partitions, parallelism)).
+2. Проверить десериализацию: switch с JSON на Avro/Protobuf.
+3. Если Kafka — `fetch.max.bytes`, `max.poll.records` tuning.
+4. Проверить network latency к Kafka brokers.
+
+### Сценарий 2: middle operator busy, source backpressured
+
+```
+[Source backpressured 80%] → [Map 100% busy] → [Sink idle]
+```
+
+**Диагноз**: Map operator CPU-bound. Backpressure propagates upstream к source.
+
+**Действия**:
+1. Disable chaining: `.map(...).startNewChain()` — если Map в одном chain с другими heavy ops.
+2. Увеличить parallelism Map operator (если data keyBy-нут — учесть skew).
+3. Профилировать hot path в Map: что именно тратит CPU.
+4. Возможно изолировать в свой slot sharing group.
+
+### Сценарий 3: всё backpressured до sink
+
+```
+[Source bp] → [Map bp] → [Sink 100% busy]
+```
+
+**Диагноз**: sink — bottleneck. Sync I/O в external system блокирует mailbox thread.
+
+**Действия**:
+1. Использовать `AsyncDataStream.unorderedWait` для external lookups вместо sync.
+2. Sink batching: KafkaSink уже async, но batch.size может быть мал.
+3. JDBC sink — increase batch.size, тuning JdbcSink.
+4. External system (DB, Elasticsearch) реально перегружен → scale-out external system.
+
+### Сценарий 4: backpressure ramps up then drops каждые 30 секунд
+
+```
+busyTimeMsPerSecond: 600 → 200 → 600 → 200 (sawtooth pattern)
+```
+
+**Диагноз**: периодический stall. Чаще всего:
+- RocksDB compaction (L0→L1 flush triggers)
+- GC pause (G1 mixed collection)
+- Checkpoint barrier alignment
+
+**Действия**:
+1. Проверить `rocksdb_compaction_pending_bytes` metric — корреляция с sawtooth.
+2. Проверить `GC.G1Old.Time` или `ZGC.Cycle.Time` — pause spikes.
+3. Включить FLIP-158 unaligned checkpoints — устраняет barrier alignment.
+4. Tune RocksDB: `state.backend.rocksdb.thread.num: 8` (больше compaction threads).
+
+### Сценарий 5: один subtask busy, остальные idle (data skew)
+
+```
+Subtask 0: busy 100%
+Subtasks 1-7: idle 90%
+```
+
+**Диагноз**: keyBy partitioning неравномерен. Чаще всего:
+- Hot key (один userId с миллиардом событий)
+- Cardinality слишком низкая (parallelism > distinct keys)
+- Non-uniform hash distribution
+
+**Действия**:
+1. Метрика `numRecordsInPerSecond` per subtask — confirms skew.
+2. Двухстадийная aggregation: salt the hot key:
+   ```java
+   keyBy(k -> k + "_" + (random % 10))
+     .window(...).aggregate(...)
+     .keyBy(originalKey)
+     .window(...).aggregate(...)
+   ```
+3. Использовать `DataStreamUtils.reinterpretAsKeyedStream` для pre-shuffled data.
+4. Custom `KeySelector` с балансировкой.
+
+---
+
+## Java API: programmatic access к метрикам
+
+Metrics доступны через REST API JobManager или через MetricGroup в user code:
+
+```java
+public class MyMapper extends RichMapFunction<Event, Result> {
+    private transient Gauge<Long> mySubtaskBusyGauge;
+
+    @Override
+    public void open(Configuration config) {
+        // Доступ к встроенным метрикам через runtime
+        // Application metrics добавляются через user MetricGroup
+        getRuntimeContext().getMetricGroup()
+            .gauge("processingDelay", () -> System.currentTimeMillis() - lastEventTs);
+    }
+
+    @Override
+    public Result map(Event e) {
+        lastEventTs = e.getEventTime();
+        return process(e);
+    }
+}
+```
+
+REST API:
+
+```bash
+# Список subtask metrics:
+curl http://jobmanager:8081/jobs/<job-id>/vertices/<vertex-id>/subtasks/metrics
+
+# Конкретная метрика:
+curl "http://jobmanager:8081/jobs/<job-id>/vertices/<vertex-id>/subtasks/0/metrics?get=Source.busyTimeMsPerSecond"
+```
+
+---
+
+## Configuration: enabling метрик
+
+Базовые backpressure metrics включены **по умолчанию с 1.13+**. Никакого config не требуется. Но опционально:
+
+```yaml
+# Sampling frequency для backpressure detection в Web UI:
+rest.flamegraph.refresh-interval: 60000      # FLIP-165 flamegraphs
+
+# Metric reporter (для Grafana):
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+
+# Latency tracking (heavy, careful):
+metrics.latency.interval: 30000              # markers every 30s
+metrics.latency.granularity: operator        # subtask | operator | single
+```
+
+`metrics.latency.interval` особенно полезен для end-to-end latency tracking, но накладные расходы существенные — не включайте в high-throughput pipelines без надобности.
+
+---
+
+## Web UI flame graphs (1.13+)
+
+FLIP-165 «Operator's flame graphs» — sampling stack traces UI per subtask. Доступно через Web UI: Job → Operator → Flame Graph tab.
+
+Показывает где именно тратится CPU в hot path. Сэмплирование происходит на JobManager (offload), низкие накладные. Идеально для диагностики CPU-bound operators когда busy=100% но непонятно почему.
+
+Пример: видите 60% времени в `KryoSerializer.deserialize` → switch на Avro/Pojo (faster types).
+
+---
+
+## Метрики для Grafana dashboard
+
+Top metrics для backpressure dashboard:
+
+```promql
+# Per-vertex aggregate:
+sum by (vertex_id) (
+  flink_taskmanager_job_task_operator_busyTimeMsPerSecond
+)
+
+# Backpressure heatmap (subtask × time):
+flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond
+
+# Idle source detection (alert):
+avg_over_time(
+  flink_taskmanager_job_task_operator_idleTimeMsPerSecond{vertex_id="source"}[5m]
+) > 800
+```
+
+Alert rule example:
+
+```yaml
+# Sustained backpressure > 800ms/sec for 5 minutes:
+- alert: FlinkBackpressureSustained
+  expr: |
+    avg_over_time(
+      flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond[5m]
+    ) > 800
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Flink job {{ $labels.job_name }} backpressured >80% sustained"
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: busyTime включает state access wait
+
+Subtask может быть в `busy` состоянии и **ждать** RocksDB I/O. С точки зрения mailbox processor это активная работа (subtask занят), но реально это I/O wait. Симптом: busy=90%, CPU usage 20%, диск I/O wait высокий.
+
+**Diagnose**: `iostat -x 1` на TaskManager host — disk util %?
+
+**Fix**: RocksDB tuning (block cache, async IO в ForSt), или disaggregated state (S3).
+
+### Gotcha 2: busy != bottleneck (chain caveat)
+
+Operators внутри chained task разделяют один thread. busyTime отображается на весь chain, не per-operator. Если в chain `map → filter → process`, и busy=100%, не понятно кто именно жжёт CPU.
+
+**Fix**: temporary `.disableChaining()` для диагностики, посмотреть кто реально busy. Затем убрать после диагностики.
+
+### Gotcha 3: idle source не означает healthy
+
+Source может быть idle потому что:
+1. Реально нет данных в Kafka (healthy)
+2. Kafka consumer заблокирован на rebalance (unhealthy)
+3. Source CPU-bound на параллельных subtasks, но текущий subtask got no partitions (skew)
+
+Cross-reference с `KafkaConsumer.records-consumed-rate` от Kafka client metrics.
+
+### Gotcha 4: backpressure после restart выглядит как pre-existing
+
+Job стартует, прочитывает большой backlog → все backpressured first 10 minutes. Это норма catch-up. Не путать с steady-state backpressure.
+
+**Diagnose**: подождать >15min после restart прежде чем диагностировать.
+
+### Gotcha 5: chained operators скрывают real bottleneck
+
+```
+Source → [Map → Filter → KeyedProcess] → Sink
+         (chained в один task)
+```
+
+Если KeyedProcess медленный, метрика показывает весь chain как busy. Source backpressured, но непонятно кто внутри chain виновник.
+
+**Fix**: `.startNewChain()` перед KeyedProcess, чтобы изолировать его как отдельный task с separate metrics.
+
+### Gotcha 6: short-burst busy не detected
+
+Метрики усредняются каждую секунду. Если operator busy 50ms каждые 100ms (burst pattern), avg busy = 50%, но waveform невидим. Real-time impact выше.
+
+**Fix**: latency markers (`metrics.latency.interval: 5000`) или flame graph при подозрении на burst pattern.
+
+---
+
+## Diagnostic checklist
+
+Когда job медленный — этот алгоритм работает в 90% случаев:
+
+1. **Открыть Web UI → Job → DAG**. Запомнить цвета.
+2. **Find first red operator** с конца. Если есть — это bottleneck.
+3. **Find first black (backpressured)** с начала. Downstream от него — bottleneck.
+4. **Subtask metrics** этого operator: skew?
+5. **Flame graph** subtask 0 операторa. Где CPU?
+6. **Latency markers** — end-to-end latency растёт?
+7. **RocksDB metrics** — compaction stalls? Block cache hit ratio?
+8. **GC metrics** — pause spikes коррелируют с busy waveform?
+
+---
+
+<Callout type="warning">
+Не угадывайте — измеряйте. До FLIP-179 (Flink 1.13) backpressure diagnosis был эвристикой. Сегодня у вас есть **точные** метрики. Если кто-то в команде говорит «попробуем увеличить parallelism» без указания конкретного red operator из Web UI — это shotgun debugging. Запретите подобный подход в production troubleshooting.
+</Callout>
+
+---
+
+<Callout type="note">
+busy + idle + backpressured ≈ 1000ms/sec (одна секунда per second). Если сумма заметно меньше — есть «GAP» неучтённого времени: GC pause, native code блок, OS-level scheduling. Это сигнал к более глубокому профилированию (async-profiler, JFR).
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job: KeyedProcessFunction с RocksDB, parallelism=8. Web UI показывает: Source 30% busy 70% idle (всё OK), Map operator (chained с filter) 90% busy 10% idle, KeyedProcess 70% busy 30% backpressured (период колебаний 30 секунд), Sink 60% busy. Throughput колеблется ±40% с тем же 30-секундным periodом. Где bottleneck, как диагностировать, какой fix?"
+  answer="Это classic RocksDB compaction stall pattern. Анализ симптомов: (1) Period 30s + sawtooth throughput — обычно RocksDB L0→L1 compaction triggers. (2) KeyedProcess 30% backpressured циклично — backpressure от downstream slow processing, но скорее всего сам KeyedProcess внутри stuck на state access во время compaction. (3) Map 90% busy в chain с filter — отдельная проблема, не основной bottleneck, но скрывает что именно в chain жжёт CPU. Diagnosis algorithm: (1) Открыть RocksDB metrics: state.backend.rocksdb.metrics.compaction-pending-bytes, num-running-compactions, num-immutable-mem-table — если pending-bytes растёт и резко падает (correlates with 30s period) → confirmed compaction stall. (2) Проверить level0_slowdown_writes_trigger (default 20) — если L0 file count приближается → write stall. (3) Метрика flink_taskmanager_job_task_operator_KeyedProcess_busyTimeMsPerSecond + iostat -x 1 — высокий disk %util во время bursts → I/O wait засчитывается как busy. Fixes (приоритет): (1) Увеличить compaction threads: state.backend.rocksdb.thread.num: 8 (default 1-2) — больше parallel compactions, меньше backlog. (2) Тuning compaction: switch с leveled на universal для write-heavy (если writes dominant) — но проверьте read amp impact. (3) Включить incremental checkpointing если не включено: state.backend.incremental: true. (4) В Flink 2.0+ — consider migration к ForSt (FLIP-427) disaggregated state — compaction moves к S3, нет local I/O wait. (5) Если RocksDB action confirmed not the issue — проверьте GC pauses (G1 mixed coll ~30s coincidence?), включите ZGC: env.java.opts: '-XX:+UseZGC -XX:MaxGCPauseMillis=10'. (6) Disable chaining temporary для Map/filter: посмотреть в Web UI кто внутри chain жжёт CPU 90% — может быть Filter с heavy predicate, может быть Map с slow deserialization. Validation: после fix throughput должен plateau с <10% variation, backPressuredTimeMsPerSecond < 100ms/sec в steady-state."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/03-aligned-vs-unaligned",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-03",
+    "description": "Quiz for aligned vs unaligned checkpoints lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-03-q1",
+      "type": "multiple-choice",
+      "question": "В чём fundamental difference aligned vs unaligned checkpoints?",
+      "options": [
+        { "id": "a", "text": "Aligned быстрее, unaligned точнее" },
+        { "id": "b", "text": "Aligned: operator waits на barrier ON ALL input channels (alignment phase, blocking — long под backpressure). Unaligned (FLIP-76, 1.11+): barrier OVERTAKES in-flight records — operator snapshot immediately, in-flight records persistятся как ChannelState вместе с operator state. Checkpoint duration bounded независимо от backpressure" },
+        { "id": "c", "text": "Они идентичны — synonyms" },
+        { "id": "d", "text": "Aligned для batch, unaligned для streaming" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Aligned (default): waits for barrier на ALL N input channels (alignment phase). Под backpressure alignment может быть minute-hour. Records на blocked channels buffer-ятся в InputBuffer. Это and is ABS classic. Unaligned (FLIP-76, 1.11+): на первый barrier на любом канале — sync snapshot НЕМЕДЛЕННО, including ChannelState (in-flight records в InputBuffer и OutputBuffer). Barrier overtakes records — emit downstream right away. ChannelState persisted на recovery — restored before resume processing. Trade-offs: Aligned — cheaper recovery (no channel state restore), slower checkpoint под backpressure. Unaligned — bounded checkpoint duration, costlier recovery, larger snapshots (включают channel state).",
+      "studyHint": "Повторите урок — раздел 'Unaligned Checkpoints'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-03-q2",
+      "type": "multiple-choice",
+      "question": "Hybrid mode (1.14+) — что это и почему recommended?",
+      "options": [
+        { "id": "a", "text": "Параллельные aligned и unaligned checkpoints" },
+        { "id": "b", "text": "execution.checkpointing.unaligned: true + aligned-checkpoint-timeout: 30s. Start aligned (cheaper recovery), если alignment > 30s — escalate to unaligned (bounded duration). Best of both worlds: dünn happy path benefits aligned (cheap recovery), под backpressure не fail (escalate to unaligned). Production default" },
+        { "id": "c", "text": "Hybrid checkpoints используют both RocksDB и ForSt" },
+        { "id": "d", "text": "Hybrid checkpoints deprecated в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Hybrid mode — production recommended pattern. Configuration: execution.checkpointing.unaligned: true + execution.checkpointing.aligned-checkpoint-timeout: 30s. Behaviour: каждый checkpoint starts aligned (cheaper recovery, simpler semantics, no channel state). Если alignment phase превышает 30s timeout — automatically escalate to unaligned (bounded duration, even under backpressure). Best of both: (a) Normal operation — aligned advantages (cheap recovery, no ChannelState overhead); (b) Under backpressure — unaligned advantages (bounded duration, no checkpoint failures). На EOS pipelines с Kafka transactions — prevents transaction timeout expiration during backpressure spikes. Production default для critical jobs.",
+      "studyHint": "Повторите урок — раздел 'Hybrid mode'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m06-03-q3",
+      "type": "multiple-choice",
+      "question": "Buffer debloating при unaligned checkpoints — почему critical?",
+      "options": [
+        { "id": "a", "text": "Optional optimization, не affecting correctness" },
+        { "id": "b", "text": "Unaligned checkpoints включают ChannelState (in-flight records в InputBuffer и OutputBuffer). Без buffer debloating buffer size большие (default), могут быть GBs in-flight на high parallelism. ChannelState такого размера → доминирует checkpoint size. Buffer debloating dynamically adjusts buffer size к ~1s processing data — minimizes ChannelState. Must-have для production unaligned" },
+        { "id": "c", "text": "Buffer debloating ускоряет RocksDB" },
+        { "id": "d", "text": "Это не related к checkpoints" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical interaction. Default network buffers большие (32KB-1MB per channel) — на 1000 subtasks × multiple channels = potentially GBs in-flight. С unaligned checkpoints этот ChannelState persisted во время snapshot — fundamentally doubles checkpoint size. Configuration: taskmanager.network.memory.buffer-debloat.enabled: true, target: 1s. Buffer size dynamically adjusted к amount of data что processor могут handle in target time (1s). Result: typical buffer 10-100x smaller, ChannelState manageable. Without debloating: 500GB ChannelState на extreme backpressure. With: 5GB. 100x reduction. Production unaligned без buffer debloating — anti-pattern.",
+      "studyHint": "Повторите урок — раздел 'Configuration cheat sheet'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-03-q4",
+      "type": "true-false",
+      "question": "Unaligned checkpoints поддерживают broadcast state pattern same as aligned.",
+      "correctAnswer": false,
+      "explanation": "False. Unaligned checkpoints НЕ поддерживают broadcast state pattern (FLIP-326 — не done). Sources с broadcast state — only aligned. Reasoning: broadcast state shared между all subtasks of operator — semantics complex для unaligned (each subtask может start snapshot at different point). Не ясно как handle in-flight broadcasts. Mixed jobs работают: operators без broadcast могут использовать unaligned, operators с broadcast принудительно aligned. Production rule: если используете broadcast state pattern (для config updates, control rules) — accept aligned для тех operators, или isolate them через slot sharing groups. Альтернатива — config через filesystem polling, не broadcast.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

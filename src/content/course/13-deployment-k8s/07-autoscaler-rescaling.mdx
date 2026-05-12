@@ -1,0 +1,377 @@
+---
+title: "Autoscaler (FLIP-271) + In-place rescaling (FLIP-291)"
+order: 7
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Autoscaler", "FLIP-271", "FLIP-291", "In-place rescaling", "Elastic Scaling", "Backpressure metrics"]
+---
+
+# Autoscaler + In-place rescaling — KILLER fitch
+
+Это **самая важная** возможность production Flink в 2026: **automatic elastic scaling без savepoint-based restart**. Без двух связанных FLIP — autoscaling = stop with savepoint → wait для completion → start с новым parallelism → restore. Минуты downtime. С FLIP-271 (Autoscaler) и FLIP-291 (In-place rescaling) autoscaler наблюдает за metrics, решает «scale up to 16», делает REST API call, Adaptive Scheduler меняет parallelism in-place за секунды.
+
+В этом уроке: как autoscaler наблюдает busy/idle/backpressure metrics, как принимает scaling decisions, что такое in-place rescale (vs savepoint-based), как настроить config tunables, troubleshoot scaling thrashing.
+
+---
+
+## Что было до FLIP-271/291
+
+Pre-1.18 rescale workflow:
+
+```text
+1. Decide: parallelism 8 → 16 (manually или via reactive mode)
+2. Trigger savepoint
+3. Wait savepoint DONE (минуты для большого state)
+4. Cancel job
+5. Update job spec с новым parallelism
+6. Submit new job from savepoint
+7. Wait until job RUNNING
+8. Recovery state distribution с новым parallelism
+Total: 2-10 минут downtime
+```
+
+Это «**savepoint-restart cycle**». Делать каждые 15 минут для динамического load — невозможно. Поэтому production обычно over-provision и rescale редко.
+
+С FLIP-291 (1.18+) появилась альтернатива — **in-place rescale**:
+
+```text
+1. Decide: parallelism 8 → 16
+2. REST API call: PATCH /jobs/{id} parallelism=16
+3. Adaptive Scheduler:
+   a. Stop tasks (быстро, без external storage)
+   b. Redistribute key groups для new parallelism
+   c. Start tasks at parallelism=16
+   d. Restore state from last completed checkpoint (in-memory pointer)
+Total: 10-60 секунд downtime
+```
+
+10x improvement, и работает в реальном времени.
+
+---
+
+## FLIP-271: Autoscaler
+
+**Flink Kubernetes Operator Autoscaler** — это компонент operator-а, который наблюдает за metrics через REST API JobManager-а, и автоматически делает rescale calls. По metric-based decision making.
+
+<DiagramContainer title="Autoscaler control loop (FLIP-271)" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink JobManager"
+        tooltip="Exposes metrics через REST endpoint /jobs/{id}/metrics: busy time per operator, backpressure ratios, throughput. Collected from TaskManager-ов в real time."
+      >
+        REST /jobs/{id}/metrics
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="poll каждые N секунд" />
+    <FlowRow>
+      <DataBox
+        label="Autoscaler controller (в Operator pod)"
+        tooltip="Часть Flink Kubernetes Operator. Collects metrics window. Computes per-operator utilization. Decides target parallelism для каждого vertex."
+      >
+        observe + decide
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="compute target parallelism" />
+    <FlowRow>
+      <DataBox
+        label="Algorithm"
+        tooltip="busy time высокий + backpressure → scale up. busy time низкий, нет lag → scale down. Учитывает target utilization (e.g. 0.7), stabilization window, history of scaling actions, key group constraints."
+      >
+        scale up / down / no-op
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="REST API call" />
+    <FlowRow>
+      <DataBox
+        label="PATCH /jobs/{id}/rescale"
+        tooltip="Если есть Adaptive Scheduler + FLIP-291 → in-place rescale. Иначе fallback на savepoint-restart. Operator также может update FlinkDeployment spec для persistent change."
+      >
+        trigger rescale
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Adaptive Scheduler applies" />
+    <FlowRow>
+      <DataBox
+        label="Job at new parallelism"
+        tooltip="Tasks redistributed по key groups для нового parallelism. State реакомпонован через key group reassignment (без чтения из S3). Job RUNNING на новом parallelism за секунды."
+      >
+        rescaled in-place
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Метрики, которые watch-ит autoscaler
+
+Autoscaler собирает per-vertex (per-operator) metrics:
+
+| Metric | Что значит | Использование |
+|---|---|---|
+| **`busyTimeMsPerSecond`** | Время в operator-е занятого processing (не idle, не backpressure). 0-1000ms/sec | Главный сигнал utilization |
+| **`backPressuredTimeMsPerSecond`** | Время заблокирован downstream backpressure | Если высокий — downstream slow |
+| **`idleTimeMsPerSecond`** | Время ждать input | Если высокий — upstream slow / нет данных |
+| **`numRecordsInPerSecond`** / **`numRecordsOutPerSecond`** | Throughput | Расчёт rate-of-change |
+| **Kafka lag** | Per-partition consumer lag | Detect ingestion bottleneck |
+
+Идеально: `busyTime ≈ 700ms/sec` (70% utilization). Если выше → bottleneck → scale up. Если ниже → over-provisioned → scale down.
+
+---
+
+## Algorithm in nutshell
+
+Autoscaler делает per-vertex decision:
+
+```text
+for each operator vertex v:
+    busy = mean(busyTimeMsPerSecond над window)
+    backpressure = mean(backPressuredTimeMsPerSecond над window)
+
+    if busy + backpressure > scale-up-threshold:
+        # Operator занят на >70% или blocked downstream
+        new_parallelism[v] = current[v] * (busy / target_utilization)
+        new_parallelism[v] = min(new_parallelism[v], max_parallelism)
+    elif busy < scale-down-threshold:
+        # Operator слабо utilized
+        new_parallelism[v] = current[v] * (busy / target_utilization)
+        new_parallelism[v] = max(new_parallelism[v], min_parallelism)
+    else:
+        new_parallelism[v] = current[v]  # no change
+
+# Принимаем decision на основе всех vertices
+# Подгоняем к key group multiple если нужно
+```
+
+Per-vertex parallelism — feature autoscaler-а: разные operators могут иметь разный parallelism. Source может быть 4, processor 16, sink 8.
+
+---
+
+## In-place rescaling (FLIP-291): как работает
+
+При rescale 8 → 16:
+
+<DiagramContainer title="In-place rescale: state redistribution через key groups" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Before: parallelism=8, maxParallelism=128"
+        tooltip="128 key groups распределены по 8 subtasks → 16 groups per subtask. Subtask 0 владеет groups 0-15, Subtask 1 — 16-31, и т.д."
+      >
+        128 KGs / 8 subtasks
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rescale to 16" />
+    <FlowRow>
+      <DataBox
+        label="Stop tasks (briefly)"
+        tooltip="Все 8 subtasks pause-ят consumption из network. Last checkpoint barrier finalized. State on disk (in TaskManager managed memory + local disk for RocksDB)."
+      >
+        pause processing
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="redistribute key groups" />
+    <FlowRow>
+      <DataBox
+        label="Redistribute: 128 KGs → 16 subtasks"
+        tooltip="Каждый subtask теперь owns 8 key groups (128/16). State files reshuffled между TM-pods (если subtasks на разных TM): через DFS или direct TM-to-TM transfer."
+      >
+        8 KGs per subtask
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="restore state" />
+    <FlowRow>
+      <DataBox
+        label="Restore from last checkpoint"
+        tooltip="Каждый subtask читает свои 8 KGs из last completed checkpoint в DFS. RocksDB SST files downloaded если cross-TM movement. ForSt — state на S3, новый subtask просто reads тот же primary."
+      >
+        load 8 KGs
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="resume" />
+    <FlowRow>
+      <DataBox
+        label="After: parallelism=16"
+        tooltip="Job RUNNING на parallelism=16. Total downtime: 10-30 секунд (зависит от state size и DFS latency). Kafka consumer offsets resume с last checkpoint position."
+      >
+        16 subtasks active
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Ключевое отличие от savepoint-based rescale
+
+| Aspect | In-place rescale (FLIP-291) | Savepoint-based rescale |
+|---|---|---|
+| Trigger | REST PATCH /jobs/{id}/rescale | flink stop -s ... + flink run -s ... |
+| State snapshot | Last completed checkpoint reused | New savepoint created |
+| DFS writes | None (pointers reuse) | Full state copy → DFS |
+| Coordination | Adaptive Scheduler internal | External tooling (operator/CLI) |
+| Downtime | 10-30s | 2-10 минут |
+| Frequency feasible | Каждые 5-15 минут (autoscaler) | Раз в день максимум |
+
+In-place rescale **не создаёт savepoint** — он reuses last completed **checkpoint**. Это работает потому что checkpoint contains full state, key-group-aware. Adaptive Scheduler знает как перепаковать key groups по новому числу subtasks.
+
+---
+
+## Конфигурация в FlinkDeployment
+
+Полный production config:
+
+```yaml
+spec:
+  flinkConfiguration:
+    # 1. Adaptive Scheduler (PRE-requisite)
+    jobmanager.scheduler: adaptive
+    jobmanager.adaptive-scheduler.min-parallelism: "2"
+    jobmanager.adaptive-scheduler.max-parallelism: "32"
+
+    # 2. Autoscaler core
+    job.autoscaler.enabled: "true"
+    job.autoscaler.metrics.window: 5min                  # window для metrics collection
+    job.autoscaler.stabilization.interval: 5min          # wait после last scaling before next eval
+    job.autoscaler.scale-up.grace-period: 1min           # cooldown после scale up
+    job.autoscaler.scale-down.interval: 1h               # минимальный интервал между scale-downs
+
+    # 3. Target utilization
+    job.autoscaler.target.utilization: "0.7"             # 70% busy time target
+    job.autoscaler.target.utilization.boundary: "0.4"    # tolerance band ±20% (50%-90% no-op)
+
+    # 4. Vertex-specific (optional)
+    job.autoscaler.vertex.min-parallelism: "2"
+    job.autoscaler.vertex.max-parallelism: "200"
+
+    # 5. Key group constraints
+    job.autoscaler.parallelism.upper.boundary: "200"     # never exceed (also limited by maxParallelism)
+
+    # 6. History / metrics persistence (recommended)
+    job.autoscaler.history.max.count: 3
+    job.autoscaler.history.max.age: 7d
+
+    # 7. Memory autoscaling (1.18+)
+    job.autoscaler.memory.tuning.enabled: "true"
+    job.autoscaler.memory.tuning.overhead: "0.2"          # 20% headroom
+
+    # 8. Backpressure threshold
+    job.autoscaler.backpressure.ratio.threshold: "0.1"   # 10% backpressure = signal scale up
+```
+
+---
+
+## Stabilization windows: anti-flapping
+
+Без stabilization autoscaler flaps:
+- Traffic spike → scale up 8 → 16
+- Spike ended → scale down 16 → 8
+- Next spike → scale up 8 → 16
+- And so on
+
+`stabilization.interval` (default 5min) — autoscaler не делает scaling decisions чаще, чем раз в N минут. Это даёт metrics window stabilize.
+
+`scale-up.grace-period` (default 1min) — cooldown после scale up. Не делать ещё одно scale up в течение grace.
+
+`scale-down.interval` (default 1h) — минимум 1 час между scale downs. Conservative — мы хотим быть consistent у scale up (рост traffic) и careful у scale down (могут вернуться обратно скоро).
+
+```text
+Sweet spot для tuning:
+- HFT-like spiky traffic: window 1min, stabilization 2min (быстрая реакция, риск thrashing)
+- Standard streaming: window 5min, stabilization 5min, scale-down 1h (default)
+- Batch-like predictable: window 15min, stabilization 30min (smooth)
+```
+
+---
+
+## Memory autoscaling (1.18+)
+
+В addition к parallelism autoscaling, FLIP-271 (extension) supports memory tuning:
+
+- **Managed memory** — для RocksDB/ForSt cache. Если cache hit ratio низкий → bump managed memory.
+- **Network memory** — buffer count. Если backpressure без CPU bottleneck → бывает network buffers shortage.
+- **Heap memory** — для user code state (HashMapStateBackend) и Flink internals.
+
+```yaml
+job.autoscaler.memory.tuning.enabled: "true"
+job.autoscaler.memory.tuning.overhead: "0.2"
+job.autoscaler.memory.tuning.maximize-managed-memory: "true"
+```
+
+С `maximize-managed-memory: true` autoscaler даёт RocksDB как можно больше managed memory (после reserving heap/network). Для state-heavy jobs это огромный wins.
+
+---
+
+## Vertex-level autoscaling (per-operator)
+
+Per-vertex parallelism может быть different. Источник, processor, sink — разные characteristics.
+
+```text
+Example after autoscaling:
+
+  Kafka Source            (parallelism 4)
+       ↓
+  Filter (stateless)      (parallelism 4, chained с source)
+       ↓ keyBy(userId)
+  Stateful processor      (parallelism 16) ← bottleneck, scaled up
+       ↓
+  Sink Kafka              (parallelism 8)
+```
+
+Autoscaler видит per-vertex busy times, делает per-vertex decisions. Source может быть Kafka-partition-bounded (макс parallelism = number of partitions, e.g. 12). Processor unbounded (key-based). Sink — между.
+
+---
+
+## Production gotchas
+
+- **maxParallelism IMMUTABLE limits autoscaler** — если default 128 и хотите scale до 200, не можете. Set max-parallelism upfront (см. урок 14.5). Best practice: maxParallelism = 1024 при первом deploy для headroom.
+- **Autoscaler без Adaptive Scheduler** — silently no-op. Always check `jobmanager.scheduler: adaptive`.
+- **In-place rescale require FLIP-291 support** — Flink 1.18+ только. Pre-1.18 fallback на savepoint-restart (медленный). Check version.
+- **State backend matters** — ForSt с disaggregated state делает in-place rescale **очень быстрым** (state pointers reuse, не download). RocksDB local — нужно копировать SST files между TM pods.
+- **Backpressure ratio false positive** — если downstream Kafka sink slow (broker bottleneck), backpressure пропагируется upstream. Autoscaler пытается scale upstream — не поможет. Fix: scale downstream OR fix Kafka.
+- **Scale flapping без stabilization** — если traffic очень spiky (< stabilization interval), autoscaler не сможет адаптироваться. Используйте longer windows или manual override для spiky patterns.
+- **Kafka partition limit** — Kafka source parallelism = min(configured, number of partitions). Autoscaler знает это, но если вы set max-parallelism > partitions, autoscaler не пойдёт выше partitions.
+- **Scale to 0 не работает в Adaptive Scheduler** — min parallelism >= 1. Для full suspend используйте FlinkDeployment `spec.job.state: suspended`.
+- **Memory tuning + autoscaler conflict** — оба меняют resources. Можно увидеть взаимодействие. Лучше enable memory tuning только после parallelism autoscaling settled.
+
+<Callout type="warning">
+Autoscaler — мощный инструмент, но при misconfigured может вызвать downtime. Test thoroughly на staging: симулируйте traffic spikes, verify scaling decisions, monitor downtime. Production deploy с conservative parameters (longer stabilization, lower max-parallelism), затем tune.
+</Callout>
+
+<Callout type="tip">
+Killer combo 2026: **FLIP-271 Autoscaler + FLIP-291 In-place rescaling + ForSt disaggregated state**. ForSt делает state portable (на S3), autoscaler меняет parallelism через REST, in-place rescale делает migration без savepoint. End-to-end автоматическое cost optimization и elasticity. State backend = ForSt — это «glue», который делает остальное эффективным.
+</Callout>
+
+---
+
+## Observability autoscaler
+
+Operator exposes autoscaler events:
+
+```bash
+kubectl describe flinkdeployment fraud-detector
+
+Events:
+  Type     Reason                Age    From      Message
+  ----     ------                ----   ----      -------
+  Normal   AutoscalerEvaluation  5m     operator  Computed target parallelism: source=4, processor=8, sink=4
+  Normal   ScaleUp               5m     operator  Scaled processor 4 → 8 (busyTime: 850ms/s, target: 700ms/s)
+  Normal   AutoscalerEvaluation  10m    operator  Computed target parallelism: source=4, processor=8, sink=4 (stable)
+  Warning  CannotScale           15m    operator  Cannot scale processor beyond maxParallelism=128
+```
+
+Prometheus metrics:
+- `flink_autoscaler_scale_events_total` — counter scaling events
+- `flink_autoscaler_target_parallelism` — per-vertex target
+- `flink_autoscaler_metric_busy_time` — current metric
+
+Alert на:
+- `cannot_scale_max_parallelism` — нужно bump max-parallelism
+- `flap_rate_high` — частые scale up/down, tune stabilization
+- `target_utilization_consistently_high` — system перегружен
+
+---
+
+<KnowledgeCheck
+  question="Job на Adaptive Scheduler + Autoscaler. Traffic утром 100k events/s, parallelism держится 8. В 14:00 spike до 800k events/s длительностью 30 минут, потом обратно к 100k. Что autoscaler делает с default settings (window=5min, stabilization=5min, scale-down=1h)?"
+  answer="14:00 — spike начинается. Метрики начинают собираться в 5min window: busy time растёт. 14:05 — window full, метрики показывают высокий busy time (~900ms/s) и backpressure. Autoscaler computes target = 8 × (900/700) ≈ 10. Scale up до 10. Stabilization 5min — wait. 14:10 — следующий evaluation. Если spike продолжается, autoscaler видит что 10 всё ещё перегружено → scale до 13-14. И так далее. К 14:25 параллелизм может быть 16-20 (зависит от spike intensity). 14:30 — spike закончился. busy time падает до low. НО scale-down.interval=1h означает autoscaler НЕ будет делать scale down ещё час. Job работает с over-provisioned parallelism до 15:30. 15:30 — scale-down eligible. Метрики window 5min показывают low utilization. Autoscaler computes target = 8. Scale down до 8 in-place. Total scale up time ~25min (reactive), total over-provision ~1h после spike. Это conservative behavior — preference correctness over cost. Для более agile reaction: reduce stabilization (5min → 2min) и scale-down.interval (1h → 15min), accepting risk of flapping. Best for spiky workloads: longer windows (10-15min) для detection, но shorter stabilization. Для truly bursty (5-min spikes), autoscaler не подходит — use static provisioning."
+/>

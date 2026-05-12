@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/06-adaptive-scheduler",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-06",
+    "description": "Quiz for Adaptive Scheduler lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-06-q1",
+      "type": "multiple-choice",
+      "question": "В чём фундаментальное отличие Adaptive Scheduler от Default Scheduler?",
+      "options": [
+        { "id": "a", "text": "Adaptive быстрее обрабатывает события" },
+        { "id": "b", "text": "Default — eager (all-or-nothing slots, фиксированный parallelism). Adaptive — lazy (range [min, max], стартует с min available slots, in-place rescale при изменении ресурсов)" },
+        { "id": "c", "text": "Adaptive только для batch, Default только для streaming" },
+        { "id": "d", "text": "Никакого реального отличия — синонимы" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Default Scheduler: eager scheduling — все N slots должны быть доступны до начала. Parallelism фиксирован при submission. Rescale = stop with savepoint + restart. Adaptive Scheduler: lazy — стартует когда есть min-parallelism slots. Range [min, max] с desired. In-place rescale (FLIP-291) без savepoint. Slot loss → rescale down вместо CRASH. Adaptive — pre-requisite для autoscaler (FLIP-271).",
+      "studyHint": "Повторите урок — Comparison + Default Scheduler / Adaptive Scheduler секции",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-06-q2",
+      "type": "multiple-choice",
+      "question": "Job на Adaptive: min=4, max=16, desired=8. В cluster 6 slots. Что произойдёт?",
+      "options": [
+        { "id": "a", "text": "Job FAILED — недостаточно slots" },
+        { "id": "b", "text": "Job стартует с parallelism=6 (>= min). Background — запрашивает ещё 2 до desired. Если в timeout не получит — продолжает на 6" },
+        { "id": "c", "text": "Job ждёт пока появятся 8 slots, ничего не делая" },
+        { "id": "d", "text": "Job стартует с parallelism=16 (max)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Adaptive Scheduler философия 'use what you have'. 6 >= min(4) → OK, стартует с parallelism=6. ResourceManager продолжает request ещё 2 slots до desired=8. Если появятся — in-place rescale up. Если нет (resource-wait-timeout, default 5min) — продолжает на 6. Default Scheduler в этой ситуации FAILED. Если бы было 3 slots (< min): wait до timeout, потом FAILED.",
+      "studyHint": "Повторите урок — Slot allocation: что значит 'min-parallelism'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-06-q3",
+      "type": "multiple-choice",
+      "question": "TM crash — потеряны 4 из 8 slots. Поведение Default vs Adaptive Scheduler?",
+      "options": [
+        { "id": "a", "text": "Default: graceful rescale до 4. Adaptive: CRASH" },
+        { "id": "b", "text": "Default: CRASH (нужно 8 slots, есть 4) → ждёт RM провизионирования новых → recovery с last checkpoint, 30-90s downtime. Adaptive: rescale down до 4 (если >= min), recovery state с parallelism=4, no full crash" },
+        { "id": "c", "text": "Оба ведут себя одинаково" },
+        { "id": "d", "text": "Adaptive создаёт новый TM мгновенно" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Default Scheduler: parallelism фиксирован на 8. Lost 4 slots → нет ресурсов для tasks → CRASH. JM просит RM провизионировать новые TM, K8s создаёт pod (30-90s), recovery с last checkpoint. Downtime substantial. Adaptive Scheduler: видит lost slots, considers rescale. Если 4 >= min-parallelism → rescale down до 4 in-place. Recovery с parallelism=4 (state редистрибуируется по new key groups). Когда RM создаст новый TM — rescale up. Total downtime <30s. Adaptive более resilient.",
+      "studyHint": "Повторите урок — Адаптация на runtime: пример",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m13-06-q4",
+      "type": "true-false",
+      "question": "Reactive Mode (Flink 1.13) — это proto-autoscaler, deprecated и заменён Adaptive Scheduler + FLIP-271 Autoscaler в production deployments.",
+      "correctAnswer": true,
+      "explanation": "True. Reactive Mode был экспериментом в 1.13 для автоматического использования всех available slots (proto-autoscaler). В 1.18+ заменён более mature stack: Adaptive Scheduler (FLIP-160) + Autoscaler (FLIP-271). Reactive Mode deprecated. Не используйте `scheduler-mode: reactive` в новых deployments — legacy path. Modern config: `jobmanager.scheduler: adaptive` + `job.autoscaler.enabled: true`.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

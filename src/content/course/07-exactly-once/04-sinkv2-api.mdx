@@ -1,0 +1,472 @@
+---
+title: "SinkV2 API — анатомия (FLIP-191)"
+description: "Sink factory, SinkWriter, Committer, SupportsPreCommitTopology, SupportsPostCommitTopology. Custom transactional sink"
+order: 4
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["SinkV2", "FLIP-191", "Committer", "PreCommitTopology", "PostCommitTopology"]
+---
+
+# SinkV2 API — анатомия (FLIP-191)
+
+SinkV2 — современный API для приёмников в Flink, заменивший `TwoPhaseCommitSinkFunction` (deprecated в 1.x, removed в 2.0) и старый `SinkFunction`. Дизайн отделяет три ответственности: запись данных в течение checkpoint cycle, commit пакетов между Writer и Committer (для compaction), и post-commit topology (для catalog updates типа Iceberg manifest). Этот урок препарирует API на уровне интерфейсов и показывает custom transactional sink.
+
+Ключевая идея SinkV2 — `Committer` — это **отдельный operator** в Flink graph, не часть SinkWriter. Это позволяет повторно использовать committer для retry, балансировать commit load и встраивать compaction/aggregation между write и commit.
+
+---
+
+## Архитектура SinkV2
+
+<DiagramContainer title="SinkV2 — operator chain" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Upstream operator"
+        tooltip="Любой DataStream operator — keyBy, process, window. Эмитит records в Sink."
+      >
+        records → sink
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="SinkWriter (parallel N)"
+        tooltip="Создаётся через Sink.createWriter(). Принимает records, буферизует их в открытую транзакцию. На barrier — prepareCommit() emit-ит Committable объекты в downstream. Operator state восстанавливается после crash."
+      >
+        write() + prepareCommit() → Committables
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Committable stream" />
+    <FlowRow>
+      <DataBox
+        label="(Optional) PreCommitTopology"
+        tooltip="Если sink implements SupportsPreCommitTopology, между Writer и Committer вставляется DataStream transformation. Используется для compaction (объединить мелкие файлы), aggregation, дедупликации Committables."
+      >
+        addPreCommitTopology() → transformed
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Committer (parallel M)"
+        tooltip="Создаётся через TwoPhaseCommittingSink.createCommitter(). Получает Committable через downstream. На notifyCheckpointComplete(N) — commit() финализирует транзакции. Может иметь other parallelism чем Writer."
+      >
+        commit() → external finalize
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="(Optional) PostCommitTopology"
+        tooltip="Если sink implements SupportsPostCommitTopology, после Committer вставляется terminal DataStream. Используется для Iceberg manifest publish, Hive metastore update, broadcast уведомления downstream consumers."
+      >
+        addPostCommitTopology() → catalog
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Три ключевые мысли:
+1. **Decomposition** — Writer и Committer разделены, могут иметь разный parallelism.
+2. **Extensible** — pre-/post-commit topology — это full DataStream API между ними.
+3. **Stateful** — каждый operator может иметь свой state.
+
+---
+
+## Базовый интерфейс — Sink
+
+```java
+package org.apache.flink.api.connector.sink2;
+
+public interface Sink<InputT> extends Serializable {
+    SinkWriter<InputT> createWriter(WriterInitContext context) throws IOException;
+}
+```
+
+Это минимум. Без committer — это **at-least-once sink** (records flushed, но не транзакционно). Пример: `print()`, простой HTTP sink.
+
+### SinkWriter
+
+```java
+public interface SinkWriter<InputT> extends AutoCloseable {
+
+    void write(InputT element, Context context) throws IOException, InterruptedException;
+
+    void flush(boolean endOfInput) throws IOException, InterruptedException;
+    // Вызывается перед close или на endOfInput (batch).
+    // Для streaming sink — flushes без commit.
+
+    @Override
+    void close() throws Exception;
+}
+```
+
+Контекст содержит `currentWatermark`, `timestamp()`, `currentProcessingTime()` — sink может использовать их для bucketing (per-time directories в FileSink).
+
+---
+
+## Транзакционный sink — TwoPhaseCommittingSink
+
+```java
+public interface TwoPhaseCommittingSink<InputT, CommittableT>
+        extends Sink<InputT> {
+
+    @Override
+    PrecommittingSinkWriter<InputT, CommittableT> createWriter(WriterInitContext ctx);
+
+    Committer<CommittableT> createCommitter(CommitterInitContext ctx);
+
+    SimpleVersionedSerializer<CommittableT> getCommittableSerializer();
+}
+
+public interface PrecommittingSinkWriter<InputT, CommittableT>
+        extends SinkWriter<InputT> {
+
+    Collection<CommittableT> prepareCommit() throws IOException, InterruptedException;
+    // Вызывается на barrier. Flush external, emit committables в downstream operator.
+}
+```
+
+### Committer
+
+```java
+public interface Committer<CommittableT> extends AutoCloseable {
+
+    void commit(Collection<CommitRequest<CommittableT>> committables)
+        throws IOException, InterruptedException;
+}
+
+public interface CommitRequest<CommittableT> {
+    CommittableT getCommittable();
+    int getNumberOfRetries();
+    void signalFailedWithKnownReason(Throwable t);
+    void signalFailedWithUnknownReason(Throwable t);
+    void retryLater();
+    void updateAndRetryLater(CommittableT updated);
+    void signalAlreadyCommitted();
+}
+```
+
+`Committer.commit()` вызывается через `notifyCheckpointComplete(N)`. `CommitRequest` даёт control над retry semantics — три ответа:
+- `success` (просто вернуться) — committable считается committed.
+- `retryLater()` — будет retry на следующем `notifyCheckpointComplete`.
+- `signalFailed*()` — fatal, job fails.
+
+---
+
+## StatefulSinkWriter — для recovery
+
+```java
+public interface StatefulSinkWriter<InputT, WriterStateT>
+        extends SinkWriter<InputT> {
+
+    List<WriterStateT> snapshotState(long checkpointId) throws IOException;
+}
+
+public interface SupportsWriterState<InputT, WriterStateT> extends Sink<InputT> {
+    @Override
+    StatefulSinkWriter<InputT, WriterStateT> createWriter(WriterInitContext ctx);
+
+    StatefulSinkWriter<InputT, WriterStateT> restoreWriter(
+        WriterInitContext ctx, Collection<WriterStateT> recoveredState);
+
+    SimpleVersionedSerializer<WriterStateT> getWriterStateSerializer();
+}
+```
+
+После crash Flink вызывает `restoreWriter(ctx, recoveredState)` — sink может восстановить **активные** транзакции (для abort) и **pending** committables (для re-commit). Это backbone recovery scenario.
+
+---
+
+## SupportsPreCommitTopology — small file compaction
+
+```java
+public interface SupportsPreCommitTopology<WriterResultT, CommittableT>
+        extends TwoPhaseCommittingSink<InputT, CommittableT> {
+
+    DataStream<CommittableT> addPreCommitTopology(DataStream<WriterResultT> writerResult);
+
+    SimpleVersionedSerializer<WriterResultT> getWriteResultSerializer();
+}
+```
+
+Пример use case — **FileSink с small file compaction**. SinkWriter записывает 64MB Parquet файлы (по rolling policy). Между Writer и Committer вставляется:
+
+```java
+@Override
+public DataStream<CommittableT> addPreCommitTopology(DataStream<WriterResultT> stream) {
+    return stream
+        .keyBy(WriterResult::getBucketPath)         // group by bucket
+        .window(GlobalWindows.create())
+        .trigger(CountTrigger.of(10))                // когда 10 files в одном bucket
+        .process(new CompactionProcessFunction());   // merge в один большой file
+}
+```
+
+Результат — `Committer` финализирует **уже compacted** файлы. Меньше manifest entries в Iceberg, меньше small files в S3.
+
+`writerResult` — что **Writer** emit-ит (может отличаться от final `CommittableT`). Pre-commit topology transforms write results в committables.
+
+---
+
+## SupportsPostCommitTopology — Iceberg manifest
+
+```java
+public interface SupportsPostCommitTopology<CommittableT>
+        extends TwoPhaseCommittingSink<InputT, CommittableT> {
+
+    void addPostCommitTopology(DataStream<CommittableT> committables);
+}
+```
+
+После Committer — terminal DataStream operator. Use cases:
+
+- **Iceberg manifest publish** — после commit data files в Iceberg metadata layer, нужно publish manifest list и update catalog.
+- **Hive metastore update** — register new partition.
+- **Broadcast notification** — пользовательский telegram bot «new data dropped».
+
+```java
+@Override
+public void addPostCommitTopology(DataStream<CommittableT> committed) {
+    committed
+        .global()                                // single subtask чтобы catalog не race-ил
+        .process(new IcebergManifestPublisher())
+        .name("iceberg-manifest-publish");
+}
+```
+
+---
+
+## Custom transactional sink — пример
+
+Custom JDBC sink с idempotent UPSERT по PK. Не настоящий 2PC — но показывает SinkV2 структуру.
+
+```java
+public class IdempotentJdbcSink<T extends WithPrimaryKey>
+        implements TwoPhaseCommittingSink<T, JdbcCommittable>,
+                   SupportsWriterState<T, JdbcWriterState> {
+
+    private final String url;
+    private final String upsertSql;
+    private final JdbcStatementBuilder<T> stmtBuilder;
+
+    @Override
+    public PrecommittingSinkWriter<T, JdbcCommittable> createWriter(WriterInitContext ctx) {
+        return new JdbcWriter(url, upsertSql, stmtBuilder);
+    }
+
+    @Override
+    public Committer<JdbcCommittable> createCommitter(CommitterInitContext ctx) {
+        return new JdbcCommitter(url);
+    }
+
+    @Override
+    public SimpleVersionedSerializer<JdbcCommittable> getCommittableSerializer() {
+        return new JdbcCommittableSerializer();
+    }
+
+    // === SinkWriter ===
+    static class JdbcWriter implements PrecommittingSinkWriter<T, JdbcCommittable> {
+
+        private Connection conn;
+        private PreparedStatement stmt;
+        private long batchSize = 0;
+        private final String batchId; // unique per checkpoint
+
+        JdbcWriter(String url, String sql, JdbcStatementBuilder<T> b) throws SQLException {
+            this.conn = DriverManager.getConnection(url);
+            this.conn.setAutoCommit(false);
+            this.stmt = conn.prepareStatement(sql);
+            this.batchId = UUID.randomUUID().toString();
+        }
+
+        @Override
+        public void write(T element, Context ctx) throws IOException {
+            try {
+                stmtBuilder.accept(stmt, element);
+                stmt.addBatch();
+                batchSize++;
+            } catch (SQLException e) {
+                throw new IOException(e);
+            }
+        }
+
+        @Override
+        public Collection<JdbcCommittable> prepareCommit() throws IOException {
+            try {
+                stmt.executeBatch();   // flush UPSERTs
+                // Не commit здесь! Committable пойдёт downstream
+                JdbcCommittable committable = new JdbcCommittable(batchId, batchSize);
+                conn.commit();          // idempotent UPSERT — можно commit сразу
+                return List.of(committable);
+            } catch (SQLException e) {
+                throw new IOException(e);
+            }
+        }
+
+        @Override
+        public void flush(boolean endOfInput) {}
+
+        @Override
+        public void close() throws Exception {
+            stmt.close();
+            conn.close();
+        }
+    }
+
+    // === Committer ===
+    static class JdbcCommitter implements Committer<JdbcCommittable> {
+
+        @Override
+        public void commit(Collection<CommitRequest<JdbcCommittable>> commits) {
+            for (CommitRequest<JdbcCommittable> req : commits) {
+                // Idempotent UPSERT уже выполнен в writer — commit здесь no-op
+                // (для full 2PC здесь был бы PREPARE + COMMIT XA transaction)
+            }
+        }
+
+        @Override
+        public void close() {}
+    }
+}
+```
+
+Полный 2PC с XA выглядел бы так:
+
+```java
+@Override
+public Collection<JdbcCommittable> prepareCommit() throws IOException, SQLException {
+    XAConnection xaConn = xaDataSource.getXAConnection();
+    XAResource xa = xaConn.getXAResource();
+    Xid xid = new XidImpl(UUID.randomUUID());
+
+    xa.start(xid, XAResource.TMNOFLAGS);
+    // ... write all batch records
+    xa.end(xid, XAResource.TMSUCCESS);
+    xa.prepare(xid);   // ← phase 1: prepared, не committed
+
+    return List.of(new JdbcXaCommittable(xid));
+}
+
+// В Committer:
+@Override
+public void commit(Collection<CommitRequest<JdbcXaCommittable>> commits) {
+    for (CommitRequest<JdbcXaCommittable> req : commits) {
+        try {
+            xaResource.commit(req.getCommittable().xid, false); // ← phase 2
+        } catch (XAException e) {
+            if (e.errorCode == XAException.XAER_NOTA) {
+                req.signalAlreadyCommitted(); // idempotent
+            } else {
+                req.retryLater();
+            }
+        }
+    }
+}
+```
+
+---
+
+## Сравнение со старым API
+
+| Aspect | SinkFunction (legacy) | TwoPhaseCommitSinkFunction (1.x) | SinkV2 (2.x) |
+|---|---|---|---|
+| Status | removed в 2.0 | deprecated | actual |
+| Decomposition | All in one class | Subclass с 4 abstract methods | Multiple interfaces |
+| Commit operator | none | same operator as writer | separate Committer operator |
+| Pre-commit topology | ❌ | ❌ | ✅ |
+| Post-commit topology | ❌ | ❌ | ✅ |
+| Async I/O | manual via RichSinkFunction | manual | первоклассно через AsyncSinkBase (FLIP-171) |
+| State management | OperatorState через `CheckpointedFunction` | через `state` field | через `SupportsWriterState` |
+| Retry control | manual | manual | через `CommitRequest` |
+
+---
+
+## AsyncSinkBase (FLIP-171)
+
+Подмножество SinkV2 для async batching sinks (Kinesis, DynamoDB, HTTP). Не транзакционен (at-least-once), но даёт:
+
+- Async batching с back-pressure
+- Built-in retry с exponential backoff
+- Buffer size + flush timeout
+- Backpressure через mailbox
+
+```java
+public class KinesisSink<T> extends AsyncSinkBase<T, PutRecordsRequestEntry> {
+    @Override
+    public AsyncSinkWriter<T, PutRecordsRequestEntry> createWriter(WriterInitContext ctx) {
+        return new KinesisAsyncSinkWriter(...);
+    }
+}
+```
+
+Используется когда: at-least-once OK, external system имеет batch API, нужен built-in rate limiting.
+
+---
+
+## Production gotchas
+
+### 1. Committer parallelism vs Writer parallelism
+
+По умолчанию Committer has **same parallelism** как Writer. Можно изменить — но осторожно: если Committer parallelism < Writer, committables shuffled через keyBy (Flink определяет sharding key). Это может нарушить commit order гарантии.
+
+**Fix**: оставлять default unless у вас precise use case (e.g., global commit для Hive metastore).
+
+### 2. Committable Serializer + versioning
+
+`SimpleVersionedSerializer.getVersion()` критичен для savepoint upgrade. Если вы меняете committable schema без version bump — после upgrade Flink не сможет десериализовать old committables → recovery fails.
+
+**Fix**: всегда bump version при изменении schema, implement `migrate()` method для версионирования.
+
+### 3. CommitRequest.retryLater() — может infinite loop
+
+Если committer всегда возвращает `retryLater`, Flink **никогда** не advance checkpoint pointer. State растёт unbounded, pending committables aggregate.
+
+**Fix**: реализовать max retry counter в committer state, после N retries → `signalFailedWithKnownReason`. Также alert на `numberOfRetries > threshold`.
+
+### 4. PreCommitTopology создаёт new keyed state — savepoint compat
+
+Если добавляете `SupportsPreCommitTopology` в existing sink без version bump, savepoint от старой версии не имеет state для нового operator → restore fails.
+
+**Fix**: SinkV2 имеет `getSinkVersion()`, использовать его для backward compat. Либо restart from scratch (savepoint reset).
+
+### 5. PostCommitTopology — не EOS!
+
+Operations в post-commit topology выполняются **after** sink commit. Если post-commit operator падает — commit уже finalized. State recovery приведёт к **повторному** запуску post-commit для committed транзакций → side effects дублируются.
+
+**Fix**: post-commit должен быть idempotent. Iceberg manifest publish — идемпотентен (manifest UUID). Telegram notification — нет.
+
+### 6. Mixing SinkFunction (legacy) и SinkV2 в одном job
+
+При миграции иногда смешивают: некоторые sink ещё на старом API. Это OK, но `enableCheckpointing` settings одинаковы для всех — EOS guarantees зависят от каждого sink отдельно.
+
+**Fix**: проверять `setDeliveryGuarantee` каждого sink, audit при upgrade.
+
+---
+
+## Cheat sheet
+
+```
+Sink<T>                       — at-least-once minimum
+  └─ createWriter()           — emit records to external
+
+TwoPhaseCommittingSink<T,C>   — EOS via 2PC
+  ├─ createWriter()           — emit + prepareCommit()
+  └─ createCommitter()        — commit(C) on notifyCheckpointComplete
+
+SupportsWriterState<T,S>      — для recovery
+  └─ restoreWriter(state)     — abort активные txns, re-emit pending committables
+
+SupportsPreCommitTopology<W,C>   — compaction / dedup
+  └─ addPreCommitTopology(W) → C
+
+SupportsPostCommitTopology<C>    — catalog publish
+  └─ addPostCommitTopology(C) → terminal
+```
+
+---
+
+<KnowledgeCheck
+  question="У вас Iceberg sink с SinkV2. На production видите: SinkWriter parallelism 32, Committer parallelism 32, Iceberg manifests содержат тысячи мелких parquet файлов (avg 4MB). Query engine жалуется на slow scan. Как использовать SinkV2 API для решения?"
+  answer="Это classic small file problem. Решение через **SupportsPreCommitTopology** для compaction между SinkWriter и Committer. Иmplementation: (1) Writer emit-ит `WriterResult` с path + size + bucket key. (2) В `addPreCommitTopology` сделать `keyBy(bucket)` + `windowAll(TumblingProcessingTimeWindows.of(5min))` + ProcessWindowFunction который compactит файлы в одном bucket. (3) ProcessWindowFunction открывает new Parquet writer, читает все small files в bucket, пишет один большой (target 128-256MB), возвращает new committable с large file path. (4) Committer финализирует уже compacted файлы — Iceberg manifest получает много меньше entries. Альтернативы: (a) увеличить Writer batch size перед flush (RollingPolicy.size = 256MB, time = 10min) — простой fix, но latency высокая; (b) post-hoc compaction через отдельный Iceberg rewrite_files procedure — separate batch job; (c) использовать Paimon вместо Iceberg — у него nested compaction встроенный. Best practice для Iceberg streaming sink — pre-commit topology + Committer parallelism сниженный (е.g., 4) для меньшего fanout манифестов. Дополнительно: после Committer добавить **SupportsPostCommitTopology** для async manifest list compaction (Iceberg rewrite_manifests)."
+/>

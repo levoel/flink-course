@@ -1,0 +1,370 @@
+---
+title: "Watermark propagation: MIN rule, idle sources, multi-input merging"
+description: "Как watermark течёт через DAG. MIN(input watermarks) propagation rule. Idle source pitfall. Multi-input merging для join, union, connect."
+order: 4
+difficulty: "advanced"
+estimatedTime: 25
+topics: ["Watermark Propagation", "MIN Rule", "Multi-input", "Idle Detection", "DAG"]
+---
+
+# Watermark propagation: как время «течёт» через DAG
+
+Watermark — не просто метка времени, это распределённое consensus решение: «все TaskManager-ы согласились, что времена до T прошли». Это consensus реализуется через простое правило MIN — но именно это правило причина 80% production проблем со stuck watermark.
+
+Этот урок объясняет propagation алгоритм, разбирает классические pitfalls и показывает, как Flink Web UI помогает диагностировать stuck watermark.
+
+---
+
+## MIN propagation rule
+
+<DiagramContainer title="Watermark propagation через operator с N inputs" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Input 1: WM = 100"
+        tooltip="Upstream channel 1 эмитит watermark T=100. Может быть upstream subtask (после shuffle) или partition source (FLIP-27 per-partition watermark)."
+      >
+        WM(in1) = 100
+      </DataBox>
+      <DataBox
+        label="Input 2: WM = 80"
+        tooltip="Channel 2 отстает по watermark — может быть медленный subtask, slow partition или просто другой темп events."
+      >
+        WM(in2) = 80
+      </DataBox>
+      <DataBox
+        label="Input 3: WM = 120"
+        tooltip="Channel 3 ушёл вперёд. Не значит, что эти события были обработаны быстрее — значит, в этом channel есть событие с timestamp >= 120 + outOfOrderness."
+      >
+        WM(in3) = 120
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Operator вычисляет current input watermark" />
+    <FlowRow>
+      <DataBox
+        label="currentInputWatermark = MIN(100, 80, 120) = 80"
+        tooltip="Это безопасная нижняя граница. Если оператор объявит WM=120, события с ts=85 с input 2 будут late. WM=80 гарантирует корректность: события с ts < 80 ещё могут прийти только с input 2, но WM(in2)=80 значит — не могут."
+      >
+        Min input WM
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Operator emits output WM (≤ input WM)" />
+    <FlowRow>
+      <DataBox
+        label="Output WM = 80"
+        tooltip="Output watermark = MIN(input watermark, current event time). Для большинства operator-ов output WM = input WM. Window operator может задержать output WM до закрытия окна. Custom KeyedProcessFunction может через ctx.output() выставлять output WM."
+      >
+        WM out = 80
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Псевдокод propagation
+
+```java
+// Внутри AbstractStreamOperator
+private long[] inputWatermarks;   // per input channel
+private long currentWatermark = Long.MIN_VALUE;
+
+void processWatermark(Watermark wm, int inputIndex) {
+    inputWatermarks[inputIndex] = wm.getTimestamp();
+
+    long newMin = computeMin(inputWatermarks);   // MIN excluding idle
+    if (newMin > currentWatermark) {
+        currentWatermark = newMin;
+        // fire event-time timers
+        timerService.advanceWatermark(newMin);
+        // emit downstream
+        output.emitWatermark(new Watermark(newMin));
+    }
+}
+```
+
+**Ключевые моменты**:
+1. Watermark только **монотонно растёт**. Если пришёл WM = 50, когда current = 80 — игнорируется
+2. **Idle channels исключаются** из MIN (если markIdle вызван)
+3. Output WM emit-ится только при изменении MIN — не на каждый input WM
+4. **Event-time timers** fire когда WM пересекает их threshold
+
+---
+
+## Idle source pitfall — самая частая проблема
+
+### Сценарий
+
+Kafka topic с 4 partitions. 3 активные, 1 idle (legacy partition без traffic):
+
+```
+Partition 0:  WM = 1000  (live)
+Partition 1:  WM = 1100  (live)
+Partition 2:  WM = 980   (live)
+Partition 3:  WM = Long.MIN_VALUE  (idle, no events)
+```
+
+MIN(1000, 1100, 980, Long.MIN_VALUE) = **Long.MIN_VALUE**
+
+→ Operator downstream видит WM = `Long.MIN_VALUE` → окна никогда не закрываются.
+
+### Решение: `withIdleness(Duration)`
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withIdleness(Duration.ofMinutes(1));
+```
+
+Через минуту без events partition emit-ит `output.markIdle()`. Downstream MIN исключает idle channels:
+
+```
+Partition 0:  WM = 1000  (live)
+Partition 1:  WM = 1100  (live)
+Partition 2:  WM = 980   (live)
+Partition 3:  IDLE       (excluded from MIN)
+```
+
+MIN(active only) = MIN(1000, 1100, 980) = **980** → watermark двигается.
+
+### Resurrection problem
+
+Если idle partition «просыпается» через 30 минут с timestamp = 1500 (далеко в прошлом относительно current WM = 1800):
+- Этот event считается **late**
+- Если есть `.allowedLateness()` — попадает в late side output
+- Без allowed lateness — silently dropped
+
+Production правило: **всегда** комбинация `.withIdleness()` + `.allowedLateness()` + `.sideOutputLateData()` для critical pipelines.
+
+---
+
+## Multi-input operators: union, connect, join
+
+### Union (same type)
+
+`stream1.union(stream2)` — все inputs одного типа. Output WM = MIN(WM streams):
+
+```java
+DataStream<Event> merged = stream1.union(stream2, stream3);
+// WM(merged) = MIN(WM(s1), WM(s2), WM(s3))
+```
+
+Если stream2 idle, нужен withIdleness на каждой union ветке.
+
+### Connect (different types)
+
+`stream1.connect(stream2)` — два потока разных типов в одном operator-е (`CoProcessFunction`). У operator-а **два input watermarks**, output WM = MIN:
+
+```java
+ConnectedStreams<Order, Inventory> cs = orders.connect(inventory);
+
+cs.keyBy(o -> o.productId, i -> i.productId)
+  .process(new CoProcessFunction<Order, Inventory, Match>() {
+      public void processElement1(Order order, Context ctx, Collector out) {
+          // event-time timer fires когда MIN(WM_order, WM_inventory) > timer
+      }
+
+      public void processElement2(Inventory inv, Context ctx, Collector out) {
+          ...
+      }
+  });
+```
+
+### Interval join
+
+`stream1.intervalJoin(stream2)` — temporal join по event time. Output WM = MIN(WM streams) — sane safety boundary.
+
+```java
+orders.keyBy(Order::getCustomerId)
+    .intervalJoin(payments.keyBy(Payment::getCustomerId))
+    .between(Time.minutes(-5), Time.minutes(5))    // join window
+    .process(new ProcessJoinFunction<Order, Payment, Match>() { ... });
+```
+
+При WM(orders) = 1000 и WM(payments) = 800, output WM = 800 — потому что order с ts=900 может ещё прийти и join с уже-прошедшим payment.
+
+### Window join
+
+`stream1.join(stream2).where(...).equalTo(...).window(...)` — join только событий в одном окне. Window закрывается когда WM > window.end.
+
+---
+
+## Propagation через keyBy и shuffle
+
+После `keyBy()` Flink делает **shuffle** — записи перераспределяются по hash(key). Watermark тоже broadcast-ится на ВСЕ downstream subtasks:
+
+<DiagramContainer title="Watermark broadcast после keyBy" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Source A: WM=100"
+        tooltip="Один upstream subtask. Эмитит watermark и data records."
+      >
+        Upstream subtask 1
+      </DataBox>
+      <DataBox
+        label="Source B: WM=120"
+        tooltip="Параллельный upstream subtask. Свой watermark, свой rate."
+      >
+        Upstream subtask 2
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="keyBy → broadcast WM на каждый downstream" />
+    <FlowRow>
+      <DataBox
+        label="Downstream 1"
+        tooltip="Получает WM от обоих upstreams (broadcast). MIN(100, 120) = 100. Свои keyed state. Один из N subtasks после keyBy."
+      >
+        WM in = MIN(100, 120) = 100
+      </DataBox>
+      <DataBox
+        label="Downstream 2"
+        tooltip="То же что downstream 1. Каждый получает все upstream WM."
+      >
+        WM in = 100
+      </DataBox>
+      <DataBox
+        label="Downstream N"
+        tooltip="Все downstream subtasks получают идентичный watermark stream от upstream-ов."
+      >
+        WM in = 100
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+**Важно**: watermarks broadcast-ятся, data — partition по hash(key). Это разная семантика propagation:
+
+```
+keyBy(userId):
+  data records → partition по hash(userId) % N
+  watermarks   → broadcast на все N
+```
+
+Это означает: даже если один key всегда идёт в downstream subtask 3, watermark от source проходит через все downstream subtasks.
+
+### Forward / hash / rebalance — все одинаково для WM
+
+Watermark propagation одинаково для всех partitioning стратегий: `forward()`, `keyBy()`, `rebalance()`, `broadcast()`. Это потому что watermark — глобальное consensus, не keyed.
+
+---
+
+## currentInputWatermark vs currentOutputWatermark в Web UI
+
+Flink Web UI показывает per-operator метрики:
+
+| Метрика | Значение |
+|---|---|
+| `currentInputWatermark` | MIN(WM от всех upstream channels) |
+| `currentOutputWatermark` | WM, который operator emit-ит downstream |
+| `numLateRecordsDropped` | Сколько записей dropped как late (не в allowed lateness) |
+
+**Диагностика stuck watermark**:
+
+1. Идём по DAG сверху вниз
+2. Находим operator, где `currentInputWatermark` = `Long.MIN_VALUE` (`-9223372036854775808`)
+3. Проверяем его upstream-ы — кто не emit-ит WM?
+
+Типичные причины:
+- Source без TimestampAssigner → noWatermarks() applied → WM = Long.MIN_VALUE
+- Idle source без `withIdleness`
+- Custom operator переопределил `processWatermark()` без emit downstream
+
+---
+
+## Window operator: hold WM до закрытия окна
+
+Window operator **задерживает** output WM до момента emit окна:
+
+```
+Window [10:00, 10:05):
+  WM input = 10:04:50  → output WM forward = 10:04:50 (или меньше)
+  WM input = 10:05:00  → window fires → output WM = 10:05:00
+  WM input = 10:05:30  → output WM = 10:05:30
+```
+
+**Tricky case**: с allowedLateness, окно не «закрывается» полностью на WM > windowEnd:
+
+```java
+.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+.allowedLateness(Duration.ofMinutes(2))
+```
+
+Window state удерживается до WM > windowEnd + allowedLateness. Output WM может быть = windowEnd, но окно ещё «живо» для late events.
+
+---
+
+## Production gotchas
+
+### 1. Кastom CoProcessFunction обнуляет WM
+
+Если вы пишете custom operator с двумя inputs, и забыли вызвать `output.emitWatermark()` — downstream получит `Long.MIN_VALUE`. Все windows застрянут.
+
+```java
+public class MyCoProcessor extends CoProcessFunction<A, B, C> {
+    public void processElement1(A a, Context ctx, Collector out) { ... }
+    public void processElement2(B b, Context ctx, Collector out) { ... }
+
+    // ❌ Если не переопределить — default OK, использует MIN inputs
+    // ❌ Если переопределить и не emit — WM tanks
+}
+```
+
+В большинстве случаев **не override** processWatermark, default behaviour корректен.
+
+### 2. Idle detection on downstream operator (не только source)
+
+`withIdleness` работает только на source-level (WatermarkStrategy). Если у вас downstream operator с conditional output (например, filter, который отбрасывает 95% events), output может стать «idle» на period, но не помечается markIdle. Flink в 1.16+ добавил sub-task idleness detection (`taskmanager.network.detailed-metrics`).
+
+### 3. Watermark скачет назад
+
+Watermark должен монотонно расти. Если custom WatermarkGenerator emit-ит WM < lastEmittedWM — Flink игнорирует (но logs warning). Если игнорирует много — это bug в generator. Audit logic.
+
+### 4. Slot sharing и WM ordering
+
+Operators в одном slot share group обрабатываются в одной mailbox thread. Watermark events ordered с data events в mailbox. Cross-task watermark — через network channel (асинхронно). Это означает: внутри chain WM sync с data, между chains — может быть skew.
+
+### 5. Broadcast inputs (BroadcastStream)
+
+```java
+DataStream<Event> events = ...;
+BroadcastStream<Rule> rules = ...;
+
+events.connect(rules.broadcast(...)).process(...);
+```
+
+Broadcast input WM трактуется специально — обычно его WM игнорируется в MIN computation, потому что rules — control plane, не data. Но в 2.x default может быть включён MIN. Проверить через UI.
+
+### 6. Long pause в idle resolution
+
+`withIdleness(Duration.ofMinutes(1))` — после 1 минуты без events. Если у вас события каждые 65 секунд (legitimate, но редкий), partition будет постоянно flip между idle/active. Это OK, но watermark будет skip-ить между MIN включая/исключая эту partition. Стабильности нет.
+
+### 7. WM от MAX_WATERMARK (end of stream)
+
+Когда bounded source завершает (BoundedOut-of-OrdernessWatermarks isAtEnd) — emit `Watermark.MAX_WATERMARK` (`Long.MAX_VALUE`). Это сигнал: «все события прошли». Все окна fire. После этого operator переходит в shutdown. На unbounded sources MAX_WATERMARK не приходит — это нормально.
+
+---
+
+## Cheat sheet
+
+```
+Operator с N inputs:
+  currentInputWatermark = MIN(inputs, excluding idle)
+  currentOutputWatermark ≤ currentInputWatermark
+
+keyBy: WM broadcast на все downstream subtasks
+union: WM = MIN(streams), idle stream excluded
+connect: WM = MIN(two streams), independent state per stream
+
+Idle:
+  Sources: withIdleness(Duration)
+  Downstream: автоматически в 1.16+ (sub-task idleness)
+
+End-of-stream:
+  Bounded: emit MAX_WATERMARK → все окна fire
+  Unbounded: MAX_WATERMARK не приходит никогда
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: Flink job с двумя Kafka source (orders, inventory) делает intervalJoin для inventory reservation. Web UI показывает: KafkaSource(orders) currentOutputWatermark = 1700000000000, KafkaSource(inventory) currentOutputWatermark = -9223372036854775808 (Long.MIN_VALUE), Join operator currentInputWatermark = Long.MIN_VALUE. Окна интервал join не fire, results не emit. Что произошло и как fix?"
+  answer="KafkaSource(inventory) currentOutputWatermark = Long.MIN_VALUE означает: один или несколько partition этой source-ы не emit'ят watermarks. После MIN propagation в Join operator currentInputWatermark = MIN(WM_orders, WM_inventory) = MIN(1700000000000, Long.MIN_VALUE) = Long.MIN_VALUE — все event-time timers заморожены, окно interval join не закрывается. Диагностика: (1) Click на KafkaSource(inventory) в UI → проверить per-subtask watermark. Возможно один subtask отстаёт. (2) Проверить, есть ли idle partitions в inventory topic — например, в inventory очень мало traffic vs orders. (3) Проверить configuration WatermarkStrategy для inventory source — если использован noWatermarks() или TimestampAssigner забыт — WM = Long.MIN_VALUE. Fix эскалация: (1) Если idle partitions — добавить .withIdleness(Duration.ofMinutes(2)) в inventory WatermarkStrategy. После 2 минут без events на partition она markIdle, MIN исключит её. (2) Если inventory вообще rare (события раз в час), уменьшить parallelism source до 1 — все partitions через один SourceReader, всегда watermark = max(events). (3) Если использован processing time для inventory как сторонний канал, перенести WM logic полностью на orders, передать inventory как broadcast — broadcast не участвует в MIN (или используется специально). (4) Watermark alignment (FLIP-217) если orders fast, inventory slow с большим drift — паузить orders. (5) Verify: orders source idle partitions тоже handled через withIdleness — иначе тот же баг переедет на orders в slack hours. Production правило: на любом multi-source pipeline ВСЕГДА withIdleness на каждом source-е + allowedLateness + sideOutputLateData."
+/>

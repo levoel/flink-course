@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/06-python-udf-thread-mode",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-06",
+    "description": "PEMJA thread mode, JVM embedded Python, GIL contention"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-06-q1",
+      "type": "multiple-choice",
+      "question": "PEMJA library и thread mode — что это и как работает?",
+      "options": [
+        { "id": "a", "text": "Это Python pip package для embedded JVM" },
+        { "id": "b", "text": "PEMJA (Python Execution Engine for Java) — Apache library с Flink 1.15+. Embeds CPython runtime в JVM через JNI (использует stable CPython ABI — Python.h, libpython3.11.so). Python код executes в same JVM thread что Java operator — no separate OS process, no IPC overhead. JNI calls ~1μs vs ~50μs gRPC. PEMJA acquires Python GIL для thread-safety. Result: ~70-90% Java baseline (vs ~30-50% process mode). Configuration: `python.fn-execution.framework: THREAD`" },
+        { "id": "c", "text": "PEMJA — Python concurrency library" },
+        { "id": "d", "text": "PEMJA deprecated в Flink 2.2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "PEMJA architecture: native JNI bridge между JVM и CPython interpreter. Uses CPython's stable ABI (`Python.h` headers, `libpython3.11.so`) — same API third-party C extensions use. **Lifecycle**: Flink starts JVM normally. PEMJA loaded as native library at TaskManager init. Each TaskManager process has one embedded CPython interpreter. JVM threads acquire Python GIL when entering Python code (PEMJA bridge handles), release when returning к Java. **Data conversion**: JVM heap data ↔ Python objects через direct memory access (no serialization between JVM bytes и Python objects for compatible types). **Performance gains**: (1) No IPC roundtrip (~50μs saved per call). (2) No serialization overhead (~10-50μs depending size). (3) No bundle batching overhead for amortization. (4) Direct memory access для primitive types. **Result**: simple Python UDF achieves ~88% Java baseline (220k vs 250k rec/sec for simple ops). Heavy pandas/numpy ops ~72% (180k rec/sec). **Trade-offs vs process mode**: (a) **Weaker isolation** — Python errors crash JVM (no separate process barrier). (b) **GIL contention** при multiple slots per TaskManager — all share single embedded interpreter. (c) **Native deps must be в JVM classpath** (not pyArchive). (d) **CPython version pinned к PEMJA build** — Flink 2.2 ships PEMJA built против CPython 3.11.x. **Use cases**: simple Python UDFs (string ops, business logic), numpy/pandas operations (compatible с stable ABI), sklearn predict. **Avoid for**: untrusted native code (segfault risk), heavy multiprocessing inside UDF.",
+      "studyHint": "Повторите урок 06 — секцию 'Что такое PEMJA' с architecture diagram",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-06-q2",
+      "type": "multiple-choice",
+      "question": "GIL contention в thread mode — почему важно настроить slot count правильно?",
+      "options": [
+        { "id": "a", "text": "GIL не affects Python performance" },
+        { "id": "b", "text": "Python's GIL (Global Interpreter Lock) — одно thread в Python interpreter одновременно. В thread mode все slots в одной TaskManager JVM share single embedded CPython → single GIL. С 8 slots/TM все simultaneously calling Python UDF → serialize through GIL → effective parallelism = 1. Effects: 8 slots ~50-60% utilization, 16 slots ~30%. **Production rule**: thread mode requires LOW numberOfTaskSlots per TM (1-2). Compensate via more TaskManagers с fewer slots each (8 TMs × 2 slots = 16 parallel)" },
+        { "id": "c", "text": "GIL устранён в Python 3.11" },
+        { "id": "d", "text": "GIL только в multithreading, не affects Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "GIL fundamentals: CPython interpreter uses single GIL to serialize Python bytecode execution across threads. Pure Python code in multiple threads doesn't actually run parallel — they take turns holding GIL. **Process mode** (default): each slot has separate Python OS process → separate Python interpreter → separate GIL per slot. 8 slots × 8 GILs = parallel execution. **Thread mode (PEMJA)**: all slots в JVM TaskManager share single embedded CPython interpreter → single GIL. Multiple threads (one per slot) calling Python UDF: only one can execute Python bytecode at a time. **Contention curve**: 1 slot — 100% utilization (no contention). 2 slots — 95% (minor lock acquisition overhead). 4 slots — ~80% (noticeable). 8 slots — ~50-60% (heavy contention). 16 slots — ~30% (severely throttled). **Workaround**: Python releases GIL during long C calls (numpy operations, native I/O, time.sleep). Heavy pure-Python code holds GIL strongly. Numpy/pandas operations release GIL за their C operations — less contention. **Production tuning**: для thread mode — `taskmanager.numberOfTaskSlots: 1-2`. Compensate via increasing TaskManager count: instead of 2 TMs × 8 slots, use 8 TMs × 2 slots. Same total parallelism (16), but per-TM GIL contention low. K8s resource implications: smaller pods (easier scheduling), но более pods (operational overhead). **Decision**: if Python UDFs are GIL-heavy (pure Python loops) — even more aggressive slot reduction needed. If primarily numpy/pandas (release GIL) — moderate slot count OK.",
+      "studyHint": "Повторите урок 06 — секцию 'GIL contention'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m12-06-q3",
+      "type": "multiple-choice",
+      "question": "Migration plan process mode → thread mode (PEMJA) — какие шаги critical?",
+      "options": [
+        { "id": "a", "text": "Просто изменить config" },
+        { "id": "b", "text": "(1) Compatibility check — verify native deps работают с embedded CPython (numpy/pandas/sklearn/torch CPU obычно OK, GPU code сложно). (2) Remove multiprocessing.Pool (use ThreadPoolExecutor вместо). (3) Configure: `python.fn-execution.framework: THREAD`, `python.fn-execution.thread.thread-mode.python-path: /opt/venv/lib/python3.11/site-packages` (deps via filesystem, not pyArchive). (4) Slot tuning: reduce numberOfTaskSlots per TM (2 max), compensate via more TMs. (5) `taskmanager.memory.task.off-heap.size: 512m+` для embedded Python. (6) Local test → staging soak test 24h → canary 5% → gradual rollout. (7) Keep process mode rollback config ready" },
+        { "id": "c", "text": "Просто redeploy с новым config без testing" },
+        { "id": "d", "text": "Migration невозможна" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Thread mode migration — careful process due isolation differences. **Step 1 — Compatibility check**: (a) Verify native deps work с stable CPython ABI: numpy, pandas, pyarrow, scikit-learn — typically OK. PyTorch CPU — usually OK. PyTorch GPU CUDA — may have CUDA init issues per JVM. TensorFlow — partial; internal multiprocessing causes issues. Custom C extensions — must test. (b) `python -c 'import numpy, pandas, ...'` для verification all imports work standalone. (c) Run UDF tests embedded mode (MiniCluster с THREAD framework). **Step 2 — Code review**: search для `multiprocessing.Pool`, `os.fork`, `subprocess` usage в UDF code. Process-fork unsafe в JVM context. Replace с `concurrent.futures.ThreadPoolExecutor`. **Step 3 — Configuration**: `python.fn-execution.framework: THREAD`. `python.fn-execution.thread.thread-mode.python-path: /opt/venv/lib/python3.11/site-packages` (paths to where Python deps installed). Drop `-pyarch` archive — deps в filesystem path now. **Step 4 — Slot tuning**: reduce slots per TM (8 → 2) для minimize GIL contention. Increase TM count to maintain total parallelism. K8s implications: more pods, easier scheduling, но more orchestration overhead. **Step 5 — Memory**: `taskmanager.memory.task.off-heap.size: 512m` minimum для embedded Python heap. Heavy ML workloads — 1g+. Monitor `taskmanager_Status_JVM_Memory_NonHeap_Used`. **Step 6 — Test pipeline**: (a) Local MiniCluster — все UDFs работают. (b) Staging soak test 24h — verify memory stable, no segfaults, throughput improved. (c) Failure injection — kill TM, observe recovery. **Step 7 — Production rollout**: canary 5% (separate cluster или traffic split), validate metrics (throughput up, latency down, no crashes), 25% → 50% → 100% over week. **Step 8 — Rollback readiness**: keep process mode config in version control, one-line switch back if issues.",
+      "studyHint": "Повторите урок 06 — секцию 'Migration: process → thread'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-06-q4",
+      "type": "true-false",
+      "question": "Thread mode (PEMJA) trades performance for isolation: Python segfault в native extension (PyTorch CUDA issue, custom C code bug) приводит к JVM crash → TaskManager restart, тогда как process mode имеет process barrier — Python crash убивает только subprocess, TaskManager JVM остаётся живым. Для untrusted или unproven native deps process mode safer.",
+      "correctAnswer": true,
+      "explanation": "Failure isolation trade-off is fundamental architectural difference. **Process mode**: Python runs в separate OS process per slot. Crash modes: (a) Python interpreter crash (segfault, SIGABRT) — Python process dies, Flink restarts Python process для that slot only. Other slots unaffected. JVM unaffected. (b) Python OOM — Python process killed by kernel OOM killer (если memory limits set), Flink restarts. (c) Native extension crash (numpy bug, custom C code segfault) — affects only Python process. **Thread mode**: Python embedded в JVM. Crash modes: (a) Python interpreter crash → JVM crash (entire TaskManager process dies). All slots in that TaskManager affected. (b) Native extension segfault → JVM crash. (c) Python OOM might be detected as JVM off-heap memory issue. **Practical implications**: (1) **Untrusted deps risk** — using new third-party Python library с potential C bugs? Process mode safer. Crash isolated. (2) **GPU code risk** — CUDA initialization issues, GPU driver bugs могут crash. PyTorch GPU в process mode safer. Thread mode CUDA workable but with more care. (3) **Mature stable deps** (numpy 1.26, pandas 2.x, sklearn) — well-tested, low crash risk → thread mode OK. (4) **Custom C extensions** — risky regardless of mode, but process mode contains blast radius. **Production wisdom**: thread mode for performance gain when (a) UDFs are pure Python or use stable mainstream deps, (b) team has tested extensively, (c) crash blast radius (entire TM) acceptable given parallelism. Process mode default for unfamiliar codebases or new deps. **Operational mitigation для thread mode**: aggressive restart strategy (TaskManager auto-restart на crash), distributed parallelism (don't put eggs in one TM basket), comprehensive monitoring (alerts on TM restart count).",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/07-rocksdb-to-forst-migration",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-07",
+    "description": "Quiz for RocksDB to ForSt migration lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-07-q1",
+      "type": "multiple-choice",
+      "question": "Почему RocksDB → ForSt migration требует CANONICAL savepoint?",
+      "options": [
+        { "id": "a", "text": "Canonical безопаснее во всём" },
+        { "id": "b", "text": "Native savepoint format backend-specific binary (RocksDB SST references vs ForSt blob storage references). Direct restore native cross-backend = FAIL. Canonical — universal serialization, ForSt reader может deserialize RocksDB-written canonical bytes" },
+        { "id": "c", "text": "ForSt не поддерживает savepoints" },
+        { "id": "d", "text": "Это требование Kubernetes Operator" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "RocksDB native — incremental, references к SST files. ForSt native — references к S3 blob storage. Incompatible binary formats. Canonical — universal serialization (state values + key groups в universal binary representation), backend-agnostic. Either backend can read canonical и deserialize в own native representation. Always `flink stop --type canonical` для backend migration. Forgotten `--type canonical` = single most common pitfall = restore FAILS на ForSt.",
+      "studyHint": "Повторите урок — Почему cross-backend migration сложный + Pitfall 1",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-07-q2",
+      "type": "multiple-choice",
+      "question": "ForSt config критически важен. Что обязательно?",
+      "options": [
+        { "id": "a", "text": "Только state.backend.type: forst" },
+        { "id": "b", "text": "(1) state.backend.forst.primary-dir на S3/HDFS (без него defaults к local — defeats purpose); (2) cache.dir + cache size 5-10% of state; (3) async.io.thread-pool-size 8-16; (4) state.api-v2.async.enabled=true (sync API + ForSt = throughput disaster)" },
+        { "id": "c", "text": "Только cache settings" },
+        { "id": "d", "text": "Custom RocksDB tuning" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt config критический. Без primary-dir на external storage не disaggregated — defeats purpose. Cache size: 5-10% of total state minimum для acceptable hit rate (1GB cache for 200GB state = 99% miss = S3 read on every access = disaster). Async I/O thread pool: 8-16 для hiding S3 latency (50-100ms per GET, parallel reads needed). Async API V2: mandatory с ForSt — sync API + ForSt = mailbox thread blocks on S3 GET = throughput 200 events/sec (catastrophic). С Async API V2 — 30k events/sec (150x).",
+      "studyHint": "Повторите урок — Step 4 + Pitfalls 2-5",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-07-q3",
+      "type": "multiple-choice",
+      "question": "Production migration 1.5TB RocksDB → ForSt. Какой workflow для minimum risk?",
+      "options": [
+        { "id": "a", "text": "Apply config change в production directly" },
+        { "id": "b", "text": "Staging 1-2 weeks с sample savepoint → pre-migration prep (downtime window, IAM, NetworkPolicy) → CANONICAL savepoint 30-45 min → update FlinkDeployment config → kubectl apply restore on ForSt → first hour validation → week monitoring → keep RocksDB canonical 30 days rollback insurance" },
+        { "id": "c", "text": "Stop job, change config, restart — done" },
+        { "id": "d", "text": "Migrate один operator at a time" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Carefully staged. Staging — clone job + sample savepoint (~100GB), test ForSt config 1-2 weeks: checkpoint success, throughput vs baseline, cache hit rate, async I/O metrics. Pre-migration — downtime window low traffic, on-call ready, S3 IAM/NetworkPolicy validated, rollback procedure documented. Canonical savepoint в production — 30-45 min для 1.5TB (mostly S3 write throughput). Apply config — Operator handles restart с initialSavepointPath. Validation — first hour critical (rapid restarts? checkpoint failures? throughput drop?). Week monitoring — daily checks. Rollback insurance — keep canonical savepoint 30 days, same canonical works на both backends — symmetric rollback. Skipping staging = russian roulette.",
+      "studyHint": "Повторите урок — Полный migration workflow + Production checklist + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-07-q4",
+      "type": "true-false",
+      "question": "Один и тот же canonical savepoint может быть restored на RocksDB или ForSt backend — это enables symmetric rollback после backend migration.",
+      "correctAnswer": true,
+      "explanation": "True. Canonical savepoint — universal format, backend-agnostic. После migration RocksDB → ForSt, тот же original canonical savepoint может быть restored обратно на RocksDB конфиг (rollback). Operator delete current ForSt deployment, restore canonical savepoint на rolled-back RocksDB FlinkDeployment. State same as pre-migration moment. Это symmetry property canonical делает migration relatively safe — rollback always possible. Native format не позволяет — locked to original backend. Canonical = insurance policy. Keep минимум 30 дней post-migration.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

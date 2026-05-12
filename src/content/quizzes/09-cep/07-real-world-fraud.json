@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/07-real-world-fraud",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-07",
+    "description": "Quiz для real-world fraud detection"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-07-q1",
+      "type": "multiple-choice",
+      "question": "Когда выбирать Pattern API/MATCH_RECOGNIZE, а когда — custom KeyedProcessFunction?",
+      "options": [
+        { "id": "a", "text": "Всегда Pattern API — он production-grade" },
+        { "id": "b", "text": "Всегда KeyedProcessFunction — Pattern API toy" },
+        { "id": "c", "text": "Pattern API: simple temporal sequences, single-key isolation, known structure, bounded window. KeyedProcessFunction: cross-key correlation, dynamic patterns from config, external lookups (async I/O), custom emit logic, ultra-low latency" },
+        { "id": "d", "text": "По языку: Java → Pattern API, Python → KeyedProcessFunction" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Decision matrix: Pattern API covers 70% production cases — declarative, NFA-optimised, watermark-driven correctness. KeyedProcessFunction covers 30% — когда нужны structural capabilities Pattern API не даёт: (1) multi-source correlation (Pattern API per-key only); (2) dynamic patterns runtime through Broadcast state; (3) external lookups через Async I/O (IterativeCondition не имеет async API); (4) custom state shape (not bound to NFA structure); (5) low-latency emit без watermark progression. Best architectures combine: enrichment (state machine) → CEP → correlator (state machine).",
+      "studyHint": "Повторите урок — Comparison decision matrix",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-07-q2",
+      "type": "multiple-choice",
+      "question": "Для detection 'account takeover sequence' где первое условие — LOGIN_SUCCESS из нового IP (нового для user). Как реализовать?",
+      "options": [
+        { "id": "a", "text": "Pattern API с IterativeCondition: ctx.getEventsForPattern('login').contains(...)" },
+        { "id": "b", "text": "Hybrid: upstream KeyedProcessFunction для enrichment (хранит ValueState<Set<String>> historical IPs, добавляет isNewIP field), потом CEP на enriched events. IterativeCondition не имеет access к historical state outside текущего partial match" },
+        { "id": "c", "text": "MATCH_RECOGNIZE с CROSS JOIN на historical IPs table" },
+        { "id": "d", "text": "Невозможно реализовать в Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Structural limit IterativeCondition: даёт access ТОЛЬКО к events в текущем partial match через ctx.getEventsForPattern(name). Historical user state (set of seen IPs) — это external knowledge, Pattern API не имеет direct access. Production solution: upstream enrichment через KeyedProcessFunction со ValueState<Set<String>> historical IPs. Adds isNewIP=true/false field to event. CEP downstream видит уже enriched events — простой where(e -> e.isNewIP()). Это standard production pattern для context-dependent CEP.",
+      "studyHint": "Повторите урок — Case 2: suspicious operation sequence",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-07-q3",
+      "type": "multiple-choice",
+      "question": "Detection coordinated fraud где user A и user B (разные users) делают transactions same merchant within 5 min из разных locations. Какой подход?",
+      "options": [
+        { "id": "a", "text": "Pattern API с .keyBy(userId)" },
+        { "id": "b", "text": "MATCH_RECOGNIZE с PARTITION BY userId" },
+        { "id": "c", "text": "KeyedProcessFunction со state machine, keyBy(merchant) — это cross-key correlation которая не expressible в Pattern API (он runs per-key). State машина хранит recent transactions per merchant и проверяет cross-user condition" },
+        { "id": "d", "text": "Two parallel Pattern API jobs с union" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Pattern API isolates per-key — нельзя нативно correlate events across users в одном partial match. Workaround keyBy(merchant) теряет per-user isolation, но это правильно для этого case: per-merchant state список recent transactions, в processElement проверяем cross-user condition (different userId + different location + within 5 min). Это state machine territory — custom state shape (List<TxRecord>), explicit TTL cleanup, custom emit logic. Pattern API не подходит structurally.",
+      "studyHint": "Повторите урок — Case 3: multi-source correlation",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-07-q4",
+      "type": "true-false",
+      "question": "Если в use case нужны dynamic patterns (бизнес update rules через UI runtime), Pattern API подходит — патtern перекомпилируется на каждое event.",
+      "correctAnswer": false,
+      "explanation": "False. Pattern API компилирует pattern в NFA at job submission time — NFA structure fixed на весь lifecycle job-а. Изменение pattern требует savepoint stop + start с новым кодом, и savepoint state структурально несовместим с new NFA. Для dynamic rules use KeyedProcessFunction со state machine + Broadcast state: rules update через broadcast stream (Kafka rules topic), broadcast state replicated на все subtasks, state machine reads current rules per event и применяет dynamic logic. Это standard pattern в production rule engines (Stripe Radar, Uber DSS).",
+      "bloomLevel": "applied"
+    }
+  ]
+}

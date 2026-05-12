@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/02-pyflink-setup",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-02",
+    "description": "PyFlink setup, packaging, deployment"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-02-q1",
+      "type": "multiple-choice",
+      "question": "Какая Python version recommended для Flink 2.2.x в production?",
+      "options": [
+        { "id": "a", "text": "Python 2.7 — самая stable" },
+        { "id": "b", "text": "Python 3.11 — production default для Flink 2.2.x. Python 3.7/3.8 dropped (EOL upstream). 3.11 имеет ~25% faster Python execution vs 3.10, PEP 657 fine-grained errors, ExceptionGroup support (better для async code), Apache Beam Portability runtime fully supports. Python 3.12/3.13 не officially supported в 2.2.x — wait до 2.3" },
+        { "id": "c", "text": "Python 3.6 для backward compatibility" },
+        { "id": "d", "text": "Любая Python version работает identically" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink 2.2.x supports Python 3.9, 3.10, 3.11. Python 3.8 dropped в 2.2 (EOL upstream 2024-10), 3.7 dropped в 1.19. Production default 3.11 reasons: (1) Latest CPython improvements — adaptive interpreter speeds Python execution ~25% vs 3.10. (2) PEP 657 fine-grained error locations — better debug experience в production logs. (3) ExceptionGroup (PEP 654) — proper handling concurrent failures в async code (critical для async UDFs Flink 2.2). (4) Apache Beam Portability runtime fully tested на 3.11. (5) PEMJA library built против 3.11 ABI. **Critical**: client (где flink run) и cluster (TaskManager pods) MUST have IDENTICAL Python version — pickle protocol, cloudpickle, native ABI зависят от exact CPython version. Use same Docker image для both.",
+      "studyHint": "Повторите урок 02 — секцию 'Версия Python: что выбирать в 2026'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-02-q2",
+      "type": "multiple-choice",
+      "question": "Три подхода к packaging Python dependencies для PyFlink: pyFiles, pyRequirements, pyArchives. Когда какой использовать?",
+      "options": [
+        { "id": "a", "text": "Они identical, naming различается" },
+        { "id": "b", "text": "pyFiles — simple .py modules (utils.py, functions.py) shipped к TaskManagers. Для simple cases без binary deps. pyRequirements — `requirements.txt` path, pip install per TaskManager (network-dependent, slow startup ~30-60s per TM, fails если pypi недоступен). pyArchives — pre-built archive Python venv (conda-pack / tar.gz of venv), production-grade: zero install time, deterministic environment, works offline, archive может быть гигабайты" },
+        { "id": "c", "text": "pyArchives deprecated" },
+        { "id": "d", "text": "Только pyFiles работает в production" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**pyFiles** (`-pyfs file1.py,file2.py`): plain Python files shipped к each TaskManager working directory. Simple, no binary deps. **pyRequirements** (`-pyreq requirements.txt`): PyFlink creates fresh venv on each TaskManager, runs `pip install -r requirements.txt`. Pros: simple, uses standard pip. Cons: per-TaskManager install (~30-60s startup), network-dependent (PyPI access), может rate-limited при scale up 50 TMs. **pyArchives** (`-pyarch venv.tar.gz#venv`): pre-built archive containing Python venv with all deps. Archive extracted на each TaskManager, used as Python environment. Pros: zero install time, deterministic (frozen versions), offline-capable, identical across TMs. Cons: archive size (numpy/pandas/torch ~1-3GB), upload time. **Production rule**: pyArchives для production workloads (especially ML с heavy deps), pyRequirements для quick dev/test. Tool: conda-pack для conda envs, или `tar -czf venv.tar.gz venv/` для pip venvs.",
+      "studyHint": "Повторите урок 02 — секцию 'Packaging Python dependencies — три approach'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-02-q3",
+      "type": "multiple-choice",
+      "question": "Production deployment PyFlink на Kubernetes с Flink Operator — какие critical settings?",
+      "options": [
+        { "id": "a", "text": "Любой Python image работает" },
+        { "id": "b", "text": "(1) Docker image extends flink:2.2.0-java17 с Python 3.11.7 (pinned patch) + system libs (libsqlite3, libssl) для native deps. (2) pyArchives via conda-pack uploaded S3, referenced в args. (3) Identical Python versions client/cluster — use SAME image для CI/dev/staging/prod. (4) `python.executable` config указывает на bundled Python. (5) FlinkDeployment CRD с entryClass=PythonDriver, args=['-py', '/opt/main.py', '-pyarch', 's3://.../env.tar.gz#env', '-pyexec', 'env/bin/python']" },
+        { "id": "c", "text": "Использовать обычный python:3.11 image" },
+        { "id": "d", "text": "Mount Python deps через NFS" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production Kubernetes deployment requires careful coordination. **Docker image**: FROM flink:2.2.0-java17 + apt-get install python3.11 python3.11-dev python3.11-venv pip + system libs (sqlite3, ssl, libgomp если numpy uses OpenMP). Set ENV PYFLINK_EXECUTABLE=/usr/bin/python3.11. Single image для consistency. **Environment archive**: conda-pack или tar venv с pinned versions всех deps (pandas, numpy, pyarrow, ML libs, apache-flink). Upload S3 (или K8s ConfigMap для small <10MB envs). **FlinkDeployment CRD** (Flink Kubernetes Operator): apiVersion: flink.apache.org/v1beta1, kind: FlinkDeployment, spec.image: my-registry/flink-py311:2.2.0, spec.job.entryClass: org.apache.flink.client.python.PythonDriver, spec.job.args: ['-py', '/opt/job/main.py', '-pyarch', 's3://...']. Flink artifact fetcher downloads archive, extracts, uses bundled Python. **Version pinning** layers: (1) Dockerfile: python3.11.7 specific patch. (2) requirements.txt: exact versions. (3) pyproject.toml: requires-python='==3.11.*'. (4) Client environment = same Docker image via docker-compose. **Configuration**: python.fn-execution.bundle.size=1000, python.fn-execution.framework=PROCESS (или THREAD per workload), task off-heap memory для embedded Python.",
+      "studyHint": "Повторите урок 02 — секцию 'Cluster-side Python' и FlinkDeployment example",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-02-q4",
+      "type": "true-false",
+      "question": "Python version mismatch между client (где `flink run`) и cluster (TaskManager pods) — самая частая проблема в PyFlink production. Client Python 3.10, cluster Python 3.11 → pickle protocol mismatch, cloudpickle различия, native ABI incompatibility → ошибки serialization UDFs. Production rule: pin IDENTICAL versions через single Docker image.",
+      "correctAnswer": true,
+      "explanation": "Python version exactness требуется на нескольких уровнях: (1) **Pickle protocol** — protocol version меняется minor versions. 3.10 default pickle.HIGHEST_PROTOCOL=5, 3.11 same но byte-level differences possible. (2) **cloudpickle** — serializes Python objects (functions, closures) for shipping к TaskManagers. cloudpickle 2.x has compat checks but minor version differences в Python bytecode (which cloudpickle includes) may cause issues. (3) **Native ABI** — numpy, pandas, pyarrow compiled against specific CPython ABI (limited stable API). Cross-version installs may segfault or produce subtle bugs. (4) **Standard library changes** — между minor versions есть semantic differences (e.g., asyncio behavior changes). **Production rule**: use SAME Docker image для CI, dev, staging, production. Image based on python:3.11.7-slim или similar pinned patch version. Client uses image via docker-compose, K8s uses same image для TaskManager pods. pyproject.toml: `requires-python = '==3.11.*'`. CI verification step: assert installed Python version matches expected. **Common failure modes**: (a) Cloud client (Cloud9, JetBrains Gateway) uses different Python than K8s — pickle deserialization fails. (b) macOS dev (Python 3.11.5 via brew) deploys к Linux 3.11.7 — usually OK, but native ABI subtle issues. (c) Image cache не invalidated на K8s after rebuild — old image still in use.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/04-compaction-strategies",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-04",
+    "description": "Quiz for compaction strategies lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-04-q1",
+      "type": "multiple-choice",
+      "question": "В чём ключевое отличие Leveled compaction от Universal compaction?",
+      "options": [
+        { "id": "a", "text": "Никакой разницы, просто разные имена" },
+        { "id": "b", "text": "Leveled — non-overlapping levels (L1+), low read amplification (1-2 SST per read), high write amplification (50-70x). Universal — overlapping SSTs, low write amp (~10x), higher read amp (variable), higher space amp" },
+        { "id": "c", "text": "Universal обязательна для ForSt" },
+        { "id": "d", "text": "Leveled deprecated с Flink 2.0" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Leveled (default): SST в L1+ non-overlapping (каждый файл имеет min/max keys не пересекающиеся), each level 10x bigger, compaction picks 1 L_i SST + overlapping L_{i+1} SST. Низкая RA (1-2 SST per read), но high WA (50-70x за 7 levels). Universal: все SST в логически одном level с overlap, compaction picks subset и merges в large SST. Низкая WA (~10x), но higher RA (variable, может быть 5-10 SST per read) и higher SA (1.5-2x space). Choose: Leveled для read-heavy, stable latency. Universal для write-heavy, SSD endurance concerns.",
+      "studyHint": "Повторите урок — Properties tables",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m04-04-q2",
+      "type": "multiple-choice",
+      "question": "Write-heavy workload: 200k writes/sec, NVMe SSD endurance critical. WA=60x с Leveled. Что делать?",
+      "options": [
+        { "id": "a", "text": "Switch к Universal compaction — WA снижается до 10-15x. SSD endurance extends ~6x. Trade-offs: P99 read latency higher, space amp 1.8x, compaction spikes" },
+        { "id": "b", "text": "Buy more SSDs" },
+        { "id": "c", "text": "Disable compaction" },
+        { "id": "d", "text": "Use FIFO compaction" }
+      ],
+      "correctAnswer": "a",
+      "explanation": "Universal compaction специально для write-heavy SSD endurance scenarios. Math: Leveled WA=60x → 200k writes × value_size × 60 = огромная I/O. Universal WA=10-15x → 5-7x меньше disk wear. Config: state.backend.rocksdb.compaction.style: UNIVERSAL, universal.size-amplification-percent: 100, universal.max-merge-width: -1, увеличить thread.num до 8. Trade-offs accept: (1) read P99 1ms vs 0.5ms — OK для 20% reads; (2) space amp +50% — need extra disk; (3) compaction spikes — provision CPU. Monitor write stall events. Alternative если read-critical: stay Leveled, optimize writebuffer.size до 256MB (меньше flushes), уменьшить level multiplier до 5 (меньше levels) — partial improvement.",
+      "studyHint": "Повторите урок — Decision matrix",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-04-q3",
+      "type": "multiple-choice",
+      "question": "Что такое 'write stall' в RocksDB и при чем тут L0?",
+      "options": [
+        { "id": "a", "text": "Это нормальное поведение, не проблема" },
+        { "id": "b", "text": "Когда L0 SST count превышает level0_slowdown_writes_trigger (default 20) — RocksDB throttles writes. После level0_stop_writes_trigger (default 36) — STOPS writes полностью пока compaction catches up. Causes: insufficient compaction threads, slow disk, write rate exceeds compaction throughput" },
+        { "id": "c", "text": "Network issue" },
+        { "id": "d", "text": "Memory leak" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Write stall — критичный production symptom. Mechanics: L0 SST накапливаются от MemTable flushes. Если compaction L0→L1 не успевает, files pile up. RocksDB вводит artificial backpressure: (1) slowdown trigger (20 files) — throttles writes; (2) stop trigger (36 files) — STOPS writes полностью. В Flink Web UI viidno как полный stall: throughput drops к 0, latency взлетает. Fixes: (1) thread.num: 8 для parallel compactions; (2) увеличить max_bytes_for_level_base; (3) faster disk; (4) consider universal для write-heavy. Plus read perf degrades параллельно — 30 overlapping L0 SST = 30 checks per read.",
+      "studyHint": "Повторите урок — Leveled section",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-04-q4",
+      "type": "true-false",
+      "question": "Compaction в RocksDB physically removes tombstones (DELETE markers) только при rewriting SST файлов, не immediately после state.clear() call.",
+      "correctAnswer": true,
+      "explanation": "True. DELETE в LSM — append tombstone marker, original key+value остаётся в SST. Physical removal происходит ТОЛЬКО когда compaction processes этот SST и решает skip tombstone (плюс corresponding live entries). Implications: (1) state.clear() heavy workloads tombstones accumulate; (2) space temporarily growth (original + tombstone); (3) read must check tombstones — performance degrades с density; (4) Universal compaction merges less frequently — tombstones linger hours. TTL compact filter rеализует cleanup в этой же compaction pass. Aggressive cleanup через delete_obsolete_files_period или switch к leveled для clear-heavy workloads.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

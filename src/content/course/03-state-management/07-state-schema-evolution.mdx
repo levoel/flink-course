@@ -1,0 +1,474 @@
+---
+title: "State Schema Evolution — миграция типов state между версиями"
+description: "POJO/Avro evolution rules, TypeSerializerSnapshot, allowable/incompatible changes, State Processor API как escape hatch"
+order: 7
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Schema Evolution", "TypeSerializer", "POJO", "Avro", "State Processor API"]
+---
+
+# State Schema Evolution — миграция типов state между версиями
+
+Production Flink job не остаётся неизменным годами. Поля добавляются, удаляются, типы меняются. Каждое такое изменение в classе, который хранится в state — потенциальная катастрофа: при restart с старым savepoint Flink пытается десериализовать stored bytes новым TypeSerializer, и часто это ломается.
+
+State Schema Evolution — механизмы, которые позволяют делать определённые изменения **без** rebootstrapping state.
+
+---
+
+## Что вообще происходит при evolution
+
+<DiagramContainer title="Schema evolution на restart с savepoint" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Savepoint contains"
+        tooltip="Savepoint содержит: (1) serialized state bytes per key, (2) TypeSerializerSnapshot — metadata описывающий формат сериализации (class name, field names, types). Это snapshot самого serializer-а на момент save."
+      >
+        state bytes + serializer snapshot
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="restart с новым code" />
+    <FlowRow>
+      <DataBox
+        label="Resolve compatibility"
+        tooltip="Flink создаёт new TypeSerializer из новой версии класса. Вызывает old.resolveSchemaCompatibility(newSerializer). Результат: COMPATIBLE / COMPATIBLE_AFTER_MIGRATION / INCOMPATIBLE."
+      >
+        oldSerializer.resolveSchemaCompatibility(new)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="три исхода" />
+    <FlowRow>
+      <DataBox
+        label="COMPATIBLE_AS_IS"
+        tooltip="Bytes остаются как есть, new serializer читает их correctly. Это самый дешёвый случай — no migration."
+      >
+        No change needed
+      </DataBox>
+      <DataBox
+        label="COMPATIBLE_AFTER_MIGRATION"
+        tooltip="Bytes нужно перечитать old serializer-ом, переписать new serializer-ом. Происходит во время restore — может быть expensive для большого state."
+      >
+        Migrate on restore
+      </DataBox>
+      <DataBox
+        label="INCOMPATIBLE"
+        tooltip="Несовместимые изменения. Restart fails. Решение: либо откатить изменения, либо использовать State Processor API для manual migration."
+      >
+        Restart fails
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## POJO Schema Evolution
+
+POJOSerializer — built-in для Flink POJOs. Supports limited automatic evolution.
+
+### Что POJO Serializer считает POJO
+
+```java
+// ✅ Valid POJO:
+public class UserProfile {
+    public String name;     // public field
+    private int age;        // OR private with getter+setter
+    public int getAge() { return age; }
+    public void setAge(int a) { age = a; }
+    public UserProfile() {} // ← public nullary constructor REQUIRED
+}
+```
+
+Если хотя бы одно правило нарушено, Flink fallback на KryoSerializer, который **не поддерживает evolution**.
+
+### Allowable POJO evolution
+
+| Change | Compatible? | Notes |
+|---|---|---|
+| Add new nullable field | ✅ COMPATIBLE_AFTER_MIGRATION | Defaulted к null/0 |
+| Remove field | ✅ COMPATIBLE_AFTER_MIGRATION | Data discarded |
+| Change field type | ❌ INCOMPATIBLE | Even widening int→long |
+| Rename field | ❌ INCOMPATIBLE | Treated as remove+add |
+| Reorder fields | ✅ COMPATIBLE | Serialization by name |
+| Change class hierarchy | ❌ INCOMPATIBLE | Parent class change |
+
+### Example: добавляем поле
+
+```java
+// v1:
+public class UserProfile {
+    public String name;
+    public int age;
+}
+
+// v2 (compatible):
+public class UserProfile {
+    public String name;
+    public int age;
+    public String email;  // ← new nullable field, defaulted to null
+}
+```
+
+При restore: old entries имеют name+age. New `email` field будет `null` для них. New writes сохраняют email.
+
+### Example: удаляем поле
+
+```java
+// v1:
+public class UserProfile {
+    public String name;
+    public int age;
+    public boolean deprecatedFlag;  // ← удаляем
+}
+
+// v2:
+public class UserProfile {
+    public String name;
+    public int age;
+}
+```
+
+При restore: `deprecatedFlag` ignored, остальные fields загружаются. Data loss in terms старого field, no failure.
+
+### Example: ломаем — change type
+
+```java
+// v1:
+public class Stats {
+    public int count;
+}
+
+// v2 (INCOMPATIBLE):
+public class Stats {
+    public long count;  // ← was int, now long
+}
+```
+
+Даже widening int→long не поддерживается automatically. Если нужно — State Processor API.
+
+---
+
+## Avro Schema Evolution
+
+Avro имеет богатую schema evolution — best supported format для evolving state.
+
+```java
+AvroSerializer<UserProfile> serializer =
+    new AvroSerializer<>(UserProfile.class);
+```
+
+Или используйте `AvroSerializationSchema` для DataStream pipeline.
+
+### Avro rules
+
+| Change | Compatible? |
+|---|---|
+| Add field with default | ✅ COMPATIBLE |
+| Remove field | ✅ COMPATIBLE if reader supports |
+| Add field WITHOUT default | ❌ INCOMPATIBLE |
+| Rename field | ❌ INCOMPATIBLE unless aliases |
+| Change type — promotion | ✅ COMPATIBLE (int→long→float→double) |
+| Change type — narrowing | ❌ INCOMPATIBLE |
+| Change union members | Partial — adding OK, removing not |
+
+### Avro schema with defaults
+
+```json
+{
+  "type": "record",
+  "name": "UserProfile",
+  "fields": [
+    {"name": "name", "type": "string"},
+    {"name": "age", "type": "int"},
+    {"name": "email", "type": ["null", "string"], "default": null}
+  ]
+}
+```
+
+Adding `email` с default null — backward compatible.
+
+### Why Avro > POJO для evolution
+
+- Defaults на all fields make adding columns safe
+- Type promotion supported
+- Aliases для rename
+- Well-defined evolution semantics из batch world
+
+**Recommendation**: для state, которая будет evolve, prefer Avro вместо POJO.
+
+---
+
+## Custom TypeSerializer + TypeSerializerSnapshot
+
+Если ни POJO, ни Avro не подходят (нестандартный binary format) — custom serializer:
+
+```java
+public class MyTypeSerializer extends TypeSerializer<MyType> {
+
+    @Override
+    public TypeSerializerSnapshot<MyType> snapshotConfiguration() {
+        return new MyTypeSerializerSnapshot();
+    }
+
+    @Override
+    public void serialize(MyType value, DataOutputView target) throws IOException {
+        target.writeUTF(value.getName());
+        target.writeInt(value.getCount());
+        // ... схема записи bytes
+    }
+
+    @Override
+    public MyType deserialize(DataInputView source) throws IOException {
+        String name = source.readUTF();
+        int count = source.readInt();
+        return new MyType(name, count);
+    }
+    // ... rest of methods
+}
+```
+
+### TypeSerializerSnapshot — где живёт evolution logic
+
+```java
+public class MyTypeSerializerSnapshot
+        extends TypeSerializerSnapshot<MyType> {
+
+    private int version;  // schema version
+
+    @Override
+    public int getCurrentVersion() { return 2; }
+
+    @Override
+    public void writeSnapshot(DataOutputView out) throws IOException {
+        out.writeInt(version);
+    }
+
+    @Override
+    public void readSnapshot(int readVersion, DataInputView in,
+                              ClassLoader cl) throws IOException {
+        this.version = in.readInt();
+    }
+
+    @Override
+    public TypeSerializerSchemaCompatibility<MyType> resolveSchemaCompatibility(
+            TypeSerializer<MyType> newSerializer) {
+        if (newSerializer instanceof MyTypeSerializer) {
+            MyTypeSerializerSnapshot newSnap = (MyTypeSerializerSnapshot)
+                ((MyTypeSerializer) newSerializer).snapshotConfiguration();
+            if (newSnap.version == this.version) {
+                return TypeSerializerSchemaCompatibility.compatibleAsIs();
+            } else if (newSnap.version > this.version) {
+                // need migration — old reader, new writer
+                return TypeSerializerSchemaCompatibility
+                    .compatibleAfterMigration();
+            } else {
+                return TypeSerializerSchemaCompatibility.incompatible();
+            }
+        }
+        return TypeSerializerSchemaCompatibility.incompatible();
+    }
+
+    @Override
+    public TypeSerializer<MyType> restoreSerializer() {
+        return new MyTypeSerializer();
+    }
+}
+```
+
+Это control над each version transition. Для production state, evolving regularly — это правильный инвестиция.
+
+---
+
+## State Processor API — escape hatch
+
+Когда automatic evolution отказывает (INCOMPATIBLE), последняя надежда — State Processor API. Это offline batch job, который:
+
+1. Reads savepoint as bounded DataStream
+2. Transforms state (любые операции — arbitrary code)
+3. Writes new savepoint
+
+```java
+StreamExecutionEnvironment env =
+    StreamExecutionEnvironment.getExecutionEnvironment();
+
+ExistingSavepoint savepoint = Savepoint.load(
+    env, "s3://bucket/old-savepoint", new EmbeddedRocksDBStateBackend());
+
+DataStream<UserState> oldStates = savepoint.readKeyedState(
+    "fraud-detector",                 // operator UID
+    new UserStateReaderFunction());
+
+DataStream<UserStateV2> newStates = oldStates.map(old ->
+    new UserStateV2(old.name, old.age, "default-email"));
+
+BootstrapTransformation<UserStateV2> transformation = OperatorTransformation
+    .bootstrapWith(newStates)
+    .keyBy(UserStateV2::getUserId)
+    .transform(new UserStateV2Bootstrapper());
+
+Savepoint
+    .create(new EmbeddedRocksDBStateBackend(), maxParallelism)
+    .withOperator("fraud-detector", transformation)
+    .write("s3://bucket/new-savepoint");
+
+env.execute("State Migration");
+```
+
+### Use cases для State Processor API
+
+- Type change int → long (POJO incompatible)
+- Restructure state (split один ValueState на несколько MapState)
+- Bulk delete old keys based on business logic
+- Initialize state from external source (database snapshot → Flink state)
+- Audit / inspect state (read savepoint в DataStream, analyze)
+
+<Callout type="warning">
+State Processor API — heavy operation. Для multi-TB savepoint занимает часы. Используйте только когда нужно фундаментально restructure state. Для simple field additions предпочитайте Avro evolution.
+</Callout>
+
+---
+
+## Schema evolution в Async State API V2
+
+Async API не меняет схему evolution — те же rules применяются. Bytes layout идентичен.
+
+```java
+// Async API:
+state.asyncValue().thenAccept(v -> { ... });
+```
+
+Под капотом тот же TypeSerializer, тот же snapshot/restore mechanism. Evolution работает прозрачно.
+
+---
+
+## Schema evolution с ForSt
+
+ForSt хранит SST files на S3, но binary layout идентичен local RocksDB. Schema evolution работает так же:
+- Old SST files читаются с old TypeSerializerSnapshot
+- New writes — new format
+- Compaction merges old+new format если COMPATIBLE_AFTER_MIGRATION
+
+---
+
+## Production gotchas
+
+### 1. KryoSerializer fallback — death sentence для evolution
+
+```java
+class NonPojo {
+    private final String name;  // ❌ no setter — fallback to Kryo
+    public NonPojo(String n) { this.name = n; }
+}
+```
+
+Если class не proper POJO, Flink fallback на KryoSerializer. Kryo **не поддерживает evolution** — любое изменение полей = INCOMPATIBLE → restart fails.
+
+**Check via logs**: при job start search for `Class ... cannot be used as a POJO type`. Это red flag.
+
+### 2. POJO с inheritance
+
+```java
+class Parent {
+    public String name;
+}
+class Child extends Parent {
+    public int age;
+}
+```
+
+Inheritance breaks POJO assumptions. Avoid — flatten в один class.
+
+### 3. Generics и evolution
+
+```java
+ValueState<List<String>>  // ✅ OK
+ValueState<MyContainer<T>>  // ⚠ Kryo fallback
+```
+
+Для generics используйте explicit TypeHint:
+
+```java
+TypeInformation.of(new TypeHint<List<String>>() {})
+```
+
+### 4. enum changes
+
+```java
+// v1:
+enum Status { ACTIVE, INACTIVE }
+// v2 (incompatible):
+enum Status { ACTIVE, INACTIVE, SUSPENDED }
+```
+
+Добавление enum value: POJO считает INCOMPATIBLE. Avro поддерживает (с default).
+
+Workaround: use Integer + business mapping.
+
+### 5. allowNonRestoredState — last resort
+
+```bash
+flink run -s <savepoint> --allowNonRestoredState ...
+```
+
+Это flag «не fail если есть state, который не resolved». Useful при removing operator или state entirely. **Data lost** для удалённых state.
+
+### 6. State migration during peak hours
+
+```bash
+flink stop --savepointPath ... <jobid>
+# Migration savepoint занимает 30+ минут для TB state
+# Job offline всё это время
+```
+
+Plan migration during low-traffic windows. Используйте State Processor API offline предварительно для тестирования.
+
+### 7. Schema evolution + maxParallelism mismatch
+
+При State Processor API rebootstrap можно одновременно изменить maxParallelism:
+
+```java
+Savepoint.create(backend, NEW_MAX_PARALLELISM)
+    .withOperator(...)
+    .write(...);
+```
+
+Это «two birds one stone» migration: schema + scale.
+
+---
+
+## Cheatsheet: allowable changes
+
+| Change | POJO Auto | Avro Auto | Custom Serializer | Result |
+|---|---|---|---|---|
+| Add nullable field | ✅ | ✅ | up to you | Easy |
+| Remove field | ✅ | ✅ | up to you | Easy |
+| Change int→long | ❌ | ✅ promotion | up to you | POJO needs SP API |
+| Rename field | ❌ | ✅ via alias | up to you | Avro alias |
+| Add enum value | ❌ | ✅ with default | up to you | Migrate manually |
+| Restructure (split state) | ❌ | ❌ | ❌ | State Processor API |
+| Add new state primitive | ✅ | ✅ | ✅ | Initialized empty |
+| Remove state primitive | ✅ with `allowNonRestoredState` | same | same | Data lost |
+
+---
+
+## Recommended practices
+
+1. **Use Avro for state types likely to evolve.** Built-in evolution rules cover most production cases.
+2. **Lock down POJO structure early.** Once deployed, breaking changes require State Processor API.
+3. **Set operator UIDs explicitly:** `.uid("fraud-detector")` — without UID, Flink generates one from operator topology. Changing topology = changing UID = state lost.
+4. **Test migrations in staging** на realistic savepoint sizes.
+5. **Document schema versions** в code comments — какой version field added/changed.
+6. **CI check:** parse Avro schemas in repo, verify compatibility перед merge.
+
+---
+
+<Callout type="tip">
+Чем дольше job в production, тем дороже миграции. Investment в proper schema strategy (Avro + операторные UID + staging migration tests) на старте окупается каждый раз при schema change. Production lesson — не недооценивайте.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job 6 месяцев. State: ValueState<UserProfile> где UserProfile — POJO. Хотим добавить поле `creditScore: int`. Что выбрать: (a) добавить как public int → restart с savepoint; (b) Avro migration через rewrite class; (c) State Processor API rebootstrap. Дайте обоснование выбора."
+  answer="Правильный выбор — (a): добавить как `public Integer creditScore` (nullable wrapper Integer, не primitive int) и restart с savepoint. POJO Serializer поддерживает COMPATIBLE_AFTER_MIGRATION для добавления nullable полей. Defaults к null для existing entries, new writes сохраняют real values. Cost: миграция bytes happens на restore (Flink reads old format, writes new) — может быть slow для multi-GB state, но job startup-only. Почему не (b): переход с POJO на Avro — это change TypeSerializer itself → INCOMPATIBLE, требует State Processor API. Hard work для marginal gain. Почему не (c): State Processor API overkill для простого field addition. Был бы нужен если: (1) меняем type существующего поля (int→long), (2) renaming, (3) restructure. CAVEAT: использовать Integer (boxed), не int (primitive) — primitive не nullable, дефолт 0, может смешать «не было score» (real null) и «score=0» (real zero). Boxed Integer допускает true null для legacy entries. Production lesson: всегда boxed types для evolvable POJO fields."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/08-operator-chaining-tuning",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-08",
+    "description": "Quiz for operator chaining tuning lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-08-q1",
+      "type": "multiple-choice",
+      "question": "Что такое operator chaining в Flink и какие benefits относительно non-chained execution?",
+      "options": [
+        { "id": "a", "text": "Это compression формат данных" },
+        { "id": "b", "text": "Оптимизация: соседние operators со compatible parallelism и forward partitioning объединяются в один task и выполняются в одном thread. Benefits: zero serialization между ops, zero network shuffle, less network buffer memory, ~10-50ns method call vs сотни µs для serialize+buffer. Empirically chained vs non-chained: throughput x3-x10 на light operators" },
+        { "id": "c", "text": "Merge consecutive checkpoints" },
+        { "id": "d", "text": "Sequential job execution" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Chaining — automatic fusion соседних operators. Условия: same parallelism, forward partitioning (no keyBy/rebalance), same slot sharing group, no explicit disableChaining/startNewChain. Runtime: один thread (mailbox), один InputGate, один ResultPartition. Operators вызываются sequentially: op1.processElement → op2.processElement → op3.processElement. Не путать с slot sharing — chain = task fusion (один thread), slot sharing = slot allocation (разные threads возможны в одном slot).",
+      "studyHint": "Повторите урок — Что такое chaining + Benefits",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-08-q2",
+      "type": "multiple-choice",
+      "question": "Когда оправдано отключать chaining через .disableChaining() или .startNewChain()?",
+      "options": [
+        { "id": "a", "text": "Всегда — для visibility" },
+        { "id": "b", "text": "Когда: (1) один operator в chain CPU-intensive — блокирует остальные ops same thread; (2) temporary для diagnostics (Web UI per-operator metrics); (3) independent scaling нужен (different parallelism — auto-break, но explicit clearer); (4) heavy state operator. Default chaining works для 95% pipelines — не отключайте без причины (x3-x10 throughput regression)" },
+        { "id": "c", "text": "Только для batch jobs" },
+        { "id": "d", "text": "В случае ошибок compilation" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Selective disable. Главные cases: (1) Heavy single op в chain (e.g., ML inference 100µs vs neighbors 1µs) — chained все блокированы heavy thread. Split → каждый operator свой thread. Cost: 2× extra serialization, но help только если slow op scaleable independently. (2) Diagnostics — chained busy=100% скрывает который operator виноват. Temp disableChaining → per-op metrics → identify bottleneck → re-enable. (3) Different parallelism — auto-break при mismatch, но explicit .rebalance() clearer. Critical: anti-pattern — disable everywhere для visibility и забыть enable обратно. Default chaining = x3-x10 throughput vs non-chained.",
+      "studyHint": "Повторите урок — Когда отключать chaining",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-08-q3",
+      "type": "multiple-choice",
+      "question": "Pipeline: Source → Map (JSON parse) → Map (schema validation) → Map (enrichment via sync DB lookup) → KeyedProcess → Sink. Chained task busy 95%, throughput plateau, повышение parallelism не помогает. Что делать?",
+      "options": [
+        { "id": "a", "text": "Использовать static config" },
+        { "id": "b", "text": "(1) Temporary disable chaining для diagnose — discover enrichment DB lookup busy 90%+ (sync I/O blocks mailbox thread). (2) Real fix: convert к AsyncDataStream.unorderedWait — capacity=100 in-flight, не блокирует thread, throughput x10-x50 если DB latency=50ms parallel. (3) Re-enable chaining (default). Alternative fixes: cache enrichment с TTL, или broadcast small dataset" },
+        { "id": "c", "text": "Увеличить heap" },
+        { "id": "d", "text": "Restart job" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic case — sync I/O в chained task. Chained shares thread → один блокирующий operator stops всех. Diagnose flow: (1) Temporary disableChaining (only diagnostic run), measure per-op metrics. Expected discovery: enrichment 90%+ busy. (2) Sync DB lookup = blocking call → mailbox thread idle. (3) Fix: AsyncDataStream.unorderedWait. Не блокирует mailbox, capacity controls in-flight requests. (4) After async, chain works fine, re-enable chaining. Анти-pattern: leave disableChaining permanently = performance loss без benefit. Other strategies: cache (если data stable), broadcast (если data small + slow-changing), connect+state. Always restore chaining after diagnosis.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-08-q4",
+      "type": "true-false",
+      "question": "keyBy ломает chain автоматически — не нужно явно .disableChaining() перед stateful operator.",
+      "correctAnswer": true,
+      "explanation": "True. keyBy = hash-based network shuffle (hash(key) % maxParallelism → key group → subtask). Network shuffle нарушает условие forward partitioning для chaining → автоматический chain break. Аналогично: rebalance(), broadcast(), partitionCustom() — все нарушают forward partitioning. Также: mismatched parallelism (setParallelism между ops разный) → rebalance auto-insert → chain break. Side outputs (getSideOutput) создают branching → не chained beyond branch point. Connect/Union с co-operators могут не chain — verify в Web UI. Phyl rule: если есть network shuffle между ops — они не chained, period.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

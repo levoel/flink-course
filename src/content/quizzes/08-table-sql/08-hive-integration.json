@@ -1,0 +1,64 @@
+{
+  "lessonSlug": "08-table-sql/08-hive-integration",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-08",
+    "description": "Quiz for Hive integration lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-08-q1",
+      "type": "multiple-choice",
+      "question": "Какие функции включает HiveCatalog в Flink SQL?",
+      "options": [
+        { "id": "a", "text": "Только чтение Hive tables" },
+        { "id": "b", "text": "(1) Reuse Hive Metastore (HMS) — federated catalog между Hive/Spark/Trino/Flink; (2) Stream read Hive partitioned tables — monitor new partitions arrival; (3) Stream write Hive partitions — partition-commit policy (metastore + success-file); (4) Hive UDFs — ADD JAR + CREATE TEMPORARY FUNCTION; (5) Hive dialect — HiveQL syntax (LATERAL VIEW, DISTRIBUTE BY); (6) Cross-catalog queries — Hive legacy + Iceberg new in one SELECT" },
+        { "id": "c", "text": "Только batch processing" },
+        { "id": "d", "text": "Это не feature" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "HiveCatalog — comprehensive integration layer для existing Hive ecosystem. **Setup**: `CREATE CATALOG hive WITH ('type' = 'hive', 'hive-conf-dir' = '/etc/hive')`. Reads `hive-site.xml` для HMS Thrift endpoint. **Capability 1 — Catalog federation**: HMS becomes single source-of-truth для multi-engine deployments. Hive batch ETL, Spark analytics, Trino interactive queries, Flink streaming все читают same metadata. Cross-catalog joins: `SELECT * FROM hive.warehouse.orders JOIN iceberg.lakehouse.users ON ...` — query across catalogs transparently. **Capability 2 — Streaming read**: hint `/*+ OPTIONS('streaming-source.enable'='true', 'monitor-interval'='1 min') */` — Flink watches HDFS/S3 directory для new partitions. Each new partition triggers downstream processing. Use case: Hive batch writes hourly partition, Flink consumes as stream. **Capability 3 — Streaming write**: `INSERT INTO hive.warehouse.partitioned_table SELECT ... WITH ('sink.partition-commit.trigger' = 'partition-time', 'sink.partition-commit.delay' = '1h', 'sink.partition-commit.policy.kind' = 'metastore,success-file')`. Partitions committed после watermark passes partition_end + delay. HMS notified, _SUCCESS file written for downstream Hive readers. **Capability 4 — Hive UDFs**: `ADD JAR '/path/sentiment.jar'; CREATE TEMPORARY FUNCTION sentiment AS 'com.company.SentimentUDF';`. Existing Hive UDF JARs (Java `org.apache.hadoop.hive.ql.exec.UDF` implementations) work без modification. Supports UDF, UDTF, UDAF. **Capability 5 — Hive dialect**: `SET 'table.sql-dialect' = 'hive'` switches parser. HiveQL features: LATERAL VIEW (UDTFs), DISTRIBUTE BY, CLUSTER BY, SORT BY, Hive built-in functions (GET_JSON_OBJECT, HASH, MD5). Limitations: no MATCH_RECOGNIZE, no temporal joins в Hive dialect. **Capability 6 — Migration support**: incremental Hive → Iceberg/Paimon migration. Dual-write pattern, gradual cutover.",
+      "studyHint": "Повторите урок — секция 'Зачем интегрироваться с Hive'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-08-q2",
+      "type": "multiple-choice",
+      "question": "Greenfield deployment с no existing Hive infrastructure. Какой catalog выбрать и почему?",
+      "options": [
+        { "id": "a", "text": "HiveCatalog — стандартный выбор" },
+        { "id": "b", "text": "**Skip Hive integration** для greenfield. Better choices: (1) Iceberg c REST catalog (Apache Polaris, Iceberg REST) — modern, multi-engine support; (2) Paimon catalog для streaming-first workloads; (3) AWS Glue или Unity Catalog для cloud-native. Avoid Hive overhead (HMS deployment + maintenance, version compatibility issues, performance overhead) когда no legacy investment to preserve" },
+        { "id": "c", "text": "Все catalogs equivalent" },
+        { "id": "d", "text": "JDBC catalog" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Greenfield = no legacy investment to preserve = no Hive justification**. Modern alternatives offer better operational characteristics. **Hive overhead для greenfield**: (1) **HMS deployment + maintenance**: Postgres/MySQL backend, Thrift service, scaling concerns, version upgrades. Significant operational burden. (2) **Version compatibility**: HMS 2.x vs 3.x incompatible с Flink connector — version pinning headache. (3) **Performance**: HMS RPC latency для each metadata query. Caching helps but not eliminates. (4) **No cloud-native**: Hive предполагает on-prem или DIY cloud deployment. (5) **Schema evolution limitations**: некоторые ALTER operations unsupported. **Modern alternatives**: **(1) Iceberg + REST catalog (Apache Polaris, Iceberg REST API)**: (a) Pure HTTP catalog — no Thrift, no HMS. (b) Multi-engine support: Spark, Trino, Snowflake, Flink read same Iceberg tables. (c) Branches/tags for data version control (Nessie style). (d) Native cloud (S3/GCS/Azure) primary. (e) Time travel и snapshot management. Use для most analytical workloads. **(2) Paimon catalog**: (a) Streaming-first design — LSM-tree storage, native upsert. (b) Changelog producer для downstream Flink consumers. (c) Best для Materialized Tables and streaming aggregations. (d) Filesystem catalog mode — no separate service. Use для streaming-heavy pipelines. **(3) AWS Glue Data Catalog**: (a) Managed service на AWS. (b) Iceberg-compatible с Glue. (c) Integration с EMR, Athena, Redshift. (d) Pay-per-call pricing. Use на AWS-native deployments. **(4) Unity Catalog (Databricks)**: (a) Lakehouse catalog. (b) Iceberg/Delta support. (c) Fine-grained ACL, lineage. (d) Use если Databricks ecosystem. **(5) Apache Polaris**: (a) Open-source equivalent of Snowflake's catalog. (b) Iceberg REST protocol. (c) Multi-tenant, fine-grained permissions. **Decision matrix**: legacy Hive ecosystem? → HiveCatalog. New cloud deployment? → Iceberg + Glue/Polaris. Streaming-heavy? → Paimon. Databricks shop? → Unity Catalog.",
+      "studyHint": "Повторите урок — секция 'Когда use Hive integration'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-08-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: загружаешь Hive UDF JAR (50 custom UDFs from legacy ecosystem) в Flink — некоторые UDFs throw `NoSuchMethodError` на runtime. Что происходит и как fix?",
+      "options": [
+        { "id": "a", "text": "Несовместимые UDFs работают без проблем" },
+        { "id": "b", "text": "**Classpath conflicts** — Hive UDF JAR contains old version dependency (e.g., commons-lang3, guava) которая conflicts с Flink's bundled newer version. JVM loads one version arbitrarily, missing methods cause NoSuchMethodError. **Fix**: (1) Shade Hive UDF JAR — relocate conflicting dependencies (commons.lang3 → shaded.commons.lang3); (2) Upgrade UDF code to newer dependencies; (3) Use Flink's parent-first classloading; (4) Audit each UDF before deploying — pre-test on staging. Most stateless UDFs migrate fine после shading"
+        },
+        { "id": "c", "text": "UDFs автоматически compatible" },
+        { "id": "d", "text": "Это Flink bug" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Classpath conflicts — common Hive UDF migration issue**. Root cause: Hive UDF JARs built против old Hadoop/Hive ecosystem dependency versions (commons-lang 2.x, guava 14, hadoop-common 2.7). Flink 2.x bundles newer versions (commons-lang3, guava 31, hadoop 3.x). JVM classloader nondeterministic on duplicate classes — picks one, other version's methods missing. **Symptoms**: `NoSuchMethodError: org.apache.commons.lang3.StringUtils.removeStart`, `NoClassDefFoundError`, runtime exceptions on UDF invocation. **Investigation**: (1) `jar tf udf.jar | grep -E 'commons|guava'` — list bundled dependencies. (2) `flink list-classpath` — show Flink's classpath. (3) Cross-reference — identify conflicts. **Fix strategies**: **(1) Shade UDF JAR**: rebuild с Maven Shade plugin, relocate conflicting deps: ```xml <relocation><pattern>org.apache.commons.lang</pattern><shadedPattern>com.company.shaded.commons.lang</shadedPattern></relocation> ``` UDF uses isolated shaded classes, no conflict. Most reliable solution. **(2) Upgrade UDF code**: rewrite using newer commons-lang3, guava etc. Best long-term but requires source code access. **(3) Classloader configuration**: `classloader.parent-first-patterns.additional` в Flink config — force certain packages parent-loaded (Flink's version). Risky — может break other things. **(4) Separate classloaders per UDF**: complex setup, requires custom Flink build. **(5) Migrate к Flink-native UDFs**: rewrite as `ScalarFunction` или `TableFunction`. Cleaner integration, native type safety, но requires effort. **Pre-deployment audit checklist**: (1) Test each UDF в staging Flink cluster individually; (2) Check thread-safety (Flink runs UDFs parallel — non-thread-safe code crashes); (3) Verify correct annotations (`@FunctionHint` для Flink 2.x); (4) Performance benchmark (some Hive UDFs CPU-bound, bottleneck pipelines); (5) Document compatibility status per UDF. **Long-term recommendation**: migrate critical UDFs to Flink-native gradually. Hive UDF compatibility layer — bridge не permanent solution.",
+      "studyHint": "Повторите урок — секция 'Production gotchas — UDF JAR conflicts'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-08-q4",
+      "type": "true-false",
+      "question": "Hive dialect (`SET 'table.sql-dialect' = 'hive'`) supports все Flink SQL features включая WATERMARK, MATCH_RECOGNIZE и temporal joins.",
+      "correctAnswer": false,
+      "explanation": "False. **Hive dialect has limitations** — оно designed для HiveQL compatibility, не Flink-native features. **NOT supported в Hive dialect**: (1) **WATERMARK syntax**: `WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND` — Hive не has watermark concept. Switch к default dialect для DDL. (2) **MATCH_RECOGNIZE**: pattern detection — Flink-specific, не SQL:2016 в Hive. (3) **Temporal joins**: `FOR SYSTEM_TIME AS OF event_time` — Hive не has temporal table semantics. (4) **Materialized Tables**: FLIP-435 feature, Flink-native. (5) **AI functions**: ML_PREDICT, VECTOR_SEARCH — Flink 2.2 features. (6) **Asynchronous lookup**: lookup join hints — Flink-specific async config. **Supported в Hive dialect**: (1) **HiveQL syntax**: LATERAL VIEW (для UDTFs), DISTRIBUTE BY, CLUSTER BY, SORT BY. (2) **Hive built-in functions**: HASH, MD5, GET_JSON_OBJECT, REGEXP_EXTRACT, etc. (3) **Hive UDFs**: custom functions через ADD JAR + CREATE TEMPORARY FUNCTION. (4) **Basic SELECT, JOIN, GROUP BY** — standard SQL ops. (5) **Hive table read/write** — DDL и DML compatible с Hive semantics. **Practical pattern — mixed dialect**: ```sql -- Default dialect для Flink-native DDL CREATE TABLE events (id INT, ts TIMESTAMP(3), WATERMARK FOR ts AS ts - INTERVAL '5' SEC) WITH ('connector' = 'kafka', ...); -- Switch к Hive для legacy HiveQL queries SET 'table.sql-dialect' = 'hive'; SELECT user_id, GET_JSON_OBJECT(payload, '$.action') FROM events LATERAL VIEW explode(tags) AS tag; -- Switch обратно SET 'table.sql-dialect' = 'default'; INSERT INTO sink_iceberg SELECT ... FROM events JOIN dim FOR SYSTEM_TIME AS OF events.ts AS d ON ...; ``` **When use Hive dialect**: (a) running existing HiveQL queries without translation (b) UDTFs requiring LATERAL VIEW (c) DISTRIBUTE BY operator needs (d) familiarity для analyst teams. **When stay в default**: (a) New Flink-native pipelines (b) Need watermarks, MATCH_RECOGNIZE, temporal joins, AI functions, MTs (c) Better optimization Flink planner has для own dialect.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

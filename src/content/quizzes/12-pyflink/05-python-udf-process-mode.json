@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/05-python-udf-process-mode",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-05",
+    "description": "Process mode, Beam Portability, bundle processing"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-05-q1",
+      "type": "multiple-choice",
+      "question": "Architecture process mode для Python UDFs — каковы components и data flow?",
+      "options": [
+        { "id": "a", "text": "Python код выполняется в same JVM thread" },
+        { "id": "b", "text": "TaskManager JVM имеет Beam Portability harness — adapter переводит Flink records в Beam Portable protobuf format. Управляет Python interpreter process lifecycle (start/stop/restart). Через gRPC services (Control, Data, State, Logging) over Unix socket. Separate Python interpreter process per slot. Records batched в bundles (default 1000 records / 1s) для amortization IPC overhead. Python UDFs выполняются в this process, results via gRPC обратно к JVM" },
+        { "id": "c", "text": "Python и Java один process через PEMJA" },
+        { "id": "d", "text": "Используется HTTP REST API между Java и Python" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Process mode architecture borrowed from Apache Beam Portability framework. Components: (1) **TaskManager JVM** — Flink runtime, when encountering Python UDF passes records к Python via IPC. (2) **Beam Portability harness** — adapter layer на JVM side. Translates Flink records к Beam Portable protobuf format (FunctionSpec, PCollection messages). Manages Python process lifecycle: spawn, restart on failure, shutdown. (3) **gRPC services** — four endpoints для communication: Control (lifecycle messages — start worker, register bundle, shutdown), Data (actual records — most bandwidth), State (keyed state access — read/write/clear), Logging (forward Python logs к JVM Log4j). (4) **Python interpreter process** — separate OS process per slot. Loaded UDFs, libraries, state cache. Receives batched records via gRPC, executes UDF code, sends results back. **Bundle processing**: single-record roundtrip IPC ~50-100μs overhead. На 100k records/sec это unacceptable. Solution: batch records в bundles (`bundle.size: 1000, bundle.time: 1000ms`), one IPC roundtrip per bundle amortizes overhead к ~0.05μs/record. **Trade-off**: bundles add latency — records wait до bundle full or timeout flush. **Transport**: gRPC over Unix domain socket (same machine, faster than TCP loopback), protobuf serialization wire format.",
+      "studyHint": "Повторите урок 05 — секцию 'Архитектура process mode' с diagram",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-05-q2",
+      "type": "multiple-choice",
+      "question": "Bundle tuning trade-offs: `bundle.size` 100 vs 1000 vs 10000 — что выбрать?",
+      "options": [
+        { "id": "a", "text": "Всегда максимальное значение" },
+        { "id": "b", "text": "bundle.size=100: latency ~100ms typical, throughput limited (overhead per call), low memory per call. bundle.size=1000 (default): balanced, ~100ms latency under normal load, good throughput для most workloads, ~120k rec/sec/subtask achievable. bundle.size=10000: max amortization (~135k rec/sec/subtask), latency может grow до 1-5 sec (waiting for bundle fill), risks watermark stalls. Production: latency-sensitive — 100, throughput-sensitive — 5000-10000, default for most — 1000" },
+        { "id": "c", "text": "Bundle size не влияет на performance" },
+        { "id": "d", "text": "Только bundle.time matters" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Bundle tuning balances throughput vs latency. **bundle.size=1 (no batching)**: every record one IPC roundtrip (~50μs), throughput capped ~8k rec/sec/subtask. Effectively unusable for production. **bundle.size=100**: amortization starts (50μs/100 = 0.5μs/record overhead), throughput ~90k rec/sec, latency moderate. Good for latency-sensitive workloads (<100ms target). **bundle.size=1000 (default)**: throughput ~120k rec/sec, latency typically 100ms at full load (bundle fills quickly). Sweet spot для balanced workloads. **bundle.size=10000**: throughput peaks ~135k rec/sec (diminishing returns vs 1000), latency могут grow к seconds (waiting for bundle fill при low traffic). Watermark progression slower (waits for bundle completion). **bundle.size=100000**: minimal additional throughput gain, latency severe (waits min(time, fill)), risks checkpoint timeouts if bundle slow. **bundle.time controls timeout**: how long Flink waits before flushing partial bundle. Pair with bundle.size: high throughput sustained — bundles fill before time. Low traffic — bundle.time triggers flush. **Production tuning**: (a) Latency SLO <500ms → bundle.size=100-200, bundle.time=200ms. (b) Throughput >100k events/sec → bundle.size=5000-10000, bundle.time=2000ms. (c) Most cases → default 1000/1000. (d) ALWAYS measure with production-representative data — synthetic benchmarks misleading.",
+      "studyHint": "Повторите урок 05 — секцию 'Bundle processing' и tuning guidelines",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-05-q3",
+      "type": "multiple-choice",
+      "question": "Production gotchas для process mode Python UDFs — какие main?",
+      "options": [
+        { "id": "a", "text": "Только slow Python performance" },
+        { "id": "b", "text": "(1) Heavy import в eval() — `import torch` каждый call, lift в open(). (2) Memory leaks в Python process — Python objects не освобождены, RSS growth. Monitor python_resident_memory_bytes, restart slot по policy. (3) Bundle straggler — один slow Python process stalls all bundles, watermark gap grows. (4) State access overhead — gRPC RPC per state access (~10-50μs each), cache hot state в Python memory. (5) Watermark progression blocked until bundle completes — slow UDF → window emission delayed. (6) Multiprocessing inside UDF deadlocks. (7) Async I/O не работает прозрачно — use Async UDFs Flink 2.2" },
+        { "id": "c", "text": "Только network issues" },
+        { "id": "d", "text": "Process mode не имеет issues" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Process mode operational complexity. **Heavy imports**: `import torch` или `import sklearn` в eval() — happens per record (Python caches but overhead still). Lift к module level или open(). **Memory leaks**: Python doesn't always free memory back to OS (heap fragmentation, ref cycles). RSS growth steady → eventually K8s OOM kill. Monitor `python_resident_memory_bytes` metric. Set Python process restart policy (Flink's `restart-strategy`). **Bundle straggler**: bundles processed sequentially per slot. One slow bundle (Python UDF temporarily slow due to GC, slow API, etc.) blocks subsequent bundles → backpressure → watermark gap. Mitigation: monitor `pythonScalarFunctionOperator_processBundleMs` histogram for outliers. **State access overhead**: gRPC RPC per state read/write — adds latency proportional to state ops density. Cache state в Python local variable, sync back periodically. Trade-off: weaker consistency for performance. **Watermark blocking**: bundle includes records and watermark events. Watermark forwarded только after bundle completes. Slow bundle → watermark stall → downstream windows don't fire → user-facing delays. **Multiprocessing inside UDF**: Python multiprocessing uses fork(). Inside Flink Python process, fork creates state mess (Flink expects single Python process per slot). Use ThreadPoolExecutor вместо multiprocessing. **Async/await in UDF**: process mode UDF model is synchronous. async def функция won't be awaited properly. For external API calls — use Async UDFs (Flink 2.2, урок 08).",
+      "studyHint": "Повторите урок 05 — Production gotchas section",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-05-q4",
+      "type": "true-false",
+      "question": "Process mode исторически — default Python UDF execution model в PyFlink. Использует Apache Beam Portability framework, обеспечивает strong failure isolation (Python crash → restart slot, JVM stays alive), но платит ~50-70% performance gap из-за IPC overhead. Для performance-critical workloads thread mode (PEMJA) или Pandas UDFs preferred.",
+      "correctAnswer": true,
+      "explanation": "Process mode characteristics. **Default since first Python UDF support** (Flink 1.10+) — Apache Beam Portability was the universal Python integration mechanism for distributed processing frameworks. Reused в PyFlink instead of building custom Python bridge. **Strong failure isolation**: Python process separate OS process per slot. Python crashes (segfault от native extension, OOM, unhandled exception в C code) → Python process dies → Flink restarts Python process для that slot → JVM unaffected, other slots unaffected. This isolation is valuable для untrusted Python deps or complex ML libraries. **Performance gap ~50-70%**: IPC over gRPC (~50μs per roundtrip) + protobuf serialization + bundle batching overhead. Even с large bundles (10000), Python interpretation cost + cross-process communication caps throughput ~30-50% Java baseline. **Alternatives for performance**: (a) **Thread mode (PEMJA, урок 06)** — Python embedded в JVM, ~70-90% Java baseline, no IPC. Trade-off: weaker isolation (Python crash → JVM crash), GIL contention. (b) **Pandas UDFs (урок 07)** — vectorized batch via Arrow zero-copy, ~90-95% Java baseline для numerical operations. Best when operations vectorizable. (c) **Async UDFs (Flink 2.2, урок 08)** — для external I/O specifically, concurrent in-flight requests. **Production decision**: process mode default safe choice. Migrate selective UDFs к faster modes when measured bottleneck. Keep process mode для critical safety (untrusted deps, GPU code).",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

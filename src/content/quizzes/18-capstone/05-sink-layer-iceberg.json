@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/05-sink-layer-iceberg",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-05",
+    "description": "Quiz for capstone sink layer"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-05-q1",
+      "type": "multiple-choice",
+      "question": "SinkV2 pre-commit topology — что это и зачем используется в Paimon sink?",
+      "options": [
+        { "id": "a", "text": "Это deprecated abstraction" },
+        { "id": "b", "text": "Sub-topology между Writer и Committer для compaction. Streaming sinks create thousands small files (checkpoint × buckets). Pre-commit compaction reads multiple small files в window, rewrites как single bigger file. Drastically reduces small-file count, improves query performance 10-100x" },
+        { "id": "c", "text": "Это только для Iceberg" },
+        { "id": "d", "text": "Это batch-only API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SinkV2 (FLIP-191) provides extensibility points. Streaming sink natural problem: каждый checkpoint commits new files. 60s checkpoint × 1440 checkpoints/day × 16 buckets = 23k files/day per partition. Storage explodes, query performance degrades (each file open = S3 GetObject + Parquet footer read). Pre-commit compaction operator merges small files перед commit. Configuration: `compaction.min.file-num: 5` (trigger threshold), `compaction.max.file-num: 50` (max per batch). Trade-off: aggressive compaction = fewer files but CPU overhead, lazy = query slow. Default min.file-num=5 reasonable start.",
+      "studyHint": "Повторите урок 05 — раздел 'SinkV2 architecture'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-05-q2",
+      "type": "multiple-choice",
+      "question": "Partitioning strategy для fact_orders — почему `partition by (order_date, category)` правильный choice, а не `partition by user_id` или `partition by created_at` (full timestamp)?",
+      "options": [
+        { "id": "a", "text": "Random choice" },
+        { "id": "b", "text": "(order_date, category): natural time + analytical dimensions, reasonable cardinality (365 × 100 = 36500/year — manageable). Anti-patterns: user_id = 200M tiny partitions, full timestamp = per-second partitions millions. Query patterns mostly filter on date range + category — partition pruning optimal" },
+        { "id": "c", "text": "Только потому что date — это standard" },
+        { "id": "d", "text": "Все varies партиции работают одинаково" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Partition design critical для query performance + storage cost. Good: (1) cardinality manageable (thousands to tens of thousands per year, not millions); (2) matches typical query filters (WHERE order_date BETWEEN ... AND category = ...); (3) даёт partition pruning при queries. Anti-patterns: high-cardinality column (user_id 200M) = millions of tiny partitions с metadata overhead worse than no partitioning; full timestamp = per-second partitions; no partitioning = full table scan even для date queries. Capstone choice: order_date + category matches business query pattern.",
+      "studyHint": "Повторите урок 05 — раздел 'Partitioning strategy'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-05-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: после 2 недель Paimon sink, checkpoint duration вырос с 5s до 45s, query performance degraded, S3 cost +40%. Likely root cause и diagnostic steps?",
+      "options": [
+        { "id": "a", "text": "Просто scale up cluster" },
+        { "id": "b", "text": "Small files problem despite compaction. Diagnosis: query Paimon system tables (file_count per partition), check compaction metrics frequency, verify config (`compaction.min.file-num`). Fixes: aggressive compaction tuning, manual one-time compaction CALL paimon.system.compact(), increase checkpoint interval (less commits), orphan file cleanup, snapshot expiration tuning" },
+        { "id": "c", "text": "Это нормально для Paimon" },
+        { "id": "d", "text": "Migrate на Iceberg" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic streaming sink production issue. Compaction может быть behind: created files faster than compacted. Diagnosis: `SELECT partition, file_count FROM table$files GROUP BY partition` — should be < 100; if 1000+ — compaction backlog. Metrics: `paimon_compaction_file_count` shows trend, `paimon_compaction_lag_seconds` shows backlog. Fixes (по effectiveness): (1) tune compaction more aggressive; (2) manual `CALL paimon.system.compact()` для one-time catch up; (3) increase checkpoint interval reduces commit frequency; (4) orphan file cleanup; (5) snapshot expiration. Lesson: compaction is critical config, not 'set and forget' — production scale exposes operational issues.",
+      "studyHint": "Повторите урок 05 — KnowledgeCheck",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-05-q4",
+      "type": "true-false",
+      "question": "EXACTLY_ONCE Paimon sink работает automatic — Just enable EXACTLY_ONCE checkpointing config.",
+      "correctAnswer": false,
+      "explanation": "EOS требует proper configuration multiple components: (1) `execution.checkpointing.mode: EXACTLY_ONCE` (Flink-level); (2) Paimon `merge-engine: deduplicate` для UPSERT semantics; (3) primary-key declared and Flink uses it; (4) Paimon sink configured с EXACTLY_ONCE delivery guarantee (explicit, не default for some versions); (5) Reconciliation script verifying source = sink under chaos testing. Production EOS bugs surface only under failure scenarios. 'It says EOS' не достаточно — verify через chaos testing. См. M18/08 для verification approach.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

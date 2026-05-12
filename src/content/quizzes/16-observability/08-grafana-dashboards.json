@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/08-grafana-dashboards",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-08",
+    "description": "Quiz for Grafana dashboards lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-08-q1",
+      "type": "multiple-choice",
+      "question": "Top 12 production metrics для Flink Grafana dashboard:",
+      "options": [
+        { "id": "a", "text": "Только heap и CPU" },
+        { "id": "b", "text": "(1) Checkpoint duration P95 — stability, (2) State size trend — growth, (3) numberOfFailedCheckpoints — failures, (4) currentInputWatermark lag — event-time progress, (5) busyTime% per operator — bottlenecks, (6) backPressuredTime% — backpressure, (7) numRecordsInPerSecond — throughput, (8) numLateRecordsDropped — data loss, (9) GC time/minute — pressure, (10) Heap usage % — memory, (11) Direct memory used — off-heap leaks, (12) RocksDB compaction pending — storage health" },
+        { "id": "c", "text": "Random sampling метрик" },
+        { "id": "d", "text": "Только business KPI" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Top 12 покрывают main production failure modes. Hierarchy dashboards: Fleet overview (cluster-wide), Per-job (detailed), Operator drill-down (debugging), Backend-specific (RocksDB tuning). '3-секунды правило' для dashboard design — основное состояние видно за 3 секунды. PromQL examples: quantile_over_time(0.95, ckpt_duration[5m]) / 1000, avg by (operator_name) (busyTime / 10) для heatmaps. Variables: $namespace, $job_name, $operator_name templated dashboard. JSON template versioned в Git, deployed via Terraform/provisioning.",
+      "studyHint": "Повторите урок — Top 12 metrics",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-08-q2",
+      "type": "multiple-choice",
+      "question": "Какие 4 tier severity alerts должны быть для production Flink + примеры?",
+      "options": [
+        { "id": "a", "text": "Только critical/warning" },
+        { "id": "b", "text": "Critical (P0, page): job stopped, persistent ckpt failures (>2 в 10min), TM OOMKilled. High (P1, Slack): sustained backpressure (>5min), watermark stuck (>10min), checkpoint duration spike, late records dropped. Medium (P2, daily digest): state size growth, GC elevated, RocksDB compaction backlog. Info (P3, Slack channel no notification): throughput drop trend, heap usage elevated. Каждый alert links к runbook" },
+        { "id": "c", "text": "Все alerts равны" },
+        { "id": "d", "text": "Только Prometheus alerting" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Tiered severity prevents alert fatigue. Critical = wake-up justified (rare, < 5/month). High = sustained issues need attention same day. Medium = trend issues для capacity planning weekly review. Info = observability artifacts. Alertmanager routing: critical → PagerDuty, high → Slack with mention, medium → daily digest, info → Slack channel. 'for' duration важен — instant alerts на transient pikes = noise. Sustained 5-10min requirement filters transient. Runbook за каждый alert: symptoms, diagnosis steps, common fixes, escalation.",
+      "studyHint": "Повторите урок — Alerting playbook",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-08-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: 200+ alerts/week, 90% transient backpressure spikes resolve через 2-5 минут. On-call alert fatigue. План оптимизации?",
+      "options": [
+        { "id": "a", "text": "Игнорировать alerts" },
+        { "id": "b", "text": "(1) Triage current alerts last 4 weeks, identify top 5 noisy. (2) Re-tier по severity (rare critical, sustained high, trend medium, info channel). (3) Add 'for: 10m+' к alerts — eliminates transient. (4) De-duplication: group_by job_name not subtask. (5) Inhibition rules: silence Backpressure если CheckpointFailing активен (correlated). (6) Silence windows для maintenance. (7) Runbook discipline — каждый alert clear playbook. (8) Dashboards simplification. (9) Quarterly review. Target: 50-70% reduction (200/week → 60-80/week)" },
+        { "id": "c", "text": "Disable backpressure alerts" },
+        { "id": "d", "text": "Page on-call больше people" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Alert fatigue убивает production reliability. 'for: 10m' instead of '5m' — only sustained backpressure triggers, reduces transient noise 80%. De-duplication: 30 backpressured subtasks → 1 alert per job, not 30. Inhibition rules в Alertmanager: backpressure и checkpoint failures correlated (root cause shared) — show only one. Silence windows: known deployment / K8s upgrade windows pre-silenced. Alert quality SLO: false positive rate < 10% critical, < 25% high. Track. Continuously tune. Less is more: every alert actionable, every page justified.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-08-q4",
+      "type": "true-false",
+      "question": "Production Grafana dashboards должны быть в Git (dashboards-as-code) + provisioned через CI/CD, не manual edits в UI.",
+      "correctAnswer": true,
+      "explanation": "True. Manual dashboards drift, undocumented, lost on Grafana restore. Versioned JSON в Git — single source of truth. Grafana provisioning: /var/lib/grafana/dashboards/flink/*.json, datasource provisioning yaml. Terraform Grafana provider для automation. Production benefits: (1) Audit trail changes, (2) Code review для dashboard changes, (3) Backup-free restore, (4) Environment parity (dev/staging/prod same dashboards), (5) Easy clone/template для new jobs. Quarterly review — retire stale panels, add new metrics for emerging concerns. Stale dashboards теряют trust команды.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

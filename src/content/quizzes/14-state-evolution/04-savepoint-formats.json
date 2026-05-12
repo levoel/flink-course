@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/04-savepoint-formats",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-04",
+    "description": "Quiz for Savepoint formats lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-04-q1",
+      "type": "multiple-choice",
+      "question": "Native vs Canonical savepoint format — главное отличие?",
+      "options": [
+        { "id": "a", "text": "Canonical новее и лучше во всём" },
+        { "id": "b", "text": "Native: backend-specific binary (RocksDB/ForSt/HashMap не interchangeable), 3-5x faster, can be incremental, default 1.15+. Canonical: universal cross-backend cross-version format, slower (full reserialize), required для State Processor API и backend migrations" },
+        { "id": "c", "text": "Native для streaming, Canonical для batch" },
+        { "id": "d", "text": "Никакой разницы — синонимы" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Native — backend-specific format, fast, default. Same Flink version + same backend safe. Cross-backend or cross-major-version restore fails. Canonical — universal binary format, slower (полная reserialize state), но cross-backend (RocksDB ↔ ForSt) и cross-version safer. Use native для regular ops (daily blue/green same backend), canonical для major upgrades, backend migrations, State Processor API jobs.",
+      "studyHint": "Повторите урок — Native vs Canonical секции + Comparison",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m14-04-q2",
+      "type": "multiple-choice",
+      "question": "Migration: Flink 2.2 + RocksDB → Flink 2.3 + ForSt. Какой format + restore mode?",
+      "options": [
+        { "id": "a", "text": "Native, NO_CLAIM" },
+        { "id": "b", "text": "CANONICAL обязательно (cross-backend RocksDB→ForSt + cross-version 2.2→2.3 safer). Restore mode CLAIM — one-way migration, не возвращаться. CLAIM enables incremental reuse. Keep separate savepoint для rollback insurance" },
+        { "id": "c", "text": "Native, CLAIM" },
+        { "id": "d", "text": "Canonical, LEGACY" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Two simultaneous changes — major version + backend. Canonical обязателен потому что (1) cross-backend RocksDB→ForSt; (2) cross-version 2.2→2.3 safer (format changes possible). Cost: canonical 100GB ~3-8 минут vs native ~30-60 сек — приемлем для once-off migration. CLAIM restore mode: one-way decision, Flink takes ownership savepoint files, incremental reuse. BUT keep separate canonical savepoint для rollback (independent of CLAIM ownership) — production safety > speed. Native here = FAIL (incompatible backends).",
+      "studyHint": "Повторите урок — Format choice decision tree + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-04-q3",
+      "type": "multiple-choice",
+      "question": "CLAIM vs NO_CLAIM restore mode — production default?",
+      "options": [
+        { "id": "a", "text": "CLAIM — auto cleanup" },
+        { "id": "b", "text": "NO_CLAIM (default 1.15+): savepoint остаётся, user owns, safe для rollback. CLAIM: Flink takes ownership, may delete savepoint when subsequent checkpoints subsume — no rollback to this specific savepoint" },
+        { "id": "c", "text": "LEGACY — proven" },
+        { "id": "d", "text": "Не имеет значения" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "NO_CLAIM (default) — safer для production. Savepoint files остаются в DFS, user manages retention, rollback to this savepoint always available. CLAIM — Flink may delete savepoint files когда subsequent checkpoints supersede the state — preserves space, enables incremental optimization, но no rollback. CLAIM appropriate для one-way migrations (backend change, major version) где rollback impossible/undesired. LEGACY — deprecated 1.x behavior, mixed ownership, не используйте.",
+      "studyHint": "Повторите урок — Restore modes + CLAIM/NO_CLAIM секции",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-04-q4",
+      "type": "true-false",
+      "question": "Production savepoint retention strategy — multi-tiered: hourly (7d), upgrade (30d), weekly (90d glacier), monthly (1y), annual (forever). Aggressive single-tier retention опасен.",
+      "correctAnswer": true,
+      "explanation": "True. Single-tier retention (e.g., 7 days only) misses long detection lag issues (memory leaks, subtle bugs detected weeks later, compliance audits). Multi-tiered: hourly automatic (operator's autoSavepointSeconds + savepointHistory) для regular ops (7d); upgrade savepoints (S3 tag) для rollback window (30d); weekly Sundays для longer history (90d, GLACIER); monthly archives (1y); annual для compliance (forever, DEEP ARCHIVE). S3 lifecycle policy automates transitions. Cost balance: GLACIER cheap, hot tier limited. Retention >= max detection time для caring issue types.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

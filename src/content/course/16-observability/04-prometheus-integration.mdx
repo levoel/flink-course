@@ -1,0 +1,507 @@
+---
+title: "Prometheus integration: pull, PushGateway, Grafana setup"
+description: "Prometheus pull (PrometheusReporter), PushGateway для short jobs, Grafana datasource setup. Service discovery в Kubernetes. Production config"
+order: 4
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Prometheus", "PushGateway", "Grafana", "Service Discovery", "Kubernetes"]
+---
+
+# Prometheus integration
+
+Prometheus — de-facto стандарт metrics для Kubernetes окружения. Pull-based, time-series, label-based — отлично подходит для Flink. В этом уроке препарируем production setup: PrometheusReporter для long-running streaming jobs, PushGateway для short batch, service discovery в K8s, и Grafana datasource configuration.
+
+---
+
+## PrometheusReporter (pull-based)
+
+Default для long-running streaming jobs. Flink exposes metrics на HTTP endpoint, Prometheus периодически scrapes.
+
+Config:
+
+```yaml
+metrics.reporters: prom
+
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+metrics.reporter.prom.filterLabelValueCharacters: true
+```
+
+После старта TaskManager на host:port открыт HTTP endpoint:
+
+```bash
+curl http://taskmanager-host:9249/metrics
+
+# HELP flink_taskmanager_job_task_operator_numRecordsIn ...
+# TYPE flink_taskmanager_job_task_operator_numRecordsIn counter
+flink_taskmanager_job_task_operator_numRecordsIn{
+  host="tm-1",
+  task_name="Source",
+  ...
+} 1234567
+```
+
+JobManager также exposes metrics на своём порту (default 9249 в JM-specific config).
+
+### Port allocation в multi-TM hosts
+
+Если несколько TaskManagers на одном host (e.g., старая deployment), нужен range:
+
+```yaml
+metrics.reporter.prom.port: 9249-9259
+```
+
+Каждый TM picks first available port. Прометheus scrape config должен охватывать range.
+
+---
+
+## Prometheus scrape config
+
+### Static targets (small deployments)
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'flink'
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - 'jobmanager:9249'
+          - 'taskmanager-1:9249'
+          - 'taskmanager-2:9249'
+          - 'taskmanager-3:9249'
+```
+
+Проблема: hardcoded targets — не работает при scale-out.
+
+### Kubernetes service discovery
+
+```yaml
+scrape_configs:
+  - job_name: 'flink-k8s'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # Только Flink pods
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: flink
+        action: keep
+      # Используем prometheus port из аннотации
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: true
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        target_label: __address__
+        regex: (.+)
+        replacement: $1
+      # Labels из K8s pod labels
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        target_label: flink_role
+```
+
+Pod annotations:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9249"
+        prometheus.io/path: "/metrics"
+      labels:
+        app: flink
+        component: taskmanager
+```
+
+Auto-discovery: каждый новый TaskManager pod автоматически discovered.
+
+### Flink Kubernetes Operator integration
+
+Если используете Flink K8s Operator (recommended для 2.x):
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-job
+spec:
+  flinkConfiguration:
+    metrics.reporters: prom
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+  podTemplate:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9249"
+```
+
+Operator автоматически apply annotations к JobManager и TaskManager pods.
+
+---
+
+## PushGateway для short-lived jobs
+
+Batch jobs (DataStream + Boundedness.BOUNDED) живут несколько minutes/hours, потом exit. Prometheus pull может miss финальные metrics — TM уже исчез.
+
+**PushGateway** — Prometheus addon. Jobs push metrics в gateway, который persists между job runs. Prometheus scrapes gateway.
+
+```yaml
+metrics.reporters: prom_push
+
+metrics.reporter.prom_push.factory.class: org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterFactory
+metrics.reporter.prom_push.hostUrl: http://pushgateway:9091
+metrics.reporter.prom_push.jobName: my-flink-batch
+metrics.reporter.prom_push.randomJobNameSuffix: true
+metrics.reporter.prom_push.deleteOnShutdown: false
+metrics.reporter.prom_push.interval: 30s
+```
+
+Параметры:
+- `randomJobNameSuffix`: append random suffix → unique job per run.
+- `deleteOnShutdown: false`: metrics persist после exit. Set `true` если хотите cleanup.
+- `interval: 30s`: push frequency.
+
+**Anti-pattern**: PushGateway для long-running streaming. Дополнительный hop, не нужен — pull-based scrape directly работает идеально.
+
+---
+
+## OpenTelemetry reporter (1.20+, 2.3 GA gRPC)
+
+Альтернатива Prometheus reporter — экспорт через OpenTelemetry Collector:
+
+```yaml
+metrics.reporters: otel
+
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OtelReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector:4317
+metrics.reporter.otel.protocol: grpc
+metrics.reporter.otel.interval: 30s
+metrics.reporter.otel.metrics-prefix: flink
+```
+
+Преимущество — unified observability stack: same OTel Collector для metrics + traces + logs. См. урок про OTel.
+
+В Flink 2.3 **gRPC export GA** — раньше был только HTTP/Protobuf. gRPC — более efficient, lower overhead.
+
+---
+
+## Grafana datasource setup
+
+После Prometheus scraping настройте Grafana:
+
+1. **Add Data Source** → Prometheus.
+2. URL: `http://prometheus:9090`.
+3. Access: Server (default).
+4. Scrape interval: 15s (match Prometheus).
+5. Query timeout: 60s.
+
+Test connection → save.
+
+Теперь импорт Flink dashboard. Community templates:
+
+- `13393` (Flink на Grafana labs) — general purpose.
+- `14911` — comprehensive with checkpoint, RocksDB.
+
+Или own dashboard через PromQL queries. См. урок Grafana dashboards.
+
+---
+
+## Filtering metrics
+
+Flink exports тысячи metrics. Multi-job cluster может easily 100k+ time series. Filter early:
+
+### По имени
+
+```yaml
+metrics.reporter.prom.filter.includes: "flink_*"
+metrics.reporter.prom.filter.excludes: "*shuffle*"
+```
+
+### По scope
+
+```yaml
+metrics.reporter.prom.scope-filter: "!flink.taskmanager.*.shuffle.*"
+```
+
+### Per-variable filtering
+
+```yaml
+metrics.reporter.prom.scope.variables.excludes: "subtask_index"
+```
+
+Каждая excluded variable уменьшает cardinality. `subtask_index` exclusion → metrics aggregated per operator (а не per subtask) — lower cardinality but lose subtask-level granularity.
+
+---
+
+## Production scrape config (Kubernetes)
+
+```yaml
+# prometheus.yml — full production setup
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'flink-jobmanager'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - flink-jobs
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        regex: jobmanager
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: $1:9249
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: flink_job
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  - job_name: 'flink-taskmanager'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - flink-jobs
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        regex: taskmanager
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: $1:9249
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: flink_job
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  # Metrics filter (drop noisy network internals):
+  metric_relabel_configs:
+    - source_labels: [__name__]
+      regex: 'flink_taskmanager_job_task_Shuffle.*'
+      action: drop
+```
+
+Labels `flink_job`, `namespace`, `pod` — основа для Grafana variable templating.
+
+---
+
+## High availability setup
+
+Prometheus single-node — single point of failure. Production options:
+
+### 1. HA Prometheus
+
+Два Prometheus instances scraping same targets. Grafana queries either.
+
+### 2. Thanos / Cortex / Mimir
+
+Distributed Prometheus-compatible storage. Long retention (years), HA, sharding.
+
+### 3. VictoriaMetrics
+
+High-performance alternative. Lower resource consumption на high cardinality.
+
+Для Flink с десятками сотнями jobs — рекомендую VictoriaMetrics or Thanos.
+
+---
+
+## Querying в PromQL
+
+Базовые queries для Flink:
+
+```promql
+# Throughput per operator:
+sum by (operator_name) (
+  rate(flink_taskmanager_job_task_operator_numRecordsInPerSecond[5m])
+)
+
+# Backpressure top-10 operators:
+topk(10,
+  avg_over_time(flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond[5m])
+)
+
+# Checkpoint duration P95:
+histogram_quantile(0.95,
+  flink_jobmanager_job_lastCheckpointDuration_bucket
+)
+
+# Watermark lag (если в millisecond Unix time):
+(time() * 1000 - flink_taskmanager_job_task_operator_currentInputWatermark) / 1000
+
+# GC time per minute:
+rate(flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Time[1m]) * 60
+
+# Heap usage %:
+flink_taskmanager_Status_JVM_Memory_Heap_Used
+/
+flink_taskmanager_Status_JVM_Memory_Heap_Max
+* 100
+
+# State size growth:
+deriv(flink_jobmanager_job_lastCheckpointSize[10m]) > 0
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Cardinality explosion от subtask labels
+
+Каждый subtask → unique time series. 200 subtasks × 50 metrics = 10k series per job. На 100 jobs = 1M series.
+
+**Fix**: filter `subtask_index` в reporter, aggregate в Prometheus query когда нужно. Или use VictoriaMetrics (high cardinality friendly).
+
+### Gotcha 2: Scrape interval too short
+
+```yaml
+scrape_interval: 1s     # ← bad
+```
+
+Per-1-second scrape × 100 endpoints × 1000 metrics = 100k samples/sec. Prometheus overwhelmed.
+
+**Fix**: 15-30s — sweet spot. Real-time не нужно для most operations.
+
+### Gotcha 3: PrometheusReporter не auto-restart после reconnect
+
+В rare scenarios reporter может не recover после Prometheus down. Metrics endpoint OK, но no scraping resume.
+
+**Fix**: TaskManager restart cycles eventually fix. Better — Flink upgrade с reporter improvements (recent versions).
+
+### Gotcha 4: Port conflicts в multi-TM hosts
+
+Two TMs на one host, default port=9249. Conflict, второй TM fails to start metrics endpoint.
+
+**Fix**: port range:
+
+```yaml
+metrics.reporter.prom.port: 9249-9269
+```
+
+### Gotcha 5: PushGateway accumulates metrics
+
+PushGateway сохраняет metrics forever (если `deleteOnShutdown: false`). Через год — gigabytes старых metrics, slow query.
+
+**Fix**: cleanup script:
+
+```bash
+curl -X DELETE http://pushgateway:9091/metrics/job/old-job-name
+```
+
+Или TTL через прометheus garbage collection script.
+
+### Gotcha 6: Metric name conflicts в multi-tenant
+
+Multiple jobs в одном namespace, same metric names → series collision.
+
+**Fix**: добавить `job_name` label в scope variables:
+
+```yaml
+metrics.scope.jm: "<host>.jobmanager"
+metrics.scope.jm.job: "<host>.jobmanager.<job_name>"
+```
+
+Или в Prometheus relabel rules.
+
+### Gotcha 7: Network reach к Prometheus from Flink
+
+Prometheus в другом namespace без NetworkPolicy → connections fail. Metrics endpoint open, но Prometheus не может scrape.
+
+**Fix**: NetworkPolicy позволить Prometheus IP/namespace access на TM port 9249.
+
+---
+
+## Configuration template (production K8s)
+
+### TaskManager Flink config:
+
+```yaml
+# Metrics reporters:
+metrics.reporters: prom
+
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249-9259
+metrics.reporter.prom.filterLabelValueCharacters: true
+
+# Scope filters (reduce cardinality):
+metrics.scope.tm: "<host>.taskmanager.<tm_id>"
+metrics.scope.tm.job: "<host>.taskmanager.<tm_id>.<job_name>"
+
+# RocksDB metrics (enable selective):
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+state.backend.rocksdb.metrics.compaction-pending-bytes: true
+```
+
+### Kubernetes pod template:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9249"
+    prometheus.io/path: "/metrics"
+  labels:
+    app: flink
+    component: taskmanager
+spec:
+  containers:
+    - name: taskmanager
+      ports:
+        - containerPort: 9249
+          name: metrics
+```
+
+### Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'flink'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: true
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: flink
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        target_label: __address__
+        regex: (.+)
+        replacement: $1
+```
+
+---
+
+<Callout type="note">
+PrometheusReporter (pull) — standard для streaming. PushGateway — только для short-lived batch. OTel reporter — recommended если у вас unified observability stack (traces + metrics + logs в OTel Collector). Не комбинируйте всё — выберите одну primary, другие как backup.
+</Callout>
+
+---
+
+<Callout type="warning">
+Cardinality explosion — главная проблема Prometheus + Flink в large clusters. Per-subtask metrics на сотнях subtasks × десятки операторов × десятки jobs = millions time series. Filter `subtask_index` в scope variables или используйте VictoriaMetrics для high-cardinality workloads.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink: 50 streaming jobs в одном K8s namespace, каждый с 20-200 subtasks. После года в production Prometheus затормозил: queries возвращаются 30+ секунд, alerting evaluation slow, disk full of TSDB. Текущий setup: standard PrometheusReporter, scrape 15s, retention 30 дней. Какой план migration? Trade-offs?"
+  answer="Анализ: ~50 jobs × 100 subtasks avg × 50 metrics = 250k unique series. Per 15s scrape = 17k samples/sec. После года = ~530B samples в TSDB → terabytes на disk. Vanilla Prometheus не optimized для этой cardinality. Migration plan: (1) Quick wins — reduce cardinality immediately. (a) Drop subtask_index label через scope filter: metrics.reporter.prom.scope.variables.excludes: subtask_index. Metrics aggregate per operator вместо per subtask. Reduces series by 10-50× depending на parallelism. Cost: lose subtask-level granularity (skew detection harder, но still through alternative metrics). (b) Filter noisy categories: metric_relabel_configs to drop flink_taskmanager_job_task_Shuffle.* (network internals). Save ~30% series. (c) Drop tag values: drop flink_jobmanager_job_lastJobManagerLeader (debugging only). (2) Medium-term: switch к VictoriaMetrics. (a) High cardinality optimized — designed для millions of series. (b) ~5-10× lower disk usage vs Prometheus (better compression). (c) ~3× faster queries на high cardinality. (d) Prometheus-compatible API → Grafana plug-and-play. (e) Migration: deploy VictoriaMetrics с remote_write from Prometheus → eventually replace Prometheus. Zero downtime. (3) Long-term: split observability stack. Tier 1 (real-time, hot): VictoriaMetrics single instance, 7 days retention, всё что нужно для alerting и live debugging. Tier 2 (historical, cold): VictoriaMetrics cluster или Thanos с S3 backend, 1 year retention, для capacity planning, post-mortem analysis. Trade-offs: (1) Drop subtask_index — lose granularity. Mitigation: keep subtask-level через separate selective scrape job для top-N critical jobs. Не applied к всем 50 jobs. (2) VictoriaMetrics vs Prometheus: PROS faster queries, less disk, better cardinality handling. CONS slight learning curve, smaller community, third-party (not CNCF core), some Prometheus features missing (e.g., specific exemplars). (3) Cluster vs single-node: clustered = HA, but more complex. Для 50 jobs single-node VictoriaMetrics достаточен (handles millions series easily). (4) Cost: storage savings (5-10× less disk) compensates operational complexity. (5) Migration risk: dual-write period (Prometheus + VictoriaMetrics) → verify consistency → switchover Grafana → decommission Prometheus. 1-2 weeks staged. Action plan: Week 1 — drop subtask_index, metric_relabel filters. Verify TSDB growth slows. Week 2 — deploy VictoriaMetrics, configure remote_write from Prometheus. Week 3 — switch Grafana к VictoriaMetrics. Week 4 — verify queries / alerts work, decommission Prometheus. Long-term — для new jobs, OTel reporter directly к OTel Collector → VictoriaMetrics, skip Prometheus path. Lesson: high-cardinality observability требует proper tooling. Vanilla Prometheus great для small-medium, but не scales to enterprise streaming platforms."
+/>

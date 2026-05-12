@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/02-state-processor-api",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-02",
+    "description": "Quiz for State Processor API lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-02-q1",
+      "type": "multiple-choice",
+      "question": "Какой savepoint format ОБЯЗАТЕЛЕН для State Processor API?",
+      "options": [
+        { "id": "a", "text": "Native — он быстрее" },
+        { "id": "b", "text": "Canonical — backend-agnostic, поддерживается State Processor API. Native (backend-specific binary) НЕ поддерживается" },
+        { "id": "c", "text": "Любой работает" },
+        { "id": "d", "text": "Только legacy format" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "State Processor API работает только с canonical savepoint format. Canonical — universal serialization, не привязан к конкретному backend (RocksDB, ForSt, HashMap). State Processor API reader может deserialize state regardless of original backend. Native format — backend-specific binary (RocksDB SST file references) — не доступен для batch processing. Triggering: `flink stop --type canonical`. Если у вас native savepoint и нужен State Processor API — нужно re-savepoint canonical first.",
+      "studyHint": "Повторите урок — State types которые поддерживаются + Production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-02-q2",
+      "type": "multiple-choice",
+      "question": "ValueState<UserProfile> на 10M users, добавить новое поле tenantId с дефолтным 'default'. Какой подход?",
+      "options": [
+        { "id": "a", "text": "Просто добавить поле — POJO evolution auto-handles" },
+        { "id": "b", "text": "Stop с canonical savepoint → State Processor API: read old state, map (add tenantId='default'), write new savepoint с new UserProfile class → restart streaming с new savepoint" },
+        { "id": "c", "text": "Запустить SQL query для bulk update" },
+        { "id": "d", "text": "Перезапустить job с --allowNonRestoredState" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "POJO evolution add nullable field — auto-handled. Но если хотим установить специфический default ('default' не null) для всех existing users → нужен manual migration. Workflow: (1) Stop с canonical savepoint (обязательно); (2) State Processor API batch job: SavepointReader.read() → readKeyedState → map к Tuple<key, oldState> → transform set tenantId='default' → BootstrapTransformation → SavepointWriter.fromExistingSavepoint().removeOperator(old).withOperator(new).write(); (3) Update streaming code с new UserProfile class; (4) Restart streaming с new savepoint; (5) Keep old savepoint минимум неделю.",
+      "studyHint": "Повторите урок — Migrate state schema: incompatible change",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-02-q3",
+      "type": "multiple-choice",
+      "question": "Job stateful UID 'fraud-detector'. State Processor API job ищет 'fraud-detector' но возвращает empty results. Что случилось?",
+      "options": [
+        { "id": "a", "text": "State Processor API broken" },
+        { "id": "b", "text": "OperatorIdentifier.forUid('fraud-detector') не match с UID в streaming code. Возможно typo, или streaming не set UID (auto-generated ID). State Processor API matches strictly by UID — empty results silent" },
+        { "id": "c", "text": "RocksDB corrupt" },
+        { "id": "d", "text": "Maven dependency missing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Silent empty results — частая State Processor API ловушка. Causes: (1) UID typo в State Processor batch job vs streaming code; (2) Streaming не set UID явно (auto-generated), State Processor не находит; (3) Operator removed между savepoint и State Processor API access; (4) Savepoint corrupt — но это обычно throws exception. Prevention: enforce `pipeline.auto-generate-uids: false` в streaming, code review UID stability, unit test State Processor jobs с production savepoint sample. State descriptor name + type также должны точно match (e.g., name 'user-state' vs 'user-state-v2').",
+      "studyHint": "Повторите урок — Production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-02-q4",
+      "type": "true-false",
+      "question": "State Processor API позволяет читать и писать savepoint state offline через стандартный DataStream batch API — это distributed batch processing, scales linear на cluster.",
+      "correctAnswer": true,
+      "explanation": "True. State Processor API — это polnoценный distributed batch processing. SavepointReader.read() open savepoint как 'таблицу', readKeyedState/readListState/readBroadcastState возвращают DataStream. Стандартные map/filter/keyBy/aggregate operations работают. Distributed — TM-ы parallel read разные key groups. Для 1TB state нужно много slot-ов + DFS bandwidth. SavepointWriter.fromExistingSavepoint() или newSavepoint() create новый savepoint от batch data. Use cases: analytics on state, bootstrap, schema migration, operator removal, maxParallelism change.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

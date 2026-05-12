@@ -1,0 +1,328 @@
+---
+title: "Blue/green deploys через savepoints"
+order: 8
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Blue/Green Deployment", "Savepoint", "Zero Downtime", "Upgrade Strategy", "Canary"]
+---
+
+# Blue/green deploys
+
+Blue/green — это deployment стратегия, при которой новая версия job-а запускается параллельно с running старой, и после verification трафик переключается атомарно. В Flink контексте идея адаптируется: **savepoint-based handover между двумя версиями job**. В этом уроке: классический blue/green workflow, реализация через Flink Kubernetes Operator (`upgradeMode: savepoint`), canary deploys для постепенного rollout, automated rollback при degradation.
+
+Blue/green в Flink — не идеальная zero-downtime (savepoint-restart всё-таки имеет 30s-5min gap), но это лучшее, что есть для stateful streaming. Альтернативы (in-place rescale из урока 07) подходят только для parallelism changes, не для code changes.
+
+---
+
+## Зачем blue/green в Flink
+
+Classical web deployment: новые pods запускаются с новым кодом, load balancer переключает trafic, старые pods удаляются. Zero-downtime.
+
+Flink сложнее: **stateful**. У running job есть state в RocksDB/ForSt. Просто запустить новый pod с другим кодом не получится — state lost.
+
+Workflow Flink:
+
+```text
+1. Trigger savepoint на blue (current job)
+2. Wait until savepoint DONE
+3. Start green (new version) restoring from savepoint
+4. Verify green работает correctly (metrics, logs)
+5. Cutover: cancel blue, keep green
+6. Optionally: keep blue savepoint для emergency rollback
+```
+
+Между шагами 1-5 — **gap**. Точная длительность зависит от savepoint size:
+
+- Small state (< 10 GB) — savepoint 30-60s, total downtime ≈ 1 минута
+- Medium state (50-100 GB) — savepoint 2-5 минут
+- Large state (TB+) — savepoint 10-30 минут
+
+С ForSt и **disaggregated state** (Flink 2.x) savepoint становится **metadata-only operation** — state уже на S3, savepoint просто записывает pointer. Это даёт **near-instant savepoints** независимо от state size.
+
+---
+
+## Архитектура blue/green в Flink
+
+<DiagramContainer title="Blue/green: savepoint handover" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Blue: fraud-detector v1.42"
+        tooltip="Текущая running version. Processes events, holds state, делает checkpoints. Image: registry.example.com/fraud-detector:1.42.0"
+      >
+        v1.42 RUNNING
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trigger savepoint" />
+    <FlowRow>
+      <DataBox
+        label="Savepoint в S3"
+        tooltip="Canonical format (cross-backend safe) для major upgrades, native (быстрее) для minor. Stored: s3://flink-prod/savepoints/fraud-detector/savepoint-<jobid>-<timestamp>/"
+      >
+        s3://.../savepoint-xyz/
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="start green from savepoint" />
+    <FlowRow>
+      <DataBox
+        label="Green: fraud-detector v1.43"
+        tooltip="Новая version. Загружает state из savepoint. Может уже processing events (если blue ещё не отключён — двойная обработка) или waits cutover."
+      >
+        v1.43 starting
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="verify green" />
+    <FlowRow>
+      <DataBox
+        label="Verification"
+        tooltip="Metrics: throughput, latency, checkpoint success rate. Logs: нет exceptions. Optional: sample выходные events comparing blue vs green."
+      >
+        compare metrics
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="cutover" />
+    <FlowRow>
+      <DataBox
+        label="Blue cancelled, Green production"
+        tooltip="Cancel blue без новых savepoint (savepoint уже сделан). Все consumers (Kafka readers) теперь обслуживаются green. Optionally keep savepoint для rollback."
+      >
+        v1.43 PRODUCTION
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Через Flink Kubernetes Operator: `upgradeMode: savepoint`
+
+Operator автоматизирует blue/green. В FlinkDeployment просто bump image tag:
+
+```yaml
+spec:
+  image: registry.example.com/fraud-detector:1.43.0   # было 1.42.0
+  job:
+    upgradeMode: savepoint                            # mandatory для blue/green
+```
+
+Operator делает реконсилиацию:
+
+```text
+1. Detect spec.image changed
+2. Trigger savepoint на existing cluster (REST POST /jobs/{id}/savepoints)
+3. Poll savepoint status, wait DONE
+4. Cancel job
+5. Save savepoint pointer в spec.savepointPath (или externally)
+6. Update JM Deployment с new image
+7. Wait JM pod ready
+8. Submit job from savepoint (--fromSavepoint <path>)
+9. Wait job RUNNING
+10. Update CR.status.lifecycleState = STABLE
+```
+
+Operator делает sequential — old job полностью отключён до start нового. Это **NOT** parallel blue/green (где обе версии работают одновременно). Это **savepoint-restart**.
+
+### Parallel blue/green (advanced)
+
+Чтобы реально иметь обе версии одновременно (для cutover testing), нужен manual workflow:
+
+```bash
+# 1. Trigger savepoint на blue (existing FlinkDeployment "fraud-detector")
+kubectl patch flinkdeployment fraud-detector --type merge -p '{
+  "spec": {
+    "job": {"savepointTriggerNonce": '$(date +%s)'}
+  }
+}'
+
+# 2. Wait savepoint DONE и получить path
+SAVEPOINT_PATH=$(kubectl get flinkdeployment fraud-detector \
+  -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}')
+
+# 3. Create green = новый FlinkDeployment с другим именем, restoring from savepoint
+cat <<EOF | kubectl apply -f -
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector-green   # ! другое имя !
+spec:
+  image: registry.example.com/fraud-detector:1.43.0
+  # ... same config as fraud-detector ...
+  job:
+    initialSavepointPath: "$SAVEPOINT_PATH"
+    upgradeMode: savepoint
+    # consumer group разный — green в shadow mode
+    args:
+      - "--consumer-group"
+      - "fraud-detector-green"
+      - "--output-topic"
+      - "fraud-alerts-shadow"   # не production output
+EOF
+
+# 4. Verification: both blue (production) и green (shadow) consuming events,
+#    compare outputs in real time
+
+# 5. После verification cutover: scale blue to 0, point green на production output
+kubectl patch flinkdeployment fraud-detector --type merge -p '{
+  "spec": {"job": {"state": "suspended"}}
+}'
+
+# Update green to production config
+kubectl patch flinkdeployment fraud-detector-green --type merge -p '{
+  "spec": {"job": {"args": ["--output-topic", "fraud-alerts"]}}
+}'
+
+# 6. После недели stability — delete blue окончательно
+kubectl delete flinkdeployment fraud-detector
+```
+
+Эта parallel модель сложнее, но даёт **real verification** — обе версии processing same events, можно сравнить output. Side outputs в Kafka shadow topic, потом diff.
+
+---
+
+## Savepoint format choice: canonical vs native
+
+Для blue/green format matter:
+
+| Format | Speed | Cross-version | Cross-backend |
+|---|---|---|---|
+| **native** (default) | Fast (3-5x быстрее) | Same major version | No (locked to backend) |
+| **canonical** | Slow | Cross-version safe | Yes (RocksDB ↔ ForSt) |
+
+```bash
+# Native format (default)
+flink stop --savepointPath s3://... <jobid>
+
+# Canonical format (для major upgrade или backend change)
+flink stop --savepointPath s3://... --type canonical <jobid>
+```
+
+В Operator:
+
+```yaml
+spec:
+  flinkConfiguration:
+    state.savepoints.type: canonical   # global
+```
+
+Или per-savepoint в FlinkDeployment:
+
+```yaml
+spec:
+  job:
+    savepointTriggerNonce: 12345
+    flinkConfiguration:
+      execution.savepoint.format: canonical
+```
+
+**Rule of thumb**: для regular upgrades (same Flink major, same backend) — native (быстрее). Для major version upgrade (Flink 1.20 → 2.2) ИЛИ backend change (RocksDB → ForSt) — canonical (см. урок 14.4).
+
+---
+
+## Canary deployment: postepenny rollout
+
+Canary — variant blue/green: новая версия получает **малую долю traffic** перед full cutover. В Flink:
+
+```text
+Pattern 1: Split topic
+1. Партишн Kafka topic 16 partitions
+2. Blue consumes 14, green consumes 2 (12% traffic)
+3. After 24h stability — green consumes 8 (50%)
+4. After 48h — green consumes 16 (100%), blue cancelled
+
+Implementation:
+- KafkaSource setAssignedPartitions(...) для green только 2 partitions
+- Blue настроен на остальные 14
+- Manual choreography через 2 FlinkDeployments
+```
+
+Это работает только для **partition-aligned canary**. Для true keyed canary (e.g., 10% users → green) сложнее — нужен outer router (не Flink) распределяющий events.
+
+---
+
+## Production gotchas
+
+- **Без savepoint blue/green не работает** — если оставите `upgradeMode: stateless`, operator не сделает savepoint при image change → state lost. **Always `savepoint` для stateful jobs.**
+- **Operator timeout на savepoint** — `kubernetes.operator.savepoint.history.max.age` controls retention. Если savepoint занимает дольше operator timeout (`kubernetes.operator.reconcile.parallelism.max-window`) — reconciliation fails, retry. Для large state set timeouts generous.
+- **Two consumer groups для parallel blue/green** — обе версии reading same Kafka topic с same consumer group → load balancing → split partitions. Это НЕ shadow mode. Для true shadow используйте different consumer groups, обе reading independently.
+- **Output side effects** — если blue/green обе writing to production Kafka topic → duplicates. Always: green в shadow topic для verification phase, switch на production topic только при cutover.
+- **State schema breaking change** — если v1.43 не может deserialize state из v1.42 (e.g., removed field, type change), restore failed. Test schema evolution в staging (см. урок 14.3). Roll-out only when verified.
+- **Stuck blue** — blue cancel может зависнуть если есть outstanding savepoints. Force cancel: `flink cancel --withSavepoint=false <jobid>`.
+- **HA storage conflict** — если green использует same `high-availability.storageDir` что blue → ConfigMap conflict, JM crash. Different cluster-id (different FlinkDeployment name) = different HA path.
+- **Savepoint cleanup** — после successful upgrade old savepoint можно удалить. НО keep последний за 24-48h для emergency rollback. Не cleanup сразу.
+- **Operator reconciliation queue** — много jobs одновременно upgrading может перегрузить operator. Stagger updates во времени.
+
+<Callout type="warning">
+**Roll-back план** — это critical часть blue/green strategy. Если green показывает degradation после cutover, нужна быстрая возможность вернуться:
+
+```bash
+# Roll-back через initialSavepointPath
+kubectl patch flinkdeployment fraud-detector --type merge -p '{
+  "spec": {
+    "image": "registry.example.com/fraud-detector:1.42.0",
+    "job": {"initialSavepointPath": "<old-savepoint-path>"}
+  }
+}'
+```
+
+Roll-back только work если: (a) old savepoint всё ещё в S3 (retention!); (b) new version не сделала breaking changes к state schema, которые old version не сможет read. Quarterly test rollback procedure. См. урок 14.8.
+</Callout>
+
+<Callout type="tip">
+В 2026 mature production использует **GitOps blue/green**: новая версия = новый image tag в FlinkDeployment YAML, merge PR → ArgoCD apply → operator делает savepoint-based blue/green automatically. Roll-back = git revert. Audit trail через git log. Каждый upgrade документирован, тестирован в staging, прошёл code review.
+</Callout>
+
+---
+
+## Verification phase: что сравнивать
+
+После start green (но перед cutover), проверьте:
+
+```yaml
+Health metrics:
+  - Job status RUNNING (не RESTARTING, не FAILED)
+  - Checkpoint success rate ~100% (failures → state has issues)
+  - Backpressure < 10% (job keeps up with input)
+  - No exceptions в logs (особенно deserialization errors)
+
+Functional comparison (если parallel blue/green):
+  - Output rate similar (events/sec)
+  - Sample outputs: green produces те же fraud alerts что blue?
+  - Latency: green не slower (потенциальные regression в коде)
+  - State size: green не grew unexpectedly (state leak в new code)
+
+Resource utilization:
+  - CPU/memory профили match blue
+  - No new errors в Prometheus alerting
+```
+
+Если все check pass — cutover. Иначе — rollback green, fix code, retry.
+
+---
+
+## Automated rollback (advanced)
+
+Operator не делает automated rollback из коробки — это **observability + alerting + manual decision**. Pattern для automation:
+
+```yaml
+# Prometheus alert
+- alert: FlinkJobUnhealthyAfterUpgrade
+  expr: |
+    flink_jobmanager_job_uptime{job="fraud-detector"} < 600
+    AND
+    increase(flink_jobmanager_job_numRestarts{job="fraud-detector"}[5m]) > 0
+  for: 5m
+  annotations:
+    description: "Job restart loop после recent upgrade"
+
+# AlertManager webhook → automation script
+# Script делает: revert FlinkDeployment к prior image, ArgoCD reconcile
+```
+
+В production 2026 это типичный pattern: Prometheus наблюдает за health post-deploy, при degradation запускает automated rollback via API. Manual approval gate для риск-неготовых сред.
+
+---
+
+<KnowledgeCheck
+  question="Команда деплоит фикс bug в FraudDetector через `kubectl apply` (bump image tag в FlinkDeployment). Operator делает savepoint-based upgrade. 5 минут после cutover Prometheus показывает alert: checkpoint failure rate 100%, RocksDB ошибки в логах. Что делать срочно, и какие checks могли это предотвратить в pre-deploy?"
+  answer="Срочный response: (1) Получить path к savepoint, который был triggered перед upgrade — kubectl get flinkdeployment -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}'. (2) Rollback: kubectl patch с прежним image tag + initialSavepointPath = найденный path. (3) Operator делает rollback workflow: cancel current, deploy old image с restore from savepoint. (4) Verify alerts gone, checkpoint success rate восстановлен. Diagnostic после rollback: checkpoint failure на RocksDB обычно означает (a) state schema breaking change — new code пытается deserialize incompatible state; (b) maxParallelism violation; (c) UID change оператор больше не маппится к state; (d) Memory misconfigured. Pre-deploy checks которые помогли бы: (1) Staging environment с продакшен savepoint — deploy new version там сначала. (2) Schema evolution validation в коде: добавить test читающий fixture savepoint. (3) UID stability check — automated test сравнивает UIDs operators в blue vs green code. (4) Resource regression test — measure state size growth, memory usage. (5) Canary deployment с малым percent traffic перед full cutover. (6) Quarterly rollback drill — verify procedure всё ещё работает и savepoints retention достаточно. Без этих guard-rails blue/green превращается в russian roulette."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/03-metrics-system",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-03",
+    "description": "Quiz for metrics system lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-03-q1",
+      "type": "multiple-choice",
+      "question": "Какие 4 типа метрик в Flink и когда какой используется?",
+      "options": [
+        { "id": "a", "text": "Только Counter и Gauge" },
+        { "id": "b", "text": "Counter (monotonic accumulated, records/errors processed), Gauge (instantaneous value, queue depth/cache size/memory), Meter (events per second, rate measurement), Histogram (distribution с percentiles, latency/sizes). В большинстве случаев — Counter + Gauge достаточно; rate вычисляется в Prometheus query (rate(counter[1m])). Histogram для latency P50/P95/P99" },
+        { "id": "c", "text": "Timer / Counter / Sum / Average" },
+        { "id": "d", "text": "Все типы equivalent" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Counter — monotonic int (errors, processedRecords). Gauge — lambda evaluated на scrape (cacheSize, memoryUsed). Meter — wrapper для rate (но Prometheus computes rate из counter, Meter redundant обычно). Histogram — percentiles distribution с reservoir (SlidingTimeWindowReservoir для sharp window). Production rule: Counter для накопления, Gauge для текущего value, Histogram для latency distribution. Meter избегайте — лучше Counter + Prometheus rate().",
+      "studyHint": "Повторите урок — Четыре типа метрик",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m16-03-q2",
+      "type": "multiple-choice",
+      "question": "Какие 12 (top) встроенных метрик критичны для production Flink dashboards?",
+      "options": [
+        { "id": "a", "text": "Только CPU и memory" },
+        { "id": "b", "text": "Checkpoint duration P95, state size trend, numberOfFailedCheckpoints, currentInputWatermark lag, busyTime% per operator, backPressuredTime% per operator, numRecordsInPerSecond throughput, numLateRecordsDropped, GC time/minute, Heap usage %, Direct memory used, RocksDB compaction pending bytes" },
+        { "id": "c", "text": "Network metrics только" },
+        { "id": "d", "text": "Random selection" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Top 12 покрывают main production failure modes. Alert thresholds: Checkpoint duration > timeout/2 (warning); FailedCheckpoints > 0 в 10min (critical); Watermark lag > 5min (high); backPressuredTime > 800ms/sec sustained 5min (high); numLateRecordsDropped > 0 (high if не side output); GC time > 10s/min G1 / > 3s/min ZGC (medium); Heap > 90% sustained (warning); Direct memory linear growth (leak); RocksDB compaction-pending-bytes растёт линейно (write stall coming). Включить RocksDB metrics via config (не enabled by default).",
+      "studyHint": "Повторите урок — Встроенные Flink metrics",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-03-q3",
+      "type": "multiple-choice",
+      "question": "Production: user metrics design для fraud detection job. Что НЕ делать и какие cardinality pitfalls избегать?",
+      "options": [
+        { "id": "a", "text": "Всё tracked per userId" },
+        { "id": "b", "text": "АНТИПАТТЕРН: getMetricGroup().addGroup('user', userId).counter('events') — millions cardinality убивает Prometheus. Правильно: Counter fraudDetected (aggregate), Histogram detectionLatencyMs (distribution), Gauge<Long> activeWatchedUsers (для capacity). Top-N tracking для hot users, не per-entity labels. Per-key labels (userId, sessionId, txn_id) — cardinality explosion. Aggregate metrics + sliding window top-N" },
+        { "id": "c", "text": "Использовать только Gauge" },
+        { "id": "d", "text": "Метрики не нужны если есть logs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Cardinality — главная проблема Prometheus + Flink в large clusters. Per-userId/sessionId labels могут привести к miллионам unique time series → Prometheus dies. Pattern fix: aggregate metrics (counter per category, sum by tags), top-N detail tracking (HyperLogLog для approximation, or explicit top-K data structure), histogram для percentile distributions (без per-entity). Production rule: cardinality labels должны быть bounded и known (e.g., status, category, severity — 5-20 values acceptable). Unbounded labels — анти-паттерн.",
+      "studyHint": "Повторите урок — Production gotchas + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-03-q4",
+      "type": "true-false",
+      "question": "Default Dropwizard Histogram reservoir (ExponentiallyDecayingReservoir) — proper choice для production latency P99 tracking за конкретное окно (e.g., last 1 minute).",
+      "correctAnswer": false,
+      "explanation": "False. Default ExponentiallyDecayingReservoir biased для recent samples, но не sharp window — старые samples оставляют 'tail' влияние. Для P99 'за last 1 minute' нужен SlidingTimeWindowReservoir(60, TimeUnit.SECONDS) — sharp cutoff. Construct: new com.codahale.metrics.Histogram(new SlidingTimeWindowReservoir(60, TimeUnit.SECONDS)). Это важно для alerting: 'P99 latency > 100ms за last minute' требует точного окна, не decaying. Default OK для general distribution view, но не для time-bound alerts.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

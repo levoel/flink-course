@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/07-pandas-udf-vectorized",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-07",
+    "description": "Pandas UDFs, Arrow zero-copy, vectorization"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-07-q1",
+      "type": "multiple-choice",
+      "question": "Pandas UDFs дают 10-50x speedup vs row-wise UDFs — какая ключевая technology behind?",
+      "options": [
+        { "id": "a", "text": "Просто Python переписан в C" },
+        { "id": "b", "text": "Apache Arrow zero-copy memory format + vectorization. Flink batches records в Arrow RecordBatch (columnar memory layout), передаёт к Python через shared memory (не serialization). Pandas видит JVM memory напрямую — pd.DataFrame columns = same memory buffers as Arrow. UDF получает entire batch, applies vectorized pandas/numpy ops (SIMD-aware, cache-friendly), returns batch результат. Result: bulk transfer + batch processing = 10-50x faster than per-record IPC + per-record execution" },
+        { "id": "c", "text": "Pandas UDFs работают быстрее потому что Python быстрее" },
+        { "id": "d", "text": "Используют GPU acceleration" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Two technologies combine для massive speedup. **Apache Arrow** — cross-language columnar memory format. Designed для zero-copy data sharing between runtimes (JVM, Python, R, C++). Key features: (1) **Columnar layout** — each column = contiguous memory buffer (int32 array, float64 array, variable-length strings via offset buffer). Cache-friendly для sequential access, SIMD-friendly для parallel ops. (2) **Shared memory** — JVM and Python see same memory addresses. No copy on transfer. (3) **Standard format** — pandas, numpy, polars, R all consume Arrow directly. **Flink Pandas UDF flow**: (1) Flink batches N records (default Arrow batch_size=10000) в Arrow RecordBatch on JVM. (2) Memory passed к Python — pandas DataFrame constructed from Arrow columns без copy (pyarrow.Table.to_pandas()). (3) UDF receives pd.Series / pd.DataFrame, applies vectorized ops (numpy operations across array, pandas methods on Series). (4) Result Series converted back through Arrow к JVM RowData. **Why so much faster**: row-wise UDF — 10M records × 50μs IPC + 10μs Python interpretation = 600 seconds. Pandas UDF — 1000 batches × 1ms total = 1 second (600x speedup). Real workloads с numpy ops — 10-50x improvement typical. **Crucial**: works для **vectorizable** operations (numpy/pandas batch ops). Non-vectorizable (per-record conditionals, sequential dependencies) — vectorization не помогает. **Performance**: simple numeric op Pandas UDF achieves ~94% Java baseline (235k rec/sec для 250k Java). **sklearn predict** naturally vectorized — batch predict 10k records in single millisecond.",
+      "studyHint": "Повторите урок 07 — секцию 'Apache Arrow: zero-copy bridge' с diagram",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m12-07-q2",
+      "type": "multiple-choice",
+      "question": "Migration row-wise UDF к Pandas UDF — что меняется в code?",
+      "options": [
+        { "id": "a", "text": "Полное переписывание" },
+        { "id": "b", "text": "Minimal changes: (1) Add `func_type='pandas'` к decorator. (2) UDF signature accepts pd.Series instead of scalar values. (3) Return pd.Series same length as input. (4) Apply vectorized ops (multiply Series вместо element value). Example: `@udf(input_types=[DataTypes.DOUBLE()], result_type=DataTypes.DOUBLE())` `def double(v): return v * 2` → `@udf(input_types=[DataTypes.DOUBLE()], result_type=DataTypes.DOUBLE(), func_type='pandas')` `def double(v: pd.Series) -> pd.Series: return v * 2`. Operations are same syntax — Python `v * 2` works element-wise on Series naturally" },
+        { "id": "c", "text": "Нужно переписать на Java" },
+        { "id": "d", "text": "Pandas UDFs нельзя использовать с existing code" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pandas UDF migration is often surprisingly easy because pandas/numpy operations work element-wise naturally. **Key changes**: (1) **Decorator**: add `func_type='pandas'` parameter. Without — UDF runs row-wise через thread/process mode. (2) **Signature**: input parameters typed as `pd.Series` instead of scalars. (3) **Return**: `pd.Series` same length as inputs (critical — broken length causes runtime error). (4) **Code**: vectorized ops syntax often identical to scalar. **Common transformations**: ```python\\n# Row-wise\\n@udf(...) def f(v): return v * 2 if v > 0 else 0\\n\\n# Pandas\\n@udf(..., func_type='pandas')\\ndef f(v: pd.Series) -> pd.Series:\\n    return v.where(v > 0, 0) * 2\\n# Or: return np.where(v > 0, v * 2, 0)\\n# Or: return v * 2 * (v > 0).astype(float)```. **Numpy ops cleanly translate**: `math.log(x)` → `np.log(x)` (works on Series). `if x: a else: b` → `np.where(cond, a, b)`. **String ops через .str accessor**: `s.upper()` → `s.str.upper()` (vectorized). **sklearn predict**: identical — `model.predict_proba(X)` naturally batches. **Aggregation UDF**: use `@udaf(..., func_type='pandas')` для custom aggregations. Receive entire group as Series, return scalar. **Performance validation**: profile UDF cProfile before/after. Expected 5-20x speedup для vectorizable code. If <2x — UDF may not be vectorizable (per-record conditionals dominate).",
+      "studyHint": "Повторите урок 07 — Scalar Pandas UDF section",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-07-q3",
+      "type": "multiple-choice",
+      "question": "Когда Pandas UDF не optimal choice?",
+      "options": [
+        { "id": "a", "text": "Pandas UDF всегда лучший choice" },
+        { "id": "b", "text": "Non-vectorizable algorithms (graph traversal per record, complex per-record conditionals с sequential dependencies). Single-record state mutation (используйте Java KeyedProcessFunction). External API calls (используйте Async UDF Flink 2.2). Complex Python state machines (DataStream API). Very small batches expected (low throughput — bundle never fills, overhead dominates). GPU inference с PyTorch large model (process mode с batched calls cleaner). Heavy custom C extensions (process mode safer)" },
+        { "id": "c", "text": "Только для tests, не production" },
+        { "id": "d", "text": "Pandas UDF deprecated в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pandas UDF excels at vectorizable batch operations. Limitations и alternatives: (1) **Non-vectorizable**: graph algorithms (traverse based on per-record decisions), parsing complex formats with state machine logic, ops with sequential dependencies (record N depends on record N-1 result). Vectorization не помогает — element-wise dependencies break batch processing. Use row-wise UDF (thread mode) или Java. (2) **State mutation**: Pandas UDF stateless by design — receives batch, returns batch. For stateful processing (counters, accumulators, deduplication) — use Java KeyedProcessFunction (fastest) or PyFlink DataStream API с ValueState/MapState. (3) **External API calls**: Pandas UDF synchronous — calling REST API per record (или per batch) blocks. For external I/O — Async UDFs Flink 2.2 (urок 08) с concurrent in-flight requests. (4) **Complex Python state machines**: business rules with branches и feedback loops — express в DataStream API ProcessFunction. (5) **Low throughput**: Pandas UDF amortizes overhead через batching. If actual throughput ~100 records/sec, batches never fill, overhead per batch dominates. Use row-wise UDF instead. (6) **GPU inference**: PyTorch GPU model loaded once per slot, batched predict efficient в process mode с custom batching. Pandas UDF Arrow conversion может add overhead для large tensors. Test both. (7) **Heavy custom C**: untrusted native extensions safer в process mode (isolation). Pandas UDF in process mode loses some Arrow benefits но retains isolation. **Decision tree**: vectorizable numeric ops → Pandas UDF. External I/O → Async UDF. Stateful → DataStream API. Untrusted code → process mode row-wise.",
+      "studyHint": "Повторите урок 07 — секцию 'When Pandas UDF не optimal'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-07-q4",
+      "type": "true-false",
+      "question": "Common Pandas UDF bug: return Series shorter than input (e.g., filtered values dropped). Always return SAME length as input — use `v.where(condition, np.nan)` для filtered values (preserves length, NaN for filtered), не `v[v > threshold]` (returns shorter series, breaks Flink batch contract).",
+      "correctAnswer": true,
+      "explanation": "Length mismatch is one of most common Pandas UDF bugs. **Flink contract**: input batch N records → output Series MUST be N records. Each input record gets exactly one output record. Flink uses positional matching: input[i] → output[i]. **Common bug**: ```python\\n@udf(..., func_type='pandas')\\ndef filter_high(v: pd.Series) -> pd.Series:\\n    return v[v > 100]  # WRONG: shorter series\\n# Error на runtime: 'Output series length 47 != input length 1000'```. **Correct patterns**: (1) **Replace with NaN**: ```python\\nreturn v.where(v > 100, np.nan)\\n# Same length, NaN for filtered values\\n# Downstream consumer filters NaN if needed\\n```. (2) **Replace with default**: `v.where(cond, 0)` or `v.where(cond, '')`. (3) **Conditional value**: `np.where(v > 100, v * 2, v)`. **Why this constraint**: Flink batches records, each gets row index. Output Series indexed positionally to match. Arrow RecordBatch has fixed-length columns. Length mismatch breaks Arrow protocol. **Filtering pattern**: if downstream filtering needed, do it AFTER UDF в SQL: ```sql\\nINSERT INTO sink\\nSELECT * FROM (SELECT user_id, scaled_value(amount) AS sv FROM input)\\nWHERE sv IS NOT NULL  -- filter NaN here\\n```. **Multi-output**: для each record need multiple outputs? Use TABLE function (TableFunction subclass) instead of UDF — explicit emit pattern. **Aggregation UDFs different rules**: UDAF (`@udaf`) reduces batch to scalar. Length not applicable — returns single value per group.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

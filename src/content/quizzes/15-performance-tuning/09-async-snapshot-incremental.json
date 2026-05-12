@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/09-async-snapshot-incremental",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-09",
+    "description": "Quiz for async snapshot и incremental checkpoints lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-09-q1",
+      "type": "multiple-choice",
+      "question": "Что такое incremental checkpoints в RocksDB и как они работают?",
+      "options": [
+        { "id": "a", "text": "Checkpoint каждый N записей" },
+        { "id": "b", "text": "RocksDB hard-link новые SST files к checkpoint dir на каждом snapshot. Только новые SST files copy к durable storage (S3). Old SST files (unchanged) — reference остаётся в metadata, не re-uploaded. Result: на 100GB state с 10% delta = 10GB upload, не 100GB. ~10× speedup. Включается state.backend.incremental: true" },
+        { "id": "c", "text": "Difference encoding между checkpoints" },
+        { "id": "d", "text": "Compression checkpoint данных" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Default since 1.10 (RocksDB только). RocksDB immutable SST files после flush → можно reference между checkpoints. Hard-link новые SST + reference unchanged + Flink metadata. Метаданные: checkpoint-N/_metadata + taskmanager-X/job-handle.bin (references к shared SST files). Один SST file может referenced многими checkpoints. Gotcha: old SST не удаляются сразу — Flink retains last num-retained (default 3). На long-running job + много sst → S3 bucket grows linearly. Periodic cleanup необходим. Self-contained checkpoints через local-recovery: true cache.",
+      "studyHint": "Повторите урок — Incremental checkpoints",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-09-q2",
+      "type": "multiple-choice",
+      "question": "Что такое Generic Incremental Checkpoints (Changelog backend, FLIP-158) и когда использовать?",
+      "options": [
+        { "id": "a", "text": "Это alternative file format" },
+        { "id": "b", "text": "Каждая state mutation пишется в changelog log на DFS (как WAL). Checkpoint = current log cursor position → constant small size (delta с last checkpoint). Background materialization копирует accumulated log → state backend. Использовать когда: нужна sub-second predictable checkpoint duration, backpressure spike корреляция с checkpoint duration, EXACTLY_ONCE latency requirement, variable state mutation pattern с compaction spikes" },
+        { "id": "c", "text": "Это deprecated механизм" },
+        { "id": "d", "text": "Только для batch jobs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-158 (1.15 experimental, 1.16 stable). Решает variability в RocksDB incremental: после L0→L1 compaction много new SSTs → next checkpoint ship всё → 50GB spike. Changelog uncoupled от compaction. Trade-offs vs RocksDB-only: (+) Predictable size (constant deltas), sub-second duration; (-) Higher DFS write throughput (every mutation written), slower recovery (log replay), 2-3× storage cost (raw mutations не compressed как SST). Materialization interval balances: маленький (1min) = меньше replay но больше DFS, большой (30min) = меньше DFS но recovery slower. Sweet spot 10min для most production.",
+      "studyHint": "Повторите урок — Generic Incremental Checkpoints",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-09-q3",
+      "type": "multiple-choice",
+      "question": "Production: 500GB state RocksDB, checkpoint interval 60s, EXACTLY_ONCE. Метрики: duration варьируется 5s-120s sawtooth, size 5GB-50GB. Downstream Kafka consumer видит latency spikes 50-150s коррелирующих с checkpoint. План fix?",
+      "options": [
+        { "id": "a", "text": "Уменьшить interval до 10s" },
+        { "id": "b", "text": "Включить Changelog backend (GIC, FLIP-158): state.backend.changelog.enabled: true, periodic-materialize.interval: 10min. Это THE fix. Plus unaligned checkpoints aligned-timeout: 30s. Sawtooth pattern (5-50GB) — classic RocksDB compaction effect (post-compaction много new SSTs нужно ship). Changelog uncoupled от compaction → constant small size → predictable duration. Expected: 1-3s consistent. EXACTLY_ONCE downstream latency прямо transmitted через notifyCheckpointComplete callback" },
+        { "id": "c", "text": "Disable EXACTLY_ONCE" },
+        { "id": "d", "text": "Увеличить S3 bandwidth" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sawtooth size 5-50GB → bursty compaction effect. EOS downstream latency = checkpoint visibility (transactional commits в notifyCheckpointComplete). Variability transmitted к users. Changelog backend specifically designed для этого scenario — sub-second predictable checkpoints. Trade-offs Changelog: DFS write throughput выше (но S3 handles это), recovery slower (10min log replay max), storage 2-3× (raw mutations). Acceptable trade для consistent low-latency. Alternative if Changelog не подходит: increase RocksDB compaction parallelism (thread.num: 8), но не решает fundamental issue. Increase checkpoint interval to 5min — fewer checkpoints но visibility latency больше. Verify post-fix: duration <5s consistent, downstream latency <15s consistent.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-09-q4",
+      "type": "true-false",
+      "question": "max-concurrent-checkpoints: 2+ безопасно для RocksDB, увеличивает throughput за счёт parallel checkpoint progress.",
+      "correctAnswer": false,
+      "explanation": "False. С 2+ parallel checkpoints RocksDB не может evict immutable MemTables (referenced both active checkpoints). MemTable accumulation → write stall trigger. RocksDB designed для один active checkpoint at a time. Production rule: max-concurrent: 1 для RocksDB. 2+ только для HashMap state (нет concurrent reference issue). Если нужно faster effective checkpoint: incremental checkpoints (delta-based) или Changelog backend (sub-second consistent). Concurrent checkpoints — anti-pattern для RocksDB jobs.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

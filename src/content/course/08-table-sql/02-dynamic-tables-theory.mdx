@@ -1,0 +1,442 @@
+---
+title: "Dynamic Tables — stream-table duality"
+description: "Changelog accumulation и changelog emission, continuous queries, append vs retract vs upsert streams"
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Dynamic Tables", "Stream-Table Duality", "Continuous Queries", "Retract Stream", "Upsert Stream"]
+---
+
+# Dynamic Tables — stream-table duality
+
+Dynamic Tables — central abstraction Flink SQL. Понимание этой модели делает разницу между «копипастой queries из туториала» и осмысленным выбором windowing, joins, materialization. Этот урок препарирует stream-table duality на уровне changelog stream semantics: что значит «таблица» когда базовый поток никогда не заканчивается, и почему один и тот же SQL может производить разные types of output streams (append, retract, upsert).
+
+Stream-table duality — концепция изначально из Kafka Streams (Confluent), но Flink её формализует через unified Table API/SQL — same syntax для batch и streaming, same execution model для bounded и unbounded sources.
+
+---
+
+## Stream → Table: changelog accumulation
+
+Каждый event в stream может быть рассматриваем как **change log entry**:
+
+```
+event 1: {user_id: A, amount: 100}
+event 2: {user_id: B, amount: 200}
+event 3: {user_id: A, amount: 50}   ← update? new row?
+```
+
+Зависит от **semantics**:
+
+### Append-only interpretation
+
+Каждый event — новая строка. Table grows infinitely:
+```
++I (insert) user=A, amount=100
++I user=B, amount=200
++I user=A, amount=50
+```
+
+Table:
+```
+| user | amount |
+| A    | 100    |
+| B    | 200    |
+| A    | 50     |
+```
+
+Это обычный transaction log.
+
+### Upsert interpretation
+
+Если event имеет **primary key**, новый event обновляет существующую row:
+
+```sql
+CREATE TABLE balance (
+    user_id STRING,
+    amount DECIMAL(10,2),
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (...);
+```
+
+```
++I user=A, amount=100      → table: (A, 100)
++I user=B, amount=200      → table: (A, 100), (B, 200)
++U user=A, amount=50       → table: (A, 50), (B, 200)
+```
+
+Table:
+```
+| user | amount |
+| A    | 50     |
+| B    | 200    |
+```
+
+Это **changelog stream**: stream рассматривается как sequence of updates.
+
+---
+
+## Table → Stream: changelog emission
+
+Когда SQL query produces output, его result — это **dynamic table**, которая меняется во времени. Чтобы physically emit его в downstream sink, нужно конвертировать в stream. Есть три способа:
+
+<DiagramContainer title="Three types of output streams from dynamic table" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Append stream"
+        tooltip="Output только содержит +I (insert) events. Используется для queries которые только добавляют rows: append-only sources + non-aggregating transformations. Все sinks support."
+      >
+        +I, +I, +I, ...
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Retract stream"
+        tooltip="Output содержит -U (retract previous row) + +U (insert new row) пары. Used для агрегаций без primary key — Flink retracts старое значение и emit-ит новое. Sink должен handle both signs."
+      >
+        -U, +U, -U, +U, ...
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Upsert stream"
+        tooltip="Output содержит +I (insert) и +U (update) events, plus -D (delete). Используется когда есть primary key — sink делает UPSERT по PK. Compact чем retract. Kafka upsert connector, Iceberg sink."
+      >
+        +I, +U, +U, -D, ...
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Choice between retract/upsert/append automatic by Flink optimizer based on query structure:
+- Append source + projection/filter → append output.
+- Append source + GROUP BY (без windowing) → **retract** output.
+- Source с PK + transformations → upsert output.
+- Tumbling window aggregation → append output (windows complete deterministically).
+
+---
+
+## Continuous query — что это значит
+
+Classic SQL: query executed against snapshot of table. Returns result, done.
+
+Streaming SQL: query **continuously** executed against ever-growing changelog. Result — dynamic table that **updates** as new events arrive.
+
+```sql
+SELECT user_id, COUNT(*) AS event_count
+FROM events
+GROUP BY user_id;
+```
+
+На каждое new event для user_X: increment counter, emit update. Output stream — retract: `-U(X, old_count)`, `+U(X, new_count)`.
+
+### Watermark и event-time aggregation
+
+Для **windowed** aggregation Flink ждёт closure window per watermark, потом emit-ит final result. Это **append** stream (каждое window emit-ится один раз):
+
+```sql
+SELECT
+    user_id,
+    TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS window_start,
+    COUNT(*) AS event_count
+FROM events
+GROUP BY user_id, TUMBLE(event_time, INTERVAL '5' MINUTE);
+```
+
+Каждое 5-min window emits exactly once when watermark passes window_end. Output is append-only.
+
+### Без windowing — retract
+
+```sql
+SELECT user_id, COUNT(*) AS event_count
+FROM events
+GROUP BY user_id;
+```
+
+Нет window boundary. Counter updates на каждое event для each user. Output — retract stream.
+
+---
+
+## ChangelogMode — что sink принимает
+
+Каждый Flink connector declares ChangelogMode:
+
+```java
+public interface DynamicTableSink {
+    ChangelogMode getChangelogMode(ChangelogMode requestedMode);
+}
+```
+
+ChangelogMode:
+- `insertOnly()` — только +I events.
+- `upsert()` — +U, +I, -D (with PK).
+- `all()` — +I, -U, +U, -D (retract mode).
+
+### Connector capabilities
+
+| Connector | Append | Retract | Upsert |
+|---|---|---|---|
+| Kafka (regular) | ✅ | ❌ | ❌ |
+| Kafka (upsert-kafka) | ❌ | ❌ | ✅ |
+| JDBC | ✅ | ❌ | ✅ (если есть PK) |
+| Filesystem (Parquet) | ✅ | ❌ | ❌ |
+| Iceberg | ✅ | ❌ | ✅ (equality deletes) |
+| Paimon | ✅ | ❌ | ✅ |
+| Elasticsearch | ✅ | ❌ | ✅ (by document ID) |
+| HBase | ✅ | ❌ | ✅ |
+| Print | ✅ | ✅ | ✅ |
+
+Если query produces retract stream но sink supports only insert — Flink **fails при planning** с error «Table sink doesn't support consuming updates».
+
+---
+
+## Examples — choice of changelog mode
+
+### Append example
+
+```sql
+INSERT INTO output_kafka
+SELECT user_id, UPPER(name) AS name_upper
+FROM input_kafka
+WHERE amount > 100;
+```
+
+Source append-only, query — projection + filter, output append. Stream is append-only `+I`.
+
+### Retract example
+
+```sql
+INSERT INTO output_kafka  -- ❌ FAIL!
+SELECT user_id, COUNT(*) AS cnt
+FROM events
+GROUP BY user_id;
+```
+
+Output is retract stream (GROUP BY without window). Kafka regular connector doesn't support retract → **planning error**.
+
+### Upsert example — fix above
+
+```sql
+CREATE TABLE output (
+    user_id STRING,
+    cnt BIGINT,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'upsert-kafka',
+    'topic' = 'user_counts',
+    ...
+);
+
+INSERT INTO output
+SELECT user_id, COUNT(*) AS cnt
+FROM events
+GROUP BY user_id;
+```
+
+Now sink supports upsert. Flink converts retract → upsert: для каждого update, emit `+U(user, new_cnt)`. Sink делает upsert by PK.
+
+---
+
+## State implications
+
+GROUP BY без window — **unbounded state**:
+
+```sql
+SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+```
+
+State stores counter per user_id forever. State grows linearly с unique users. Без cleanup — memory exhaustion eventually.
+
+**Fix patterns**:
+
+```sql
+-- (1) Idle state retention — cleanup keys без events за N hours
+SET table.exec.state.ttl = '24h';
+
+-- (2) Tumbling window — bounded by window
+SELECT user_id, COUNT(*) FROM events
+GROUP BY user_id, TUMBLE(event_time, INTERVAL '1' HOUR);
+
+-- (3) HOP window для running statistics с bound
+SELECT user_id, COUNT(*) FROM events
+GROUP BY user_id, HOP(event_time, INTERVAL '1' MINUTE, INTERVAL '1' HOUR);
+```
+
+Window-based aggregations имеют natural cleanup: state released после watermark passes window_end + allowed_lateness.
+
+---
+
+## Materialized view — dynamic table в storage
+
+Concept duality расширяется: dynamic table может быть **materialized**:
+
+```sql
+CREATE TABLE user_metrics (
+    user_id STRING,
+    event_count BIGINT,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'paimon',
+    'path' = 's3://lakehouse/paimon/user_metrics'
+);
+
+INSERT INTO user_metrics
+SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+```
+
+`user_metrics` теперь **physical table** в Paimon, обновляется в real-time каждым event. Можно query как regular Paimon table из Spark/Trino/Flink. Это foundation для **Materialized Tables** (FLIP-435) — declarative version этой setup.
+
+---
+
+## Time attributes — для event time aggregation
+
+Streaming queries требуют **time attribute** на columns для windowing:
+
+### Processing time
+
+```sql
+CREATE TABLE events (
+    user_id STRING,
+    data STRING,
+    proc_time AS PROCTIME()
+) WITH (...);
+
+SELECT user_id, COUNT(*) FROM events
+GROUP BY user_id, TUMBLE(proc_time, INTERVAL '5' MINUTE);
+```
+
+`PROCTIME()` — current TM wall clock. Простой, но не deterministic при replay.
+
+### Event time с watermark
+
+```sql
+CREATE TABLE events (
+    user_id STRING,
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (...);
+
+SELECT user_id, COUNT(*) FROM events
+GROUP BY user_id, TUMBLE(event_time, INTERVAL '5' MINUTE);
+```
+
+`WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND` — out-of-orderness 5s. Watermark = max(event_time) - 5s. Deterministic при replay (event_time из payload).
+
+---
+
+## Production gotchas
+
+### 1. State explosion от non-windowed GROUP BY
+
+```sql
+-- ❌ Unbounded state — каждый user_id в state forever
+SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+```
+
+State growth O(unique users). TBs of state eventually. RocksDB OOM.
+
+**Fix**: либо TTL (`table.exec.state.ttl=24h`), либо window-based aggregation.
+
+### 2. Retract output → sink doesn't support
+
+```
+Caused by: TableException: Table sink 'kafka' doesn't support consuming update changes which is produced by node GroupAggregate(...)
+```
+
+**Fix**: use `upsert-kafka` connector с PK, или wrap query в TUMBLE window для append output.
+
+### 3. Mixing PROCTIME и event-time в join
+
+```sql
+-- ❌ join over proc_time stream + event_time stream
+SELECT *
+FROM stream_a JOIN stream_b
+  ON stream_a.user_id = stream_b.user_id
+  AND stream_a.proc_time BETWEEN stream_b.event_time - INTERVAL '1' HOUR
+                              AND stream_b.event_time;
+```
+
+Different time semantics — Flink optimizer rejects.
+
+**Fix**: same time attribute в обоих streams (event_time recommended).
+
+### 4. Watermark too aggressive — lost events
+
+```sql
+WATERMARK FOR event_time AS event_time - INTERVAL '1' SECOND  -- ❌ слишком мало
+```
+
+Out-of-order events > 1s late dropped (or sent в side output). User complaints.
+
+**Fix**: измерить P99 out-of-orderness on production stream, set watermark = P99 + safety margin.
+
+### 5. Idle source freezes pipeline
+
+```
+Source A: events каждую секунду
+Source B: events каждые 5 минут
+```
+
+JOIN waits for watermark min(A, B). Idle source = watermark stuck = no output.
+
+**Fix**: WatermarkStrategy.withIdleness(Duration.ofMinutes(1)) на B — mark idle, не block.
+
+### 6. Table name shadowing
+
+```sql
+CREATE TABLE foo (a INT) WITH (...);
+CREATE TABLE foo (b INT) WITH (...);  -- ❌ override silently?
+```
+
+В Flink 2.x — proper conflict detection, throws. Но при upgrade legacy с 1.x — некоторые catalog implementations silent override.
+
+**Fix**: use `CREATE TABLE IF NOT EXISTS` или `CREATE OR REPLACE TABLE`.
+
+### 7. INSERT INTO from append source to PK-keyed sink — wrong key
+
+```sql
+CREATE TABLE input (id INT, name STRING) WITH ('connector' = 'kafka', ...);
+CREATE TABLE output (
+    id INT, name STRING,
+    PRIMARY KEY (id) NOT ENFORCED
+) WITH ('connector' = 'upsert-kafka', ...);
+
+INSERT INTO output SELECT id, name FROM input;
+```
+
+Если две rows в input have same `id`, upsert sink keeps только last. Это OK если intentional — но если каждый event independent, это loss.
+
+**Fix**: либо append output (regular kafka), либо ensure id uniqueness in source.
+
+---
+
+## Cheat sheet
+
+```
+Stream → Table:
+    append    — каждый event = new row
+    upsert    — event с PK = update or insert
+    retract   — sequence of (-old, +new) pairs
+
+Table → Stream (changelog modes):
+    insertOnly  — +I только
+    upsert      — +I, +U, -D с PK
+    all         — +I, -U, +U, -D (retract)
+
+Query result mode:
+    append source + projection/filter → append
+    append source + GROUP BY (no window) → retract
+    source + windowed agg → append (window completes once)
+    source с PK + transform → upsert
+
+State implications:
+    GROUP BY без window — unbounded, need TTL
+    TUMBLE/HOP window — bounded by watermark + allowedLateness
+```
+
+---
+
+<KnowledgeCheck
+  question="Query: `INSERT INTO output_kafka SELECT user_id, SUM(amount) FROM transactions GROUP BY user_id`, где output_kafka — regular Kafka connector. Flink fails с error 'Table sink doesn't support consuming update changes'. Какие три fix options и trade-offs каждой?"
+  answer="Three architectural fixes для retract → append/upsert mismatch. **Fix 1 — upsert-kafka connector**: change DDL output_kafka к `'connector' = 'upsert-kafka'` с PRIMARY KEY (user_id) NOT ENFORCED. Flink emit upsert stream: +U(user, sum) на каждое update. Kafka topic используется compacted (log.cleanup.policy=compact) — last value per key retained. Downstream consumers видят current state per user. Pros: state per user в Kafka, compact topic, native upsert support. Cons: (a) needs compacted topic config; (b) compaction lag — old values temporarily visible; (c) downstream consumer должен handle tombstones (-D); (d) только last value per user. **Fix 2 — windowed aggregation**: wrap в TUMBLE/HOP window: `SELECT user_id, TUMBLE_START(event_time, INTERVAL '5' MIN), SUM(amount) FROM ... GROUP BY user_id, TUMBLE(event_time, INTERVAL '5' MIN)`. Output append-only (each window emits once when watermark passes). Pros: (a) regular Kafka OK; (b) bounded state (released after watermark + allowed_lateness); (c) ordered output by window time; (d) batch-aware analysts familiar pattern. Cons: (a) latency = window_size + watermark_lag; (b) loses per-event granularity; (c) needs event_time + watermark в source. **Fix 3 — keep retract output, change sink to support it**: use `print` connector (debug only), JDBC sink which can handle delete operations, Iceberg with equality deletes, или Paimon (LSM merge handles updates). Pros: full retract semantics, fine-grained updates. Cons: (a) sink choice limited; (b) different operational model; (c) may not match downstream consumer needs. **Recommendation hierarchy**: для real-time dashboards — Fix 1 (upsert-kafka) если consumers handle upsert mode, либо Fix 2 для analyst-friendly batch-like output. Fix 3 — для lakehouse sinks где retract semantics natural. Key insight — это не bug в Flink, это explicit guard против data correctness issues с incompatible sink types."
+/>

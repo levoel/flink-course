@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "08-table-sql/05-materialized-tables",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-05",
+    "description": "Quiz for Materialized Tables lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-05-q1",
+      "type": "multiple-choice",
+      "question": "Что делает Flink при `CREATE MATERIALIZED TABLE m FRESHNESS = INTERVAL '30' SECOND AS SELECT ...`?",
+      "options": [
+        { "id": "a", "text": "Только создаёт catalog entry" },
+        { "id": "b", "text": "(1) Parses query, validates, infers schema. (2) Registers catalog metadata с TYPE='MATERIALIZED_TABLE'. (3) Creates physical Paimon table в default warehouse (или configured). (4) Auto-generates streaming refresh job: source → query operators → Paimon sink. (5) Submits job to JobManager — runs continuously, обновляет table с freshness ≤ 30s. Material table tracks job ID для lifecycle. No separate sink DDL, no INSERT INTO" },
+        { "id": "c", "text": "Сохраняет query без execution" },
+        { "id": "d", "text": "Batch только" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Materialized Table — flagship feature Flink 2.0 GA (FLIP-435). Это **declarative pipeline** где одно SQL statement spawns entire streaming infrastructure. **Full lifecycle**: (1) **Parsing/Planning**: Flink анализирует SELECT, infers output schema, determines time attributes, watermark strategy от input sources. Builds logical plan. (2) **Catalog registration**: special entry с TYPE='MATERIALIZED_TABLE', stores SELECT query + freshness + refresh strategy. Visible via SHOW TABLES, DESCRIBE. (3) **Physical backend table**: Apache Paimon default (configurable). Schema из SELECT result columns. Bucket count auto-determined OR configurable. Partition spec based on PARTITIONED BY если задано. (4) **Refresh job generation**: Flink generates streaming JobGraph: source operators → query operators → Paimon sink. Submitted to cluster, JobMaster manages lifecycle. Job ID stored в catalog entry. (5) **Continuous execution**: refresh job runs continuously. Source events processed, results upserted в Paimon. Checkpoint interval matches FRESHNESS (every 30s commit). Consumers read latest Paimon snapshot. **Comparison к manual pipeline**: traditional approach (CREATE source + CREATE sink + INSERT INTO + submit job) requires multiple coordinated steps + manual lifecycle. MT compresses к ONE declarative statement. **Hierarchical**: MT можно reference в other MTs — `CREATE MATERIALIZED TABLE level2 AS SELECT ... FROM level1_mt` — Flink generates incremental update job для level2 reading level1's changelog. Like dbt models в batch — but real-time.",
+      "studyHint": "Повторите урок — секция 'Anatomy — что Flink делает under the hood'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-05-q2",
+      "type": "multiple-choice",
+      "question": "Почему именно Apache Paimon выбран backend для Materialized Tables vs Iceberg?",
+      "options": [
+        { "id": "a", "text": "Только Paimon free" },
+        { "id": "b", "text": "Paimon streaming-first design: (1) LSM-tree handles continuous updates natively, Iceberg equality deletes accumulate и нужен external rewrite; (2) Changelog producer — emit changes как stream для downstream Flink consumers; (3) Partial-update merge engine — multi-source columns; (4) Native upsert via PK efficient; (5) Smaller snapshots — frequent commits don't cause manifest explosion в Iceberg style" },
+        { "id": "c", "text": "Только performance" },
+        { "id": "d", "text": "Iceberg deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Paimon selected как backend through architectural fit для streaming MT workload. **Storage model differences**: **Iceberg**: flat list of immutable Parquet files + metadata.json + manifest list. Updates через equality deletes (merge-on-read). Designed batch-first, multi-engine reads (Spark/Trino/Snowflake). **Paimon**: LSM-tree поверх Parquet/ORC. Records sorted by PK, organized в levels (L0/L1/...). Updates merged natively через LSM compaction. Designed streaming-first. **Why Paimon wins для MT**: **(1) Update handling**: MT с GROUP BY producing retract/upsert stream → millions of updates. Iceberg accumulates delete files требующие external `rewrite_files` action. Paimon LSM handles updates inline через compaction — no external action. **(2) Changelog producer**: `'changelog-producer' = 'input'` — Paimon emits stream of changes (INSERT/UPDATE/DELETE) which downstream Flink/Spark consumers can read as CDC stream. Iceberg only emits snapshot-level changelog (full diff). Enables MT chaining: Level 2 MT reads Level 1 MT's changelog incrementally. **(3) Partial-update merge engine**: `'merge-engine' = 'partial-update'` — multiple sources update different columns of same PK row. Common для multi-stream enrichment patterns. **(4) Snapshot frequency**: 30s FRESHNESS → 30s checkpoint → ~2880 snapshots/day. Iceberg metadata.json explodes with this rate (every snapshot adds entry). Paimon snapshot files lightweight, no manifest cascade. **(5) Compaction integrated**: Paimon writer threads trigger compaction sync/async. Iceberg compaction = separate batch procedure. **Trade-off**: Iceberg multi-engine read support broader (Snowflake, Databricks). Paimon Flink/Spark/Trino — narrower ecosystem. For Materialized Tables (Flink-managed) — narrower OK.",
+      "studyHint": "Повторите урок — секция 'Apache Paimon backend'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m08-05-q3",
+      "type": "multiple-choice",
+      "question": "Какие три lifecycle operations возможны на Materialized Table после CREATE?",
+      "options": [
+        { "id": "a", "text": "Только DROP" },
+        { "id": "b", "text": "(1) `ALTER MATERIALIZED TABLE m SET FRESHNESS = INTERVAL 'n' UNIT` — изменяет freshness, старый refresh job stop-with-savepoint, новый starts с тем же state. (2) `ALTER ... SUSPEND` / `RESUME` — pause/restart refresh job, table остаётся в catalog с last state. (3) `ALTER ... REFRESH` — one-time full refresh для FULL mode. Plus `DROP MATERIALIZED TABLE` — full cleanup (job stop, storage delete, catalog remove). State preserved между ALTER operations через job lineage" },
+        { "id": "c", "text": "Только READ" },
+        { "id": "d", "text": "MT immutable после create" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MT lifecycle management — declarative, similar в spirit к Kubernetes deployments. **(1) SET FRESHNESS** — most common operation. Use cases: tightening freshness когда business needs more real-time, или relaxing для cost savings. Behavior: Flink stop-with-savepoint old refresh job, start new job from savepoint. **State preserved**: aggregation counters, join state, watermarks — all carried over. No recomputation от scratch. **Caveat**: mode switch (batch ↔ streaming) requires job recreate — state lost. Stay в same mode для seamless ALTER. **(2) SUSPEND/RESUME** — operational control. SUSPEND stops refresh job, table остаётся в catalog с last committed state. Consumers continue reading stale data. RESUME restarts job from suspended checkpoint. Use cases: (a) cost optimization (suspend overnight); (b) maintenance window (Flink cluster upgrade); (c) emergency stop (data quality issue investigation). **Monitoring critical**: `materializedTable.lastRefreshTimestamp` metric — alert if stale > 2 × freshness (forgotten SUSPEND). **(3) REFRESH** — manual trigger для FULL mode tables. AUTOMATIC mode (streaming) doesn't need — continuous. FULL mode (batch refresh) — REFRESH triggers immediate run instead of waiting next scheduled. Use cases: data correction (rerun after fixing source bug), demand-driven refresh. **(4) DROP MATERIALIZED TABLE [IF EXISTS]** — full cleanup. Stops refresh job, deletes Paimon storage, removes catalog entry. Не recoverable. **Schema evolution**: `ALTER MATERIALIZED TABLE m ADD COLUMN new_col INT` supported. Dropping columns / changing types — usually requires drop+recreate.",
+      "studyHint": "Повторите урок — секция 'ALTER MATERIALIZED TABLE'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-05-q4",
+      "type": "true-false",
+      "question": "Materialized Table без PRIMARY KEY работает correctly для GROUP BY aggregations.",
+      "correctAnswer": false,
+      "explanation": "False — **common pitfall**. Without explicit PRIMARY KEY in MT DDL, Paimon backend treats table as append-only. Query GROUP BY aggregation produces retract stream — но без PK Paimon append all retract+insert events, не merge их. **Result**: (1) State growth unbounded — каждое update создаёт два records (retract + insert) в Paimon, никогда не merged; (2) Query result shows multiple rows per group instead of aggregate; (3) Storage explodes — millions of micro-records; (4) Downstream consumers see all retract markers — confusion. **Correct DDL**: ```sql CREATE MATERIALIZED TABLE user_metrics ( user_id STRING, cnt BIGINT, total_spend DECIMAL, PRIMARY KEY (user_id) NOT ENFORCED ) FRESHNESS = INTERVAL '30' SECOND AS SELECT user_id, COUNT(*) AS cnt, SUM(amount) AS total_spend FROM events GROUP BY user_id; ``` С PRIMARY KEY: Paimon uses 'deduplicate' merge engine (default) — последняя row per PK retained. Retract+insert pairs collapse — only final state stored per user. Compact representation, correct query results. **General rule**: для MT с GROUP BY всегда declare PRIMARY KEY matching GROUP BY columns. Even если semantically unique. **Exceptions**: append-only MT без aggregation — no PK needed: `CREATE MATERIALIZED TABLE filtered AS SELECT * FROM events WHERE amount > 100`. **Other merge engines**: `'merge-engine' = 'partial-update'` для multi-source updates, `'aggregation'` для sum/max/etc aggregating engine. Choose based on semantics. **Debug**: SHOW CREATE TABLE m — verify PK exists. Query Paimon table from Spark/Trino — count distinct vs raw — should match для PK-keyed MT.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

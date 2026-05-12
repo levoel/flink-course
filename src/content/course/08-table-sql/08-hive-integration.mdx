@@ -1,0 +1,429 @@
+---
+title: "Hive integration — catalog, query syntax, UDFs"
+description: "HiveCatalog setup, Hive query syntax compatibility, Hive UDFs в Flink SQL, when use Hive integration"
+order: 8
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["HiveCatalog", "Hive UDFs", "Catalog Federation", "Migration", "Hive Dialect"]
+---
+
+# Hive integration — catalog, query syntax, UDFs
+
+Hive — historic data warehouse standard. У многих organizations existing Hive infrastructure: tables в HDFS/S3, metadata в Hive Metastore, hundreds of UDFs, queries written в HiveQL. Flink integrates с Hive deeply: read/write Hive tables, register HiveCatalog как Flink catalog, use Hive UDFs в Flink SQL, switch dialect между Flink SQL и Hive SQL. Этот урок разбирает HiveCatalog setup, query compatibility, UDF integration и когда Hive integration оправдана vs new Flink-native architecture.
+
+Use case: migrate batch Hive workloads на streaming в Flink incrementally без discard existing investment.
+
+---
+
+## Зачем интегрироваться с Hive
+
+Pros:
+- **Reuse Hive Metastore** — единый catalog между Hive, Spark, Trino и Flink.
+- **Hive tables как Flink streams** — partition watch, incremental scan.
+- **Existing UDFs** — десятки JAR libraries не нужно переписывать.
+- **HiveQL queries** — analysts продолжают писать в familiar syntax.
+
+Cons:
+- **Hive Metastore — еще одна dependency** — нужен deployment + maintenance.
+- **Hive UDFs не всегда thread-safe** — могут конфликтовать с Flink concurrency.
+- **Performance overhead** — HMS RPC calls для metadata.
+
+When use: existing Hive ecosystem (>10 tables, >5 UDFs). New deployments — лучше Iceberg/Paimon с REST catalog.
+
+---
+
+## HiveCatalog setup
+
+```sql
+CREATE CATALOG hive_catalog WITH (
+    'type' = 'hive',
+    'hive-conf-dir' = '/opt/flink/conf/hive',
+    'default-database' = 'default'
+);
+
+USE CATALOG hive_catalog;
+SHOW DATABASES;
+SHOW TABLES;
+```
+
+Hive configuration files (`hive-site.xml`) в `hive-conf-dir`:
+```xml
+<configuration>
+    <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://hive-metastore:9083</value>
+    </property>
+    <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>s3://data-warehouse/hive</value>
+    </property>
+</configuration>
+```
+
+Flink reads HMS via Thrift RPC. Каталог federated с другими (Iceberg catalog, default_catalog).
+
+### Multi-catalog setup
+
+```sql
+CREATE CATALOG hive_legacy WITH ('type' = 'hive', ...);
+CREATE CATALOG iceberg_new WITH ('type' = 'iceberg', ...);
+CREATE CATALOG default_flink_catalog WITH ('type' = 'generic_in_memory');
+
+-- Federated queries
+SELECT *
+FROM hive_legacy.warehouse.orders AS o
+JOIN iceberg_new.lakehouse.users AS u ON o.user_id = u.user_id;
+```
+
+Cross-catalog joins работают transparently. Common migration pattern: read legacy Hive, write new Iceberg.
+
+---
+
+## Hive tables — streaming read
+
+Flink can read Hive tables как streaming source через **partition monitoring**:
+
+```sql
+SELECT *
+FROM hive_catalog.warehouse.events
+/*+ OPTIONS(
+    'streaming-source.enable' = 'true',
+    'streaming-source.partition.include' = 'all',
+    'streaming-source.monitor-interval' = '1 min',
+    'streaming-source.consume-start-offset' = '2026-05-01'
+) */;
+```
+
+Behavior: Flink monitors Hive table partitions, reads new partitions as they appear. Each partition arrival triggers downstream processing.
+
+Use case: Hive batch ETL writes hourly partitions, Flink streams them as they become available.
+
+---
+
+## Hive tables — streaming write
+
+```sql
+CREATE TABLE hive_catalog.warehouse.events_processed (
+    event_id BIGINT,
+    user_id STRING,
+    amount DECIMAL(10, 2),
+    `date` STRING,
+    `hour` STRING
+) PARTITIONED BY (`date`, `hour`)
+WITH (
+    'connector' = 'hive',
+    'sink.partition-commit.trigger' = 'partition-time',
+    'sink.partition-commit.delay' = '1h',
+    'sink.partition-commit.policy.kind' = 'metastore,success-file'
+);
+
+INSERT INTO hive_catalog.warehouse.events_processed
+SELECT event_id, user_id, amount,
+       DATE_FORMAT(event_time, 'yyyy-MM-dd') AS `date`,
+       DATE_FORMAT(event_time, 'HH') AS `hour`
+FROM events;
+```
+
+Behavior: Flink writes partitions, commit via `partition-commit.policy.kind`:
+- `metastore` — update HMS that partition exists.
+- `success-file` — write `_SUCCESS` file для downstream Hive readers.
+
+Partition committed когда watermark passes `partition_end + delay` (event-time semantics).
+
+---
+
+## Hive dialect — HiveQL в Flink SQL
+
+```sql
+SET 'table.sql-dialect' = 'hive';
+
+SELECT
+    user_id,
+    COUNT(*) AS cnt,
+    HASH(user_id) AS user_hash
+FROM hive_catalog.warehouse.events
+GROUP BY user_id;
+
+SET 'table.sql-dialect' = 'default';   -- switch back к Flink SQL
+```
+
+Hive dialect supports:
+- HiveQL syntax (DISTRIBUTE BY, SORT BY, LATERAL VIEW, CLUSTER BY).
+- Hive built-in functions (HASH, MD5, GET_JSON_OBJECT, ...).
+- Hive UDFs registered в HMS.
+
+Limitations:
+- Some Flink SQL features не работают в Hive dialect (MATCH_RECOGNIZE, temporal joins).
+- Watermark в Hive dialect — different syntax.
+
+---
+
+## Hive UDFs
+
+Three types of Hive UDFs:
+
+### Built-in scalar UDFs
+
+```sql
+SET 'table.sql-dialect' = 'hive';
+SELECT
+    user_id,
+    GET_JSON_OBJECT(payload, '$.action') AS action,
+    REGEXP_EXTRACT(user_agent, '(Chrome|Firefox|Safari)', 1) AS browser
+FROM events;
+```
+
+Native Hive functions available transparently.
+
+### Custom UDFs from JAR
+
+```sql
+ADD JAR '/opt/flink/hive-udfs/sentiment-analyzer.jar';
+
+CREATE TEMPORARY FUNCTION sentiment_score
+AS 'com.company.udf.SentimentAnalyzer'
+LANGUAGE JAVA;
+
+SELECT user_id, text, sentiment_score(text) AS sentiment
+FROM social_posts;
+```
+
+Existing Hive UDF JAR loaded directly без modification. Class implements `org.apache.hadoop.hive.ql.exec.UDF` interface.
+
+### UDTF (user defined table function)
+
+```sql
+CREATE TEMPORARY FUNCTION explode_tags AS 'org.apache.hadoop.hive.ql.udf.generic.GenericUDTFExplode';
+
+SELECT user_id, tag
+FROM events,
+LATERAL VIEW explode_tags(tags) AS tag;
+```
+
+UDTFs return multiple rows per input. LATERAL VIEW is Hive syntax (must use Hive dialect).
+
+### UDAF (aggregate UDFs)
+
+```sql
+ADD JAR '/opt/flink/hive-udfs/median.jar';
+CREATE TEMPORARY FUNCTION median AS 'com.company.udf.MedianUDAF';
+
+SELECT user_id, median(amount) AS median_amount
+FROM orders
+GROUP BY user_id;
+```
+
+UDAFs работают в both Hive и Flink dialect. Plus Flink built-in: APPROX_PERCENTILE для approximate aggregation.
+
+---
+
+## Cross-catalog query example
+
+Migration pattern: stream Hive partition arrivals + enrich с Iceberg dim table.
+
+```sql
+-- Hive source — legacy partitioned data
+CREATE CATALOG hive_legacy WITH ('type' = 'hive', ...);
+
+-- Iceberg destination
+CREATE CATALOG iceberg WITH ('type' = 'iceberg', ...);
+
+-- Hive UDF
+ADD JAR '/opt/flink/hive-udfs/legacy-parser.jar';
+CREATE TEMPORARY FUNCTION parse_legacy AS 'com.company.LegacyParser';
+
+-- Stream Hive partitions, enrich, write Iceberg
+INSERT INTO iceberg.lakehouse.unified_events
+SELECT
+    e.event_id,
+    parse_legacy(e.raw_payload) AS parsed_payload,
+    u.name AS user_name,
+    u.segment
+FROM hive_legacy.warehouse.events
+/*+ OPTIONS('streaming-source.enable'='true', 'streaming-source.monitor-interval'='1 min') */ AS e
+JOIN iceberg.lakehouse.users FOR SYSTEM_TIME AS OF e.event_time AS u
+  ON e.user_id = u.user_id;
+```
+
+One query reads Hive legacy table в streaming, applies Hive UDF, joins Iceberg modern table, writes Iceberg destination. Migration без drop-replace.
+
+---
+
+## Когда use Hive integration
+
+### Use cases (Hive worthwhile)
+
+1. **Existing Hive Metastore** с десятками tables — costly migrate, reuse.
+2. **Hive UDF library** — десятки custom JARs.
+3. **HiveQL analysts** — team прочно знает HiveQL, минимизировать retraining.
+4. **Hive → Flink migration** — incremental, не big bang.
+5. **Federated queries** — Hive legacy data + Flink streaming results.
+
+### When skip Hive (greenfield)
+
+1. **New deployment** — Iceberg/Paimon с REST catalog cleaner.
+2. **Cloud-native** — Glue, Polaris, Unity Catalog modern alternatives.
+3. **Streaming-first** — Paimon handles streaming better than Hive.
+4. **No legacy** — Hive overhead unjustified.
+
+Modern stack: Iceberg + REST catalog (Polaris/Apache Iceberg REST) + Paimon for streaming tables.
+
+---
+
+## Performance considerations
+
+### HMS RPC overhead
+
+Each metadata query (DESCRIBE table, partition listing) — HMS RPC call. Frequent metadata operations bottleneck.
+
+**Mitigation**: Flink caches metadata. Tune `table.catalog.hive.metadata-cache.expire-after-write`.
+
+### Partition explosion
+
+Hive supports thousands of partitions per table. Loading ALL partitions metadata expensive.
+
+```sql
+SELECT * FROM hive_table WHERE date='2026-05-12';
+```
+
+Without partition prune predicate, full partition list fetched. With WHERE clause, HMS supports partition pruning.
+
+**Best practice**: query with explicit partition predicates.
+
+### Hive file formats
+
+Common formats:
+- **ORC** — columnar, native Hive — best read performance.
+- **Parquet** — also columnar — equivalent.
+- **Text/CSV** — row-based — avoid для analytics.
+- **Avro** — row-based but schema-aware.
+
+Flink reads all via dedicated codecs.
+
+---
+
+## Production gotchas
+
+### 1. HMS version mismatch
+
+```
+Caused by: Required field 'client_protocol' is unset!
+```
+
+Flink expects HMS version compatible с bundled `flink-sql-connector-hive-3.1.3_2.12-...`. HMS 2.x vs 3.x incompatible.
+
+**Fix**: match Flink Hive connector version с HMS version. Use `flink-sql-connector-hive-2.3.x` for Hive 2.x, `-3.1.x` for Hive 3.x.
+
+### 2. UDF JAR conflicts
+
+```
+NoSuchMethodError: org.apache.commons.lang3.StringUtils.removeStart
+```
+
+Hive UDF JAR имеет old `commons-lang3` dependency, Flink имеет newer. Classpath conflict.
+
+**Fix**: shade Hive UDF JAR (relocate commons-lang3), или upgrade UDF code.
+
+### 3. Watermark не работает с Hive source
+
+```sql
+SELECT * FROM hive_table
+/*+ OPTIONS('streaming-source.enable'='true') */
+-- No watermark specified в DDL
+```
+
+Streaming Hive source emits records, но без watermark windowed aggregations не emit results.
+
+**Fix**: explicit WATERMARK в DDL:
+```sql
+CREATE TABLE hive_streaming_view AS
+SELECT *, TO_TIMESTAMP(event_time_str) AS event_time
+FROM hive_legacy.warehouse.events;
+-- Plus WATERMARK on event_time computed column
+```
+
+### 4. Hive partition watch с slow filesystems
+
+S3 partition listing slow (1000 partitions = 1-5 seconds API calls). Streaming source latency suffers.
+
+**Fix**: 
+- Increase monitor-interval (1 min → 5 min).
+- Use Iceberg instead (manifest-based, fast).
+
+### 5. UDF concurrency issues
+
+Hive UDFs assumed sequential execution. Flink runs them в parallel — non-thread-safe UDFs crash.
+
+**Fix**: ensure UDF thread-safe (no shared mutable state). Audit before deploying в Flink. Most stateless UDFs safe.
+
+### 6. Hive ACID tables не supported для streaming
+
+Hive 3.x supports ACID transactions via ORC delta files. Flink streaming read of ACID tables limited.
+
+**Fix**: для ACID semantics use Iceberg/Paimon. Hive ACID — legacy pattern.
+
+### 7. Catalog в default_catalog override
+
+```sql
+USE CATALOG hive_catalog;
+SHOW TABLES;  -- shows Hive tables
+DROP CATALOG hive_catalog;  -- ❌ disconnects, current session lost catalog
+```
+
+After DROP CATALOG, queries fail until re-create или USE другой.
+
+**Fix**: avoid DROP CATALOG в production scripts; manage через configuration.
+
+### 8. Hive dialect breaking Flink-specific syntax
+
+```sql
+SET 'table.sql-dialect' = 'hive';
+
+CREATE TABLE foo (
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND  -- ❌ not Hive syntax
+);
+```
+
+WATERMARK syntax не valid в Hive dialect.
+
+**Fix**: define table в Flink default dialect, switch to Hive only для SELECT queries.
+
+---
+
+## Cheat sheet
+
+```
+HiveCatalog:
+    CREATE CATALOG hive WITH ('type'='hive', 'hive-conf-dir'='/path');
+    USE CATALOG hive;
+
+Streaming read Hive:
+    SELECT * FROM hive.db.table
+    /*+ OPTIONS('streaming-source.enable'='true', 'monitor-interval'='1min') */
+
+Streaming write Hive:
+    INSERT INTO hive.db.partitioned_table
+    SELECT ..., date, hour
+    WITH ('sink.partition-commit.trigger'='partition-time')
+
+Hive UDFs:
+    ADD JAR '/path/udf.jar';
+    CREATE TEMPORARY FUNCTION fn AS 'com.company.UDF';
+
+Hive dialect:
+    SET 'table.sql-dialect' = 'hive';
+    -- HiveQL syntax: LATERAL VIEW, DISTRIBUTE BY, CLUSTER BY
+    SET 'table.sql-dialect' = 'default';
+
+When use Hive:
+    ✅ legacy HMS + UDFs, migration path
+    ❌ greenfield (use Iceberg/Paimon)
+```
+
+---
+
+<KnowledgeCheck
+  question="Migration scenario: company has Hive data warehouse с 1000 tables in HDFS Parquet, 50 custom Hive UDFs (sentiment analysis, fraud rules, user enrichment), 100 daily ETL jobs. Goal: migrate к Flink streaming pipelines, reuse infrastructure where possible. Step-by-step migration plan?"
+  answer="**Phased incremental migration, 6-12 months**:\n\n**Phase 1 — Foundation (months 1-2)**: (1) Setup Flink cluster (Kubernetes Operator preferred). (2) Configure HiveCatalog: `CREATE CATALOG hive_legacy WITH ('type'='hive', 'hive-conf-dir'='/etc/hive')`. (3) Verify ALL Hive UDF JARs work in Flink: `ADD JAR; CREATE TEMPORARY FUNCTION` — test each in isolation. Document thread-safety status (audit для shared mutable state). (4) Setup Iceberg catalog параллельно для new tables: `CREATE CATALOG iceberg WITH ('type'='iceberg', ...)`. (5) Establish CI/CD для DDL — version control SQL scripts. (6) Train analysts on Flink SQL dialect (familiar syntax с Hive extensions).\n\n**Phase 2 — Read-only Hive (months 2-3)**: (7) Start reading Hive tables как streaming sources: `SELECT * FROM hive_legacy.db.events /*+ OPTIONS('streaming-source.enable'='true', 'monitor-interval'='5 min') */`. (8) Implement first 10 pipelines: simple per-partition processing (e.g., daily aggregations restated к real-time). (9) Keep writing к Hive для downstream compat: `INSERT INTO hive_legacy.db.aggregations SELECT ...`. (10) Validate output matches batch Hive results — backfill periods, run both pipelines parallel for verification. (11) Monitor HMS RPC load — может need HMS scaling.\n\n**Phase 3 — Hybrid writes (months 3-5)**: (12) Identify high-volume tables (top 50 by row count) — migrate writes к Iceberg: `INSERT INTO iceberg.lakehouse.events_v2 SELECT ... FROM hive_legacy.db.events`. (13) Dual-write strategy: write both Hive (legacy compat) и Iceberg (new) для 30 days, allow downstream consumers gradual migration. (14) Use cross-catalog joins: streaming pipelines read Hive legacy + write enriched Iceberg. (15) Migrate UDFs gradually — most stay as Hive UDFs (ADD JAR), some rewrite as Flink SQL UDFs (idempotent, performant). (16) Materialized Tables для new aggregation patterns: `CREATE MATERIALIZED TABLE user_metrics FRESHNESS=INTERVAL '1' MIN AS SELECT ... FROM iceberg.lakehouse.events_v2`.\n\n**Phase 4 — Streaming-first (months 5-8)**: (17) New pipelines built streaming-native — Kafka sources, Iceberg/Paimon sinks. (18) Identify Hive batch jobs convertible к streaming — replace cron-based ETLs с continuous Materialized Tables. Cost-aware: streaming costs more compute но deletes data engineer toil. (19) Add AI functions для new use cases: ML_PREDICT для real-time scoring, VECTOR_SEARCH для semantic search — capabilities not available в batch Hive. (20) Sunset deprecated Hive tables: notify consumers, switch read sources к Iceberg, eventually drop. (21) Migrate UDFs to Flink-native где beneficial — performance improvements, type safety.\n\n**Phase 5 — Decommission (months 8-12)**: (22) Last 10% Hive tables — explicit migration project. (23) HMS preserved для historical queries but new writes 100% Iceberg/Paimon. (24) Old daily ETL jobs (now redundant since streaming MTs) deactivated. (25) UDF library refactored — separate flink-udfs.jar с Flink-native implementations. (26) HMS deprovision OR kept як read-only archive для compliance.\n\n**Architecture rationale**: (a) **Don't big-bang migrate** — risk too high, breaks downstream consumers. Incremental с safety nets. (b) **Dual-write phase critical** — verifies new infrastructure matches old, builds trust. (c) **HiveCatalog as bridge** — minimal disruption for analysts, gradual learning curve. (d) **Iceberg over Paimon для main tables** — multi-engine read support (Spark, Trino, Snowflake) maintains existing tooling. Paimon only для streaming-heavy aggregation tables. (e) **UDF strategy**: 60% stay Hive UDFs (low cost), 20% rewritten Flink-native (performance gain), 20% deprecated (functionality replaced by Materialized Tables / AI functions). (f) **Cost tracking**: streaming compute > batch — set budget alarms, identify pipelines где batch refresh sufficient (FRESHNESS=INTERVAL '1' HOUR with FULL refresh). **Risk mitigations**: (i) Hive UDF JAR conflicts — pre-test on Flink staging. (ii) HMS performance — scale HMS RDB (Postgres) для concurrent Flink + Hive workloads. (iii) Consumer rollback path — keep Hive read paths 6+ months после Iceberg cutover. (iv) ATP / Watermark handling — train team carefully, mistakes cost data correctness."
+/>

@@ -1,0 +1,344 @@
+---
+title: "HA: ZooKeeper vs Kubernetes ConfigMaps"
+order: 5
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["High Availability", "ZooKeeper", "Kubernetes ConfigMaps", "Leader Election", "Checkpoint Storage"]
+---
+
+# HA: ZooKeeper vs Kubernetes ConfigMaps
+
+JobManager — это single point of coordination в Flink: он хранит JobGraph, completed checkpoint pointer, координирует savepoints, scheduling. Если JM crash, все running jobs останавливаются. **High Availability** решает эту проблему: 2+ JM pods, leader election, automatic failover. В Flink 2.x есть **две реализации HA**: исторический **ZooKeeper-based** (legacy) и **Kubernetes ConfigMap-based** (default modern). В этом уроке: как работает leader election в обоих, что хранится где, when use each, миграция между ними.
+
+---
+
+## Что должно «выживать» при JM crash
+
+При HA JM нужно сохранять persistent metadata:
+
+1. **JobGraph** — сериализованный план job-а (operators, edges, parallelism). При recovery новый JM подбирает его и продолжает.
+2. **Completed checkpoint pointer** — путь к последнему завершённому checkpoint-у в DFS. Без него recovery не знает с какого state восстанавливаться.
+3. **Submitted JobGraph store** — все pending JobGraph-ы (если cluster обслуживает несколько jobs).
+4. **Leader election state** — кто текущий лидер, какие еpoch / generation.
+5. **Running jobs registry** — какие job IDs activet.
+
+**Сами state data** (RocksDB SST files, ForSt blob storage) хранятся в DFS (S3/HDFS) — это отдельный от HA metadata storage. HA-сервис хранит только pointers и coordination data.
+
+| HA component | ZK-based | K8s ConfigMap-based |
+|---|---|---|
+| Pointers + metadata | ZK znodes | K8s ConfigMaps |
+| Leader election | ZK ephemeral nodes + watch | K8s leader-election lease |
+| Configuration | `high-availability.type: zookeeper` | `high-availability.type: kubernetes` |
+| Cluster ID | znode prefix | ConfigMap label selector |
+| Actual state data | DFS (S3/HDFS) | DFS (S3/HDFS) |
+
+---
+
+## ZooKeeper-based HA (legacy)
+
+ZK был оригинальным choice для HA в Flink с самого начала. Использует apache curator framework поверх raw ZK.
+
+<DiagramContainer title="ZK-based HA: координация через ZooKeeper ensemble" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager 1 (Leader)"
+        tooltip="При старте регистрируется в ZK через curator LeaderLatch — ephemeral sequential node. Самый младший sequence number = leader. Лидер активно обслуживает Dispatcher / ResourceManager / JobMaster."
+      >
+        active leader
+      </DataBox>
+      <DataBox
+        label="JobManager 2 (Standby)"
+        tooltip="Тоже регистрируется, но получает большой sequence. Watch на предыдущий node. Standby — Dispatcher не активен, RM не активен, никаких jobs не обслуживает."
+      >
+        standby (watch)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="connect" />
+    <FlowRow>
+      <DataBox
+        label="ZooKeeper Ensemble (3 nodes)"
+        tooltip="Apache ZooKeeper, обычно 3 или 5 ноды для quorum. Хранит znodes: /flink/<cluster-id>/leader/, /flink/<cluster-id>/jobgraphs/, /flink/<cluster-id>/checkpoints/, /flink/<cluster-id>/checkpoint-counter/."
+      >
+        zk1, zk2, zk3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="store pointers" />
+    <FlowRow>
+      <DataBox
+        label="DFS (S3 / HDFS)"
+        tooltip="Реальные state data: checkpoint chk-<N>/ folders, JobGraph blob, savepoint files. ZK хранит только URI pointers на эти данные."
+      >
+        actual data
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Leader election в ZK
+
+Использует **ephemeral sequential nodes**:
+
+```text
+ZooKeeper path: /flink/fraud-detector/leader/
+
+При старте JM-1: создаёт ephemeral node "lock-0000000001"
+При старте JM-2: создаёт ephemeral node "lock-0000000002"
+JM-2 ставит watch на lock-0000000001
+Лидер = node с наименьшим sequence number → JM-1
+
+Если JM-1 crash (TCP connection дропнулся):
+  → ephemeral node удаляется автоматически (ZK feature)
+  → JM-2 получает watch event
+  → JM-2 проверяет — теперь он младший → становится лидером
+  → JM-2 активирует Dispatcher/RM, читает JobGraph из ZK, recovery
+```
+
+### Конфигурация
+
+```yaml
+high-availability.type: zookeeper
+high-availability.zookeeper.quorum: zk1:2181,zk2:2181,zk3:2181
+high-availability.zookeeper.path.root: /flink
+high-availability.zookeeper.path.cluster-id: fraud-detector
+high-availability.zookeeper.client.session-timeout: 60000
+high-availability.zookeeper.client.connection-timeout: 15000
+high-availability.zookeeper.client.acl: open       # или creator
+high-availability.storageDir: s3://flink-prod/ha/fraud-detector
+```
+
+### Преимущества ZK HA
+
+- **Battle-tested** — ZK используется в Flink с самого начала, ZK-based recovery flow самый зрелый.
+- **Fast leader election** — ZK ephemeral nodes + watch = sub-second detection of leader failure.
+- **Independent** — не привязан к K8s, работает в bare-metal / YARN / Mesos deployments.
+- **Heavy state read/write performance** — ZK прозрачен для частых обновлений checkpoint counter.
+
+### Недостатки ZK HA
+
+- **Operational overhead** — ZK ensemble нужно отдельно deploy, monitor, patch, backup. 3 dedicated nodes minimum. Для K8s production это лишний кластер.
+- **Cluster dependency** — если ZK ensemble down (например zk node disk full, network partition) → все JM-ы теряют leadership, jobs становятся unstable.
+- **Multi-cluster sharing trap** — соблазн share один ZK между всеми Flink clusters. Result: cascading failures, debugging hell.
+- **Не cloud-native** — managing ZK на Kubernetes — это antipattern (StatefulSet с persistent volumes, забота о quorum при rolling restarts).
+
+---
+
+## Kubernetes ConfigMap-based HA (default modern)
+
+С 1.12+ Flink имеет native K8s HA implementation. Идея: использовать K8s API для leader election (через **lease objects** или **ConfigMap annotations**), и K8s ConfigMaps для хранения metadata. **Никакого ZK не нужно**.
+
+<DiagramContainer title="K8s ConfigMap-based HA — leader election через K8s API" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager 1 (Leader)"
+        tooltip="При старте пытается захватить leader election через ConfigMap annotation update (atomic compare-and-swap). Если успешно — leader. Renew lease каждые 5s через K8s API."
+      >
+        active leader
+      </DataBox>
+      <DataBox
+        label="JobManager 2 (Standby)"
+        tooltip="Также пытается захватить leadership. Detects что lease уже взят. Polling по таймауту lease renewal — если 30s no renew, попытка take over."
+      >
+        standby (poll)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="K8s API" />
+    <FlowRow>
+      <DataBox
+        label="K8s API server"
+        tooltip="Атомарные операции через resourceVersion (optimistic concurrency). Update ConfigMap или Lease object — если resourceVersion матчит, succeeded. Иначе CAS fail, retry."
+      >
+        ConfigMap / Lease leader election
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="metadata stored" />
+    <FlowRow>
+      <DataBox
+        label="ConfigMaps"
+        tooltip="<cluster-id>-cluster-config-map — cluster-level metadata (current leader, dispatcher leader, etc). <cluster-id>-<jobid>-config-map — job-level (JobGraph pointer, latest checkpoint pointer)."
+      >
+        metadata
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="actual data" />
+    <FlowRow>
+      <DataBox
+        label="DFS (S3 / HDFS)"
+        tooltip="Те же S3 buckets для checkpoint data и savepoint data. ConfigMaps хранят только pointers."
+      >
+        S3 / HDFS
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Leader election через ConfigMap
+
+Псевдо-код:
+
+```text
+function acquireLeadership(cluster_id, my_uuid):
+  while true:
+    configMap = K8s.get(<cluster-id>-cluster-config-map)
+    existing_leader = configMap.annotations["leader.uuid"]
+    existing_lease = configMap.annotations["lease.expiry"]
+
+    if existing_leader is None OR existing_lease < now():
+      # либо нет лидера, либо lease истёк → try take over
+      configMap.annotations["leader.uuid"] = my_uuid
+      configMap.annotations["lease.expiry"] = now() + 30s
+      try:
+        K8s.update(configMap)  # с resourceVersion check
+        return SUCCESS         # we are now leader
+      catch ConflictError:
+        sleep 1s; continue     # кто-то ещё успел, retry
+    else:
+      sleep 5s; continue       # лидер активен, wait
+```
+
+Лидер renew lease каждые 5s. Если crash и не renew 30s → standby take over.
+
+### Конфигурация
+
+```yaml
+high-availability.type: kubernetes
+high-availability.storageDir: s3://flink-prod/ha/fraud-detector
+
+# Optional fine-tuning
+high-availability.kubernetes.leader-election.lease-duration: 15s
+high-availability.kubernetes.leader-election.renew-deadline: 10s
+high-availability.kubernetes.leader-election.retry-period: 2s
+```
+
+Note: **storageDir обязателен** даже в K8s HA — там хранятся blob references на JobGraph и т.п. ConfigMap имеет ограничение 1MB total, поэтому большие artifacts хранятся в DFS.
+
+### Преимущества K8s HA
+
+- **No external dependency** — K8s API уже есть в любом K8s cluster-е. Нет нужды в ZK ensemble.
+- **Cloud-native** — встроено в orchestration платформу, leverages её мощь (RBAC, watch streams, audit logs).
+- **Simpler operations** — нет ZK для патчинга, backup, monitoring.
+- **GitOps-friendly** — конфигурация в одном FlinkDeployment YAML, никаких external services.
+- **Auto-cleanup** — при удалении FlinkDeployment ConfigMaps удаляются вместе с ним.
+
+### Недостатки K8s HA
+
+- **Привязка к K8s** — работает только на Kubernetes. Bare-metal Flink без K8s → ZK.
+- **K8s API server bottleneck** — при много jobs heavy leader renewals могут нагружать API server (хотя обычно несущественно).
+- **Failover slower than ZK** — lease-based detection 30s vs ZK ephemeral 5-10s. Для most cases не критично.
+- **ConfigMap 1MB limit** — JobGraph больше 1MB → stored в DFS, ConfigMap содержит pointer. Обычно работает, но edge case с большими JobGraph (1000+ operators) может surprise.
+
+---
+
+## Comparison и migration
+
+| Аспект | ZK-based | K8s-based |
+|---|---|---|
+| External dependency | ZooKeeper ensemble (3+ nodes) | Только K8s API |
+| Leader election speed | менее 5s | 15-30s (lease) |
+| Operational complexity | High (own cluster) | Low (K8s native) |
+| Multi-tenancy | Trick (ZK paths) | Native (namespaces) |
+| Bare-metal / YARN | Yes | No |
+| K8s recommended | No (legacy) | Yes |
+| In Flink 2.x default? | No | **Yes** |
+| Production on K8s 2026 | Не используйте | Default |
+
+### Когда выбирать что
+
+- **K8s ConfigMap HA**: production на K8s, новые deployments. Default choice 2026.
+- **ZK HA**: bare-metal / YARN deployments, legacy infrastructure где ZK уже есть, migration path сложен.
+
+### Миграция ZK → K8s HA
+
+Не работает live — нельзя «переключить» HA flavor у running cluster. Workflow:
+
+```text
+1. Trigger canonical savepoint на running job (ZK HA)
+2. Stop job
+3. Update FlinkDeployment: high-availability.type: zookeeper → kubernetes
+4. Apply (operator делает teardown + redeploy с K8s HA)
+5. Start job restoring from savepoint
+6. Verify ConfigMaps создаются:
+   kubectl get configmaps -n streaming-prod -l app=fraud-detector
+7. После недели stability — decommission ZK ensemble
+```
+
+`canonical` savepoint format здесь критичен — он portable между HA flavors (см. урок 14.4).
+
+---
+
+## Что хранится в ConfigMap (детальный peek)
+
+```bash
+kubectl get configmap fraud-detector-cluster-config-map -o yaml
+```
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fraud-detector-cluster-config-map
+  annotations:
+    control-plane.alpha.kubernetes.io/leader: '{"holderIdentity":"abc-uuid","leaseDurationSeconds":15,"acquireTime":"2026-05-12T10:00:00Z","renewTime":"2026-05-12T10:00:08Z"}'
+data:
+  jobGraph: <reference URI to S3 blob>
+  completedCheckpoint: s3://flink-prod/checkpoints/fraud-detector/chk-1234/_metadata
+  checkpointCounter: "1235"
+  dispatcherSubmittedJobGraphs: |
+    job-id-1: <pointer>
+    job-id-2: <pointer>
+```
+
+При JM failover standby JM читает этот ConfigMap, восстанавливает JobGraph + completed checkpoint, продолжает.
+
+---
+
+## Checkpoint storage relationship
+
+HA и **checkpoint storage** — две разные вещи, но связанные:
+
+- HA метаданные (ConfigMaps / ZK znodes) — где хранится **pointer** на latest checkpoint
+- Checkpoint storage (`state.checkpoints.dir`) — где хранится **сами checkpoint data** (state, JobGraph, _metadata)
+
+Без HA: JM crash = потеря knowledge о last checkpoint → recovery from scratch.
+С HA: новый JM читает pointer из ConfigMap/ZK → recovery с latest checkpoint → exactly-once preserved.
+
+```yaml
+flinkConfiguration:
+  # HA метаданные
+  high-availability.type: kubernetes
+  high-availability.storageDir: s3://flink-prod/ha/fraud-detector
+
+  # Checkpoint data
+  state.checkpoints.dir: s3://flink-prod/checkpoints/fraud-detector
+  state.savepoints.dir: s3://flink-prod/savepoints/fraud-detector
+```
+
+Это два разных S3 prefix-а. Часто люди путают и пытаются reuse — не надо.
+
+---
+
+## Production gotchas
+
+- **HA storageDir уникален per cluster** — нельзя share между jobs, конфликт ConfigMaps. Включайте cluster-id в path.
+- **Без HA в production = data loss waiting to happen** — JM crash + recovery from scratch = потеря state. HA обязателен.
+- **JM `replicas: 1` + HA = почти ничего не даёт** — failover требует standby JM. С replicas=1 при JM crash K8s рестартанет pod, но recovery будет 60-120s downtime. Replicas=2 — failover за 30s.
+- **K8s API server overload** — heavy lease renewals от 50+ Flink clusters одновременно могут грузить API server. Если видите throttling — увеличьте `lease-duration` (15s → 30s) для уменьшения частоты renewals.
+- **ZK + K8s одновременно** — некоторые legacy setups имеют оба `high-availability.type` и `zookeeper.quorum` set. Flink использует один, но это confusing для debugging. Cleanup configs.
+- **ConfigMap quota** — некоторые K8s installations имеют resource quotas на ConfigMaps. Каждый Flink cluster создаёт 3-5 CM-ов. 100 jobs = 300-500 CM-ов. Если quota maxed → operator deploys fail.
+- **HA storage в shared S3 bucket** — bucket policy должен allow Flink ServiceAccount-у read/write. IAM IRSA (IAM Roles for Service Accounts) — standard pattern для AWS.
+
+<Callout type="tip">
+В 2026 на K8s используйте **K8s ConfigMap-based HA**. ZK keep только если у вас bare-metal Flink или legacy infrastructure с ZK уже на месте. Flink Kubernetes Operator (урок 04) делает K8s HA default — нужно только указать storageDir в S3.
+</Callout>
+
+<Callout type="warning">
+HA не защищает от bug в коде. Если ваш job crash из-за NPE в operator, JM рестартанет, recovery с last checkpoint, опять тот же NPE → infinite restart loop (с exponential backoff). HA даёт infrastructure resilience, не code correctness. Используйте `restart-strategy` ограничения + alerting.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="JM pod рестартанулся (K8s killed его из-за OOM). Через 90 секунд новый pod RUNNING, но job в статусе CREATED минут 5, потом FAILED. Что произошло, и как это связано с HA?"
+  answer="Сценарий зависит от HA configuration: (1) Если HA НЕ был включён — новый JM не знает о существовании prior job, поэтому submit-ит fresh job из main(). State начинается с нуля, что для stateful job = катастрофа. FAILED скорее всего потому что main() ожидал какие-то external resources которые не доступны при cold start. (2) Если HA включён (ZK или K8s) — новый JM должен прочитать JobGraph + checkpoint pointer из HA storage. 5-минутный CREATED + FAILED намекает что recovery failed — возможные причины: (a) HA storageDir недоступен (S3 permission lost при ServiceAccount rotation); (b) Last checkpoint corrupt или удалён (state.checkpoints.num-retained=1 + race condition); (c) ConfigMaps удалены/повреждены (другой controller их трогает); (d) JobGraph blob в DFS недоступен. Диагностика: kubectl logs нового JM, искать `Recovering from <path>` failures. Также `replicas: 1` для JM = no warm standby → 90s downtime — это симптом отсутствия true HA. Fix: `jobManager.replicas: 2` + `restart-strategy` ограничения + monitoring на checkpoint failures."
+/>

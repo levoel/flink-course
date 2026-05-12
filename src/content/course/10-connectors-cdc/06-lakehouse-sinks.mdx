@@ -1,0 +1,373 @@
+---
+title: "Lakehouse sinks: Iceberg, Paimon, Hudi, Delta через SinkV2"
+description: "Глубокий разбор lakehouse sinks anatomy: Iceberg / Paimon / Hudi / Delta через SinkV2 (FLIP-191). Pre-commit topology (small file compaction), post-commit topology (manifest publish, metastore update). Comparison ecosystem"
+order: 6
+difficulty: "advanced"
+estimatedTime: 36
+topics: ["Iceberg", "Paimon", "Hudi", "Delta", "Lakehouse", "SinkV2", "Pre-Commit Topology", "Post-Commit Topology", "Manifest"]
+---
+
+# Lakehouse sinks — где Flink встречает aналитический мир
+
+Lakehouse — это convergence data warehouse (ACID, schema, query) с data lake (cheap object storage, open formats). Flink — наиболее common streaming engine для ingesting into lakehouse. Четыре main forms: **Iceberg, Paimon, Hudi, Delta**. Все четыре implement SinkV2 (FLIP-191), но с разными trade-offs.
+
+Этот урок разбирает: anatomy lakehouse sinks через SinkV2 (pre-commit topology для small file compaction, post-commit для manifest publish), ecosystem comparison, choice criteria.
+
+---
+
+## SinkV2 advanced: pre-commit и post-commit topologies
+
+SinkV2 (FLIP-191) дает more granular control чем basic Sink interface. Полная structure:
+
+```java
+public interface WithPreCommitTopology<InputT, CommT> 
+        extends TwoPhaseCommittingSink<InputT, CommT> {
+    DataStream<CommT> addPreCommitTopology(DataStream<CommT> committables);
+}
+
+public interface WithPostCommitTopology<InputT, CommT> 
+        extends TwoPhaseCommittingSink<InputT, CommT> {
+    void addPostCommitTopology(DataStream<CommT> committables);
+}
+```
+
+Это extends basic two-phase commit с two optional intermediate topologies:
+
+1. **Pre-commit topology** — operator graph between SinkWriter и Committer. Used для compaction, deduplication, batching.
+2. **Post-commit topology** — operator graph after Committer. Used для manifest publish, metastore updates, downstream notifications.
+
+<DiagramContainer title="SinkV2 advanced: writer → pre-commit → committer → post-commit" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="SinkWriter (per-subtask)"
+        tooltip="Writes data files (Parquet/ORC) к S3 staging area. Produces Committables — pointers к written files. Не commits — это just staging. На checkpoint barrier produces pre-committables."
+      >
+        Records → Parquet files (staging)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Committables через WithPreCommitTopology" />
+    <FlowRow>
+      <DataBox
+        label="Pre-commit topology"
+        tooltip="Optional operator graph между writer и committer. Iceberg использует это для small file compaction — collects committables, merges small files (Iceberg DataFiles) в larger files перед manifest commit. Paimon тоже compacts. Reduces metadata size и future query overhead."
+      >
+        Compactor: small files → merged files
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="committables (now larger files)" />
+    <FlowRow>
+      <DataBox
+        label="Committer (typically parallelism=1)"
+        tooltip="Globally coordinated commit. Iceberg: writes manifest, updates metadata.json atomically. Paimon: appends к snapshot LSM. Hudi: updates timeline. Delta: writes _delta_log entry. Это atomic — либо all committable applied, либо none."
+      >
+        Manifest write + metadata atomic update
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="post-commit hooks" />
+    <FlowRow>
+      <DataBox
+        label="Post-commit topology"
+        tooltip="После successful commit. Iceberg: optionally trigger Hive metastore sync, Glue catalog update, notify downstream Spark jobs. Paimon: trigger compaction if needed. Provides extensibility for ecosystem integration."
+      >
+        Metastore sync / downstream notification
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Iceberg sink anatomy
+
+Apache Iceberg — table format с manifest-based metadata. Snapshot-based, ACID, schema evolution, time travel.
+
+```java
+TableLoader tableLoader = TableLoader.fromHadoopTable("s3://lakehouse/iceberg/orders");
+
+DataStream<RowData> rowStream = stream.map(new OrderToRowDataMapper());
+
+FlinkSink.forRowData(rowStream)
+    .tableLoader(tableLoader)
+    .writeParallelism(8)
+    .equalityFieldColumns(Arrays.asList("order_id"))   // для upsert
+    .upsert(true)
+    .build();
+```
+
+### Iceberg pipeline structure
+
+1. **Writer (`IcebergFilesCommitter`)** — записывает Parquet/Avro data files в `s3://.../data/` directory. Produces `WriteResult` (DataFile + DeleteFile entries).
+
+2. **Pre-commit topology** — optional small file compaction. Default: no compaction, files committed as-is. With explicit compaction operator — merges small files.
+
+3. **Committer (parallelism=1)** — single committer subtask:
+   - Calls `Table.newAppend()` или `Table.newOverwrite()` (или `Table.newRowDelta()` для upsert)
+   - Writes new manifest file
+   - Atomically updates `metadata.json` via optimistic concurrency (CAS on `version-hint.text`)
+   - Possible конфликт с concurrent writers — retry with backoff
+
+4. **Post-commit topology** — optional Hive metastore sync, Glue catalog update.
+
+### Snapshot semantics
+
+Каждый commit = new snapshot. Snapshots support:
+- **Time travel**: `SELECT * FROM orders AS OF '2026-05-12 10:00:00'`
+- **Rollback**: `ALTER TABLE orders ROLLBACK TO SNAPSHOT 12345`
+- **Incremental scans**: `SELECT * FROM orders.incremental(snapshot_from=A, snapshot_to=B)`
+
+---
+
+## Paimon sink anatomy
+
+Apache Paimon (originally Flink Table Store, donated к ASF в 2024) — designed specifically для streaming-первого lakehouse. LSM-tree-based, native CDC support.
+
+```java
+Map<String, String> options = Map.of(
+    "warehouse", "s3://lakehouse/paimon/",
+    "bucket", "8",
+    "changelog-producer", "lookup"
+);
+
+CatalogContext context = CatalogContext.create(options);
+Catalog catalog = CatalogFactory.createCatalog(context);
+Identifier identifier = Identifier.create("default", "orders");
+
+Table table = catalog.getTable(identifier);
+
+FlinkSinkBuilder<RowData> sinkBuilder = new FlinkSinkBuilder<>((FileStoreTable) table)
+    .withInput(rowStream)
+    .build();
+```
+
+### Paimon — LSM-tree table format
+
+Paimon — fundamentally LSM-tree storage, similar к RocksDB but на object storage:
+- **Memtable** (in-memory write buffer)
+- **L0 SST files** (S3 объекты — Parquet-based)
+- **L1+ compaction levels**
+- **Snapshot files** — manifest equivalent
+
+Advantages для streaming:
+- **Native upserts/deletes** — primary key tables natively support change events
+- **Streaming reads** — can tail snapshots like Kafka topic
+- **Compaction** — automatic background compaction, no Spark needed
+- **Native CDC integration** — designed для Flink CDC pipelines
+
+### Paimon pipeline structure
+
+1. **Writer** — per-subtask LSM-tree writer. Maintains memtable, flushes к L0 files на checkpoint.
+2. **Pre-commit topology** — optional compaction operator (или background compactor).
+3. **Committer** (parallelism=1) — writes snapshot file, atomic.
+4. **Post-commit topology** — может trigger expire-snapshots cleanup.
+
+---
+
+## Hudi sink anatomy
+
+Apache Hudi — older lakehouse format, popular для CDC ingestion. Two storage types:
+
+- **Copy-On-Write (COW)** — каждое update rewrites whole file. Simple, write-heavy.
+- **Merge-On-Read (MOR)** — updates write к delta log files, merged на read. Read-heavy.
+
+```java
+Configuration hudiConf = new Configuration();
+hudiConf.setString(FlinkOptions.TABLE_TYPE, FlinkOptions.TABLE_TYPE_MERGE_ON_READ);
+hudiConf.setString(FlinkOptions.PATH, "s3://lakehouse/hudi/orders");
+hudiConf.setString(FlinkOptions.RECORD_KEY_FIELD, "order_id");
+hudiConf.setString(FlinkOptions.PARTITION_PATH_FIELD, "order_date");
+
+HoodieFlinkSink<RowData> sink = HoodieFlinkSink.forStream(rowStream, hudiConf);
+```
+
+### Hudi pipeline
+
+- **Writer** — writes data files (COW) или delta log files (MOR).
+- **Pre-commit topology** — Hudi-specific: bulk insert sorting, file size optimization.
+- **Committer** — writes `commit` file в Hudi timeline.
+- **Post-commit topology** — async compaction (для MOR), clean-up.
+
+Hudi имеет дополнительную complexity: timeline operations (commit, clean, compact, rollback) требуют careful coordination. Flink-Hudi integration historically rough, improving.
+
+---
+
+## Delta sink anatomy
+
+Delta Lake — open-sourced Databricks format. Transaction log (`_delta_log/`) — JSON-based, append-only.
+
+```java
+DeltaSink<RowData> deltaSink = DeltaSink.forRowData(
+    new Path("s3://lakehouse/delta/orders"),
+    new Configuration(),
+    rowType
+).build();
+
+stream.sinkTo(deltaSink);
+```
+
+### Delta pipeline
+
+- **Writer** — writes Parquet к staging.
+- **Pre-commit topology** — optional optimization.
+- **Committer** — appends к `_delta_log/00000000000000000123.json` с atomic put-if-not-exists.
+- **Post-commit topology** — Z-order optimization, vacuum hooks.
+
+Delta Lake — Databricks ecosystem. Native streaming support, но Flink integration less mature чем Iceberg/Paimon.
+
+---
+
+## Сравнительная таблица: lakehouse formats
+
+| Aspect | Iceberg | Paimon | Hudi | Delta |
+|---|---|---|---|---|
+| Origin | Netflix, 2019 | Alibaba (Flink Table Store), 2024 ASF | Uber, 2017 | Databricks, 2019 |
+| Format | Manifest-based snapshots | LSM-tree | Timeline-based | Transaction log JSON |
+| Streaming primary | No (designed batch-first) | **Yes** | Yes | Yes |
+| CDC primary key tables | Via merge-on-read | **Native** | Native (MOR) | Via SCD operations |
+| Upsert support | Equality deletes | Native | Native | MERGE INTO |
+| Compaction | External (Spark/Trino) или Flink job | **Automatic background** | Automatic (MOR) | Optimize command |
+| Time travel | Yes (snapshots) | Yes (snapshots) | Yes (timeline) | Yes (versions) |
+| Schema evolution | Strong | Strong | Limited | Strong |
+| Query engines | All (Trino, Spark, Flink, Athena) | Flink, Spark, Trino | Spark, Flink, Trino | Spark (best), Trino |
+| Recommended для Flink | Batch + streaming mixed | **Streaming-first** | CDC ingestion legacy | Databricks ecosystem |
+
+---
+
+## Choosing the right format для Flink
+
+### Iceberg
+**Choose when:**
+- Mixed query workload (Spark batch + Flink streaming + Trino analytical)
+- Need broad ecosystem support
+- Snapshot-based time travel critical
+- Existing investment in Iceberg
+
+**Avoid when:**
+- Pure streaming с many small files — Iceberg requires explicit compaction job
+
+### Paimon
+**Choose when:**
+- Streaming-first architecture
+- Flink-centric ecosystem
+- CDC ingestion (Flink CDC + Paimon) — first-class integration
+- Automatic compaction needed (no separate Spark job)
+
+**Avoid when:**
+- Heavy non-Flink query engine usage (less mature support)
+- Need rich SQL features Iceberg has
+
+### Hudi
+**Choose when:**
+- Legacy investment
+- Heavy CDC workload и Hudi tooling already established
+- Read-heavy с MOR tables
+
+**Avoid when:**
+- Greenfield project — Iceberg/Paimon preferred
+- Flink-first (Hudi-Flink integration historically rough)
+
+### Delta
+**Choose when:**
+- Databricks ecosystem
+- Spark-primary с some streaming
+- Delta-specific features (Z-ordering, VACUUM)
+
+**Avoid when:**
+- Flink-only ecosystem
+- Pure open-source preference (Delta is open-source but Databricks-centric)
+
+---
+
+## Production gotchas
+
+### 1. Small files problem — universal
+
+All lakehouse formats suffer от small files. Streaming sink writes file per checkpoint per subtask:
+
+```
+checkpoint interval = 60s, parallelism = 8, throughput per subtask = 50MB/min
+→ 8 files × 50MB per checkpoint = manageable
+→ если throughput per subtask = 5MB/min: 8 files × 5MB = 40 files/min = 2400 files/hour
+```
+
+Many small files:
+- Listing slow (Iceberg manifests grow)
+- Query engines do many small reads
+- S3 cost (request-based pricing)
+
+**Mitigation:**
+- Iceberg: scheduled `RewriteDataFilesAction` (Spark job) каждый час/день
+- Paimon: automatic background compaction (built-in)
+- Hudi: async compaction
+- Delta: `OPTIMIZE` command (Databricks tooling)
+
+**Flink-side:** larger checkpoint interval (но trade-off с recovery time), pre-commit topology с compactor.
+
+### 2. Concurrent writers conflicts
+
+Iceberg uses optimistic concurrency на metadata.json. С multiple writers (Flink + Spark hourly compaction) — conflict possible:
+
+```
+Flink: writes snapshot S100 → uses CAS, sees version=99 → expected, sets version=100. OK.
+Spark: in parallel writes snapshot S99' → expects version=99, but version=100 now. FAIL retry.
+```
+
+Retry с backoff. Heavy contention → throughput drop.
+
+**Mitigation:** schedule compaction during low-write windows, use Iceberg branching для concurrent writes.
+
+### 3. Committer parallelism = 1 — bottleneck
+
+Committer typically parallelism 1 для serial atomic commit. На high-throughput jobs committer может lag.
+
+**Symptom:** SinkWriter backpressure, committables queue grows.
+
+**Mitigation:** Iceberg supports parallel writes к different partitions (если partitioning aligns), но committer still 1. Если committer slow — increase JVM heap там, optimize file metadata size.
+
+### 4. Schema evolution mid-job
+
+```
+Flink job schema X (no field 'shipping_addr')
+Iceberg table altered: ADD COLUMN shipping_addr STRING
+Flink continues writing without field
+```
+
+Iceberg fills null. OK. Но reverse — Flink writes new field, table not yet altered — write fails.
+
+**Practice:**
+- Coordinate schema changes — alter table FIRST, then deploy new Flink code.
+- Use Flink CDC с schema evolution для automatic synchronisation (см. урок 08).
+
+### 5. Watermark + Iceberg snapshots
+
+Iceberg commits — snapshot per checkpoint. Snapshot includes ALL data writes within checkpoint interval. Watermark progress определяет когда events visible:
+
+- Event time = T1, checkpoint at T2 (T2 > T1) → snapshot committed → event visible.
+- Late event (event time = T0, T0 < watermark) — dropped before reaching sink, not in snapshot.
+
+Latency от event arrival до snapshot visibility ≈ checkpoint interval. Tune accordingly.
+
+### 6. S3 throttling под heavy ingestion
+
+Iceberg manifest списки могут расти. S3 lists throttle при много requests. Plus PUT throttle 5000/sec per prefix.
+
+**Mitigation:** partition strategy distributes writes (date/hour partitions), monitor S3 metrics (4xx errors → throttling).
+
+---
+
+## Key takeaways
+
+- **Lakehouse sinks** все implement SinkV2 с **pre-commit topology** (compaction) + **post-commit topology** (metastore sync).
+- **Iceberg**: manifest-based, snapshot semantics, batch-first design — choose для broad ecosystem.
+- **Paimon**: LSM-tree streaming-first, native CDC + automatic compaction — choose для Flink-centric streaming.
+- **Hudi**: timeline-based, older format, COW/MOR options — choose для CDC legacy.
+- **Delta**: transaction log, Databricks-centric — choose для Spark ecosystem.
+- **Universal gotcha**: small files problem — все formats need explicit compaction.
+- **Committer parallelism = 1** — серийный atomic commit, может быть bottleneck.
+
+---
+
+<KnowledgeCheck
+  question="Объясните pre-commit и post-commit topologies в SinkV2 на примере Iceberg sink. Зачем pre-commit topology нужна?"
+  answer="SinkV2 даёт granular control над commit pipeline через WithPreCommitTopology и WithPostCommitTopology interfaces. Pre-commit topology: operator graph между SinkWriter и Committer — обрабатывает Committables перед commit. В Iceberg pre-commit topology используется для small file compaction: SinkWriter pишет Parquet files в staging, pre-commit operator collects committables (DataFile entries), merges small files в larger files (например 4 файла по 30MB → 1 файл 120MB), produces consolidated committables к Committer. Это критично потому что streaming sink тенденция к мелким файлам (file per checkpoint × parallelism = N small files per commit). Без pre-commit compaction нужно external compaction job (Spark RewriteDataFilesAction). Post-commit topology: операторы после Committer, использовать для Hive metastore sync (Glue catalog update), notification downstream Spark jobs, triggering Iceberg expire-snapshots cleanup. Полная structure: Writer → pre-commit (compaction) → Committer (atomic manifest write) → post-commit (ecosystem integration). Это significantly cleaner чем legacy TwoPhaseCommitSinkFunction где compaction logic нужно было hand-roll."
+/>

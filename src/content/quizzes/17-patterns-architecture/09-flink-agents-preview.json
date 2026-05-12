@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/09-flink-agents-preview",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-09",
+    "description": "Quiz for Flink Agents preview"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-09-q1",
+      "type": "multiple-choice",
+      "question": "Flink Agents (FLIP-531, 0.2.1 March 2026) — что это и чем отличается от ML_PREDICT?",
+      "options": [
+        { "id": "a", "text": "Это renaming ML_PREDICT" },
+        { "id": "b", "text": "Sub-project для event-driven AI agents на Flink runtime. Отличие от ML_PREDICT: agents — multi-step reasoning + actions (не single inference call), stateful conversation memory через Flink state, tool calls с EOS guarantees, multi-turn dialogues. Equivalent в Python — LangGraph, но с production-grade runtime (durability, EOS, autoscaling)" },
+        { "id": "c", "text": "Это конкурент Flink, отдельный engine" },
+        { "id": "d", "text": "Только preview, никогда не GA" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ML_PREDICT — single function call (one inference). Agents — completely different abstraction: multi-step orchestration, agents make decisions, call tools, maintain conversation context, multi-turn dialogues. Под капотом — KeyedProcessFunction с ValueState<Conversation>, async LLM calls, async tool invocation. EOS critical: tool calls с side effects (Kafka publish, Stripe refund) выполняются ровно один раз через Flink 2PC. Не replacement для LangChain — production runtime для production-grade agents. Roadmap: 1.0 GA — Q4 2026 / Q1 2027.",
+      "studyHint": "Повторите урок 09 — раздел 'Зачем нужна отдельная sub-project'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-09-q2",
+      "type": "multiple-choice",
+      "question": "EOS для tool calls в Flink Agents — почему критично и как реализовано?",
+      "options": [
+        { "id": "a", "text": "Не критично, agents просто idempotent" },
+        { "id": "b", "text": "Critical: tools могут иметь side effects (Stripe refund, Kafka publish, DB update). Без EOS retry после crash → double charge. Flink Agents используют 2PC: tool execution prepared → checkpoint → commit. Crash между prepare и commit — recovered transaction replays correctly, no duplicate. Tools должны support transactional semantics (Kafka yes, HTTP arbitrary — нет)" },
+        { "id": "c", "text": "Реализовано через distributed lock" },
+        { "id": "d", "text": "Не работает в preview" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Самая критичная safety property для production agents. Без EOS: LLM decides 'refund $500', tool execution начата → crash → restart → LLM re-decides 'refund $500' → second refund. $1000 lost. С EOS (Flink 2PC reused): (1) tool execution prepared (e.g. Kafka transaction begin); (2) checkpoint barrier — agent state + tool prepared state committed; (3) tool committed (Kafka commit). Crash между 1 и 2: tool transaction rolled back, replay clean. Crash между 2 и 3: recovered transaction committed on restart. Transactional tools required (Kafka, JDBC); non-transactional (HTTP arbitrary) — at-least-once с app-level idempotency.",
+      "studyHint": "Повторите урок 09 — раздел 'EOS semantics для tool calls'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-09-q3",
+      "type": "multiple-choice",
+      "question": "Production adoption Flink Agents (preview 0.2.1) — какая стратегия right?",
+      "options": [
+        { "id": "a", "text": "Migrate всё на Flink Agents немедленно" },
+        { "id": "b", "text": "Hybrid pilot strategy: existing production остаётся на mature (LangChain/LangGraph), parallel pilot на Flink Agents для один specific workflow (low risk, high volume — например simple FAQ routing). Через 6-12 месяцев оценить если 0.3+ mature для full migration. Don't bet entire system на preview tech, но также не lose 2 years — learn curve now" },
+        { "id": "c", "text": "Только experimental projects, не production" },
+        { "id": "d", "text": "Ignore до 1.0 GA" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pragmatic adoption strategy для preview tech. 0.2.x — API breaking changes ожидаются, observability immature, community small. Полное rollout критических workflows = risk. Полное игнорирование = lose learning, можно miss что-то когда Flink Agents становится default. Optimal: (1) keep mature production tools (LangGraph/LangChain) для critical paths; (2) pilot Flink Agents на narrow scope — one specific workflow, low risk; (3) measure operational reality (recovery, scaling, EOS practical benefit); (4) when 0.3-1.0 GA — evaluate full migration с established team familiarity. Это applicable к любой emerging tech adoption.",
+      "studyHint": "Повторите урок 09 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-09-q4",
+      "type": "true-false",
+      "question": "Flink Agents — это direct replacement для LangChain/LangGraph для всех use cases.",
+      "correctAnswer": false,
+      "explanation": "Не replacement, complement. LangChain/LangGraph wins на: maturity (2+ years production), community size, rapid iteration, Python ecosystem depth. Flink Agents wins на: production-grade infrastructure (EOS, durability, autoscaling, observability built-in). Когда Flink Agents лучше: scale (millions events/day), money-critical tools (refunds, payments), durable state requirements. Когда LangChain лучше: prototyping, dev, smaller scale, не need EOS. Production reality 2026: use both — LangChain для most agents, Flink Agents для high-scale production-critical.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,398 @@
+---
+title: "State Processor API: offline state manipulation"
+order: 2
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["State Processor API", "SavepointReader", "SavepointWriter", "Bootstrap State", "State Migration"]
+---
+
+# State Processor API
+
+**State Processor API** — это «superpower» Flink: чтение и запись state savepoints через DataStream batch API, **offline**, без запуска streaming job. Use cases — read state для analytics ("сколько уникальных user-ов в state?"), bootstrap state из batch до запуска streaming, migrate schema, удалить или modify operator state, готовить state для testing. Это абсолютно необходимый инструмент в production для тех ситуаций, когда in-streaming schema evolution недостаточен или вообще невозможен.
+
+В этом уроке: что такое State Processor API, как читать savepoint через SavepointReader, как создавать новый savepoint через SavepointWriter, реальные сценарии (bootstrap, schema migration, удаление operator-а, maxParallelism change), gotchas.
+
+---
+
+## Зачем offline state manipulation
+
+Production Flink job — это **state**. Со временем требования меняются:
+
+1. **Schema evolution**: state class имела поля `(userId, txCount)`, нужно добавить `lastSeenAt`. Avro/POJO evolution handles это automatically (см. урок 14.3). Но если изменение incompatible — нужен manual migration.
+2. **Operator removal**: убрать operator из топологии. Просто `flink run --allowNonRestoredState` помечает state как «not restored» — это OK, но state остаётся orphan в savepoint forever. State Processor API — удалить cleanly.
+3. **Bootstrap state**: новый job stateful, но нужно populated initial state из исторических данных (batch S3 dump). Без State Processor API — никак.
+4. **maxParallelism change**: max parallelism IMMUTABLE после старта (см. урок 14.5). Чтобы изменить — нужен offline rebootstrap state с новым maxParallelism. State Processor API — единственный способ.
+5. **State inspection**: «сколько entries в моём MapState? Какие users в state?» — без State Processor API нужно писать query через DataStream и pause job.
+6. **Recover from corruption**: один operator state corrupt, остальные OK. Удалить плохой operator state, восстановить остальное.
+
+---
+
+## Архитектура State Processor API
+
+<DiagramContainer title="State Processor API: savepoint как table" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Savepoint в DFS"
+        tooltip="Стандартный Flink savepoint в S3/HDFS. Canonical format ОБЯЗАТЕЛЕН для State Processor API. Native format не поддерживается (backend-specific binary). Состоит из _metadata + state файлов на operator."
+      >
+        s3://.../savepoint-xyz/
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="SavepointReader.read()" />
+    <FlowRow>
+      <DataBox
+        label="SavepointReader (Batch DataStream)"
+        tooltip="Открывает savepoint в read-only mode. Каждый operator state становится 'таблицей'. readKeyedState/readListState/readBroadcastState возвращают DataStream<Row> — обычный batch processing API."
+      >
+        savepoint → DataStream
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="transform / aggregate" />
+    <FlowRow>
+      <DataBox
+        label="Batch processing"
+        tooltip="Стандартный Flink batch DataStream API. Map, filter, keyBy, aggregate, write. Это полноценный распределённый processing — может обрабатывать TB state на cluster."
+      >
+        DataStream batch transforms
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="SavepointWriter" />
+    <FlowRow>
+      <DataBox
+        label="SavepointWriter (или fromExistingSavepoint)"
+        tooltip="Создаёт новый savepoint из batch data. Поддерживает: withOperator (add new operator state), removeOperator (delete), changeOperator (modify). Можно create from scratch или modify existing."
+      >
+        DataStream → new savepoint
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="write savepoint" />
+    <FlowRow>
+      <DataBox
+        label="New savepoint в DFS"
+        tooltip="Полностью валидный savepoint, можно использовать для restore streaming job. Канонический format."
+      >
+        s3://.../new-savepoint/
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Setup: dependencies
+
+```xml
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-state-processor-api</artifactId>
+    <version>2.2.0</version>
+</dependency>
+```
+
+State Processor API — отдельная dependency, не часть flink-core. Standalone приложение, бежит как batch job.
+
+---
+
+## Чтение savepoint: simple example
+
+Задача: «сколько unique user IDs в state?»
+
+```java
+import org.apache.flink.state.api.SavepointReader;
+import org.apache.flink.state.api.functions.KeyedStateReaderFunction;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.util.Collector;
+
+public class StateInspectionJob {
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        String savepointPath = "s3://flink-prod/savepoints/fraud-detector/sp-2026-05-10/";
+
+        SavepointReader savepoint = SavepointReader.read(
+            env,
+            savepointPath,
+            new EmbeddedRocksDBStateBackend()
+        );
+
+        // Читаем keyed state из оператора с UID "fraud-detector"
+        DataStream<UserState> userStates = savepoint.readKeyedState(
+            OperatorIdentifier.forUid("fraud-detector"),
+            new FraudDetectorReader(),
+            Types.STRING,                          // key type (userId)
+            TypeInformation.of(UserState.class)    // output type
+        );
+
+        userStates.print();   // или write to S3 для дальнейшего analytics
+
+        env.execute("State inspection");
+    }
+
+    // Reader function для каждого keyed state entry
+    public static class FraudDetectorReader extends KeyedStateReaderFunction<String, UserState> {
+
+        private ValueState<UserState> state;
+
+        @Override
+        public void open(Configuration parameters) {
+            // Тот же state descriptor что в streaming job — UID, name, types
+            state = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("user-state", UserState.class)
+            );
+        }
+
+        @Override
+        public void readKey(String key, Context ctx, Collector<UserState> out) throws Exception {
+            UserState value = state.value();
+            if (value != null) {
+                out.collect(value);
+            }
+        }
+    }
+}
+```
+
+Ключевые моменты:
+
+- `OperatorIdentifier.forUid("fraud-detector")` — оператор identified по UID из streaming job. **UID должен быть указан в streaming job явно** (см. урок 14.6).
+- `KeyedStateReaderFunction` — итерируется по каждой key, открывая state как в streaming context.
+- Output — обычный DataStream, можно agregате/filter/write.
+
+---
+
+## Bootstrap state: example
+
+Задача: «новый job стартует с pre-populated state из historical S3 dump».
+
+```java
+import org.apache.flink.state.api.SavepointWriter;
+import org.apache.flink.state.api.OperatorTransformation;
+import org.apache.flink.state.api.functions.KeyedStateBootstrapFunction;
+
+public class BootstrapJob {
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Read historical data
+        DataStream<UserHistory> historicalData = env.fromSource(
+            FileSource.forRecordStreamFormat(
+                new HistoricalUserFormat(),
+                Path.fromLocalFile(new File("s3://historical/users.parquet"))
+            ).build(),
+            WatermarkStrategy.noWatermarks(),
+            "historical-source"
+        );
+
+        // Transform в KeyedState — what we want to bootstrap
+        BootstrapTransformation<UserHistory> transformation = OperatorTransformation
+            .bootstrapWith(historicalData)
+            .keyBy(UserHistory::getUserId)
+            .transform(new UserStateBootstrapper());
+
+        // Create savepoint с pre-populated state
+        SavepointWriter.newSavepoint(
+            env,
+            new EmbeddedRocksDBStateBackend(),
+            128       // maxParallelism — выбираем generously
+        )
+        .withOperator(
+            OperatorIdentifier.forUid("fraud-detector"),
+            transformation
+        )
+        .write("s3://flink-prod/savepoints/fraud-detector/bootstrap/");
+
+        env.execute("Bootstrap savepoint");
+    }
+
+    public static class UserStateBootstrapper extends KeyedStateBootstrapFunction<String, UserHistory> {
+
+        private ValueState<UserState> state;
+
+        @Override
+        public void open(Configuration parameters) {
+            state = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("user-state", UserState.class)
+            );
+        }
+
+        @Override
+        public void processElement(UserHistory history, Context ctx) throws Exception {
+            UserState us = new UserState(
+                history.getUserId(),
+                history.getTotalTransactions(),
+                history.getLastSeenAt()
+            );
+            state.update(us);
+        }
+    }
+}
+```
+
+Затем streaming job стартует с этого savepoint:
+
+```bash
+flink run-application \
+    --target kubernetes-application \
+    -Dexecution.savepoint.path=s3://flink-prod/savepoints/fraud-detector/bootstrap/ \
+    ...
+```
+
+State уже populated — streaming job сразу имеет user histories без warm-up периода.
+
+---
+
+## Modify existing savepoint: remove operator
+
+Задача: оператор `legacy-aggregator` больше не нужен (rewrote downstream). Удалить state из savepoint cleanly.
+
+```java
+SavepointReader oldSavepoint = SavepointReader.read(
+    env,
+    "s3://flink-prod/savepoints/fraud-detector/sp-2026-05-10/",
+    new EmbeddedRocksDBStateBackend()
+);
+
+SavepointWriter.fromExistingSavepoint(env, oldSavepointPath, new EmbeddedRocksDBStateBackend())
+    .removeOperator(OperatorIdentifier.forUid("legacy-aggregator"))
+    .write("s3://flink-prod/savepoints/fraud-detector/cleaned/");
+```
+
+После этого restore streaming job с cleaned savepoint — никакого orphan state.
+
+---
+
+## Migrate state schema: incompatible change
+
+Задача: state class изменился incompatible — `Map<String, Long>` → `Map<String, EventCounter>`. Avro/POJO evolution не сможет, нужен manual.
+
+```java
+// Шаг 1: Read old state
+DataStream<Tuple2<String, Map<String, Long>>> oldStates = oldSavepoint.readKeyedState(
+    OperatorIdentifier.forUid("event-counter"),
+    new OldEventCounterReader(),
+    Types.STRING,
+    Types.TUPLE(Types.STRING, Types.MAP(Types.STRING, Types.LONG))
+);
+
+// Шаг 2: Transform к новой структуре
+DataStream<Tuple2<String, Map<String, EventCounter>>> newStates = oldStates
+    .map(tuple -> {
+        Map<String, EventCounter> newMap = new HashMap<>();
+        for (Map.Entry<String, Long> e : tuple.f1.entrySet()) {
+            newMap.put(e.getKey(), new EventCounter(
+                e.getValue(),                   // legacy count
+                Instant.now()                   // new field: lastUpdated
+            ));
+        }
+        return Tuple2.of(tuple.f0, newMap);
+    });
+
+// Шаг 3: Bootstrap new operator state
+BootstrapTransformation<Tuple2<String, Map<String, EventCounter>>> transform =
+    OperatorTransformation
+        .bootstrapWith(newStates)
+        .keyBy(t -> t.f0)
+        .transform(new NewEventCounterBootstrapper());
+
+// Шаг 4: Write new savepoint
+SavepointWriter.fromExistingSavepoint(env, oldSavepointPath, backend)
+    .removeOperator(OperatorIdentifier.forUid("event-counter"))     // remove old
+    .withOperator(OperatorIdentifier.forUid("event-counter"), transform)   // add migrated
+    .write(newSavepointPath);
+```
+
+Streaming job restarts с new savepoint, new code reads `EventCounter` instances correctly.
+
+---
+
+## maxParallelism change через State Processor API
+
+Production gotcha (см. урок 14.5): default `maxParallelism = 128`. Если хотите scale до 200+ — невозможно, изменить нельзя на live job.
+
+Решение — State Processor API offline rebootstrap:
+
+```java
+// Read state со старым maxParallelism (default 128)
+SavepointReader oldSavepoint = SavepointReader.read(env, oldPath, backend);
+
+DataStream<UserState> allUserStates = oldSavepoint.readKeyedState(
+    OperatorIdentifier.forUid("fraud-detector"),
+    new FraudDetectorReader(),
+    Types.STRING,
+    TypeInformation.of(UserState.class)
+);
+
+// Bootstrap new savepoint с новым maxParallelism = 1024
+BootstrapTransformation<UserState> transform = OperatorTransformation
+    .bootstrapWith(allUserStates)
+    .keyBy(UserState::getUserId)
+    .transform(new BootstrapFunction());
+
+SavepointWriter.newSavepoint(env, backend, 1024)    // ← new maxParallelism
+    .withOperator(OperatorIdentifier.forUid("fraud-detector"), transform)
+    .write(newSavepointPath);
+```
+
+Это reads все user states (TB data → batch processing across distributed cluster), rebuilds savepoint с maxParallelism=1024 (key groups перепакованы), writes back. Streaming job restarts с new savepoint, можно теперь scale до 1024 parallelism.
+
+**Стоимость**: для multi-TB state эта операция занимает часы. Поэтому **правильно set maxParallelism upfront** — не давать себе попадать в ситуацию rebootstrap.
+
+---
+
+## State types которые поддерживаются
+
+| Type | Read | Write/Bootstrap | Notes |
+|---|---|---|---|
+| **KeyedState** (ValueState, MapState, ListState, ReducingState, AggregatingState) | Yes | Yes | Main use case |
+| **OperatorState** (UnionListState, BroadcastState) | Yes | Yes | Source offsets и similar |
+| **Window state** | Yes | Yes (с UID окна) | Window contents |
+| **Async state (FLIP-424)** | Partial (2.1+) | Limited | Async API V2 evolving |
+
+ForSt state (FLIP-427) supported через стандартный API, но performance может быть slower из-за S3 reads. Для большого state рассмотрите temporary local RocksDB backup перед State Processor API processing.
+
+---
+
+## Performance considerations
+
+State Processor API — это **batch processing**. Большой savepoint = много I/O:
+
+- **Multi-TB savepoint** — может потребовать большой Flink cluster для State Processor API job. Distributed read через TM-ы scales linear.
+- **RocksDB savepoint** — каждый SST file читается по key. Для random key access — slow. Sequential dump быстрее.
+- **Network bandwidth** — DFS read TB занимает время. S3 throughput ~100 MB/s per connection.
+
+Production tip: **size your State Processor cluster proportionally**. Для 1TB savepoint — 8-16 parallelism + good local disk для shuffling.
+
+---
+
+## Production gotchas
+
+- **UID consistency** — `OperatorIdentifier.forUid("...")` ДОЛЖЕН match UID streaming job. Опечатка → state не найден, silent empty read.
+- **State descriptor matching** — name + type должны точно match. ValueState named "user-state" не найдёт state named "user-state-v2".
+- **Canonical savepoint только** — native savepoint format NOT supported. Triggering: `flink stop --type canonical ...`.
+- **State Processor API + ForSt** — supported, но reads slow (S3 latency). Для large operations может потребоваться bring state локально temporarily.
+- **maxParallelism upfront** — НЕ давайте себе попадать в ситуацию rebootstrap. State Processor API multi-TB — часы downtime.
+- **Schema migration testing** — test с маленьким production savepoint перед full migration. Validate output state читается streaming job correctly.
+- **Concurrency** — State Processor API job требует resources (slots, memory). Не run в production cluster — отдельный job/cluster.
+- **State versioning** — храните прошлые savepoints до verification new state работает. Roll-back через restore from old savepoint.
+
+<Callout type="warning">
+State Processor API — мощный инструмент с большим blast radius. Один баг в migration code — corrupted state. Always: (1) test на small staging savepoint; (2) keep old savepoint до verification; (3) run в isolated cluster (не production); (4) review code carefully — это runs once и result определяет state годами.
+</Callout>
+
+<Callout type="tip">
+Используйте State Processor API НЕ только для emergency migrations, а как regular tool: weekly job для analytics on state, bootstrap state для new jobs, удаление stale entries (e.g., users not seen в 1 год). Это превращает state из «black box» в queryable resource.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job stateful с UID 'user-tracker' имеет 500GB ValueState<UserProfile> на 10M users. Бизнес требует: добавить новое поле `tenantId` в UserProfile (раньше not существовало) и migrate всех users с дефолтным tenantId='default'. Как сделать?"
+  answer="State Processor API workflow: (1) Stop streaming job с canonical savepoint (canonical обязателен для State Processor API). (2) Создать State Processor batch job: (a) SavepointReader.read() open savepoint; (b) readKeyedState с OperatorIdentifier.forUid('user-tracker') + reader function, читающий UserProfile (old schema без tenantId); (c) Map transform: для каждого UserProfile добавить tenantId='default' (миграция к new schema); (d) SavepointWriter.fromExistingSavepoint().removeOperator('user-tracker').withOperator('user-tracker', new bootstrap with new UserProfile class).write(). (3) Update streaming job code с новым UserProfile class (с tenantId). Critical: schema registration (Avro/POJO) должна быть compatible или manual в reader/writer. (4) Restart streaming job с new savepoint + new code. (5) Validate sampling: read некоторые keys из state, verify tenantId='default'. (6) Keep old savepoint минимум неделю для rollback. Альтернативный approach (если schema evolution compatible — добавить nullable field) — POJO evolution auto-handles это (см. урок 14.3), не нужен State Processor API. Но для NOT-nullable field с custom default — State Processor API необходим. Cost: для 500GB ~ 30-60 минут State Processor batch job + downtime streaming job. Plan window."
+/>

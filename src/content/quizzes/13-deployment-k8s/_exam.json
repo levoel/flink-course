@@ -1,0 +1,89 @@
+{
+  "moduleId": "13-deployment-k8s",
+  "title": "Module 13 Exam — Deployment + Kubernetes Operator",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m13-exam",
+    "description": "Integrated exam for Deployment + K8s Operator module"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-exam-q1",
+      "type": "multiple-choice",
+      "question": "Production stateful streaming job на Kubernetes в 2026. Какой полный stack рекомендуется?",
+      "options": [
+        { "id": "a", "text": "Standalone Flink + Helm + manual rescale scripts" },
+        { "id": "b", "text": "Application mode + Flink Kubernetes Operator + Adaptive Scheduler + FLIP-271 Autoscaler + FLIP-291 in-place rescale + K8s ConfigMap-based HA + ForSt disaggregated state + GitOps (ArgoCD)" },
+        { "id": "c", "text": "Per-job mode + ZooKeeper HA + manual savepoints" },
+        { "id": "d", "text": "Session mode + Reactive Mode + RocksDB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Полный production stack 2026 на K8s: (1) Application mode — изоляция, GitOps-friendly (per-job mode removed в 2.0); (2) Flink Kubernetes Operator — declarative CRDs, reconciliation, automatic savepoints; (3) Adaptive Scheduler — pre-requisite для elastic scaling; (4) FLIP-271 Autoscaler — metric-based decisions; (5) FLIP-291 in-place rescale — без savepoint при rescale; (6) K8s ConfigMap HA — cloud-native, нет ZK; (7) ForSt disaggregated state — state на S3, savepoint metadata-only; (8) GitOps — каждое изменение PR, audit trail через git. Стек заменяет 90% операционной сложности automation.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-exam-q2",
+      "type": "multiple-choice",
+      "question": "spec.image: v1.42 → v1.43 + spec.job.parallelism: 8 → 16 в одном PR. Что operator делает?",
+      "options": [
+        { "id": "a", "text": "Apply одновременно без savepoint" },
+        { "id": "b", "text": "Single reconciliation, sequential execution: trigger savepoint → cancel → update JM Deployment с новым image → submit job с parallelism=16 restore from savepoint. Если default maxParallelism=128, rescale до 16 ОК. Best practice — отдельные PR для образа и parallelism" },
+        { "id": "c", "text": "Reject как conflict" },
+        { "id": "d", "text": "Только image apply, parallelism игнорируется" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator делает атомарную reconciliation, execution sequential: savepoint → cancel → image update → submit. Канонический savepoint format поддерживает rescale (state редистрибуируется по новым key groups). Critical check: maxParallelism — default 128, для 16 OK. Если бы хотели scale до 200+ — restart FAIL (см. урок 14.5). Best practice: разделять concerns на отдельные PR (image, parallelism) — легче debug если что-то ломается. Один PR — атомарная change, но если что-то fail mid-way, rollback включает обе.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-exam-q3",
+      "type": "multiple-choice",
+      "question": "FLIP-291 in-place rescale vs savepoint-based rescale — фундаментальное отличие?",
+      "options": [
+        { "id": "a", "text": "In-place быстрее на 10-15%" },
+        { "id": "b", "text": "In-place: reuses last completed CHECKPOINT (pointers reuse, no DFS write), Adaptive Scheduler stops tasks briefly + redistributes key groups + restores, 10-30s downtime. Savepoint-based: creates NEW savepoint (full state write to DFS, minutes для large state) + cancel + restart, 2-10 минут" },
+        { "id": "c", "text": "In-place требует ZooKeeper HA" },
+        { "id": "d", "text": "Savepoint-based работает только на heap backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-291 (1.18+) — game-changer. In-place: уже existing checkpoint contains key-group-aware state, Adaptive Scheduler perepakuet key groups для нового parallelism, restore from existing checkpoint, никакого DFS write. Savepoint-based — full state copy, медленно. 10x improvement. Этот скачок делает autoscaling (FLIP-271) practical — можно делать частые scaling decisions без минутных downtimes. С ForSt disaggregated state даже быстрее — state pointers reuse без скачивания SST files между TM pods.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m13-exam-q4",
+      "type": "multiple-choice",
+      "question": "Per-job mode в Flink 2.x — что с ним?",
+      "options": [
+        { "id": "a", "text": "Default режим, рекомендуется" },
+        { "id": "b", "text": "Полностью удалён в 2.0 (FLIP-419). Если в legacy scripts/configs встречается `cluster.mode: per-job` или `-t kubernetes-per-job` — мигрируйте на Application mode" },
+        { "id": "c", "text": "Deprecated, но работает" },
+        { "id": "d", "text": "Только для batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Per-job mode полностью удалён в Flink 2.0 (FLIP-419). Это был middle-ground между Application и Session: dedicated cluster per job (как Application), но main() компилировался на клиенте (как Session). Subtle bugs из-за client environment ≠ JM environment. Application mode полностью его заменяет: dedicated cluster + main() в JM. Любой legacy код с per-job mode не работает в 2.x. Миграция: change `-t kubernetes-per-job` → `-t kubernetes-application`, ensure JAR в Docker image как local:///opt/flink/usrlib/.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-exam-q5",
+      "type": "multiple-choice",
+      "question": "K8s ConfigMap HA vs ZooKeeper HA — что выбрать в 2026 для нового deployment?",
+      "options": [
+        { "id": "a", "text": "ZooKeeper — battle-tested" },
+        { "id": "b", "text": "K8s ConfigMap-based HA: no external dependency, cloud-native, default в 2.x для K8s deployments. ZK keep только для bare-metal / non-K8s Flink или legacy infrastructure с уже работающим ZK ensemble" },
+        { "id": "c", "text": "etcd-based" },
+        { "id": "d", "text": "HA не нужен — K8s сам делает failover" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "K8s ConfigMap HA — default 2026 для new K8s deployments. Преимущества: (1) leverage K8s API уже доступный; (2) leader election через atomic ConfigMap/Lease updates с optimistic concurrency; (3) no extra cluster для maintain; (4) cleaner ops, GitOps-friendly; (5) auto-cleanup при FlinkDeployment delete. ZK HA жизнеспособен только в bare-metal / YARN setups где K8s нет, или legacy ZK ensemble уже на месте. Without HA вообще = JM SPOF, crash = downtime / data loss.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-exam-q6",
+      "type": "true-false",
+      "question": "Adaptive Scheduler (FLIP-160) обязателен для работы FLIP-271 Autoscaler и FLIP-291 in-place rescaling. Без `jobmanager.scheduler: adaptive` autoscaler silently не работает.",
+      "correctAnswer": true,
+      "explanation": "True. Adaptive Scheduler — фундамент elastic scaling stack. Default Scheduler не поддерживает: (1) elastic parallelism (range [min, max]); (2) in-place rescale без savepoint (FLIP-291 requires Adaptive); (3) graceful slot loss handling. Autoscaler (FLIP-271) делает REST API calls для rescale — но Default Scheduler не реагирует на rescale request. Result: autoscaler logs показывают evaluations, но scaling actions не происходят. Common production gotcha — `job.autoscaler.enabled: true` без `jobmanager.scheduler: adaptive`. Always оба together.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

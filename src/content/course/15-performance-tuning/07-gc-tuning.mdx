@@ -1,0 +1,492 @@
+---
+title: "GC tuning для streaming: G1, ZGC, Shenandoah"
+description: "G1 (default) vs ZGC (low pause) vs Shenandoah для streaming workload. env.java.opts конфигурация. Когда использовать каждый. Метрики и диагностика"
+order: 7
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["GC Tuning", "G1GC", "ZGC", "Shenandoah", "Java 17", "Java 21", "Low Latency"]
+---
+
+# GC tuning для streaming
+
+GC pause — главная причина latency spikes в Flink job-ах. Stateful streaming на heap (HashMapStateBackend), event objects, watermark generators — все это создаёт GC pressure. На high-throughput pipeline с 100MB/sec потоком объектов GC может занимать 5-15% CPU времени, а отдельные pauses — десятки или сотни миллисекунд.
+
+В Flink 2.x (Java 17/21 required) выбор GC принципиально шире чем раньше: G1 (default), ZGC (generational, GA в Java 21), Shenandoah (production-ready). В этом уроке препарируем когда какой выбрать и как тюнить.
+
+---
+
+## GC landscape Java 17/21 для streaming
+
+| GC | Pause | Throughput | Heap range | Использовать когда |
+|---|---|---|---|---|
+| **G1** (default) | 10-200ms | High | 4GB-32GB | General-purpose, default outdoor pipelines |
+| **ZGC** (gen, Java 21+) | < 1ms | Medium-High | 8GB-16TB | Low-latency требование, large heap |
+| **Shenandoah** (gen) | < 10ms | Medium | 4GB-1TB | Альтернатива ZGC, более mature for some workloads |
+| Parallel GC | 100-1000ms | Highest | Any | Batch (НЕ для streaming) |
+| Serial GC | High | Low | < 100MB | Никогда для production |
+
+Java 17 LTS — minimum для Flink 2.x. Java 21 LTS добавил **generational ZGC** — это game changer для low-latency.
+
+---
+
+## G1 (Garbage-First) — default
+
+G1 разбивает heap на **regions** (~2-32MB), young/old generations динамические. Concurrent mark, incremental copy.
+
+```
+[Heap]
+[Y][Y][O][O][Y][H][O][O][Y][O][...]
+ Y = young region
+ O = old region
+ H = humongous (>50% region size)
+```
+
+**Pros**:
+- Pause time goal (`MaxGCPauseMillis`) — soft target.
+- Concurrent mark not stop-the-world.
+- Stable performance до 32GB heap.
+
+**Cons**:
+- Pauses 10-200ms typical, не sub-millisecond.
+- На very large heap (>32GB) degrades.
+- Humongous objects (большие arrays) ломают region allocator.
+
+### G1 tuning для Flink
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=100
+  -XX:G1HeapRegionSize=4m
+  -XX:InitiatingHeapOccupancyPercent=35
+  -XX:+ParallelRefProcEnabled
+  -XX:G1ReservePercent=20
+  -XX:+UseStringDeduplication
+```
+
+Параметры:
+
+- `MaxGCPauseMillis=100` — soft goal 100ms pause. Lower = более частые pauses, выше CPU.
+- `G1HeapRegionSize=4m` — explicit region size (avoid auto-calculation на edge sizes).
+- `InitiatingHeapOccupancyPercent=35` — начать concurrent mark при 35% old gen (default 45%). Раннее старт = меньше шансов на full GC.
+- `G1ReservePercent=20` — reserve 20% heap для evacuation failures. Защита от full GC под burst.
+- `UseStringDeduplication` — JVM ищет identical String objects и shares — экономит heap на high-cardinality string keys.
+
+---
+
+## ZGC — low pause champion
+
+ZGC использует **colored pointers** и **load barriers** — concurrent everything, кроме trivial root scan. Java 21 LTS — generational ZGC GA (раньше был только flat).
+
+**Pros**:
+- Pauses **< 1ms** даже на TB heap.
+- Generational в Java 21 — efficiency сравнима с G1 для большинства workloads.
+- Не degrades с увеличением heap.
+
+**Cons**:
+- 5-15% throughput cost.
+- Memory overhead ~3% (colored pointer metadata).
+- На small heap (<8GB) overhead не worth.
+
+### ZGC tuning для Flink (Java 21+)
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+UseZGC
+  -XX:+ZGenerational
+  -XX:MaxGCPauseMillis=10
+  -XX:+AlwaysPreTouch
+  -XX:-OmitStackTraceInFastThrow
+  -Xms8g
+  -Xmx8g
+```
+
+Параметры:
+
+- `+UseZGC` + `+ZGenerational` — generational ZGC (Java 21).
+- `MaxGCPauseMillis=10` — target pause (soft, обычно достигается).
+- `+AlwaysPreTouch` — touch all heap pages at startup. Предотвращает page faults during runtime (commit RSS upfront).
+- `-Xms == -Xmx` — fixed heap size (ZGC любит stable heap).
+
+**Best practice**: Java 21 LTS + generational ZGC — это recommended для latency-critical Flink jobs.
+
+---
+
+## Shenandoah — альтернатива ZGC
+
+Shenandoah — concurrent GC от Red Hat, included в OpenJDK 17+. Pauses sub-10ms, similar idea к ZGC (concurrent compaction).
+
+**Когда выбирать вместо ZGC**:
+- Java 17 (где generational ZGC не доступен — только Java 21+).
+- Workload-specific bench показывает better behavior.
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+UseShenandoahGC
+  -XX:+ShenandoahUncommit
+  -XX:ShenandoahUncommitDelay=300000
+  -XX:+AlwaysPreTouch
+```
+
+В большинстве cases **ZGC predominates** для streaming. Shenandoah — backup plan.
+
+---
+
+## GC выбор: decision tree
+
+```
+Heap size?
+├─ < 4GB
+│   └─ G1 (overhead ZGC/Shenandoah не worth)
+│
+├─ 4-32GB
+│   ├─ Latency-critical (P99 < 50ms)?
+│   │   ├─ Java 21+ → ZGC generational
+│   │   └─ Java 17 → Shenandoah
+│   └─ General-purpose → G1 (default)
+│
+└─ > 32GB
+    └─ ZGC (Java 21+) или Shenandoah (Java 17)
+```
+
+---
+
+## Метрики для diagnose GC pressure
+
+```promql
+# G1 metrics:
+flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Time
+flink_taskmanager_Status_JVM_GarbageCollector_G1_Old_Generation_Time
+flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Count
+
+# ZGC metrics:
+flink_taskmanager_Status_JVM_GarbageCollector_ZGC_Cycles_Time
+flink_taskmanager_Status_JVM_GarbageCollector_ZGC_Pauses_Time
+
+# Memory metrics:
+flink_taskmanager_Status_JVM_Memory_Heap_Used
+flink_taskmanager_Status_JVM_Memory_Heap_Max
+flink_taskmanager_Status_JVM_Memory_NonHeap_Used
+```
+
+Healthy indicators:
+
+| Metric | Healthy | Action |
+|---|---|---|
+| GC time per minute (G1 Young) | < 5000ms (8%) | > 10000ms → switch к ZGC, или increase heap |
+| GC time per minute (ZGC) | < 1000ms (1.5%) | > 3000ms → check allocation rate, larger heap |
+| Heap_Used / Heap_Max | < 75% peak | > 90% sustained → bigger heap, или leak |
+| GC count rate | Stable | Spikes coincide с throughput peaks → tune |
+
+---
+
+## JFR (Java Flight Recorder) для diagnose
+
+JFR — low-overhead profiler. Continuous recording можно держать в production:
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+FlightRecorder
+  -XX:StartFlightRecording=duration=0,filename=/var/log/flink-jfr.jfr,settings=profile
+  -XX:FlightRecorderOptions=stackdepth=64,maxsize=100M
+```
+
+JFR collects: GC events, allocation stack traces, thread states, contention. Analyze с JDK Mission Control:
+
+- GC pause duration histogram.
+- Allocation rate per class.
+- Where time spent (CPU profile).
+
+Идеально для production troubleshooting — overhead < 1%.
+
+---
+
+## Diagnostic flow для GC issues
+
+Симптом: периодические latency spikes, throughput dips.
+
+```
+1. Метрики GC time per minute:
+   - G1 Old > 5000ms/min → full GC events → critical
+   - Sum (Young + Old) > 10s/min → tune
+
+2. JFR recording 5-10 minutes:
+   - Pause duration histogram
+   - Allocation profile (which class allocates most)
+
+3. Анализ allocation hotspots:
+   - Avro/Protobuf objects? → optimize codec
+   - String objects? → enable +UseStringDeduplication
+   - byte[] buffers? → check ByteBuffer reuse
+
+4. Heap headroom:
+   - Heap used > 80% sustained → bigger heap
+   - Heap fluctuates 30%-90% → garbage spikes from operator
+
+5. Switch GC если G1 не tunable:
+   - ZGC (Java 21) для < 10ms pauses
+```
+
+---
+
+## Production tuning patterns
+
+### Pattern 1: Stateless transform (light heap)
+
+```yaml
+taskmanager.memory.process.size: 4g
+
+env.java.opts.taskmanager: >
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=100
+  -XX:+UseStringDeduplication
+```
+
+G1 — best balance для small heap.
+
+### Pattern 2: Stateful с HashMapStateBackend (heap-heavy)
+
+```yaml
+taskmanager.memory.process.size: 16g
+taskmanager.memory.managed.fraction: 0.1   # state на heap, не managed
+
+env.java.opts.taskmanager: >
+  -XX:+UseZGC
+  -XX:+ZGenerational
+  -XX:MaxGCPauseMillis=10
+  -XX:+AlwaysPreTouch
+```
+
+State on heap → большая нагрузка GC. ZGC mandatory.
+
+### Pattern 3: RocksDB state + lightweight processing
+
+```yaml
+taskmanager.memory.process.size: 16g
+taskmanager.memory.managed.fraction: 0.5   # большой RocksDB
+
+env.java.opts.taskmanager: >
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=100
+  -XX:G1HeapRegionSize=4m
+  -XX:InitiatingHeapOccupancyPercent=35
+```
+
+State в RocksDB (managed memory, off-heap), heap небольшой → G1 OK.
+
+### Pattern 4: Low-latency real-time (sub-50ms P99)
+
+```yaml
+taskmanager.memory.process.size: 16g
+
+env.java.opts.taskmanager: >
+  -XX:+UseZGC
+  -XX:+ZGenerational
+  -XX:MaxGCPauseMillis=5
+  -XX:+AlwaysPreTouch
+  -XX:-OmitStackTraceInFastThrow
+  -Xms14g
+  -Xmx14g
+```
+
+Aggressive ZGC config для absolute minimum pause.
+
+### Pattern 5: Large state HashMap backend (legacy, не recommended)
+
+```yaml
+taskmanager.memory.process.size: 32g
+
+env.java.opts.taskmanager: >
+  -XX:+UseZGC
+  -XX:+ZGenerational
+  -XX:MaxGCPauseMillis=10
+  -XX:+AlwaysPreTouch
+  -Xms28g
+  -Xmx28g
+```
+
+Generational ZGC — единственный viable выбор для 32GB heap streaming.
+
+---
+
+## Allocation reduction strategies
+
+GC tuning только лечит симптомы — root cause часто allocation rate. Reduction strategies:
+
+### 1. Reuse objects в hot path
+
+```java
+public class ReuseMapper extends RichMapFunction<Event, Result> {
+    private transient Result reusable;
+
+    @Override
+    public void open(Configuration cfg) {
+        reusable = new Result();
+    }
+
+    @Override
+    public Result map(Event e) {
+        reusable.userId = e.getUserId();
+        reusable.count = e.getCount();
+        return reusable;  // ← reuse instance
+    }
+}
+```
+
+Caveat: только если downstream не holdит reference. Не работает если operator chained → next operator reads sync OK. Не работает если sink буферизует references.
+
+### 2. Avoid String concatenation в hot path
+
+```java
+// BAD: allocates new String каждую запись
+String key = e.getUserId() + "_" + e.getCategory();
+
+// GOOD: pre-computed compose
+String key = ConcatPool.intern(e.getUserId(), e.getCategory());
+```
+
+Или explicit `StringBuilder` reuse.
+
+### 3. Primitive collections (Eclipse Collections, fastutil)
+
+```java
+// BAD: 24 bytes per Long в HashMap<Long,Long>
+HashMap<Long, Long> map = new HashMap<>();
+
+// GOOD: int-keyed primitive map
+Long2LongHashMap map = new Long2LongHashMap();   // 16 bytes total per entry
+```
+
+Critical для large in-memory state.
+
+### 4. Pooled ByteBuffer для serialization
+
+```java
+private static final BufferPool POOL = ...;
+
+byte[] serialize(Event e) {
+    ByteBuffer buf = POOL.acquire();
+    try {
+        // serialize into buf
+        return Arrays.copyOf(buf.array(), buf.position());
+    } finally {
+        POOL.release(buf);
+    }
+}
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Set Xmx без AlwaysPreTouch
+
+```yaml
+env.java.opts: "-Xmx16g"
+```
+
+JVM аллоцирует virtual memory upfront, но physical pages только по requested. На burst (e.g., GC) — page faults → latency spikes 10-100ms.
+
+**Fix**: `-XX:+AlwaysPreTouch` — touch all pages на старте, повышает startup time но eliminates runtime spikes.
+
+### Gotcha 2: Xms != Xmx
+
+```yaml
+-Xms4g -Xmx16g
+```
+
+JVM может shrink heap во время idle, потом aggressively grow обратно → GC pressure spikes.
+
+**Fix**: `-Xms == -Xmx`. Fixed heap, predictable.
+
+### Gotcha 3: ZGC + small heap = overhead
+
+ZGC overhead ~3% memory + ~10% throughput. На 2GB heap это значимая трата.
+
+**Fix**: ZGC только при heap >= 8GB.
+
+### Gotcha 4: G1 humongous objects
+
+Allocations > 50% of G1 region size = humongous. Stored separately, не cleaned до full GC. Big Avro/Protobuf objects могут triggerить.
+
+**Diagnose**: GC log shows `G1 Humongous Allocation`. JFR показывает large allocations.
+
+**Fix**: `-XX:G1HeapRegionSize=8m` (bigger regions), или reduce object size.
+
+### Gotcha 5: -XX:+OmitStackTraceInFastThrow
+
+Default JVM omits stack traces for re-thrown exceptions для performance. Но в production debugging критично иметь полные traces.
+
+**Fix**: `-XX:-OmitStackTraceInFastThrow` — full traces. Minor performance cost.
+
+### Gotcha 6: GC log в K8s ephemeral storage
+
+```yaml
+-Xlog:gc*:file=/tmp/gc.log:time,uptime
+```
+
+В Kubernetes /tmp может быть tmpfs (memory) → memory pressure. Использовать persistent volume или disable file logging.
+
+### Gotcha 7: Java version drift
+
+Flink 2.x build на Java 17 — но runtime на Java 21. Generational ZGC доступен только runtime Java 21+. Verify:
+
+```bash
+docker exec <tm-pod> java -version
+```
+
+Если Java 17 runtime + `-XX:+ZGenerational` → JVM startup fails.
+
+---
+
+## Configuration baseline (production)
+
+### Conservative G1 (large state в RocksDB, moderate latency requirement)
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=100
+  -XX:G1HeapRegionSize=4m
+  -XX:InitiatingHeapOccupancyPercent=35
+  -XX:+ParallelRefProcEnabled
+  -XX:G1ReservePercent=20
+  -XX:+UseStringDeduplication
+  -XX:+AlwaysPreTouch
+  -XX:-OmitStackTraceInFastThrow
+  -XX:+ExitOnOutOfMemoryError
+  -Xlog:gc*:file=/flink/logs/gc.log:time,uptime:filecount=5,filesize=100m
+```
+
+### Aggressive ZGC (low-latency, Java 21+)
+
+```yaml
+env.java.opts.taskmanager: >
+  -XX:+UseZGC
+  -XX:+ZGenerational
+  -XX:MaxGCPauseMillis=10
+  -XX:+AlwaysPreTouch
+  -XX:-OmitStackTraceInFastThrow
+  -XX:+ExitOnOutOfMemoryError
+  -XX:+UseStringDeduplication
+  -Xlog:gc*:file=/flink/logs/gc.log:time,uptime:filecount=5,filesize=100m
+```
+
+---
+
+<Callout type="note">
+Java 21 LTS + generational ZGC — recommended default для всех новых production Flink 2.x deployments. Старая мудрость «G1 default OK для всего» больше не актуальна — generational ZGC превосходит G1 для streaming workload с large heap практически по всем параметрам.
+</Callout>
+
+---
+
+<Callout type="warning">
+GC tuning — это последняя линия optimization, не первая. Если у вас GC pressure — сначала проверьте: (1) allocation hotspots в JFR; (2) leaks в HashMapStateBackend; (3) heap headroom (Heap_Used / Heap_Max > 80%? bigger heap). Только потом tune GC algorithm. Иначе вы маскируете симптомы, не решая root cause.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Flink 2.x job на Java 21, HashMapStateBackend (state на heap), 24GB process.size, managed.fraction=0.1. Симптомы: P99 latency 800ms (target 50ms), throughput 50% от ожидаемого. GC metrics: G1 Young Gen time = 8000ms/min (default G1), Old Gen rare. Heap used 70-90% volatile. Какой план tuning?"
+  answer="Анализ: heavy heap allocation + G1 Young Gen занимает 13% времени (8s/min = 13% CPU). P99 inflated в основном GC pauses. Job на heap state backend (HashMapStateBackend) = state objects живут в JVM heap → large young+old gen pressure. План tuning (приоритизированно): (1) Switch к generational ZGC (Java 21). env.java.opts: -XX:+UseZGC -XX:+ZGenerational -XX:MaxGCPauseMillis=10 -XX:+AlwaysPreTouch -Xms20g -Xmx20g. Это single biggest win — pauses падают с десятков мс до < 1ms, P99 должен упасть в 5-10×. CPU cost ~5-10% (compensated by elimination of GC stop-the-world). (2) Verify heap sizing. 24GB process - JVM overhead (~2GB) - metaspace (256MB) - framework heap (128MB) = ~21GB available для Task Heap (managed = 2.4GB). Set -Xmx20g для headroom. (3) +AlwaysPreTouch обязательно — touch all pages upfront, eliminates page fault spikes под ZGC. (4) Verify Java 21 runtime: docker exec <tm> java -version — generational ZGC требует Java 21+. (5) Reduce allocation pressure. JFR recording 5-10min: identify top allocators. Если HashMap state values — рассмотреть migration к RocksDB (state в managed off-heap, GC pressure исчезает). Это medium-term fix, но настоящее лечение. (6) Если HashMap state required (e.g., latency требования). Tune: use primitive collections (Long2LongHashMap из Eclipse Collections / fastutil) - 60% меньше heap для same data. State objects reuse where possible (RichFunction.open() pre-allocate). (7) +UseStringDeduplication — высокая cardinality string keys (userIds) → JVM shares identical strings, экономит heap. (8) Monitor пост-tuning: GC time per minute (ZGC) должен быть < 1000ms (1.5%). P99 < 50ms. Heap used stable plateau. (9) Если ZGC всё равно не справляется (rare): switch на RocksDB state backend — fundamental fix для GC pressure. State становится off-heap, GC pressure только от event objects. Critical insight: GC tuning маскирует symptoms — root cause в этом job архитектурный (HashMap state для heavy state). Long-term: migrate к RocksDB. Short-term: ZGC + allocation reduction даст 80% выигрыша."
+/>

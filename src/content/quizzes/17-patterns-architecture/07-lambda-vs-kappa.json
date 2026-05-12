@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/07-lambda-vs-kappa",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-07",
+    "description": "Quiz for Lambda vs Kappa architecture"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-07-q1",
+      "type": "multiple-choice",
+      "question": "Lambda Architecture — почему она была востребована в 2012-2015 и почему сейчас почти deprecated?",
+      "options": [
+        { "id": "a", "text": "Lambda всегда была плохой архитектурой" },
+        { "id": "b", "text": "Тогда: streaming engines незрелые (Storm no EOS, Spark Streaming micro-batch с issues) — нужен batch для correctness + speed layer для latency. Сейчас: Flink 2.x streaming достиг batch maturity (EOS, materialized tables, ForSt), Iceberg/Paimon — один storage для stream + batch, Hybrid Sources для replay. Двойная кодовая база Lambda — overhead без выгод" },
+        { "id": "c", "text": "Streaming engines в 2026 стали slow" },
+        { "id": "d", "text": "Kafka исчез" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Lambda была optimal compromise эпохи. Batch (MapReduce/Spark) reliable но slow → accurate views. Speed layer (Storm/early Spark Streaming) fast но not accurate → real-time views. Merge в serving layer. Trade-offs: дублирование кода, merge complexity, double ops cost, inconsistency. К 2026 streaming engines стали accurate (EOS, watermarks, replay), один codebase в Flink покрывает оба use cases. Modern Hybrid (Iceberg lakehouse + Flink + Spark over same storage) replaced Lambda для greenfield.",
+      "studyHint": "Повторите урок 07 — раздел 'Lambda Architecture'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-07-q2",
+      "type": "multiple-choice",
+      "question": "Hybrid Source в Flink — как работает и где применяется в Kappa replay?",
+      "options": [
+        { "id": "a", "text": "Это experimental feature, не stable" },
+        { "id": "b", "text": "Combines bounded source (Iceberg backfill — parallel splits over historical data) + unbounded source (Kafka live). Automatic switch at chosen timestamp. Application code не различает 'backfill' vs 'live' — это один stream с continuously accumulated state. Идеальный fit для Kappa replay over years history — Iceberg parallel faster than linear Kafka replay" },
+        { "id": "c", "text": "Это только batch API" },
+        { "id": "d", "text": "Удалён в 2.0" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Hybrid Source (FLIP-150) — Kappa-architecture enabler. Modern setup: events дублируются в Kafka (короткий retention 7 days) + Iceberg long-term (years). Replay из Kafka linear через one consumer thread — слишком slow для big history. Hybrid Source: IcebergSource (bounded, parallel splits) reads months/years history fast, на завершение switch на KafkaSource для recent days и live. State accumulated continuously. На bug fix: deploy V2 parallel, замкнуть Hybrid Source на полный history, catch up за часы (не дни), atomic cutover на V2.",
+      "studyHint": "Повторите урок 07 — раздел 'Modern Kappa'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-07-q3",
+      "type": "multiple-choice",
+      "question": "Modern Hybrid architecture (Iceberg + Flink + Spark) — почему это default для greenfield в 2026?",
+      "options": [
+        { "id": "a", "text": "Только потому что modern и trendy" },
+        { "id": "b", "text": "Iceberg/Paimon как primary storage layer — shared между streaming (Flink) и batch (Spark). One codebase для both. Trino для ad-hoc. Iceberg time travel + Hybrid Source для replay. ML training через batch over Iceberg. Regulatory batch reconciliation тоже. Best of both worlds: streaming для real-time, batch для где batch правильно" },
+        { "id": "c", "text": "Это только marketing buzzword" },
+        { "id": "d", "text": "Это просто Lambda переименованная" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Modern Hybrid — pragmatic combination. Storage: Iceberg/Paimon lakehouse. Compute: Flink (streaming), Spark (batch ML training), Trino (ad-hoc). Все читают same tables. Преимущества над Lambda: один storage layer (vs Cassandra views + S3 raw + Kafka), shared schema, Iceberg time travel = built-in replay capability. Преимущества над pure Kappa: ML training natively batch over Iceberg (не replay миллиарды events), regulatory batch reconciliation simpler, ad-hoc queries Trino fast. Это default 2026 для new analytics platforms.",
+      "studyHint": "Повторите урок 07 — раздел 'Modern hybrid pattern'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-07-q4",
+      "type": "true-false",
+      "question": "Pure Kappa replay through Kafka — лучшее решение для всех reprocessing scenarios.",
+      "correctAnswer": false,
+      "explanation": "Pure Kafka replay имеет проблемы: (1) Long retention Kafka financially expensive — 100B events × 1KB × 6 months = много TB на brokers; (2) Replay linear через single consumer thread — replay 6 months events может занять дни; (3) Schema evolution в Kafka requires schema registry с strict compatibility. Modern alternatives: (a) Tiered storage Kafka 3.6+ для long retention cheap; (b) Hybrid Source — Iceberg parallel backfill + Kafka live; (c) MirrorMaker archive в S3, replay через Flink Filesystem source. Pure Kappa был ideal до Iceberg ecosystem mature; теперь modern hybrid лучше для most cases.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

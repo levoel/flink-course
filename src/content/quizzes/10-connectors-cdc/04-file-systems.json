@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/04-file-systems",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-04",
+    "description": "Quiz для file systems connector"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-04-q1",
+      "type": "multiple-choice",
+      "question": "В чём разница между OnCheckpointRollingPolicy и DefaultRollingPolicy, и почему bulk format (Parquet) использует первую?",
+      "options": [
+        { "id": "a", "text": "OnCheckpoint безопаснее, DefaultRollingPolicy deprecated" },
+        { "id": "b", "text": "OnCheckpointRollingPolicy: roll только на checkpoint barrier. DefaultRollingPolicy: roll по time/size/inactivity. Bulk formats (Parquet/ORC) self-describing с footer — only valid когда closed. Roll mid-checkpoint → invalid file. OnCheckpoint guarantees close на barrier sync = exactly-once compatible. Record formats append-able — DefaultRollingPolicy fine" },
+        { "id": "c", "text": "OnCheckpoint только для CSV, DefaultRollingPolicy для Parquet" },
+        { "id": "d", "text": "Они эквивалентны" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical для понимания file format compatibility. Bulk formats (Parquet, ORC, Avro container) — self-describing files с footer/metadata блок написанным НА close. Open Parquet file invalid (missing footer). Поэтому close must быть coordinated с checkpoint barrier для exactly-once recovery — OnCheckpointRollingPolicy. Trade-off: file size = checkpoint_interval × throughput. Record formats (CSV, JSON Lines) — line-based, любой close point valid. DefaultRollingPolicy combines rolloverInterval, maxPartSize, inactivityInterval для flexible policy. Production tuning: aim 100-512MB files — adjust checkpoint interval (для bulk) или rolling parameters (для record).",
+      "studyHint": "Повторите урок — секция Rolling policies",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m10-04-q2",
+      "type": "multiple-choice",
+      "question": "Production: streaming FileSink на S3 создаёт 10000 small files (5MB each) per hour. Query engines slow. Что решать?",
+      "options": [
+        { "id": "a", "text": "Увеличить parallelism" },
+        { "id": "b", "text": "Small files problem. Mitigation layers: (1) Adjust rolling policy для larger files (rolloverInterval, maxPartSize tuned для 100-512MB target); (2) Reduce sink parallelism если throughput per subtask small; (3) Downstream compaction job — Iceberg RewriteDataFilesAction, Spark compaction (важно: FileSink не compacts automatically); (4) Lakehouse format (Iceberg/Paimon) с native compaction вместо raw FileSink" },
+        { "id": "c", "text": "Использовать EXACTLY_ONCE delivery" },
+        { "id": "d", "text": "Игнорировать — S3 handles это автоматически" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Universal lakehouse problem. Streaming sink → file per checkpoint per subtask. С parallelism 8 + 1min checkpoint = 480 files/hour. Cost: listing slow (Iceberg manifests grow), query engines (Presto, Athena) do many small reads, S3 throttling. FileSink не compacts — responsibility отдельной job. Multi-layer mitigation: (1) Sink-side: larger checkpoint interval или rolling policy для 100-512MB target. (2) Downstream: Iceberg's RewriteDataFilesAction (Spark), Paimon's automatic background compaction, Hudi async compaction. (3) Architectural: choose lakehouse format с native compaction (Paimon — automatic) vs raw FileSink (manual).",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-04-q3",
+      "type": "multiple-choice",
+      "question": "Explain in-progress vs pending vs finished файлы в FileSink lifecycle.",
+      "options": [
+        { "id": "a", "text": "Это три статуса данных в Hive metastore" },
+        { "id": "b", "text": "Three states transactional lifecycle: in-progress (.inprogress, currently being written, не visible) → pending (.pending, closed на barrier, не visible, Committable produced) → finished (final name, visible). Crash recovery: pending files persist в checkpoint, on recovery re-applied → finished. Exactly-once via rename idempotency" },
+        { "id": "c", "text": "Это lifecycle Iceberg snapshots" },
+        { "id": "d", "text": "Это разные format types" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Foundation exactly-once semantics FileSink. Lifecycle: (1) Record arrives → SinkWriter writes к .inprogress file (transactional staging, not visible). (2) Checkpoint barrier arrives → close file, rename к .pending (still not visible) → produce Committable. (3) notifyCheckpointComplete → Committer renames .pending → final name (now visible). Recovery: если crash перед stage 3, Flink restores Committables из checkpoint state, re-applies commit (rename .pending → final). Rename idempotent (если уже renamed, OK). No data loss, no duplicates = exactly-once.",
+      "studyHint": "Повторите урок — секция Recovery semantics",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m10-04-q4",
+      "type": "true-false",
+      "question": "FileSource с monitorContinuously(Duration.ofMinutes(1)) превращает source в CONTINUOUS_UNBOUNDED — keep discovering new files каждую минуту вместо one-time read.",
+      "correctAnswer": true,
+      "explanation": "Правда. FileSource boundedness configurable через builder methods. forBulkFileFormat без monitorContinuously → BOUNDED (one-time read, stops после processing all current files). С monitorContinuously(Duration) → CONTINUOUS_UNBOUNDED — SplitEnumerator periodically polls directory, emits new splits для newly discovered files. Used для incremental ingestion (files dropped continuously в S3 by upstream jobs). Watermark strategy must быть compatible с unbounded mode. Production caveat: S3 listing на directories с millions files slow — better partition (year/month/day) для scoped listings, or use manifest-based formats (Iceberg) для O(1) discovery.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

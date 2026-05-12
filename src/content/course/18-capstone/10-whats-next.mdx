@@ -1,0 +1,259 @@
+---
+title: "Capstone — что дальше: career path, conferences, ecosystem"
+description: "Дальнейшее изучение после курса: Flink Forward conferences, Apache Slack community, advanced topics — Paimon deep, RisingWave/Materialize alternatives, AI/Agents, contributing to OSS."
+order: 10
+difficulty: "advanced"
+estimatedTime: 14
+topics: ["Career", "Community", "Conferences", "Future Learning"]
+---
+
+# Capstone — что дальше: career path, conferences, ecosystem
+
+Курс закончен. Вы прошли путь от «что такое stream processing» до production-grade capstone pipeline с CDC, stateful processing, EOS, K8s autoscaling, chaos testing, observability. Это substantive скилл — не «знание API», а способность дизайнить и operate real-time data systems в production.
+
+Этот урок — карта дальнейшего изучения. Куда идти, что читать, с кем общаться, и как deepen skills в направлениях которые матёр в 2026+.
+
+---
+
+## Где вы сейчас
+
+После курса вы способны:
+
+- **Design** stateful streaming architecture для real production use case (fraud detection, real-time analytics, CDC pipelines, recommendations).
+- **Implement** Flink job с proper state management, watermark strategy, EOS sinks.
+- **Deploy** на Kubernetes с autoscaling, HA, blue/green upgrades.
+- **Operate** — chaos testing, observability, on-call response.
+- **Debug** typical production issues — backpressure, checkpoint failures, state growth.
+
+Это middle-senior level Flink expertise. Senior+ — это depth (deep RocksDB internals, custom operators, SQL planner contributions) и breadth (broader ecosystem, multiple streaming engines, data architecture).
+
+---
+
+## Communities и conferences
+
+### Apache Flink community
+
+- **Apache Flink Slack** — `apache-flink.slack.com`. Free signup, active community. Channels: `#general`, `#help-flink`, `#flink-cdc`, `#flink-on-kubernetes`, `#flink-sql`.
+- **Mailing lists**: `dev@flink.apache.org` (development), `user@flink.apache.org` (general help).
+- **Apache Flink GitHub** — `github.com/apache/flink`. Watch, star, contribute.
+- **Apache Flink CDC GitHub** — `github.com/apache/flink-cdc`. Active project.
+- **Apache Paimon GitHub** — `github.com/apache/paimon`. Streaming lakehouse сompanion.
+
+### Conferences
+
+- **Flink Forward** — annual conference, organized by Ververica (Alibaba acquired). Recordings on YouTube channel `@FlinkForward`. Watch latest year talks for current state-of-the-art.
+- **Current** — Confluent's annual streaming conference. Heavy Kafka focus, но Flink talks present.
+- **Streaming Data Summit (online)** — vendor-organized, varies quality.
+- **DataAI Summit (Databricks)** — Spark focus, но streaming + lakehouse intersect.
+
+### Specific YouTube channels
+
+- **Apache Flink** official channel — meetup talks, tutorials.
+- **Robert Metzger / Stephan Ewen** — Flink committer talks (deep technical).
+- **Ververica** — vendor channel, but quality content.
+
+---
+
+## Advanced Flink topics
+
+### Apache Paimon deep
+
+Capstone использовал Paimon basics. Advanced topics:
+
+- **Append-only tables** для streaming OLAP без UPSERT overhead.
+- **Bucket mode = -1** — dynamic bucketing, automatic re-balancing.
+- **Compact procedures** — scheduled compaction strategies для large tables.
+- **Branches и tags** — Git-like versioning over data, A/B testing on data.
+- **Materialized views in Paimon** — declarative streaming pipelines.
+
+References:
+- `paimon.apache.org` docs.
+- Source code: `github.com/apache/paimon`.
+
+### RisingWave / Materialize alternatives
+
+Modern streaming SQL DBs — different paradigm от Flink (specialized для SQL aggregations vs general).
+
+- **Materialize** — Differential Dataflow based. Incremental view maintenance. Sweet spot: real-time dashboards с zero staleness.
+- **RisingWave** — distributed streaming SQL, PostgreSQL compatible. Sweet spot: streaming SQL aggregations.
+
+Why learn:
+- Comparison perspective — when Flink overkill, when these tools fit.
+- Career — these tools growing market, related role pipeline.
+- Architecture decisions — knowing options means making informed tradeoffs.
+
+References:
+- Materialize blog — high quality streaming SQL content.
+- RisingWave docs — strong tutorials для streaming SQL basics.
+
+### Flink Agents — emerging area
+
+Flink Agents preview discussed в M17/09. Watch this space:
+
+- FLIP-531 — actively evolving, breaking changes expected through 1.0.
+- Community Slack `#flink-agents` channel.
+- Early adopter case studies — likely papers / blog posts from Alibaba, Netflix через 2026-2027.
+
+### Custom operators / extensions
+
+Beyond using Flink — extending it:
+
+- **Custom Source connectors** — implement FLIP-27 Source API для proprietary sources.
+- **Custom Sink** — SinkV2 API для new sinks.
+- **Table API UDFs** — scalar, table, async functions.
+- **Custom State backend** — extremely advanced, rare need.
+
+Path: read existing connectors (`flink-connector-kafka`, `flink-connector-jdbc`) as reference; small custom extension; eventual upstream contribution.
+
+### Internals deep dive
+
+Если ROAD к Flink committer / deep expertise:
+
+- **RocksDB / ForSt internals** — LSM tree, compaction strategies, JNI overhead.
+- **Network stack** — Netty layer, credit-based protocol implementation.
+- **Memory management** — managed memory allocation, off-heap buffers.
+- **Scheduler** — Adaptive Scheduler internals, in-place rescaling mechanics.
+- **Checkpoint coordination** — ABS algorithm, barrier alignment, async snapshots.
+
+References:
+- Flink Improvement Proposals (FLIPs) — `cwiki.apache.org/confluence/display/FLINK/Flink+Improvement+Proposals`.
+- VLDB papers — Flink contributions (Apache Flink: Unified Stream and Batch Processing — original; Disaggregated State paper — 2025).
+- Source code with strategic depth (start from `StreamExecutionEnvironment.execute()` → JobGraph → ExecutionGraph → Scheduler).
+
+---
+
+## Broader ecosystem
+
+### Adjacent technologies
+
+- **Apache Kafka** — Flink complementary. Deep Kafka knowledge invaluable (partitioning, transactions, KIP-848 cooperative rebalancing).
+- **Apache Iceberg** — alternative к Paimon для lakehouse. Stronger ecosystem (Snowflake, BigQuery, Trino support).
+- **Apache Arrow** — columnar in-memory format. Increasingly important in cross-system zero-copy.
+- **DuckDB** — embedded analytics — useful для testing, validation.
+- **dbt** — analytics engineering — complementary к streaming для downstream transforms.
+- **Trino / Presto** — interactive SQL over lake — common pairing with Flink pipelines.
+
+### MLOps integration
+
+Modern streaming + ML — growing intersection:
+
+- **Feature stores** — Feast, Tecton, Hopsworks. Integration patterns с Flink.
+- **Model serving** — TensorFlow Serving, ONNX Runtime, BentoML. ML_PREDICT vs external.
+- **MLflow / Weights & Biases** — model versioning, experiments tracking.
+- **Vector databases** — Pinecone, Qdrant, Weaviate. VECTOR_SEARCH в Flink 2.2.
+
+### Cloud-specific knowledge
+
+Cloud providers offer managed Flink:
+
+- **AWS** — Managed Service for Apache Flink (formerly Kinesis Data Analytics).
+- **Confluent** — Flink in Confluent Cloud (kafka + flink integrated).
+- **Aiven** — Managed Flink + Kafka.
+- **Ververica Platform** — commercial Flink platform.
+
+Managed services tradeoffs: less ops burden, less flexibility, vendor lock-in.
+
+---
+
+## Career paths
+
+### Senior Streaming Engineer
+
+Focus: deeply understand Flink + ecosystem, lead production deployments, mentor others. Path: 3-5 years с Flink production exposure, contributions back (bug fixes, features), conference talks.
+
+### Streaming Architect
+
+Focus: design data architectures using streaming, evaluate technologies, set patterns. Path: senior engineer + cross-team architecture experience + strong business communication.
+
+### Platform Engineer (Streaming Platform)
+
+Focus: building internal Flink-as-a-Platform — multi-tenant clusters, self-service onboarding, observability. Path: K8s + Flink + DevOps experience combined.
+
+### Flink Committer / Apache Member
+
+Focus: open source contribution. Path: meaningful contributions, mailing list participation, FLIP authorship, eventual nomination.
+
+### Data Engineer (Streaming Specialty)
+
+Focus: end-to-end data pipelines using Flink + Kafka + Iceberg + dbt. Path: data engineering background + streaming depth.
+
+### ML Platform Engineer (Streaming + AI)
+
+Emerging area. Focus: real-time ML inference, feature stores, agent platforms. Combines Flink + ML/AI knowledge.
+
+---
+
+## Книги и paper-ы
+
+**Essential reading:**
+
+- **Streaming Systems** (Tyler Akidau, Slava Chernyak, Reuven Lax) — fundamentals streaming concepts. Required reading.
+- **Designing Data-Intensive Applications** (Martin Kleppmann) — broader data systems. Chapters on stream processing excellent.
+- **Apache Flink documentation** — `flink.apache.org/docs/stable/` — surprisingly comprehensive.
+
+**Academic papers (for depth):**
+
+- **The Dataflow Model** (Akidau et al, 2015) — windowing, watermarks foundations.
+- **Apache Flink: Unified Stream and Batch Processing** (Carbone et al, 2015) — Flink original design paper.
+- **Disaggregated State Management in Apache Flink** (Liu et al, VLDB 2025) — ForSt internals.
+- **Chandy-Lamport: Distributed Snapshots** (1985) — checkpoint algorithm foundation.
+
+**Blog posts to follow:**
+
+- Apache Flink blog — `flink.apache.org/blog/`. Release announcements, technical deep-dives.
+- Ververica blog — vendor blog, quality content.
+- Confluent blog — Kafka focus, but Flink cross-over content.
+- Materialize blog — best streaming SQL content на интернете.
+- DoorDash, Netflix, Uber engineering blogs — periodic Flink production stories.
+
+---
+
+## Open source contribution
+
+Path к committer / community member:
+
+1. **Use Flink at scale** — accumulate production experience.
+2. **Report bugs constructively** — minimal reproductions, clear context.
+3. **Fix small bugs** — start with «good first issue» tagged items.
+4. **Add tests / documentation** — accepted contributions, less risk.
+5. **Propose feature / write FLIP** — only after demonstrating community presence.
+6. **Review others' PRs** — important for committer pipeline.
+7. **Speak at meetups / conferences** — visibility.
+
+Realistic timeline: 1-2 years sustained contribution для committer recognition.
+
+---
+
+## Continuous learning
+
+Streaming evolving rapidly. Strategies для staying current:
+
+- **Subscribe Apache Flink release notes** — major releases ~6 months.
+- **Follow Flink Slack** — first-line awareness of new features.
+- **Quarterly review** — what's new in Flink, Paimon, Iceberg, Kafka. Adjust skills accordingly.
+- **Practical experimentation** — when new feature released, try it in side project. Hands-on > reading.
+- **Network with other Flink engineers** — meetups, Slack DMs, conference networking.
+- **Internal knowledge sharing** — present к team, write internal docs. Best way to solidify knowledge.
+
+---
+
+<Callout type="note">
+Skill в streaming systems compound over years. Engineers с 5+ years Flink production experience commanding senior+ salaries (~$200-350k+ US 2026, comparable EU/UK). Это niche but valuable specialty. Investment в depth here — long-term career upside.
+</Callout>
+
+---
+
+## Финальные слова
+
+Курс показал технические foundations, но настоящее mastery — это **production exposure**. Один production pipeline running 6 months teaches more than 10 courses. Find opportunity at work, contribute к open source, build personal project — get hands-on.
+
+Streaming — это field где theory и practice deeply связаны. Knowing windowing concepts ≠ knowing how to handle late events in production. Course gave you map; territory awaits.
+
+Удачи в work с Flink. Build cool things.
+
+---
+
+<KnowledgeCheck
+  question="Course retrospective: имея завершённый курс (18 modules, 100+ уроков, capstone проект), какие top 3 capabilities вы можете confidently claim в resume / interview, и какие areas требуют ещё 6-12 месяцев real production experience до confident claim?"
+  answer="**Confidently claim after course (top 3):** (1) **Design real-time streaming architectures** — for given business requirements (CDC, real-time analytics, recommendations), choose appropriate patterns (stateful microservice, lookup/temporal joins, Lambda vs Kappa), justify technology choices (Paimon vs Iceberg, Flink vs alternatives). Have architecture diagram скиллs + ability discuss trade-offs. (2) **Implement Flink jobs с proper state, watermarks, EOS** — ProcessFunctions, ValueState/MapState с TTL, watermark strategies including alignment, side outputs, transactional sinks. Know critical primitives и їх внутренности. (3) **Deploy on K8s + observability foundations** — FlinkDeployment manifests, Adaptive Scheduler, HA setup, autoscaler config, OTel metrics, Grafana dashboards, alerts с runbooks. **Need 6-12 months production for confident claim:** (1) **Production troubleshooting expertise** — courses teach symptoms и common fixes, но real expertise from sleepless 3 AM debugging sessions across diverse failure modes. Confident claim после 2-3 major incidents survived (no data loss, root cause identified). (2) **Capacity planning + cost optimization** — sizing tutorials give starting point, real expertise from observing actual workload patterns, optimizing for cost ($X budget), handling growth. Need year of production budget management. (3) **Cross-team architecture decisions** — explaining choices к stakeholders (PM, finance, regulatory), evaluating vendor tools, leading migrations, mentoring others. This скилл primarily от team interaction context, not solo learning. (4) **Specific scale claims** — 'I've handled 50k events/sec exactly-once' — requires actually doing it, with metrics, with reproducibility. **Action plan for filling gaps:** (1) Get production exposure — current company has Flink? volunteer. No? Personal project + open source contribution. (2) Build portfolio — production stories blog posts, talks at meetups, open source PRs. Demonstrates production reality, not course completion. (3) Continuous learning через described resources. **Honest framing in interview:** 'I've built capstone production-grade pipeline with X technologies. Looking forward to applying в team production scale. Strong fundamentals, comfortable learning new patterns under guidance, hungry for incident response experience.' This is true и appropriate — overstating production experience credibility-risk."
+/>

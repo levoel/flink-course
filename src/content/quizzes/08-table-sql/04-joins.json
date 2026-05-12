@@ -1,0 +1,64 @@
+{
+  "lessonSlug": "08-table-sql/04-joins",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-04",
+    "description": "Quiz for SQL joins lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-04-q1",
+      "type": "multiple-choice",
+      "question": "Use case: orders stream нужно enrich с user_profile (10M users, frequently updated через Postgres CDC). Какой join type?",
+      "options": [
+        { "id": "a", "text": "Regular join — простой подход" },
+        { "id": "b", "text": "Temporal join с CDC source в Flink: ingest user_profile через postgres-cdc connector (PK + WATERMARK FOR update_time), use `JOIN user_profile FOR SYSTEM_TIME AS OF o.event_time` — deterministic historical lookup. Lookup join к external Postgres slower (5ms per call × 100k events/s = bottleneck), не supports historical versions. State estimate 10M users × ~1KB = ~10GB в RocksDB" },
+        { "id": "c", "text": "Lookup join к Postgres напрямую" },
+        { "id": "d", "text": "Interval join" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Temporal join — correct choice для frequently-changing dim tables. **Architecture**: (1) Setup `user_profile_cdc` table с `'connector' = 'postgres-cdc'` connector reading WAL/replication slot. Defines PRIMARY KEY (user_id) NOT ENFORCED + WATERMARK FOR update_time AS update_time. (2) Query: `SELECT o.*, u.name, u.segment FROM orders o JOIN user_profile_cdc FOR SYSTEM_TIME AS OF o.event_time AS u ON o.user_id = u.user_id`. **Why temporal not lookup**: (a) **Throughput**: 100k events/sec × 5ms Postgres lookup latency × 16 parallelism = max ~3.2k events/sec — fundamental bottleneck. With CDC dim в Flink state — 100k events/sec achievable (state lookup ~10μs). (b) **Historical correctness**: order at event_time T должен see user_profile version active at T, not current state. Lookup join only current state. Temporal join handles versions. (c) **Cost**: Postgres queries expensive (DB CPU + connection pool). CDC streams once, joined many times — amortized cost. (d) **Determinism**: temporal join replay produces identical results (versions preserved). Lookup non-deterministic (DB state changes). **State management**: 10M users × ~1KB row = ~10GB в RocksDB. Manageable on NVMe SSD. ForSt backend для disaggregated state если scale 100M+ users. **Production gotchas**: (a) CDC source watermark advances slowly если low update rate — pipeline blocks. Mitigation: WatermarkStrategy.withIdleness. (b) State growth from versions — set retention to keep last N versions per PK. (c) Initial backfill: full table snapshot scan first, then incremental. Use postgres-cdc 'startup.mode = initial' для this.",
+      "studyHint": "Повторите урок — секция 'Temporal join — versioned dim table'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-04-q2",
+      "type": "multiple-choice",
+      "question": "Regular join `SELECT * FROM orders JOIN payments ON orders.id = payments.order_id` без time bound. Какие state implications и mitigation?",
+      "options": [
+        { "id": "a", "text": "State bounded — Flink auto-manages" },
+        { "id": "b", "text": "Unbounded state growth — каждая incoming row stored по join key indefinitely. Linearly растёт с unique order_id-ов. После days/weeks — TBs state, RocksDB OOM. Mitigation: SET 'table.exec.state.ttl' = '24h' — release state entries after 24h без access. Production typical 24-48h matching business rest cadence. Alternative: switch к interval join если есть time correlation, или temporal join если dim semantics" },
+        { "id": "c", "text": "Streaming joins всегда bounded" },
+        { "id": "d", "text": "Используется external storage" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Regular join — most flexible но most state-heavy. **State growth**: каждая incoming row from either side stored в hash table по join key. New event from orders → look для match в payments state + store self в orders state. Same для payments. No automatic cleanup — Flink не знает когда join key 'done'. **Real impact**: 1000 orders/sec × 1KB row × 86400 sec/day = ~80GB per day per side. Without TTL, weeks-months → TBs state. RocksDB struggles, eventually OOM-Killed или disk full. **Mitigation hierarchy**: **(1) idle state retention (TTL)**: `SET 'table.exec.state.ttl' = '24h'`. Global session setting. State entries unaccessed > TTL deleted. Production typical 24-48h matches order-payment expected latency. Too short — miss legitimate late matches. Too long — state grows. **(2) Convert к interval join**: if there's time correlation (payment within 1 hour of order): `ON o.id = p.order_id AND p.t BETWEEN o.t AND o.t + INTERVAL '1' HOUR`. State automatically bounded by max interval. **(3) Convert к temporal join**: if payment side is dim-like (versioned by PK). **(4) Architectural redesign**: enrich at source level (denormalize в Kafka), не stream join. **Monitoring**: `Status.JVM.Memory.Direct.MemoryUsed`, RocksDB state size growth, alert на linear unbounded growth. **Important caveat**: TTL globally affects ALL stateful operators в session — windowed aggregations (which have natural cleanup) also subject to TTL. Может break aggregation correctness if TTL < window size + allowedLateness. Flink 2.x adds per-operator TTL hints.",
+      "studyHint": "Повторите урок — секция 'Regular join' и 'Production gotchas'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-04-q3",
+      "type": "multiple-choice",
+      "question": "Lookup join к external Postgres dim table. Какие options optimization и trade-offs?",
+      "options": [
+        { "id": "a", "text": "Только увеличить parallelism" },
+        { "id": "b", "text": "(1) `'lookup.cache' = 'PARTIAL'` + max-rows + expire-after-write — LRU cache, 10x-100x throughput. (2) `'lookup.cache' = 'FULL'` — preload entire table в memory (good для small dims). (3) Async I/O под капотом — parallel non-blocking requests. (4) Retry config: lookup.max-retries, timeout.ms. Trade-off: cache hit rate vs memory; FULL ограничен по dim size; PARTIAL может miss recent updates"
+        },
+        { "id": "c", "text": "Использовать только regular join" },
+        { "id": "d", "text": "Cache не нужен" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Lookup join optimization все about minimizing external system load. **Without cache**: 100k events/sec × Postgres query 5ms × parallelism 16 = max 3.2k events/sec. DB CPU saturated. **(1) PARTIAL cache**: `'lookup.cache' = 'PARTIAL'` + `'lookup.partial-cache.max-rows' = '10000'` + `'lookup.partial-cache.expire-after-write' = '10min'`. LRU cache of most-recent N entries. Hit rate depends на access pattern — usually 80-95% для recurring users. Throughput jumps к ~50k events/sec. Trade-off: cache misses still hit DB; stale data up to expire-after-write duration. **(2) FULL cache**: `'lookup.cache' = 'FULL'` + `'lookup.full-cache.reload-strategy' = 'PERIODIC'` (or 'TIMED'). Loads entire table в memory at startup, refreshes periodically. Best throughput (same as in-memory hash). Limits: dim size < memory budget (~10GB typically), reload interval determines staleness. **(3) Async I/O internals**: lookup join uses AsyncFunction под капотом. Per subtask: pending queue (default 100 concurrent requests), parallel non-blocking calls, callbacks emit results. Configure: `'lookup.async.output-mode' = 'allow-unordered'` для better throughput. **(4) Retry**: `'lookup.max-retries' = '3'`, `'lookup.timeout' = '5s'` — handle transient external errors. **(5) Hybrid pattern**: lookup join + temporal join — primary через temporal (most events), lookup для rare cold-cache misses. **When prefer over temporal**: (a) dim table doesn't fit в Flink state; (b) dim updates rarely (cache validity long); (c) operationally simpler (no CDC pipeline). **Production caveats**: monitor cache hit rate (Flink metric), DB query latency P99, queue depth.",
+      "studyHint": "Повторите урок — секция 'Lookup join — external system'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-04-q4",
+      "type": "true-false",
+      "question": "Temporal join `FOR SYSTEM_TIME AS OF event_time` производит deterministic результаты при replay (same input → same enrichment).",
+      "correctAnswer": true,
+      "explanation": "True. **Determinism — fundamental property temporal join**. Mechanism: для row с event_time = T, temporal join lookup-ит versioned table state at time T. State at T = applied all dim updates с update_time <= T, ordered by update_time. **Replay scenario**: Pipeline crashes, restart from checkpoint, source replays events from saved offsets. Each replayed event has same event_time. Temporal join queries same versioned state at same T. **Result identical** — same enriched output. **Critical contrast with lookup join**: lookup join uses processing time (`FOR SYSTEM_TIME AS OF proc_time`), queries current external state. During replay, external state may have changed → different enrichment. Non-deterministic. **Requirements для determinism**: (1) **Time attribute event_time** в both streams — not processing time. (2) **Versioned dim table** with PK + WATERMARK FOR update_time. (3) **Source replay** behavior — Kafka offsets, не non-replayable sources. **Practical implications**: (a) **Reproducible analytics**: same query on same input window always produces same numbers — critical для financial/regulatory pipelines где audit must reproduce results. (b) **A/B testing**: comparing pipeline versions on same data — confidence that differences are code, не временные. (c) **Cross-pipeline consistency**: multiple Flink jobs reading same source с same enrichment logic produce identical results. **Caveat**: requires upstream sources to be replayable и produce same events same order. Kafka satisfied. Non-deterministic sources (e.g., probabilistic samplers) break replay determinism even with temporal join.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

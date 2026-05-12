@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/05-nfa-implementation",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-05",
+    "description": "Quiz для NFA implementation"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-05-q1",
+      "type": "multiple-choice",
+      "question": "Почему Flink CEP использует NFA, а не DFA?",
+      "options": [
+        { "id": "a", "text": "DFA не существует для regex-like patterns" },
+        { "id": "b", "text": "NFA имеет polynomial size в number of states; DFA через subset construction exponentially blows up. Plus oneOrMore с unbounded length не закрывается finite-state DFA. IterativeCondition требует non-determinism с stack-like state. AFTER MATCH SKIP variants natural как multiple active computation states" },
+        { "id": "c", "text": "NFA быстрее на каждый event" },
+        { "id": "d", "text": "Это historical choice без особой причины" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "DFA конвертация regex → exponential blow-up из subset construction. NFA polynomial, но с multiple active states одновременно. Для CEP: (1) oneOrMore допускает unbounded sequences — не finite-state; (2) IterativeCondition с running aggregations требует access к matched events — это не regular language; (3) AFTER MATCH SKIP variants естественно expressed через non-determinism. Trade-off: NFA slower per event (check multiple active states), но manageable state size. DFA was non-starter для CEP в general.",
+      "studyHint": "Повторите урок — секция NFA vs DFA",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m09-05-q2",
+      "type": "multiple-choice",
+      "question": "Что такое Shared Buffer и DeweyVersion в CEP engine?",
+      "options": [
+        { "id": "a", "text": "Это deprecated концепты Flink 1.x" },
+        { "id": "b", "text": "Shared Buffer — DAG-style storage matched events с versioning через DeweyVersion (hierarchical dot-separated paths). Это позволяет multiple ComputationStates шарить events efficiently — O(N) вместо O(N×M) naive duplication" },
+        { "id": "c", "text": "Это in-memory cache Flink job graph" },
+        { "id": "d", "text": "Buffer для network shuffles между TaskManager-ами" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Shared Buffer — ключевая optimization CEP engine. Naive: каждая ComputationState хранит свою copy событий — O(N×M) для M parallel matches, N events each. С Shared Buffer + DeweyVersion (например 1.2.1 ⊂ 1.2 ⊂ 1) — events shared via hierarchical versioning. Когда ComputationState expires (timeout, terminal), Flink prunes events не reachable from active versions. Reduces storage от O(N×M) к O(distinct_event_path_lengths) — обычно O(N).",
+      "studyHint": "Повторите урок — секция ComputationState и Shared Buffer",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m09-05-q3",
+      "type": "multiple-choice",
+      "question": "Pattern с followedByAny + oneOrMore + allowCombinations имеет какую state complexity?",
+      "options": [
+        { "id": "a", "text": "O(1) constant" },
+        { "id": "b", "text": "O(N) linear" },
+        { "id": "c", "text": "O(2^N) exponential — allowCombinations enumerates все subsets matching events. 2^20 = 1M parallel partial matches для всего 20 events. Combined с followedByAny это NEVER на production без tight bounds" },
+        { "id": "d", "text": "O(N log N)" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Triple-combo combinatorial explosion: followedByAny — non-det relaxed, каждый matching A создаёт state с каждым subsequent B → cartesian; oneOrMore — variable-length, growing per event; allowCombinations — все 2^N subsets matching events. Combined: для N=20 = 1M ComputationStates, каждая с shared events pointers. State blow-up, checkpoint stall, JVM OOM. Production safe alternative: followedBy (single match per A), bound через times(min, max), MATCH_RECOGNIZE с tight WITHIN, или custom state machine.",
+      "studyHint": "Повторите урок — секция Why complex patterns expensive",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-05-q4",
+      "type": "true-false",
+      "question": "Изменение pattern (добавление state, изменение predicate) preserves savepoint compatibility — можно restart с new pattern на old savepoint.",
+      "correctAnswer": false,
+      "explanation": "False. Pattern change → NFA structure changes → savepoint state structure не matches new NFA → deserialization error на restart. Это hard constraint NFA serialization. Production practice: pattern change = breaking deployment. Drain existing patterns (stop without savepoint, или explicit timeout window для full processing), deploy с new code и clean state. Альтернативы: dual-write (старая + новая jobs во время migration), explicit state migration code. Это major operational consideration — pattern changes treat as schema breaking change.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

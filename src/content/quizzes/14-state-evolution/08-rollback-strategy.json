@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/08-rollback-strategy",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-08",
+    "description": "Quiz for Rollback strategy lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-08-q1",
+      "type": "multiple-choice",
+      "question": "Foundation эффективного rollback в Flink production — что это?",
+      "options": [
+        { "id": "a", "text": "Git revert" },
+        { "id": "b", "text": "Pre-upgrade savepoint автоматически created Operator-ом при upgradeMode: savepoint. Этот savepoint = rollback artifact. Без него rollback impossible — нет state pre-upgrade. Retention: 30 дней минимум для critical jobs" },
+        { "id": "c", "text": "Kubernetes rollback k8s deployment" },
+        { "id": "d", "text": "Disabling new feature flags" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pre-upgrade savepoint — foundation. Flink Kubernetes Operator с upgradeMode: savepoint автоматически triggers savepoint перед image change. Этот savepoint = exact state pre-upgrade. Rollback workflow: revert FlinkDeployment к previous image + initialSavepointPath = pre-upgrade savepoint → operator делает restart с previous state. Без savepoint retention = no rollback possible. Configure spec.flinkConfiguration.execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION + savepointHistory retention. Critical jobs need 30+ days retention for late-detected issues.",
+      "studyHint": "Повторите урок — Foundation: kept savepoint before upgrade + Retention policy",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m14-08-q2",
+      "type": "multiple-choice",
+      "question": "Friday 16:00 deploy v1.43. Monday 09:00 detect bug (false positives slow weekend growth). Rollback к v1.42. Challenges?",
+      "options": [
+        { "id": "a", "text": "Просто patch — instant rollback" },
+        { "id": "b", "text": "(1) Pre-upgrade savepoint 65h old — retention должен покрывать; (2) Data forward time — 65h events будут reprocessed v1.42 → downstream duplicates, EOS sink transactional ID bump required чтобы избежать 2PC conflicts; (3) Kafka log retention — events expired могут отсутствовать; (4) Downstream coordination — alerts may include false positives + duplicates" },
+        { "id": "c", "text": "Никаких — Flink handles automatically" },
+        { "id": "d", "text": "Need full DR procedure" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Multi-layer challenges. Pre-upgrade savepoint retention — default 7-30 дней obычно OK. Data replay — 65h events будут reprocessed (savepoint Kafka offsets от Friday) → downstream sees duplicates, EOS sink transactional IDs collide с v1.43 committed transactions (need bump prefix to e.g., 'fraud-detector-tx-v2'). Kafka log retention — если log retention < 65h, some events expired = state can't fully rebuild — gap. Forward compatibility — pre-upgrade savepoint has old schema, v1.42 reads fine. Decision: rollback vs forward fix (v1.43.1 hotfix). Depends на bug severity, downstream tolerance. Coordination: notify ops, business about alert duplicates. Post-mortem: better canary, deploy windowing.",
+      "studyHint": "Повторите урок — Forward compatibility traps + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-08-q3",
+      "type": "multiple-choice",
+      "question": "Quarterly drill — что это и зачем?",
+      "options": [
+        { "id": "a", "text": "Performance benchmark" },
+        { "id": "b", "text": "Regular exercise rollback procedure на staging — simulate upgrade gone wrong, execute runbook, time RTO, identify gaps, update procedures. Без drill процедура decays (S3 paths drift, IAM rotates, runbook stale). Untested DR/rollback = no DR/rollback" },
+        { "id": "c", "text": "Compliance audit" },
+        { "id": "d", "text": "Team training session" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical practice. Untested rollback procedure decays — S3 bucket paths изменились, IAM rotations broke permissions, runbook ссылается на устаревшие tool versions, team forgets steps. Quarterly drill: (1) simulate upgrade gone wrong на staging (deploy intentional bad image); (2) execute rollback runbook step-by-step; (3) measure actual RTO (target <30 min); (4) identify gaps в documentation; (5) train junior engineers. Drill artifacts — updated runbook, RTO metrics, fix tickets. Real incident — first time team executes procedure = chaos. Drill ensures procedure works when really needed.",
+      "studyHint": "Повторите урок — Quarterly drill",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-08-q4",
+      "type": "true-false",
+      "question": "При rollback с Exactly-Once Kafka sink ВСЕГДА bump transactional.id.prefix — иначе rollback replays events с теми же transactional IDs что v1.43 уже committed → 2PC conflicts.",
+      "correctAnswer": true,
+      "explanation": "True. EOS Kafka sink uses Two-Phase Commit с unique transactional IDs (prefix + subtask suffix). Pre-upgrade savepoint Kafka offsets = от Friday. Rollback к v1.42 + Friday savepoint = reprocess Friday→Monday events. Kafka EOS sink commits transactions с same transactional.id.prefix as v1.43 used → broker sees conflict (transactional ID already в active state or differently committed) → 2PC fails, sink crashes. Fix: bump transactional.id.prefix at rollback (e.g., add '-rollback-v1' suffix). New prefix = new transaction coordinator state, no conflicts. Important checklist item для EOS rollbacks.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

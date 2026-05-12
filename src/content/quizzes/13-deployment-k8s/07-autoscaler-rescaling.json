@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/07-autoscaler-rescaling",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-07",
+    "description": "Quiz for Autoscaler + In-place rescaling lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-07-q1",
+      "type": "multiple-choice",
+      "question": "Что главное различие между in-place rescale (FLIP-291) и savepoint-based rescale?",
+      "options": [
+        { "id": "a", "text": "In-place быстрее на 5-10%" },
+        { "id": "b", "text": "In-place: reuses last completed CHECKPOINT, redistributes key groups in-place, downtime 10-30s. Savepoint-based: создаёт NEW savepoint в DFS, copies, restores — downtime 2-10 минут" },
+        { "id": "c", "text": "In-place требует ZooKeeper" },
+        { "id": "d", "text": "Savepoint-based работает только на heap state backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "In-place rescale: Adaptive Scheduler stops tasks briefly → redistributes key groups для нового parallelism → restore state из last completed checkpoint (pointers reuse, без DFS write) → resume. 10-30s downtime, no new savepoint. Savepoint-based: trigger savepoint (full state write to DFS, минуты для большого state) → cancel → start с новым parallelism → restore from savepoint. 2-10 минут. In-place возможен только потому что checkpoint contains full state, key-group-aware. FLIP-291 GA с 1.18+.",
+      "studyHint": "Повторите урок — In-place rescaling (FLIP-291): как работает + Comparison",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m13-07-q2",
+      "type": "multiple-choice",
+      "question": "Какие метрики autoscaler наблюдает для scaling decisions?",
+      "options": [
+        { "id": "a", "text": "Только CPU usage TM-ов" },
+        { "id": "b", "text": "Per-vertex busyTimeMsPerSecond, backPressuredTimeMsPerSecond, idleTimeMsPerSecond, numRecords in/out, Kafka lag. Target ~700ms/s busy = 70% utilization" },
+        { "id": "c", "text": "Network bandwidth" },
+        { "id": "d", "text": "JM heap usage" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Autoscaler watches per-vertex (per-operator) metrics через JM REST API: busyTimeMsPerSecond (главный сигнал — fraction time operator processing, не idle/backpressure), backPressuredTimeMsPerSecond (downstream slow), idleTimeMsPerSecond (upstream slow), throughput rates, Kafka consumer lag. Target utilization обычно 0.7 (70% busy). Если busy + backpressure > scale-up threshold → compute target parallelism = current × (busy / target_util). Per-vertex decisions — разные operators могут иметь разный parallelism.",
+      "studyHint": "Повторите урок — Метрики, которые watch-ит autoscaler + Algorithm in nutshell",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-07-q3",
+      "type": "multiple-choice",
+      "question": "Job: traffic spike до 800k events/s на 30min, потом обратно 100k. Default autoscaler (window=5min, stabilization=5min, scale-down=1h). Что произойдёт?",
+      "options": [
+        { "id": "a", "text": "Instant scale up при spike, instant scale down после" },
+        { "id": "b", "text": "Reactive scale up ~25min (window collect + stabilization waits). После spike — over-provisioned ещё 1h (scale-down.interval), потом scale down" },
+        { "id": "c", "text": "Не реагирует — короткий spike" },
+        { "id": "d", "text": "Job CRASH из-за overload" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Conservative behavior. 14:00 spike начинается. 14:05 window full → metrics show high busy time → scale up. 14:10 еще scaling up. К 14:25 параллелизм 16-20. 14:30 spike закончился — но scale-down.interval=1h означает no scale down ещё час. До 15:30 over-provisioned. Это preference correctness over cost. Для agile reaction: reduce stabilization (5→2min), scale-down (1h→15min), accept thrashing risk. Для bursty (5min spikes) autoscaler не подходит — use static provisioning.",
+      "studyHint": "Повторите урок — Stabilization windows: anti-flapping + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-07-q4",
+      "type": "true-false",
+      "question": "Если в config не указано `jobmanager.scheduler: adaptive`, автоскейлер (FLIP-271) silently не работает — Default Scheduler не поддерживает in-place rescale.",
+      "correctAnswer": true,
+      "explanation": "True. FLIP-271 Autoscaler требует Adaptive Scheduler как фундамент. Без adaptive scheduler-а autoscaler не может trigger in-place rescale — Default Scheduler не имеет mechanism для elastic parallelism change. Autoscaler может ещё попытаться через savepoint-restart (если operator настроен), но это очень медленно и не intended use. Common production gotcha — autoscaler enabled, но scheduler default → выглядит работающим (operator logs показывают evaluations), а реально no scaling actions. Always set `jobmanager.scheduler: adaptive`.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

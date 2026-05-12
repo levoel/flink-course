@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/06-managed-memory-integration",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-06",
+    "description": "Quiz for managed memory integration lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-06-q1",
+      "type": "multiple-choice",
+      "question": "Что такое WriteBufferManager (WBM) и зачем нужен?",
+      "options": [
+        { "id": "a", "text": "RocksDB compaction thread" },
+        { "id": "b", "text": "Shared MemTable budget across Column Families. Без WBM каждая CF имеет own fixed MemTable budget → 10 CF × 4 slots × 128MB = 5GB native memory → OOM. С WBM global budget enforced, triggers flush largest MemTable when threshold reached" },
+        { "id": "c", "text": "Network buffer manager" },
+        { "id": "d", "text": "Это deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "WriteBufferManager — RocksDB feature для memory budget enforcement across multiple CFs. Без WBM каждая CF allocates own MemTable without coordination. С WBM: global budget tracked, при threshold (e.g., 1.6GB) — RocksDB triggers flush of largest MemTable (any CF, any slot in instance). Result: total MemTable usage bounded. В Flink WBM injected by DefaultConfigurableOptionsFactory когда memory.managed: true. Config: state.backend.rocksdb.memory.write-buffer-ratio: 0.5 (50% managed memory dedicated к WBM, остальное Block Cache).",
+      "studyHint": "Повторите урок — WriteBufferManager section",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m04-06-q2",
+      "type": "multiple-choice",
+      "question": "TaskManager memory split (8GB process, managed.fraction=0.4). Сколько memory доступно для Block Cache по default?",
+      "options": [
+        { "id": "a", "text": "8GB" },
+        { "id": "b", "text": "Approx 1.6GB total. Calc: 8GB process - Framework (256MB) - Task heap (~3GB) - Metaspace (256MB) - JVM overhead (800MB) ≈ 3GB Flink Memory. Managed = 40% × 3GB = 1.2GB. write-buffer-ratio=0.5 → WBM=600MB, BC=600MB" },
+        { "id": "c", "text": "32GB" },
+        { "id": "d", "text": "Unlimited" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Memory math: process.size=8GB разбивается: framework heap+offheap ~256MB, task heap (default ~25% of Flink memory) ~750MB, managed.fraction=0.4 × Flink memory, metaspace 256MB, jvm overhead 10% × process = 800MB. Flink memory ≈ 6GB total (after framework, metaspace, overhead). Managed = 0.4 × 6GB = 2.4GB. Из этих 2.4GB: write-buffer-ratio=0.5 → WBM 1.2GB, Block Cache 1.2GB. Примерные numbers зависят от version и precise settings. Monitor через flink_taskmanager_Status_JVM_Memory_Direct_MemoryUsed и rocksdb metrics — должны быть within budget.",
+      "studyHint": "Повторите урок — TaskManager memory model",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-06-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: Status.JVM.Memory.Direct.MemoryUsed растёт линейно от 0 до 4.5GB, потом K8s OOMKill. size-all-mem-tables показывает 3.8GB. Что это?",
+      "options": [
+        { "id": "a", "text": "Normal behavior" },
+        { "id": "b", "text": "WriteBufferManager не enforcing budget. Total MemTable should be ~1.6GB (50% managed × write-buffer-ratio), actual 3.8GB — 2.4x превышение. Likely cause: custom RocksDBOptionsFactory без super.createDBOptions() — WBM injection lost → каждая CF allocates own MemTable" },
+        { "id": "c", "text": "Java heap leak" },
+        { "id": "d", "text": "Network buffer overflow" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic signs: direct memory grows linearly (not plateau), size-all-mem-tables exceeds budget (3.8GB vs expected 1.6GB) → 2.4x превышение. WBM не работает. Diagnosis: (1) Check для custom RocksDBOptionsFactory — если present, verify class extends DefaultConfigurableOptionsFactory и calls super.createDBOptions() FIRST; (2) Check state.backend.rocksdb.memory.managed (default true, но some legacy configs disable); (3) Verify managed.fraction makes sense (0.4-0.5 typical). Fix: remove custom factory или extend Default properly. After fix: direct_memory_used plateau ~ managed budget, size-all-mem-tables < write-buffer-ratio × managed. Prevention: CI check для RocksDBOptionsFactory subclass — auto-fail if not extends DefaultConfigurableOptionsFactory.",
+      "studyHint": "Повторите урок — Production gotchas",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-06-q4",
+      "type": "true-false",
+      "question": "Когда state.backend.rocksdb.memory.managed: true, Block Cache shared между slots (а не per-slot fixed).",
+      "correctAnswer": true,
+      "explanation": "True. С managed: true (default since Flink 1.10), Block Cache и WriteBufferManager — shared resources from managed memory pool. All slots within TaskManager share single Block Cache budget. Pros: efficient utilization — idle slots не tying memory, hot slots can use more. Cons: no isolation — one heavy state slot can crowd out others. С memory.fixed-per-slot вместо — each slot has own budget, predictable но less efficient. Slot sharing groups позволяют separate operators в different slots для физической isolation если нужно. Default behavior правильный для most workloads.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

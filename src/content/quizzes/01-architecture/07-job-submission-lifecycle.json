@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/07-job-submission-lifecycle",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-07",
+    "description": "Use IDs: flink-m01-07-q1, flink-m01-07-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-07-q1",
+      "type": "multiple-choice",
+      "question": "Какая правильная последовательность шагов job submission в Flink Application mode на K8s?",
+      "options": [
+        { "id": "a", "text": "Client → TM → JM → RM → Running" },
+        { "id": "b", "text": "Client uploads JAR → Dispatcher persists JobGraph → JobMaster created → main() executed inside JM → ExecutionGraph init → ResourceManager allocates slots (может pod create) → JobMaster deploys TDD per subtask → TM restores state + sets up channels → RUNNING" },
+        { "id": "c", "text": "Шагов нет, всё одновременно" },
+        { "id": "d", "text": "JM → Client → TM → Dispatcher → Running" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Полный lifecycle (см. урок 07): (1) Client uploads JAR; (2) Dispatcher receives, validates, persists JobGraph в HA storage; (3) JobMaster spins up — main() runs inside JM в application mode, compile в JobGraph; (4) ExecutionGraph initialization; (5) Scheduler asks ResourceManager for slots — на K8s может потребовать pod creation; (6) JobMaster шлёт TaskDeploymentDescriptor (TDD) каждому TM через RPC; (7) TM creates Task, loads user code, state restore (если есть checkpoint), opens input/output channels; (8) RUNNING — mailbox начинает processing.",
+      "studyHint": "Повторите урок 07 — диаграмма 'Lifecycle от submit до running'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-07-q2",
+      "type": "multiple-choice",
+      "question": "Production job в application mode на K8s с 200 GB state. Recovery занимает 8 минут — нарушает SLA. Что в order приоритета поможет?",
+      "options": [
+        { "id": "a", "text": "Просто увеличить количество TM-ов" },
+        { "id": "b", "text": "(1) Local recovery (state.backend.local-recovery + persistent volume) — read state из local disk при same TM, ~30s vs 8 min; (2) Generic Log-Based Incremental Checkpoints (state.backend.changelog.enabled) — recovery replay-ит small changelog, 2-3 min; (3) ForSt + disaggregated state — primary на S3, recovery metadata-only ~30s; (4) Pre-warm TM pods" },
+        { "id": "c", "text": "Поменять Flink на Spark" },
+        { "id": "d", "text": "Disable checkpoints" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Главный bottleneck — state restore (download 200 GB из S3). Просто scale up TM-ов не поможет линейно: per-task download остаётся ограничен S3 throughput per TM. Реальные optimizations (приоритет): (1) Local recovery — для same-TM restart ~30 сек, но не помогает при node failure; (2) GIC — async upload changelog, recovery replay малого log-а; (3) ForSt — disaggregated state на S3 убирает download полностью, recovery metadata-only; (4) Pre-warm TM pods — экономит 30-90 сек pod startup. Также RocksDB compaction tuning чтобы реже падать.",
+      "studyHint": "Повторите урок 07 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m01-07-q3",
+      "type": "multiple-choice",
+      "question": "Что содержит TaskDeploymentDescriptor (TDD), который JobMaster шлёт TaskManager-у?",
+      "options": [
+        { "id": "a", "text": "Только jar файл" },
+        { "id": "b", "text": "Только metadata, никаких данных" },
+        { "id": "c", "text": "jobId, executionAttemptId, vertexId, serialized invokable (StreamTask class), consumed/produced partitions (channel descriptors), serialized operator factory + chain, state handle (если restore from checkpoint), slot resource profile" },
+        { "id": "d", "text": "Только список subtasks" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "TDD — самодостаточный descriptor для запуска одного subtask. Содержит: identifiers (jobId, executionAttemptId, vertexId для tracking), serialized StreamTask wrapper над user operator, partition descriptors для setup input/output channels (где найти upstream/downstream), сериализованный operator chain (chained operators в одном TDD), state handle с pointer на checkpoint данные (для state restore), slot resource profile. Отправляется через RPC TaskExecutorGateway.submitTask. После этого TM имеет всё, чтобы запустить Task.",
+      "studyHint": "Повторите урок 07 — раздел 'Шаг 5: Task deployment'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-07-q4",
+      "type": "true-false",
+      "question": "В application mode на K8s типичный cold start занимает 70-300+ секунд: pod creation (image pull, JVM startup) ~30-90s + slot allocation ~30-90s + state restore (variable, может быть minutes для TB-state).",
+      "correctAnswer": true,
+      "explanation": "Точный breakdown тайминга (без optimizations): pod creation 30-90s (image pull, JVM startup), JobMaster init 2-10s, slot allocation 30-90s (если новые TM pods нужны), task deployment 2-5s, state restore variable. Total cold 70+ секунд even для simple jobs. Warm setup (pre-warm TM pods): 20-60s. Сравнить: Session mode warm 5-15s, потому что cluster уже running. Для critical SLA pre-warm + local recovery + GIC сильно ускоряют.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/03-taskmanager-slots",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-03",
+    "description": "Use IDs: flink-m01-03-q1, flink-m01-03-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-03-q1",
+      "type": "multiple-choice",
+      "question": "Что такое task slot в Flink, и что между slot-ами изолируется?",
+      "options": [
+        { "id": "a", "text": "Slot = CPU core с hard CPU isolation" },
+        { "id": "b", "text": "Slot — единица планирования. Каждый subtask занимает один slot. Изолируется hard: managed memory (RocksDB), network buffers. Не изолируется: CPU (soft, OS scheduler), task heap (общий JVM heap), JVM metaspace" },
+        { "id": "c", "text": "Slot — отдельный JVM-процесс" },
+        { "id": "d", "text": "Slot = thread pool с N workers" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Slot — abstract scheduling unit, не CPU core и не процесс. Hard изоляция: managed memory (RocksDB block cache distributed через MemoryManager + WriteBufferManager) и network buffers (через NetworkBufferPool). Soft isolation (= no isolation): CPU делится OS-планировщиком, JVM heap общий (OOM в одном slot валит весь TM), metaspace shared. Это значит slot изолирует state, не CPU — для hard CPU isolation нужны отдельные TM-pods (один slot per pod).",
+      "studyHint": "Повторите урок 03 — раздел 'Что shared между slots, что — нет'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-03-q2",
+      "type": "multiple-choice",
+      "question": "TaskManager 4 GB process.size. Сколько примерно памяти доступно user code (task heap)?",
+      "options": [
+        { "id": "a", "text": "4 GB полностью" },
+        { "id": "b", "text": "~1.1 GB. Из 4 GB вычитаются: framework heap (128 MB), framework off-heap (128 MB), metaspace (256 MB), JVM overhead (~400 MB), network (~400 MB), managed (1.6 GB при fraction=0.4). Остаток = task heap" },
+        { "id": "c", "text": "Ровно половина" },
+        { "id": "d", "text": "~3.5 GB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-49 memory model делит process.size на 7 областей: Framework Heap (128M default), Framework Off-Heap (128M), Task Off-Heap (0 default), Managed (fraction 0.4 = 1.6 GB), Network (fraction 0.1 = 410 MB), Metaspace (256M), JVM Overhead (fraction 0.1, clamped). Task Heap = process - все остальные. Для 4 GB process с defaults остаётся ~1.1 GB. Если хочется больше task heap — уменьшайте managed fraction (но это RocksDB cache!) или увеличивайте process.size.",
+      "studyHint": "Повторите урок 03 — раздел 'Пример распределения 4 ГБ'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m01-03-q3",
+      "type": "multiple-choice",
+      "question": "Что такое mailbox processor в Flink subtask, и почему блокирующий sync DB call в processElement — катастрофа?",
+      "options": [
+        { "id": "a", "text": "Это thread pool, blocking call просто использует другой thread" },
+        { "id": "b", "text": "Mailbox — single-threaded event loop в каждом subtask. Один thread processит data, timers, control mail (checkpoints). Sync DB call блокирует весь mailbox: checkpoints не успевают, watermarks не propagate, timers не fire. Решение — Async I/O" },
+        { "id": "c", "text": "Mailbox только для checkpoints" },
+        { "id": "d", "text": "Это network buffer" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Каждый subtask имеет ровно один mailbox thread с event loop: либо processElement, либо onTimer, либо processMail (checkpoint barriers, control messages). Это устраняет race conditions внутри subtask — state без локов. НО синхронная блокирующая операция (DB call, slow disk) останавливает весь mailbox. Последствия: checkpoint barriers застревают → checkpoint timeout, watermarks stuck → windows не fire, latency spikes. Для external lookups обязателен Async I/O (модуль 02 урок 06) — non-blocking через AsyncFunction + callbacks.",
+      "studyHint": "Повторите урок 03 — раздел 'Mailbox processor — модель потоков'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-03-q4",
+      "type": "true-false",
+      "question": "Установить numberOfTaskSlots=8 на TaskManager-е с 4 GB process.size — плохая идея для большинства production workloads, потому что каждому slot достаётся <150 MB heap, что нереалистично.",
+      "correctAnswer": true,
+      "explanation": "Из 4 GB process только ~1.1 GB task heap (FLIP-49 распределение). Делим на 8 slots = ~140 MB per slot. Это меньше, чем требуется для большинства Flink workloads — даже простые transformations с buffer-ами легко OOM. Для many slots увеличивайте process.size proportionally. Грубая эвристика: 0.5-2 GB heap per slot. Для state-heavy — 8-16 GB process / 1-2 slots. Для stateless — 2-4 GB / 4-8 slots.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

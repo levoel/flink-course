@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/05-max-parallelism-change",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-05",
+    "description": "Quiz for maxParallelism immutable trap lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-05-q1",
+      "type": "multiple-choice",
+      "question": "Почему maxParallelism IMMUTABLE после старта job?",
+      "options": [
+        { "id": "a", "text": "Это политическое решение разработчиков Flink" },
+        { "id": "b", "text": "maxParallelism определяет number of key groups. keyGroupId = murmurHash(key) % maxParallelism. Изменение maxParallelism = вся hash distribution invalid — каждый key назначается другому key group → state distribution destroyed → state lost" },
+        { "id": "c", "text": "RocksDB ограничение" },
+        { "id": "d", "text": "Network protocol restriction" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Математика state distribution. maxParallelism = number of key groups (atomic units state distribution). keyGroupId computed via murmurHash(key) % maxParallelism. Each subtask owns range of contiguous key groups (e.g., parallelism=8, maxParallelism=128 → subtask 0 owns KGs 0-15). Change maxParallelism = all hash assignments invalid = state distribution destroyed = state lost. Not bug, fundamental math. Не fixable by Flink without rebuilding state distribution offline (State Processor API rebootstrap).",
+      "studyHint": "Повторите урок — Что такое maxParallelism + Почему immutable",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m14-05-q2",
+      "type": "multiple-choice",
+      "question": "Production job 1.5TB state, parallelism=32, maxParallelism=128 (default). Autoscaler хочет 256 parallelism. Что делать?",
+      "options": [
+        { "id": "a", "text": "Просто рестартовать с parallelism=256" },
+        { "id": "b", "text": "Restore с parallelism > maxParallelism FAILS. Единственное решение: State Processor API offline rebootstrap. Stop с canonical savepoint, write batch job reading old state и writing new savepoint с maxParallelism=2048 (headroom). 1.5TB = 3-4 часа downtime. Restart streaming с new savepoint" },
+        { "id": "c", "text": "Использовать --allowNonRestoredState" },
+        { "id": "d", "text": "Изменить config во flink-conf.yaml и рестартовать" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production trap. Restore fails 'Cannot restore: max parallelism = 128, requested = 256'. Solution: rebootstrap state. Workflow: (1) canonical savepoint; (2) State Processor batch job — read old state with old maxParallelism=128, BootstrapTransformation для new key group distribution, SavepointWriter.newSavepoint(env, backend, 2048) с new maxParallelism; (3) 1.5TB ~ 3-4 hours batch processing на distributed cluster (16+ parallelism, big disks); (4) Validate new savepoint; (5) Restart streaming с new savepoint, unblocked scale до 256. Lesson: ALWAYS setMaxParallelism(1024+) при first deploy — free insurance.",
+      "studyHint": "Повторите урок — Production trap + Rebootstrap workflow + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-05-q3",
+      "type": "multiple-choice",
+      "question": "Правильный maxParallelism для нового production job в 2026?",
+      "options": [
+        { "id": "a", "text": "Не set — Flink сам разберётся" },
+        { "id": "b", "text": "1024 минимум (sweet spot — ~1% overhead, 8x headroom если planned parallelism ~100). Rounded к power-of-2. Higher (2048, 4096) если truly massive scale planned. 32768 — maximum allowed" },
+        { "id": "c", "text": "128 — default ОК" },
+        { "id": "d", "text": "32768 — максимально возможный" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "1024 — sweet spot для most production. Math: planned parallelism × 4-8x headroom. Plan 100 eventually → 512-1024 minimum. 1024 → ~1% overhead, незаметно. 2048-4096 OK для truly massive scale. 32768 — noticeable overhead, only для 10000+ subtasks. 128 default — landmine, plus easy to leave at default and forget. Set explicitly via setMaxParallelism(1024) or pipeline.max-parallelism: 1024 config. Per-operator may differ — source bounded by Kafka partitions, heavy state operator high maxParallelism.",
+      "studyHint": "Повторите урок — Set maxParallelism upfront + Math: правильный maxParallelism",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-05-q4",
+      "type": "true-false",
+      "question": "`pipeline.max-parallelism` (= maxParallelism, immutable) и `jobmanager.adaptive-scheduler.max-parallelism` (scheduler upper bound, mutable) — это две РАЗНЫЕ настройки, легко путать.",
+      "correctAnswer": true,
+      "explanation": "True. Two separate concepts often confused. `pipeline.max-parallelism` (или setMaxParallelism()) — number of key groups, IMMUTABLE after job start, default 128. `jobmanager.adaptive-scheduler.max-parallelism` — scheduler upper bound на parallelism, CAN change в config, ограничивает autoscaler. Scheduler max ≤ pipeline max (key groups limit). Can have scheduler max=200 + pipeline max=1024 — allows scaling up to 200 currently, but key groups support up to 1024 future. Common gotcha: bumping scheduler max-parallelism в надежде на больше parallelism, но pipeline max-parallelism стопит — реальный hard limit.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

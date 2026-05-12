@@ -1,0 +1,387 @@
+---
+title: "MATCH_RECOGNIZE в SQL: SQL:2016 standard для pattern matching"
+description: "Глубокий разбор MATCH_RECOGNIZE SQL:2016: PATTERN, MEASURES, DEFINE, AFTER MATCH SKIP variants (TO NEXT ROW, PAST LAST ROW, TO FIRST/LAST). Real examples: stock V-shape, fraud login sequence"
+order: 4
+difficulty: "advanced"
+estimatedTime: 36
+topics: ["MATCH_RECOGNIZE", "SQL:2016", "PATTERN", "MEASURES", "DEFINE", "AFTER MATCH SKIP", "Pattern Variables"]
+---
+
+# MATCH_RECOGNIZE — SQL standard для CEP
+
+`MATCH_RECOGNIZE` — это SQL:2016 standard для declarative pattern matching над таблицами/streams. Flink Table API/SQL поддерживает его поверх той же NFA engine, что и DataStream Pattern API. Это самый powerful (и сложный) SQL construct в Flink.
+
+В отличие от Pattern API (Java DSL), `MATCH_RECOGNIZE` — fully SQL: можно встраивать в существующие SQL pipelines, joining с lookup tables, экспортировать в metastore. Это **the way** делать CEP в Flink SQL — нет conventional `CEP.pattern()` в SQL.
+
+---
+
+## Анатомия MATCH_RECOGNIZE
+
+Минимальный пример:
+
+```sql
+SELECT *
+FROM Ticker
+MATCH_RECOGNIZE (
+    PARTITION BY symbol           -- equivalent keyBy
+    ORDER BY rowtime              -- сортировка events (must be event-time attribute)
+    MEASURES                      -- что emit в результате
+        A.price AS start_price,
+        LAST(B.price) AS end_price,
+        MATCH_NUMBER() AS match_num
+    ONE ROW PER MATCH             -- одна row per match (alternative: ALL ROWS PER MATCH)
+    AFTER MATCH SKIP PAST LAST ROW -- куда переходить после match
+    PATTERN (A B+ C)              -- regex-like pattern over variables
+    DEFINE                        -- условия для variables
+        B AS B.price < PREV(B.price),
+        C AS C.price > LAST(B.price)
+);
+```
+
+Семь основных clauses:
+
+1. **`PARTITION BY`** — partitioning, equivalent `keyBy(symbol)`.
+2. **`ORDER BY`** — order of events. **Должен быть event-time attribute** (rowtime) для streaming — нельзя ORDER BY произвольное поле.
+3. **`MEASURES`** — выражения для output. Aggregates (`FIRST`, `LAST`, `SUM`, `COUNT`) применяются к pattern variables.
+4. **`ONE ROW PER MATCH`** vs **`ALL ROWS PER MATCH`** — output cardinality.
+5. **`AFTER MATCH SKIP`** — стратегия consume-а events после match (4 варианта, ниже).
+6. **`PATTERN`** — regex-like syntax над pattern variables.
+7. **`DEFINE`** — predicates per pattern variable.
+
+---
+
+## Pattern variables и PATTERN clause
+
+В PATTERN clause строится regex-like expression над **pattern variables**:
+
+```sql
+PATTERN (A B+ C D?)
+```
+
+- `A`, `B`, `C`, `D` — pattern variables (имена)
+- `B+` — `B` встречается 1+ раз (как `oneOrMore`)
+- `D?` — `D` встречается 0 или 1 раз (как `optional`)
+- `B*` — 0+ раз
+- `B{3}` — ровно 3 раза
+- `B{3,5}` — от 3 до 5 раз
+- `B{3,}` — 3+ раз
+
+Concatenation — strict (как `next` в Pattern API). Реализуется через NFA — те же mechanics.
+
+Reluctant qualifier с `?`:
+
+```sql
+PATTERN (A B+? C)    -- B+ reluctant: matches минимальное количество B
+```
+
+Alternation:
+
+```sql
+PATTERN ((A B) | (C D))
+```
+
+Group и precedence через скобки.
+
+---
+
+## DEFINE: predicates per variable
+
+```sql
+DEFINE
+    A AS A.price > 100,
+    B AS B.price < PREV(B.price),
+    C AS C.price > LAST(B.price) * 1.05
+```
+
+В DEFINE можно ссылаться на:
+
+- **`<var>.col`** — column текущего matched row для variable.
+- **`PREV(<var>.col, N)`** — N-th previous row in pattern (default N=1). Это **physical previous** — предыдущий row в ORDER BY, не logical pattern position.
+- **`NEXT(<var>.col, N)`** — следующий row in pattern. Доступен только в `RUNNING` mode within `MATCH_RECOGNIZE`.
+- **`FIRST(<var>.col)`**, **`LAST(<var>.col)`** — первый/последний matched row для variable.
+
+Variables, которые не имеют DEFINE entry, дефолтятся к `TRUE` — match any row.
+
+<Callout type="note">
+**`PREV` vs `LAST`**: `PREV(B.price)` — physical предыдущий row in ORDER BY. `LAST(B.price)` — последний matched row для B variable (может быть много назад, если другие variables matched между). Это разные семантики — частый источник bugs.
+</Callout>
+
+---
+
+## MEASURES: aggregates и output expressions
+
+```sql
+MEASURES
+    A.price AS start_price,           -- column из first row of A
+    LAST(B.price) AS bottom_price,    -- last B row
+    FIRST(C.price) AS first_C_price,
+    SUM(B.price) AS total_B_sum,
+    COUNT(B.*) AS B_count,
+    MATCH_NUMBER() AS match_num,      -- sequential number of match per partition
+    CLASSIFIER() AS var               -- name of variable that matched this row (только в ALL ROWS PER MATCH)
+```
+
+Aggregates:
+- `FIRST(<var>.col)`, `LAST(<var>.col)`
+- `SUM`, `MIN`, `MAX`, `AVG`, `COUNT` — applied across matched rows of a variable
+- `MATCH_NUMBER()` — index of current match within partition
+
+Special: `RUNNING` vs `FINAL` mode для aggregates:
+
+```sql
+MEASURES
+    RUNNING SUM(B.price) AS running_sum,    -- incremental, обновляется на каждом B
+    FINAL SUM(B.price) AS final_sum         -- финальный, после завершения match
+```
+
+В `ONE ROW PER MATCH` mode default — `FINAL`. В `ALL ROWS PER MATCH` mode default — `RUNNING`.
+
+---
+
+## ONE ROW vs ALL ROWS PER MATCH
+
+`ONE ROW PER MATCH` (default) — одна row per match, с values из MEASURES:
+
+```
+Input:   t1: 100, t2: 95, t3: 90, t4: 92, t5: 105
+Pattern: A B+ C (где B = price < PREV, C = price > LAST(B))
+Match:   {A: t1, B: [t2, t3], C: t4}, потом {A: t4, ...}
+
+Output (ONE ROW):
+  symbol, t1.price=100, last_B_price=90, c.price=92
+```
+
+`ALL ROWS PER MATCH` — output каждой row, с MEASURES и `CLASSIFIER()` showing какая variable матчила row:
+
+```
+Output (ALL ROWS):
+  t1, A, 100, ...
+  t2, B, 95, ...
+  t3, B, 90, ...
+  t4, C, 92, ...
+```
+
+ALL ROWS полезен для debugging, не очень для production analytics (heavy output).
+
+---
+
+## AFTER MATCH SKIP — 4 варианта
+
+Самая subtle часть `MATCH_RECOGNIZE`. После match-а где начинать looking for next match? 4 опции:
+
+<DiagramContainer title="AFTER MATCH SKIP variants на одной последовательности" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Input events"
+        tooltip="Будем матчить pattern (A B+ C) где B = price down, C = price up. Sequence генерирует множество overlapping potential matches — AFTER MATCH SKIP определяет какие emit."
+      >
+        100, 95, 90, 92, 88, 90
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="match 1 found: A=100, B=[95,90], C=92" />
+    <FlowRow>
+      <DataBox
+        label="SKIP PAST LAST ROW"
+        tooltip="Default & most common. Skip past the LAST row of last match. Дальше matching стартует со следующего event после last matched row (after 92). Не может быть overlapping matches. Used для disjoint, non-overlapping pattern detection."
+      >
+        Continue at 88 → match 2: A=88, B=[], C=90
+      </DataBox>
+      <DataBox
+        label="SKIP TO NEXT ROW"
+        tooltip="Skip только past FIRST row of last match. Может attempt match starting с next row after A. Most permissive — самые overlapping matches. Risk infinite loop если pattern admits empty match (NFA должна check)."
+      >
+        Continue at 95 → дополнительные overlapping matches
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="специализированные" />
+    <FlowRow>
+      <DataBox
+        label="SKIP TO FIRST var"
+        tooltip="Skip к first row of specified variable. Например 'SKIP TO FIRST B' — после match continue at first B row (95). Полезно для chaining patterns где new match overlaps previous in known way."
+      >
+        Continue at 95 (first B)
+      </DataBox>
+      <DataBox
+        label="SKIP TO LAST var"
+        tooltip="Skip к last row of specified variable. 'SKIP TO LAST B' — continue at last B (90). Variant для overlapping patterns с control."
+      >
+        Continue at 90 (last B)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### SKIP PAST LAST ROW (default & safe)
+
+```sql
+AFTER MATCH SKIP PAST LAST ROW
+```
+
+Non-overlapping matches. Continue после last row of match. Это **production default** для большинства case-ов: fraud detection хочет один alert per pattern instance, не cartesian product.
+
+### SKIP TO NEXT ROW
+
+```sql
+AFTER MATCH SKIP TO NEXT ROW
+```
+
+Очень permissive — каждый row может start new match. Используется когда нужны overlapping matches («каждая суб-последовательность которая matches»).
+
+**Danger:** если pattern admits empty match (например `A?` — pattern может match zero rows), NFA может entered infinite loop. Flink validates это и throws error.
+
+### SKIP TO FIRST/LAST variable
+
+```sql
+AFTER MATCH SKIP TO FIRST B
+AFTER MATCH SKIP TO LAST B
+```
+
+Continue at first/last row of specified variable. Используется для controlled overlapping — например когда хотите chain matches «each downtrend share the bottom row with previous downtrend's bottom».
+
+---
+
+## Real example 1: stock V-shape
+
+«Найти V-shapes: downtrend followed by uptrend, with bottom price detection»:
+
+```sql
+SELECT *
+FROM Ticker
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY rowtime
+    MEASURES
+        FIRST(DOWN.price) AS start_price,
+        LAST(DOWN.price)  AS bottom_price,
+        LAST(UP.price)    AS end_price,
+        FIRST(DOWN.rowtime) AS start_time,
+        LAST(UP.rowtime)    AS end_time,
+        (LAST(UP.price) - LAST(DOWN.price)) AS recovery_amount
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (START DOWN+ UP+)
+    DEFINE
+        DOWN AS DOWN.price < PREV(price),
+        UP   AS UP.price > PREV(price)
+);
+```
+
+Что описано:
+- `START` — first event, no DEFINE → matches any row (entrance в pattern)
+- `DOWN+` — 1+ consecutive downtrend rows (price decreasing relative to previous physical row)
+- `UP+` — 1+ consecutive uptrend rows
+- `MEASURES` — start price, bottom, end, times, recovery amount
+
+`PREV(price)` без variable references physical previous row in ORDER BY. Это даёт «relative to immediately preceding row» semantics — точно то, что нужно для trend detection.
+
+---
+
+## Real example 2: fraud login sequence
+
+«3 LOGIN_FAIL events followed by LOGIN_SUCCESS within 1 минуту»:
+
+```sql
+SELECT user_id, fail_count, fail_start_time, success_time
+FROM LoginEvents
+MATCH_RECOGNIZE (
+    PARTITION BY user_id
+    ORDER BY rowtime
+    MEASURES
+        COUNT(F.*)            AS fail_count,
+        FIRST(F.rowtime)      AS fail_start_time,
+        S.rowtime             AS success_time
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (F{3,} S) WITHIN INTERVAL '1' MINUTE
+    DEFINE
+        F AS F.event_type = 'LOGIN_FAIL',
+        S AS S.event_type = 'LOGIN_SUCCESS'
+);
+```
+
+Ключевые моменты:
+
+- `F{3,}` — 3 or more fails (как `timesOrMore(3)` в Pattern API)
+- `WITHIN INTERVAL '1' MINUTE` — bound от first до last event match. **Critical** для streaming (без него — unbounded state)
+- `PARTITION BY user_id` — per-user isolation
+- `MEASURES` извлекает useful aggregates
+
+---
+
+## Сравнительная таблица: Pattern API vs MATCH_RECOGNIZE
+
+| Feature | Pattern API (Java) | MATCH_RECOGNIZE (SQL) |
+|---|---|---|
+| API style | Builder DSL | Declarative SQL |
+| Embedding | Только Java/Scala | Любой Flink SQL pipeline |
+| Lookup joins | Manual | Native через temporal/lookup |
+| Aggregations | Manual через IterativeCondition | Native `FIRST`/`LAST`/`SUM`/`COUNT` |
+| Pattern variables | `name` в `begin`/`next` | First-class concept |
+| Quantifiers | `times(N)`, `oneOrMore()` | `{N}`, `+`, `*`, `?` |
+| Contiguity | `next`/`followedBy`/`followedByAny` | Concatenation (strict default) |
+| After match strategy | `AfterMatchSkipStrategy` API | `AFTER MATCH SKIP` clause (4 variants) |
+| Output cardinality | One per match (`.select`) | `ONE ROW` vs `ALL ROWS PER MATCH` |
+| Schema evolution | Manual | Easier через SQL DDL |
+| Engine | Same NFA | Same NFA |
+
+Bottom line: для production patterns с aggregations и joins — **MATCH_RECOGNIZE предпочтительнее**. Pattern API лучше для programmatic generation patterns (например когда patterns derive из user config) и для cases с сложными `IterativeCondition`.
+
+---
+
+## Production gotchas
+
+### 1. `ORDER BY` обязан быть event-time
+
+В streaming mode `MATCH_RECOGNIZE` требует `ORDER BY <event_time_attribute>`. Произвольный column → error. Это потому что NFA должен matched events в temporal order, а это event time, а не processing time.
+
+```sql
+-- ❌ Не работает в streaming
+ORDER BY some_column
+
+-- ✅ Event time attribute
+ORDER BY rowtime
+```
+
+### 2. `WITHIN INTERVAL` — единственный bound
+
+Для streaming `WITHIN INTERVAL` — единственный способ ограничить partial-match state. Без него — partial matches накапливаются вечно (как в Pattern API без `within`).
+
+### 3. `AFTER MATCH SKIP TO NEXT ROW` + empty match → runtime error
+
+Flink не разрешит pattern, который может match zero rows с `SKIP TO NEXT ROW` — infinite loop. Например `PATTERN (A?)` с `SKIP TO NEXT ROW` — runtime exception. Используйте `SKIP PAST LAST ROW` или fix pattern чтобы требовать non-empty match.
+
+### 4. `PREV(col)` без variable — physical previous
+
+Это часто confuse-ит. `PREV(price)` — physical предыдущий row in ORDER BY. `PREV(B.price)` (с variable) — previous row для variable B (может быть много назад). 
+
+```sql
+-- DOWN: текущая цена < предыдущая физическая цена
+DOWN AS DOWN.price < PREV(price)
+
+-- DOWN: текущая цена < последняя цена которая matched DOWN
+DOWN AS DOWN.price < PREV(DOWN.price)   -- разная семантика!
+```
+
+### 5. `MEASURES` в `ONE ROW PER MATCH` — FINAL semantics
+
+В `ONE ROW PER MATCH` default — FINAL: aggregate computed после полного match. Это hidden поведение — если вы хотите running aggregates (например для `ALL ROWS PER MATCH` outputs), нужен explicit `RUNNING`.
+
+---
+
+## Key takeaways
+
+- `MATCH_RECOGNIZE` — SQL:2016 standard, Flink реализует поверх той же NFA как Pattern API.
+- **PARTITION BY + ORDER BY (event-time) обязательны** в streaming.
+- **`PATTERN` clause** — regex-like over pattern variables, **`DEFINE`** даёт predicates.
+- **`MEASURES`** позволяет aggregates (`FIRST`/`LAST`/`SUM`) per variable.
+- **4 `AFTER MATCH SKIP` варианта**: `PAST LAST ROW` (safe default), `TO NEXT ROW` (permissive), `TO FIRST/LAST var` (controlled overlap).
+- **`WITHIN INTERVAL`** обязателен для streaming bounded state.
+- `PREV(col)` vs `PREV(var.col)` — physical vs pattern-local previous.
+
+---
+
+<KnowledgeCheck
+  question="Объясните разницу между AFTER MATCH SKIP PAST LAST ROW и AFTER MATCH SKIP TO NEXT ROW. Почему второй может вызвать runtime error?"
+  answer="SKIP PAST LAST ROW: после match continue с row immediately after LAST matched row. Disjoint, non-overlapping matches. Safe default. SKIP TO NEXT ROW: continue с row immediately after FIRST matched row — caждый row может быть start нового match → overlapping matches возможны. Runtime error возникает если pattern admits empty match (например PATTERN (A?) — A optional). Тогда continue at next row может match empty pattern бесконечно → infinite loop. Flink validates это во время compile/plan и throws error. Production-fix: использовать SKIP PAST LAST ROW или make pattern требующим non-empty match (например PATTERN (A B?) — A обязательное)."
+/>

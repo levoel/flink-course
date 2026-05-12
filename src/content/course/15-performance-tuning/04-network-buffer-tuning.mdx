@@ -1,0 +1,406 @@
+---
+title: "Network buffers и credit-based flow control tuning"
+description: "Credit-based flow control internals, buffer pool sizing, taskmanager.network.fraction, buffer debloating (1.14+) для динамического размера buffers"
+order: 4
+difficulty: "advanced"
+estimatedTime: 25
+topics: ["Network Buffers", "Credit-Based Flow Control", "Buffer Debloating", "Backpressure", "Tuning"]
+---
+
+# Network buffers и credit-based flow control
+
+Между subtasks Flink shuffle-ит данные через **network buffers** — off-heap memory ByteBuffer-ы, аллоцированные из network memory pool. На уровне network stack между upstream и downstream subtasks работает **credit-based flow control** — механизм, который не даёт upstream завалить downstream буферами и реализует backpressure без TCP-уровневых stalls.
+
+В этом уроке препарируем механику: как credits протекают через граф, как Flink аллоцирует buffer pool, и как новая фича **buffer debloating** (Flink 1.14, FLIP-183) автоматически уменьшает buffers под backpressure для ускорения checkpoint alignment.
+
+---
+
+## Credit-based flow control: основная идея
+
+В классическом TCP-based shuffle (Flink ≤ 1.4) backpressure работал через TCP window: если downstream не успевает читать, TCP receive buffer заполняется → upstream блокируется на send. Проблема: backpressure через всю TCP-цепочку, включая network stack OS, делал latency хаотичной и блокировал **все** соединения через тот же TCP channel.
+
+В 1.5+ (FLIP-37) появился **credit-based flow control** на уровне Flink:
+
+```
+Upstream хочет послать buffer → проверяет credit от downstream
+  Credit > 0 → отправить buffer, decrement credit
+  Credit == 0 → НЕ отправлять, ждать credit announce
+
+Downstream обработал buffer → освобождает место → шлёт credit announce upstream
+```
+
+Это даёт:
+- **Backpressure per channel** (не блокирует весь TCP)
+- **Predictable latency** — нет TCP stall
+- **Точная диагностика** через `backPressuredTimeMsPerSecond`
+
+<DiagramContainer title="Credit-based flow control между subtasks" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Upstream subtask"
+        tooltip="Producer. Имеет output buffer pool. Перед отправкой каждого buffer проверяет credit от downstream. Если credit=0 — блокируется (backpressured)."
+      >
+        ResultSubpartition (output)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="buffer → if credit > 0" />
+    <FlowRow>
+      <DataBox
+        label="Netty channel"
+        tooltip="Один TCP channel может мультиплексировать N логических каналов (N = upstream.parallelism × downstream.parallelism / pairs of TM). Credits работают per логический канал."
+      >
+        TCP / Netty multiplexed
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="buffer + credit announce ←" />
+    <FlowRow>
+      <DataBox
+        label="Downstream subtask"
+        tooltip="Consumer. Имеет input buffer pool, exclusive + floating buffers. После обработки buffer — credit announce upstream. Credit = num available buffers в pool."
+      >
+        InputChannel + InputGate
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Buffer pool sizing
+
+Flink аллоцирует **network memory** из Total Flink Memory (см. FLIP-49). Default: `taskmanager.memory.network.fraction: 0.1` (10%).
+
+Этот пул разделяется на buffer-ы фиксированного размера (`taskmanager.memory.segment-size`, default 32KB).
+
+```yaml
+taskmanager.memory.network.fraction: 0.1     # 10% of Flink memory
+taskmanager.memory.network.min: 256mb        # lower bound
+taskmanager.memory.network.max: 2gb          # upper bound
+taskmanager.memory.segment-size: 32kb        # size of each buffer
+```
+
+При 6.5GB Flink Memory: 650MB network → 650MB / 32KB = ~20,000 buffers.
+
+### Distribution buffer-ов
+
+Каждый InputGate/InputChannel получает:
+
+| Тип | Назначение | Конфиг |
+|---|---|---|
+| **Exclusive buffers** | Резервированы per channel | `taskmanager.network.memory.buffers-per-channel: 2` |
+| **Floating buffers** | Pool для overflow | `taskmanager.network.memory.floating-buffers-per-gate: 8` |
+
+```
+exclusive_per_channel × num_channels_in
++ floating_per_gate × 1
+= input buffers per subtask
+```
+
+Аналогично для output (ResultPartition):
+
+```yaml
+taskmanager.network.memory.max-buffers-per-channel: 10
+```
+
+---
+
+## Math: buffer requirement расчёт
+
+Имеем job:
+- Parallelism = 100
+- Один shuffle stage (`keyBy`) — fan-out 100:100
+- Buffers per channel = 2 (exclusive)
+- Floating per gate = 8
+
+**Output side per subtask**:
+- 100 outgoing channels × 1 buffer-per-channel = 100 buffers
+- Plus output write buffer (~1-2)
+- ≈ 102 buffers per subtask
+
+**Input side per subtask**:
+- 100 incoming channels × 2 exclusive = 200 buffers
+- Plus 8 floating per gate
+- ≈ 208 buffers per subtask
+
+**Total per subtask**: ~310 buffers × 32KB = ~10MB
+
+**Total per TaskManager** (4 slots × 310 = 1240 buffers × 32KB) = ~40MB
+
+С 650MB network memory budget остаётся margin. Но если parallelism вырастает до 1000:
+
+```
+input buffers per subtask: 1000 × 2 + 8 = 2008
+output buffers per subtask: 1000 × 1 = 1000
+total: 3008 buffers × 32KB = 96MB per subtask
+× 4 slots = 384MB per TaskManager
+```
+
+С 650MB margin меньше, может потребоваться increase `network.fraction`.
+
+---
+
+## Symptom: «Insufficient network buffers» exception
+
+```
+java.io.IOException: Insufficient number of network buffers: required 250,
+  but only 100 available. The total number of network buffers is currently
+  set to 8000.
+```
+
+Причина: TaskManager не может аллоцировать buffers для всех каналов. Это **start-up** проблема, проявляется на первой инициализации task.
+
+**Решение**:
+
+1. Увеличить `taskmanager.memory.network.fraction`:
+   ```yaml
+   taskmanager.memory.network.fraction: 0.15  # 15%
+   taskmanager.memory.network.max: 4gb
+   ```
+
+2. Или уменьшить `buffers-per-channel`:
+   ```yaml
+   taskmanager.network.memory.buffers-per-channel: 1   # вместо 2
+   ```
+
+3. Или уменьшить parallelism / fan-out:
+   - Скаттер с rebalance на меньший parallelism сжимает fan-out.
+
+---
+
+## FLIP-183: Buffer debloating (1.14+)
+
+Старая модель: buffer-ы фиксированного размера 32KB. Проблема — на slow downstream путь записи через сотни 32KB буферов создаёт большой in-flight delay. При backpressure inflight data может быть 100MB+ — это убивает latency и blocking-checkpoint alignment.
+
+**Buffer debloating** (FLIP-183) — dynamic buffer sizing based on processing throughput. Цель: держать in-flight data ≤ 1 second of processing.
+
+```yaml
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 1s    # цель: 1 секунда in-flight
+taskmanager.network.memory.buffer-debloat.period: 200ms # частота re-evaluation
+taskmanager.network.memory.buffer-debloat.samples: 20   # усреднение по 20 samples
+taskmanager.network.memory.buffer-debloat.threshold-percentages: 25
+```
+
+Как работает:
+
+```
+Каждые 200ms:
+  measure downstream throughput (records / sec)
+  measure record size avg
+  → calculate optimal buffer size = target_time × throughput / utilization
+  → adjust buffer-per-channel и/или buffer size
+  → if change > threshold_percentages → apply new sizing
+```
+
+При **низкой** throughput — buffers shrink (быстрее flush, меньше in-flight).
+При **высокой** throughput — buffers grow до max.
+
+**Эффект**: при backpressure in-flight data резко падает, **checkpoint alignment ускоряется** в 2-5x на slow downstream.
+
+---
+
+## Когда включать buffer-debloating
+
+| Workload | Включать? | Почему |
+|---|---|---|
+| Aligned checkpoints + variable throughput | **Да** | Уменьшает alignment time |
+| EXACTLY_ONCE с slow sinks | **Да** | Меньше in-flight, быстрее barriers |
+| Стабильный throughput, low backpressure | Не критично | Минимальная польза |
+| Unaligned checkpoints включены | Меньше пользы | Unaligned уже решает alignment |
+
+Default в Flink 2.x — **disabled** (хотя в 1.14+ доступно). Production recommendation: **включить** для большинства streaming pipelines.
+
+---
+
+## Конфигурация ключевых параметров
+
+```yaml
+# Network memory budget:
+taskmanager.memory.network.fraction: 0.1
+taskmanager.memory.network.min: 256mb
+taskmanager.memory.network.max: 2gb
+
+# Buffer size:
+taskmanager.memory.segment-size: 32kb
+
+# Per-channel allocation:
+taskmanager.network.memory.buffers-per-channel: 2
+taskmanager.network.memory.floating-buffers-per-gate: 8
+taskmanager.network.memory.max-buffers-per-channel: 10
+
+# Buffer debloating (1.14+):
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 1s
+taskmanager.network.memory.buffer-debloat.period: 200ms
+
+# Netty:
+taskmanager.network.netty.num-arenas: 4
+taskmanager.network.netty.server.numThreads: -1   # -1 = auto
+taskmanager.network.netty.client.numThreads: -1
+```
+
+---
+
+## Buffer timeout и latency trade-off
+
+`StreamExecutionEnvironment.setBufferTimeout(ms)` — насколько долго buffer-у позволено собирать данные перед отправкой:
+
+```java
+env.setBufferTimeout(100);    // max 100ms latency, default
+env.setBufferTimeout(0);      // immediate flush, наибольшая latency reduction
+env.setBufferTimeout(-1);     // infinite, full throughput, max batching
+```
+
+Trade-off:
+- **0 ms**: каждая запись отправляется немедленно. Min latency, но network overhead из-за маленьких сообщений. Padding/header dominate.
+- **100 ms (default)**: balance. Большинство случаев.
+- **-1**: max throughput, latency = filling time of 32KB buffer (could be seconds на slow throughput).
+
+Pre-1.14: setBufferTimeout — единственный rope. С buffer-debloating проблема автоматизируется.
+
+---
+
+## Production tuning patterns
+
+### Pattern 1: High parallelism (1000+ subtasks)
+
+```yaml
+taskmanager.memory.network.fraction: 0.2     # 20% — много каналов
+taskmanager.memory.network.max: 4gb
+taskmanager.network.memory.buffers-per-channel: 1   # уменьшить
+taskmanager.network.memory.floating-buffers-per-gate: 16
+```
+
+Логика: fan-out 1000×1000 → 1M channels — каждый канал должен получить минимум буферов.
+
+### Pattern 2: Low-latency (sub-100ms требование)
+
+```yaml
+taskmanager.memory.segment-size: 8kb          # меньше buffer = меньше delay filling
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 100ms
+```
+
+И в коде:
+```java
+env.setBufferTimeout(10);
+```
+
+Логика: оптимизируем под latency а не throughput.
+
+### Pattern 3: Max throughput (batch-like)
+
+```yaml
+taskmanager.memory.segment-size: 64kb         # больше buffer = lower per-record overhead
+taskmanager.network.memory.buffer-debloat.enabled: false
+```
+
+В коде:
+```java
+env.setBufferTimeout(-1);
+```
+
+Логика: максимизируем batching, жертвуем latency.
+
+### Pattern 4: EXACTLY_ONCE с slow downstream
+
+```yaml
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 500ms
+```
+
+И:
+```yaml
+execution.checkpointing.unaligned: true   # FLIP-76 unaligned checkpoints
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+```
+
+Логика: debloat уменьшает in-flight, unaligned убирает alignment delay полностью.
+
+---
+
+## Метрики для мониторинга
+
+```promql
+# Buffer pool usage:
+flink_taskmanager_Status_Shuffle_Netty_AvailableMemorySegments
+flink_taskmanager_Status_Shuffle_Netty_UsedMemorySegments
+flink_taskmanager_Status_Shuffle_Netty_TotalMemorySegments
+
+# In-flight buffers (если debloating включён):
+flink_taskmanager_job_task_buffersInUseCount
+flink_taskmanager_job_task_buffersOutPoolUsage
+
+# Per channel:
+flink_taskmanager_job_task_Shuffle_Netty_Output_<index>_numBuffersOut
+flink_taskmanager_job_task_Shuffle_Netty_Input_<index>_numBytesInRemote
+```
+
+Healthy indicators:
+- `AvailableMemorySegments` > 10% of total — есть margin
+- `buffersInUseCount` plateau, не растёт
+- `numBuffersOut` per channel — равномерно распределён, не skew
+
+---
+
+## Production gotchas
+
+### Gotcha 1: large fan-out пишет all subtasks буфера
+
+`keyBy → window` с parallelism=1000 — каждый upstream subtask имеет 1000 outgoing channels, каждому нужен exclusive buffer. Memory blows up быстро.
+
+**Fix**: уменьшить `buffers-per-channel` до 1, увеличить `floating-buffers-per-gate`.
+
+### Gotcha 2: BroadcastStream — отдельная стори
+
+Broadcast partitioning sends every record к **every** downstream subtask. Если parallelism=1000 — каждая запись копируется 1000 раз через 1000 channels. Buffer pressure огромный.
+
+**Fix**: broadcast — только для **small** state (config updates, dictionaries). Никогда не broadcast event streams.
+
+### Gotcha 3: rebalance + low buffer-per-channel = stalls
+
+Если `buffers-per-channel: 1` и rebalance round-robin — каждый upstream цикл блокируется на credit announce. Slow round-trip = backpressure.
+
+**Fix**: оставить `buffers-per-channel: 2` для rebalance/shuffle, уменьшать только если memory pressure.
+
+### Gotcha 4: setBufferTimeout не learnable per-operator
+
+`env.setBufferTimeout(100)` — глобально. Не получится «sink буферим 1s, остальные 10ms». Если нужно — split job или use sink-specific batching.
+
+### Gotcha 5: debloating triggers buffer resize → extra work
+
+Buffer-debloating пересчитывает sizes каждые 200ms (по умолчанию). На stable workload pure overhead. На burst workload — pays off. Не включайте «just in case» если throughput steady.
+
+### Gotcha 6: K8s pod restart and network buffers
+
+После restart, новый TaskManager регистрируется и channels пересоздаются — credit handshake между upstream/downstream может задержаться. На крупном parallelism (>500) это секунды-десятки секунд. Job показывает backpressure все это время — это normal recovery, не steady-state issue.
+
+---
+
+## Diagnostic checklist
+
+1. **Network memory usage**: `AvailableMemorySegments` < 10% — увеличить fraction.
+2. **«Insufficient buffers» exception** на старте — calculate buffer requirement vs allocation.
+3. **Sustained backpressure**: check buffer-debloat effect — может помочь alignment.
+4. **High in-flight на slow sink**: debloat + unaligned checkpoints.
+5. **Latency spikes коррелируют с network usage**: проверить segment-size, bufferTimeout.
+
+---
+
+<Callout type="note">
+Buffer debloating (FLIP-183) — это must-have feature для production Flink 1.14+. Особенно для EXACTLY_ONCE с variable throughput. Включите в baseline config — single config line даёт 2-5x ускорение checkpoint alignment под backpressure. Default disabled чисто из conservatism Flink discoverable; в production это де-факто mandatory.
+</Callout>
+
+---
+
+<Callout type="warning">
+Не уменьшайте `taskmanager.memory.segment-size` (default 32KB) без серьёзной причины. Каждый buffer имеет fixed header overhead (~50 bytes). При segment-size=4KB header — 1.25% от полезной нагрузки. При 32KB — 0.15%. Меньшие buffers увеличивают per-record overhead → throughput падает 5-15%.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Job: 200 subtasks, EXACTLY_ONCE с Kafka sink, parallelism rebalance перед sink. Checkpoint duration plateau ~5 минут (timeout 10 минут), при этом state size всего 200MB. Логи checkpoint coordinator показывают, что 80% времени уходит на 'alignment' (ожидание barriers всеми channels). Какие config tuning применить? Объясните механизм."
+  answer="Проблема — long checkpoint alignment time, не state size (200MB маленький). Анализ: при aligned checkpoints (default EXACTLY_ONCE) каждая subtask должна получить barrier по ВСЕМ input channels прежде чем emit barrier дальше и snapshot. Если downstream slow → in-flight data накапливается → upstream barrier ждёт обработки в очереди. 5min alignment означает огромный in-flight backlog. Solutions stacked: (1) Buffer debloating (FLIP-183, 1.14+) — обязательный baseline: taskmanager.network.memory.buffer-debloat.enabled: true, target: 500ms. Эта config заставляет network buffers shrink под backpressure → in-flight data уменьшается в разы → alignment ускоряется 2-5x. Single config change — biggest win для этой проблемы. (2) Unaligned checkpoints (FLIP-76): execution.checkpointing.unaligned: true. Когда aligned timeout превышен — switch на unaligned: in-flight data включается в snapshot, barriers emit сразу. Размер checkpoint больше (плюс in-flight), но duration предсказуемая. Recommended pair: aligned-checkpoint-timeout: 30s — попытка aligned первые 30s, потом fallback на unaligned. (3) Network buffers tuning: уменьшить buffers-per-channel с default 2 до 1 → меньше in-flight at baseline. taskmanager.network.memory.buffers-per-channel: 1. (4) Verify downstream sink не bottleneck: Kafka sink с EOS использует transactions — transaction.timeout.ms должен быть > checkpoint.timeout × 2 (default 10min may be tight). Поднять transaction.timeout.ms: 1200000 (20min). (5) Если problem persists после buffer-debloat + unaligned — root cause не в network, а в downstream sink processing rate (e.g., Kafka broker slow). Diagnose: backPressuredTimeMsPerSecond на pre-sink operator >800 sustained → нужен scale-out sink либо async wrapper. Production config baseline для EOS + variable throughput: execution.checkpointing.unaligned: true, aligned-checkpoint-timeout: 30s, buffer-debloat.enabled: true, buffer-debloat.target: 500ms. Это должно reduce alignment до <30s."
+/>

@@ -1,0 +1,383 @@
+---
+title: "Aligned vs Unaligned Checkpoints (FLIP-76)"
+description: "Aligned checkpoints (default) vs Unaligned (FLIP-76, 1.11+): barrier обгоняет in-flight records, ChannelState persistence, recovery cost. Hybrid mode."
+order: 3
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Aligned Checkpoints", "Unaligned Checkpoints", "FLIP-76", "ChannelState", "Backpressure", "Hybrid Mode"]
+---
+
+# Aligned vs Unaligned Checkpoints
+
+Aligned checkpoints — default Flink behaviour и foundation ABS algorithm. Но под backpressure alignment phase может занимать **минуты**, что катастрофично для checkpoint latency. **Unaligned Checkpoints (FLIP-76)**, introduced в Flink 1.11, решают эту проблему: barrier «обгоняет» in-flight records, snapshot включает channel state, recovery немного дороже но checkpoint duration независим от backpressure.
+
+Этот урок: deep dive в alignment phase, как unaligned барьеры работают, ChannelState mechanics, when each strategy makes sense, и hybrid mode (1.14+) — start aligned, escalate to unaligned после timeout.
+
+---
+
+## Aligned checkpoints: что значит "alignment"
+
+<DiagramContainer title="Aligned checkpoint: barrier ждёт в channel" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Operator с 3 input channels"
+        tooltip="Stateful operator. Получает records и barriers от 3 upstream subtasks (через network shuffle). Каждый канал имеет свой InputBuffer (per-channel)."
+      >
+        Inputs A, B, C
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier(N) arrives on channel A first" />
+    <FlowRow>
+      <DataBox
+        label="Channel A: BLOCKED"
+        tooltip="После получения barrier на канале A — записи на A buffered в InputBuffer. Operator не читает A пока не закончит alignment. Это создаёт backpressure на upstream subtask, который пишет в A."
+      >
+        A blocked, buffer fills
+      </DataBox>
+      <DataBox
+        label="Channel B: live"
+        tooltip="Канал B продолжает работать. Records читаются, processed. Если barrier приходит на B — он blocked тоже."
+      >
+        B reading
+      </DataBox>
+      <DataBox
+        label="Channel C: live"
+        tooltip="Канал C тоже продолжает. Если на C сейчас barrier пришёл бы — C blocked. Alignment не complete пока barrier на ВСЕХ channels."
+      >
+        C reading
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier(N) arrives on B, потом C" />
+    <FlowRow>
+      <DataBox
+        label="Alignment complete"
+        tooltip="Все 3 channels imeют barrier. Сейчас operator может safely snapshot — все records от checkpoint N уже processed, ничего после barrier N в state не попадёт."
+      >
+        Snapshot now safe
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="sync snapshot + forward barrier" />
+    <FlowRow>
+      <DataBox
+        label="Snapshot → forward → unblock"
+        tooltip="Sync snapshot phase (миллисекунды через RocksDB native). Forward barrier downstream. Unblock channels — A flush buffered records, продолжать normal flow."
+      >
+        Continue processing
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Зачем нужна alignment
+
+Alignment обеспечивает **invariant**: все события до barrier N processed, ничего после barrier N в state. Это гарантирует:
+- Snapshot consistent — содержит exactly то, что было обработано до barrier
+- На recovery — replay все события после barrier из source, никакой data duplication
+
+### Почему alignment может быть долгим
+
+**Backpressure scenario**:
+```
+Upstream subtask A: fast — пишет 1M records/sec в channel A
+Upstream subtask B: slow — пишет 1K records/sec в channel B
+```
+
+Когда trigger checkpoint:
+- Barrier emit'ится в Source A и B одновременно
+- Source A быстро пройдёт DAG → barrier reaches operator quickly (e.g., 100ms)
+- Source B медленно processed records → barrier reaches operator после minutes
+- В это время канал A blocked, buffer fills
+- Backpressure cascade upstream: A's upstream останавливается, его upstream тоже...
+
+**Realistic numbers**:
+- No backpressure: alignment 10-100ms
+- Moderate backpressure: alignment 1-10s
+- Severe backpressure: alignment 1-30min
+- Pathological: timeout (default 10min) → checkpoint fail
+
+---
+
+## Unaligned Checkpoints: FLIP-76 (Flink 1.11+)
+
+**Идея**: вместо ждать barrier на all channels, **немедленно** делать snapshot. Barrier «обгоняет» in-flight records. In-flight records persistятся в `ChannelState` как часть snapshot.
+
+<DiagramContainer title="Unaligned checkpoint: barrier overtakes in-flight" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Operator: 3 inputs, barrier на A first"
+        tooltip="Barrier приходит на канал A. Записи в InputBuffer (in-flight) до barrier — нужно persist. Records после barrier — будут processed после snapshot."
+      >
+        A: in-flight records buffered
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Unaligned: snapshot IMMEDIATELY" />
+    <FlowRow>
+      <DataBox
+        label="Snapshot включает: operator state + ChannelState"
+        tooltip="ChannelState = in-flight records в InputBuffer и OutputBuffer на момент barrier. Они persistятся вместе с operator state. На recovery channel buffers восстанавливаются — replay этих in-flight данных."
+      >
+        Snapshot + in-flight channels
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="forward barrier IMMEDIATELY downstream" />
+    <FlowRow>
+      <DataBox
+        label="Barrier overtakes in-flight"
+        tooltip="Barrier emit-ится downstream немедленно — обгоняет records, которые ещё в OutputBuffer этого operator. Downstream получает barrier раньше тех records. Они persistятся в ChannelState downstream."
+      >
+        Barrier flows fast через DAG
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="No alignment wait!"
+        tooltip="Checkpoint duration НЕ зависит от backpressure. Barrier пролетает через DAG за миллисекунды. Async upload включает ChannelState — снимок может быть больше aligned."
+      >
+        Bounded checkpoint time
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Алгоритм
+
+```java
+// pseudocode для unaligned operator
+public void processBarrier(CheckpointBarrier barrier, int inputChannel) {
+    // 1. Persist все in-flight records на blocked channels
+    Map<Integer, List<Record>> inflightInputs = collectInflightInputs();
+
+    // 2. Persist outgoing buffers (records, которые ещё не отправлены downstream)
+    Map<Integer, List<Record>> inflightOutputs = collectInflightOutputs();
+
+    // 3. Сразу snapshot operator state
+    SnapshotResult snapshot = snapshotState();
+    snapshot.addChannelState(inflightInputs, inflightOutputs);
+
+    // 4. Forward barrier (обгоняя outgoing in-flight!)
+    output.emitBarrierBeforeInflight(barrier);
+
+    // 5. Async upload включает channel state
+    asyncWriter.upload(snapshot);
+}
+```
+
+### ChannelState recovery
+
+На restart Flink восстанавливает:
+1. Operator state (как обычно)
+2. **InputBuffer** state — replay in-flight inputs до того как читать новые с network
+3. **OutputBuffer** state — emit in-flight outputs до того как processing produce new
+
+Это эквивалентно «time-machine» — Flink restore exact byte-level state каналов в момент checkpoint.
+
+---
+
+## Comparison таблица
+
+| Aspect | Aligned | Unaligned |
+|---|---|---|
+| Под backpressure | Alignment phase 1-30min | Bounded — миллисекунды |
+| Snapshot size | Только operator state | + ChannelState (in-flight) |
+| Async upload | State only | State + channel buffers |
+| Recovery cost | Restore state, replay from source | Restore state + channels, then continue |
+| Best for | Low backpressure, simple recovery | High backpressure, large parallelism |
+| Default | Yes | No (opt-in) |
+
+### Recovery cost trade-off
+
+**Aligned**: simple recovery. Restore state → source replay → run.
+
+**Unaligned**: more complex recovery. Restore state + restore InputBuffer + restore OutputBuffer. Records от ChannelState реплейятся первыми, потом read more from source.
+
+**Recovery time math**:
+```
+Aligned recovery:
+  state_size / DFS_bandwidth + replay_from_source_offset
+
+Unaligned recovery:
+  (state_size + channel_state_size) / DFS_bandwidth + ...
+```
+
+ChannelState typically MB-scale (in-flight buffers per channel × num channels), comparable to state but не dominant.
+
+---
+
+## Configuration
+
+### Включить unaligned
+
+```yaml
+# Включить unaligned для всех checkpoints
+execution.checkpointing.unaligned: true
+
+# Maximum allowed alignment time перед force unaligned (1.14+)
+# Если alignment > 30s — escalate to unaligned для следующего checkpoint
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+```
+
+### Hybrid mode (1.14+)
+
+```yaml
+execution.checkpointing.unaligned: true                       # enable feature
+execution.checkpointing.aligned-checkpoint-timeout: 30s       # start aligned, escalate
+```
+
+Strategy: try aligned first (cheaper recovery), escalate to unaligned если alignment > 30s. Это default best practice — combines benefits.
+
+### Programmatic
+
+```java
+CheckpointConfig config = env.getCheckpointConfig();
+config.enableUnalignedCheckpoints();
+config.setAlignedCheckpointTimeout(Duration.ofSeconds(30));   // hybrid
+```
+
+---
+
+## When to use each
+
+### Use aligned by default if:
+- Backpressure редкий или managed
+- State не очень большой (< 100GB)
+- Recovery time critical (aligned cheaper recovery)
+- Simple operations, predictable load
+
+### Use unaligned if:
+- Backpressure частый (peak loads, bursty traffic)
+- Checkpoint duration > checkpoint interval consistently
+- Large parallelism (1000+ tasks) — alignment phase scales badly
+- Source latency critical (Kafka transaction.timeout.ms < checkpoint duration → data loss risk)
+
+### Use hybrid (recommended):
+- **Production по умолчанию** — start aligned, escalate под backpressure
+- Best of both worlds — cheap recovery normally, bounded duration под stress
+
+---
+
+## Real production scenario
+
+### Without unaligned
+
+```
+Job: Fraud detection, parallelism=200, state=500GB RocksDB
+Normal load: checkpoint duration = 30s
+Peak load (Black Friday): backpressure из-за DB sink throttling
+  Alignment time grows from 100ms to 5min
+  Checkpoint duration: 5min + 30s = 5.5min
+  Interval: 60s
+  → checkpoints fail, max-concurrent-checkpoints=1 → no new checkpoint
+  → Kafka transaction.timeout.ms = 15min → if not committed → DATA LOSS
+
+Symptom: Black Friday → late checkpoints → committed transactions lag
+         → если crash, replay много данных → potentially missing alerts
+```
+
+### With unaligned (hybrid)
+
+```
+Same scenario but with unaligned hybrid:
+  Aligned timeout = 30s
+  Peak backpressure → alignment exceeds 30s → escalate to unaligned
+  Unaligned checkpoint duration = ~30s (independent of backpressure)
+  ChannelState ~10GB (in-flight)
+  Async upload = 30s (S3)
+  → checkpoints succeed, Kafka transactions commit on time
+  → no data loss
+```
+
+---
+
+## Production gotchas
+
+### 1. ChannelState size может быть large
+
+При extreme backpressure (1M records/sec across много channels), InputBuffer накапливаются до GBs. ChannelState includes these → checkpoint размер двойной.
+
+**Mitigation**: buffer debloating (`taskmanager.network.memory.buffer-debloat.enabled: true`) уменьшает default buffer size, ChannelState smaller.
+
+### 2. Не работает с broadcast inputs
+
+Unaligned checkpoints **не поддерживают** broadcast state pattern (FLIP-326 не done). Sources with broadcast state — only aligned. Mixed jobs работают, но broadcast части используют aligned.
+
+### 3. Recovery от unaligned checkpoint медленнее
+
+Дополнительно к state, нужно replay channel state перед resume processing. На 10GB channel state может добавить минуты к recovery.
+
+### 4. Concurrent checkpoints + unaligned
+
+```yaml
+execution.checkpointing.max-concurrent-checkpoints: 3
+execution.checkpointing.unaligned: true
+```
+
+Три параллельных checkpoint, каждый со своим ChannelState — memory pressure. Обычно concurrent=1 правильнее с unaligned.
+
+### 5. Unaligned + GIC (Generic Log-Based Incremental Checkpoints)
+
+Можно combine — но GIC уже даёт stable checkpoint duration через DSTL. Unaligned overhead (ChannelState) не нужен при GIC, обычно.
+
+**Stack ranking для checkpoint reliability**:
+1. GIC (state.backend.changelog.enabled) — best для stable duration
+2. Unaligned hybrid — good fallback if GIC unavailable
+3. Plain aligned — simple, default
+
+### 6. Buffer debloating critical с unaligned
+
+```yaml
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 1s
+```
+
+Buffer debloating dynamically adjusts buffer sizes — keeps amount of in-flight data к target processing time (e.g., 1s). Это minimizes ChannelState size с unaligned. **Must-have** при unaligned production.
+
+### 7. Snapshot includes upstream output buffers too
+
+Unaligned snapshot — это per-operator. Включает input AND output buffers operator-а. Downstream operators on recovery видят replayed records — must be idempotent или re-input.
+
+---
+
+## Configuration cheat sheet
+
+```yaml
+# Production-grade hybrid:
+execution.checkpointing.interval: 60s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 10min
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+execution.checkpointing.max-concurrent-checkpoints: 1
+
+# Critical для unaligned:
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.target: 1s
+
+# Если есть GIC — добавить:
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+dstl.dfs.base-path: s3://bucket/dstl
+```
+
+---
+
+## Performance metrics (UI)
+
+Web UI per operator:
+- `lastCheckpointDuration` — total
+- `lastCheckpointAlignmentDuration` — alignment phase only (key metric!)
+- `lastCheckpointSyncDuration` — sync snapshot phase
+- `lastCheckpointAsyncDuration` — async upload
+- `lastCheckpointSize` — bytes uploaded
+- `unalignedCheckpointsEnabled` — current mode
+
+Alert если `lastCheckpointAlignmentDuration > 5s` consistently.
+
+---
+
+<KnowledgeCheck
+  question="Production: Flink fraud detection job (parallelism=500, RocksDB state=2TB). Normal operation: checkpoint duration = 45s. During peak hour (Black Friday): alignment phase grows to 8min, checkpoint timeout (10min) — checkpoints fail, Kafka transaction.timeout.ms = 15min expires. Data loss risk. Спроектируйте polное решение."
+  answer="Multi-layer solution для bounded checkpoint duration независимо от backpressure. (1) Enable hybrid unaligned checkpoints: execution.checkpointing.unaligned: true + execution.checkpointing.aligned-checkpoint-timeout: 30s. Start aligned (cheaper recovery), escalate к unaligned если alignment > 30s. Это handles bursty backpressure. (2) Enable buffer debloating: taskmanager.network.memory.buffer-debloat.enabled: true, target: 1s. Без debloating ChannelState может быть TBs при extreme backpressure на 500 subtasks. Debloating dynamically adjusts buffer size к ~1s processing data, минимизирует ChannelState. (3) Enable Generic Log-Based Incremental Checkpoints (GIC/DSTL): state.backend.changelog.enabled: true, state.backend.changelog.storage: filesystem, dstl.dfs.base-path: s3://bucket/dstl. Это даёт STABLE checkpoint duration (seconds) независимо от state size и backpressure — каждый state mutation дубль-пишется в DSTL (append-only log на DFS), checkpoint = flush DSTL (ms), materialization периодическая (10 min default). На 2TB state durations: без GIC = minutes, с GIC = seconds. (4) Increase Kafka transaction.timeout.ms к 1 hour, transaction.max.timeout.ms (broker setting) к 1 hour — даёт buffer для отсутствия coincidence checkpoint duration и transaction timeout. (5) Consider ForSt state backend (FLIP-427) — disaggregated state на S3, не зависит от local disk. Checkpoint становится metadata-only operation, recovery time не зависит от размера state. Especially useful если 2TB state на local NVMe выматывает diskpressure под compaction. (6) Reduce checkpoint interval to 30s — больше частых меньших checkpoints вместо редких больших. Combined с GIC это полностью стабильно. (7) max-concurrent-checkpoints=1 (default) — чтобы не overload async upload при overlapping. (8) Monitor lastCheckpointAlignmentDuration в Prometheus — alert > 5s sustained. (9) Test under load в staging — Black Friday simulation. Expected result: alignment не превышает 30s timeout (escalate), checkpoint duration bounded к ~30s (independently of state size с GIC), Kafka transactions commit on time, нет data loss. Cost: GIC adds ~10-20% DFS bandwidth для DSTL writes, но stable behaviour stoit того. ForSt adds S3 cost но снимает diskpressure на TM. Production rule: для critical EOS jobs всегда: unaligned hybrid + GIC + buffer debloating + extended Kafka timeouts. Это required baseline."
+/>

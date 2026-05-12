@@ -1,0 +1,316 @@
+---
+title: "Lambda vs Kappa architecture — modern reconciliation"
+description: "Lambda architecture (batch + speed layer) vs Kappa (stream-only): trade-offs, исторические причины, современная Kappa через Iceberg incremental processing и Hybrid Sources. Когда какой подход."
+order: 7
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Lambda Architecture", "Kappa Architecture", "Hybrid Sources", "Iceberg", "Reprocessing"]
+---
+
+# Lambda vs Kappa architecture — modern reconciliation
+
+В 2012 году Nathan Marz описал **Lambda Architecture**: batch layer для accuracy, speed layer для latency, serving layer для unification. Это была optimal compromise эпохи MapReduce — batch медленный, но reliable, streaming быстрый, но fragile. Lambda стала default architecture для real-time analytics на 5-7 лет.
+
+В 2014 году Jay Kreps (Confluent) описал **Kappa Architecture**: один streaming layer, replay из event log для reprocessing, no batch. Это была bold idea эпохи Kafka + early Flink/Storm — нужна была streaming engine, которая could really replace batch.
+
+Сейчас, в 2026, ландшафт изменился: Flink матуре streaming (2.x ForSt, EOS, materialized tables), Iceberg/Paimon stream и batch over одна data layer, Hybrid Sources в Flink делают bounded backfill + unbounded live transparent. Lambda — почти deprecated pattern, но иногда правильный выбор. Этот урок разбирает обе архитектуры в современном контексте.
+
+---
+
+## Lambda Architecture: оригинальная схема
+
+<DiagramContainer title="Lambda architecture: batch + speed + serving" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Event source"
+        tooltip="Kafka или другой immutable log. Single source of truth — events дальше идут в обе ветки."
+      >
+        Kafka events
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="fan-out" />
+    <FlowRow>
+      <DataBox
+        label="Batch layer"
+        tooltip="Daily/hourly Spark/MapReduce job. Reads complete historical data из S3. Computes accurate views с full-fidelity. Slow (hours) but accurate."
+      >
+        Spark daily batch
+      </DataBox>
+      <DataBox
+        label="Speed layer"
+        tooltip="Real-time stream processor (Flink/Storm/Kafka Streams). Computes approximate views с low latency. Less accurate (late events, simpler logic) but immediate."
+      >
+        Flink streaming
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="separate writes" />
+    <FlowRow>
+      <DataBox
+        label="Batch view"
+        tooltip="Pre-computed aggregates в Cassandra/HBase. Updated daily. Accurate но lag 1+ day."
+      >
+        Batch views
+      </DataBox>
+      <DataBox
+        label="Real-time view"
+        tooltip="Approximate aggregates в Redis/Druid. Updated per-event. Latest hour не отражена в batch views."
+      >
+        Speed views
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="merge at query time" />
+    <FlowRow>
+      <DataBox
+        label="Serving layer"
+        tooltip="Query layer merge-ит batch view (старшее чем 1 день) + speed view (последние 24 часа). Application видит unified результат."
+      >
+        Query merge
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Почему Lambda существовал
+
+1. **Streaming engines были незрелые** (2012-2015). Storm — no exactly-once. Early Spark Streaming — micro-batch с проблемами. Logic в streaming layer была упрощённой (best-effort), требовалось batch для correctness.
+
+2. **Бизнес требовал accurate historical reports** + **low-latency dashboards** — обе нужны одновременно.
+
+3. **Replay over event log** ещё не был practical. Kafka retention был днями, не месяцами.
+
+### Что не нравилось в Lambda
+
+1. **Двойная кодовая база**. Logic для aggregation in Spark (batch) + duplicate logic in Flink (streaming). Изменение бизнес-правила = два места правки. Bugs из-за divergence.
+
+2. **Merge complexity в serving layer**. Что значит «merge batch view как 1 неделя назад + speed view как 1 неделю назад»? Boundary detection, dedup events, conflict resolution — операционная боль.
+
+3. **Two pipelines = double operational cost**. Two systems to monitor, alert, scale, secure.
+
+4. **Inconsistency** — batch и speed могут disagree, особенно при late events. Иногда serving layer показывает разные numbers в зависимости от что когда обработалось.
+
+---
+
+## Kappa Architecture: stream-only
+
+<DiagramContainer title="Kappa architecture: один streaming pipeline" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Event log"
+        tooltip="Kafka с long retention (90 days или бесконечно). Источник истины. Все processing идёт отсюда."
+      >
+        Kafka (long retention)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="primary stream" />
+    <FlowRow>
+      <DataBox
+        label="Streaming job V1"
+        tooltip="Flink stateful pipeline. Реализует ВСЮ бизнес-логику. Один codebase, один movement of data."
+      >
+        Flink V1 (production)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="" />
+    <FlowRow>
+      <DataBox
+        label="View V1"
+        tooltip="Materialized view в Iceberg/Cassandra/ClickHouse. Single source-of-truth для serving."
+      >
+        Iceberg view
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="changing logic? новый job parallel" />
+    <FlowRow>
+      <DataBox
+        label="Streaming job V2"
+        tooltip="Новый pipeline с fixed/updated логикой. Стартует с earliest offsets. Replay полной истории, materialized в новый view. Параллельно работает с V1."
+      >
+        Flink V2 (replay from earliest)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="catch up → cutover" />
+    <FlowRow>
+      <DataBox
+        label="View V2"
+        tooltip="После catch-up parallel pipeline даёт identical results к V1 (с fixed logic). Atomic cutover — switch reads на V2, V1 stopped."
+      >
+        Iceberg view V2
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Преимущества Kappa
+
+1. **Single codebase**. Логика в одном Flink pipeline. Изменения линейные.
+2. **Replay capability**. Bug fix? Запускаешь V2 с earliest, через несколько часов catch up. Atomic cutover.
+3. **No serving merge complexity**. Один view, один query path.
+4. **Simpler operations**. One system to monitor.
+
+### Когда Kappa не подходил (исторически)
+
+1. **Streaming engines не делали то, что batch делал** — complex multi-pass algorithms, expensive joins, ML model training.
+2. **Kafka retention financially expensive** — storing 6 months events в Kafka = большие диски brokers.
+3. **Replay over 100B events очень slow** — даже Flink с parallelism=100 несколько дней.
+
+---
+
+## Modern Kappa: Iceberg incremental processing
+
+В 2024-2026 это всё изменилось. Iceberg/Paimon как primary storage layer + Flink streaming + batch обе работают over them. **Hybrid Sources** делают bounded backfill + unbounded live transparent.
+
+```java
+// Backfill из Iceberg + live stream из Kafka в одной job
+HybridSource<Event> hybrid = HybridSource
+    .builder(IcebergSource.<Event>builder()
+        .table(table)
+        .bounded(true)        // bounded — finite scan
+        .build())
+    .addSource(KafkaSource.<Event>builder()
+        .setBootstrapServers(...)
+        .setTopics("live-events")
+        .setStartingOffsets(OffsetsInitializer.timestamp(switchPointMs))
+        .build(),
+        Boundedness.CONTINUOUS_UNBOUNDED)
+    .build();
+
+env.fromSource(hybrid, WatermarkStrategy..., "hybrid-source")
+    ...
+```
+
+Source автоматически switch-ится с Iceberg на Kafka при completion bounded part. Application code не различает «backfill» и «live» — это один stream.
+
+<DiagramContainer title="Modern Kappa: Iceberg + Hybrid Source" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Source choice"
+        tooltip="Flink Hybrid Source — IcebergSource (bounded backfill) + KafkaSource (live). Switch automatic at Kafka starting timestamp."
+      >
+        Iceberg history + Kafka live
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="seamless transition" />
+    <FlowRow>
+      <DataBox
+        label="Flink pipeline"
+        tooltip="Один stateful job. Backfill phase reads Iceberg как bounded source (parallel splits). At end of bounded — switch на Kafka live. State accumulated continuously."
+      >
+        Stateful streaming
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="" />
+    <FlowRow>
+      <DataBox
+        label="Iceberg sink"
+        tooltip="Те же Iceberg tables — append-only fact, upsert dimensions. EOS через 2PC."
+      >
+        Iceberg sink (EOS)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="incremental scan" />
+    <FlowRow>
+      <DataBox
+        label="Downstream stream / batch"
+        tooltip="Iceberg incremental scan — reads changes since last snapshot. Можно сделать downstream Flink job на этом изменений, и/или batch (Spark/Trino) для analytics."
+      >
+        Both streaming + batch over Iceberg
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Iceberg incremental scan
+
+```java
+IcebergSource<Record> source = IcebergSource.<Record>builder()
+    .table(catalog.loadTable("warehouse.events"))
+    .streaming(true)
+    .startSnapshotId(lastProcessedSnapshotId)  // от last snapshot
+    .monitorInterval(Duration.ofSeconds(10))    // check для new snapshots
+    .build();
+```
+
+Iceberg streaming source emits новые data files как только snapshot committed (через 2PC от upstream writer). Это даёт **near-real-time analytics over Iceberg** без отдельного Kafka layer.
+
+---
+
+## Когда Lambda всё ещё имеет смысл
+
+1. **Очень дорогое ML training** — модели обучаются на full historical dataset (years of data). Это batch by nature. Streaming layer держит near-real-time approximate scoring.
+
+2. **Complex multi-pass algorithms** — например, PageRank-like iteration, graph algorithms, что requires множественные passes по data. Streaming их не умеет efficient.
+
+3. **Regulatory requirement** — финансовые регуляторы могут требовать nightly batch reconciliation с audit trail (e.g. SOX, MAR в финансах). Streaming numbers могут быть «working», но **gold-standard** numbers всегда из batch.
+
+4. **Mature batch infrastructure** + small streaming addition — если бизнес имеет 10 years investment в Spark warehouse, добавление одного streaming pipeline не requires разобрать всё.
+
+---
+
+## Modern hybrid pattern (часто оптимальный)
+
+Это не «pure Lambda» и не «pure Kappa», а pragmatic combination:
+
+| Workload type | Engine | Storage |
+|---|---|---|
+| Real-time ops (fraud, alerting) | Flink streaming | Kafka + Redis |
+| Real-time analytics (last 30 days) | Flink streaming → Iceberg | Iceberg (streaming source/sink) |
+| Long-tail batch analytics | Spark | Iceberg (same tables) |
+| ML feature compute | Spark/dbt daily + Flink hourly | Feature store + Iceberg |
+| Reprocessing on bug fix | Flink replay from Iceberg (Hybrid Source) | Iceberg (snapshot-time travel) |
+
+Это **«lakehouse-centric» architecture**: Iceberg/Paimon — central storage. Flink — streaming compute. Spark — batch compute. Both share storage. Best of both worlds.
+
+---
+
+## Comparison table
+
+| Dimension | Pure Lambda | Pure Kappa | Modern Hybrid |
+|---|---|---|---|
+| Codebases | 2 (batch + speed) | 1 (stream) | 1-2 (depending on workload) |
+| Operational complexity | High | Medium | Medium |
+| Reprocessing | Re-run batch | Replay stream | Replay stream через Iceberg |
+| Storage | Cassandra views + S3 raw | Kafka long retention | Iceberg (single primary) |
+| Cost | High (2 systems) | Medium | Medium |
+| Suitability for ML training | High | Low | High (Spark over Iceberg) |
+| Latency | Speed: ms, Batch: hours | Stream: ms always | Stream: ms, Batch: hours |
+| Best in 2026 | Legacy/regulatory | Specific cases | Default choice |
+
+---
+
+## RisingWave / Materialize: streaming SQL DB
+
+Альтернатива в современном Kappa лагере — **streaming SQL DBs**:
+
+- **Materialize** — streaming SQL поверх Differential Dataflow. Incremental views с zero staleness.
+- **RisingWave** — open-source distributed streaming SQL. PostgreSQL compatible.
+
+Эти инструменты позиционируются как «один engine для streaming analytics» — без separate Flink + serving DB. Sweet spot — real-time dashboards, KPI tracking, до низких десятков TB.
+
+Для больших scale (100s GB state, custom Java logic, ML inference) Flink остаётся лучшим выбором.
+
+<Callout type="note">
+В 2024-2026 стало модным сравнивать Flink с RisingWave/Materialize, но это не direct competitors. Flink — general purpose streaming framework (DataStream, ProcessFunction, ML_PREDICT, custom code). RisingWave/Materialize — specialized для streaming SQL aggregation. В большой архитектуре часто используются оба: Flink для complex stateful + custom code, RisingWave для interactive query layer над streaming.
+</Callout>
+
+---
+
+## Production gotchas
+
+- **Kappa replay slow на huge history** — replay 6 months events с parallelism=32 может занять дни. Mitigations: (1) increase parallelism temporarily; (2) Hybrid Source — backfill из Iceberg parallel (быстрее Kafka linear); (3) start replay из определённой timestamp, не earliest, если возможно.
+- **Iceberg streaming source поллинг latency** — `monitorInterval=10s` означает данные visibility 10s после commit. Для sub-second latency используйте Kafka, не Iceberg, как primary streaming source.
+- **Schema evolution в Iceberg vs Kafka** — Iceberg natively versioned schemas; Kafka requires schema registry для same level. При Kappa с Kafka schemas — invest в proper schema management.
+- **Long Kafka retention financially expensive** — 100B events × 1 KB × 6 months = много TB на brokers. Solutions: (1) tiered storage (Kafka 3.6+); (2) MirrorMaker archive в S3, replay через Flink Filesystem source; (3) compacted topic — только latest value per key.
+- **Lambda merge ambiguity** — query «count(*) since X» в Lambda может вернуть different values depending на свежесть batch и speed views. Document semantics; carefully document «as-of» semantics в API contract.
+- **Hybrid Source watermark coordination** — backfill phase emit-ит historical watermarks (low values). При switch на Kafka watermarks jump up. Это OK если operators handle non-decreasing watermarks (default). Custom operators могут break.
+- **Iceberg snapshot expiration** — Iceberg хранит N последних snapshots. Если replay требует snapshot 1 год назад, но retention 30 дней — snapshot deleted, replay impossible. Configure retention под worst-case replay scenario.
+- **Concurrent V1+V2 в Kappa replay** — двойной cost compute temporarily. Plan для resource availability.
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: e-commerce analytics. Real-time dashboard (1 sec freshness) + nightly financial reports + ML model training на 2 years history + ad-hoc Trino queries. Choose architecture (Lambda / Kappa / Hybrid) и justify."
+  answer="**Modern Hybrid** — оптимальный выбор. Архитектура: (1) **Iceberg lakehouse** как primary storage layer для всех data (event store, dimensions, aggregations). (2) **Flink streaming pipeline** — Kafka source → stateful processing → Iceberg sink (EOS через 2PC). Это даёт real-time dashboard через near-real-time Iceberg materialized views (refreshing each 1-5 sec через Materialized Tables FRESHNESS), плюс continuously updated Iceberg tables. (3) **Spark batch jobs** для nightly financial reports — reads same Iceberg tables как gold-standard accurate reconciliation. Это удовлетворяет regulatory requirement (audit trail батч). (4) **Spark/PyTorch ML training** — full historical scan Iceberg для feature engineering, model training. Не competing с streaming за resources. (5) **Trino** для ad-hoc — reads Iceberg directly. Bug-fix replay: Flink replay с Hybrid Source (Iceberg backfill + Kafka live) — fixes V2 deployed parallel, catch-up, atomic cutover на V2 view. Почему не pure Lambda: двойная code base, merge complexity, ML training не нуждается в speed layer, modern Kappa решает same. Почему не pure Kappa: ML training сложно через streaming replay, batch nightly reports — naturally batch semantics, Trino ad-hoc — batch query. Modern hybrid даёт: один codebase для real-time + batch (Flink + Spark over Iceberg), один storage layer (Iceberg), replay capability (Flink + Iceberg time travel), proper batch для где batch правильно. Это default для greenfield в 2026."
+/>

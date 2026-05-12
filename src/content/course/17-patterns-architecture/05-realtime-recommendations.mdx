@@ -1,0 +1,390 @@
+---
+title: "Real-time recommendations — feature store, async lookups, ML_PREDICT inline"
+description: "Production architecture для real-time recommendation engine на Flink 2.2: feature store через Async I/O lookups, ML_PREDICT inline в Streaming SQL, model registration через CREATE MODEL, hybrid online+offline features."
+order: 5
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["ML_PREDICT", "Feature Store", "Async I/O", "Recommendations", "Flink 2.2", "AI"]
+---
+
+# Real-time recommendations — feature store, async lookups, ML_PREDICT inline
+
+Recommendation engines исторически работали по двух-уровневой схеме: offline training в Spark/PyTorch, online inference через отдельный microservice (Python FastAPI поверх pickled model). Streaming pipeline звал inference service через HTTP, получал predictions, использовал в downstream. Эта архитектура работает, но имеет проблемы: дополнительный hop, separate scaling, separate observability, language boundary Java↔Python, ML model versioning не coupled с pipeline.
+
+Flink 2.2 разрушает это разделение. **ML_PREDICT** SQL функция (FLIP-526) вызывает ML модель **прямо из streaming SQL**. Модель регистрируется через `CREATE MODEL`, использует remote endpoints (OpenAI, Anthropic, self-hosted TensorFlow Serving, ONNX Runtime) или embedded inference. Combined с **VECTOR_SEARCH** (FLIP-540) для semantic similarity, у вас полная real-time recommendation pipeline в одном Flink job.
+
+Это `★ KILLER` урок: разбираем полную production архитектуру recommendation system на Flink 2.2.
+
+---
+
+## Архитектура: hybrid online + offline features
+
+<DiagramContainer title="Real-time recommendation pipeline на Flink 2.2" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="User action stream"
+        tooltip="Clickstream events: page_view, add_to_cart, search, watch_video. Kafka topic 'user-actions'. Million+ events/sec на large e-commerce."
+      >
+        Kafka: user-actions
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="real-time features" />
+    <FlowRow>
+      <DataBox
+        label="Streaming feature compute"
+        tooltip="Flink streaming aggregations: last 5min views, click-through rate, session depth. ValueState/MapState per user. Materialized в feature store."
+      >
+        Flink streaming SQL
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="materialize features" />
+    <FlowRow>
+      <DataBox
+        label="Online feature store"
+        tooltip="Redis / Cassandra / Feast / Tecton. Low-latency K-V для inference. Features per user_id, per product_id. Updated real-time from streaming + batch backfill from warehouse."
+      >
+        Redis / Feast
+      </DataBox>
+      <DataBox
+        label="Offline features"
+        tooltip="Historical features из warehouse: user lifetime value, product affinity matrix, demographic vectors. Computed daily в Spark/dbt. Loaded в feature store через batch sync."
+      >
+        Warehouse → feature store
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Async I/O lookup" />
+    <FlowRow>
+      <DataBox
+        label="Inference pipeline"
+        tooltip="Flink SQL job. ML_PREDICT с features из feature store. Modern alternative — VECTOR_SEARCH для semantic similarity (collaborative filtering). LATERAL TABLE для multi-output."
+      >
+        ML_PREDICT + VECTOR_SEARCH
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="recommendations" />
+    <FlowRow>
+      <DataBox
+        label="Recommendation topic"
+        tooltip="Kafka topic 'user-recommendations' — ranked product IDs per user. Consumed by frontend (homepage carousel, email service, push notifications)."
+      >
+        Kafka: recommendations
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Часть 1: Streaming feature compute
+
+Streaming features — features которые меняются в real-time на основе текущего поведения user-а.
+
+```sql
+-- Создаём streaming view с per-user аггрегатами
+CREATE TABLE user_actions (
+    user_id STRING,
+    product_id STRING,
+    action STRING,  -- view, click, add_to_cart, purchase
+    event_time TIMESTAMP_LTZ(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'user-actions',
+    'format' = 'avro'
+);
+
+CREATE MATERIALIZED TABLE user_realtime_features
+FRESHNESS = INTERVAL '5' SECOND
+AS
+SELECT
+    user_id,
+    COUNT(*) FILTER (WHERE action = 'view') AS views_5min,
+    COUNT(DISTINCT product_id) AS unique_products_5min,
+    AVG(CASE WHEN action = 'click' THEN 1.0 ELSE 0.0 END) AS ctr_5min,
+    MAX(event_time) AS last_seen,
+    COLLECT(product_id) AS recent_products
+FROM TABLE(
+    TUMBLE(TABLE user_actions, DESCRIPTOR(event_time), INTERVAL '5' MINUTE))
+GROUP BY user_id, window_start, window_end;
+```
+
+Materialized Table (FLIP-435 GA в Flink 2.0) автоматически создаёт refresh job. Backend — Apache Paimon. Result доступен из feature store через JDBC/CDC mirror.
+
+---
+
+## Часть 2: Feature store integration через Async I/O
+
+Real-time features материализуются в Paimon → синхронизируются в Redis для low-latency lookups.
+
+```java
+public class FeatureLookup extends RichAsyncFunction<UserAction, EnrichedAction> {
+
+    private transient AsyncCommands<String, String> redis;
+    private transient Cache<String, UserFeatures> l1Cache;
+    private transient ObjectMapper mapper;
+
+    @Override
+    public void open(Configuration cfg) {
+        RedisClient client = RedisClient.create(redisUrl);
+        redis = client.connect().async();
+        l1Cache = Caffeine.newBuilder()
+            .maximumSize(50_000)
+            .expireAfterWrite(Duration.ofSeconds(30))
+            .recordStats()
+            .build();
+        mapper = new ObjectMapper().findAndRegisterModules();
+    }
+
+    @Override
+    public void asyncInvoke(UserAction action, ResultFuture<EnrichedAction> result) {
+        String userKey = "features:user:" + action.userId();
+
+        UserFeatures cached = l1Cache.getIfPresent(userKey);
+        if (cached != null) {
+            result.complete(Collections.singleton(new EnrichedAction(action, cached)));
+            return;
+        }
+
+        CompletableFuture<String> userF = redis.get(userKey).toCompletableFuture();
+        CompletableFuture<String> prodF = redis.get("features:product:" + action.productId()).toCompletableFuture();
+
+        CompletableFuture.allOf(userF, prodF).thenAccept(v -> {
+            try {
+                UserFeatures uf = parse(userF.get());
+                ProductFeatures pf = parseProduct(prodF.get());
+                l1Cache.put(userKey, uf);
+                result.complete(Collections.singleton(
+                    new EnrichedAction(action, uf, pf)));
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            }
+        });
+    }
+}
+
+// В pipeline:
+DataStream<EnrichedAction> enriched = AsyncDataStream.unorderedWait(
+    actions,
+    new FeatureLookup(),
+    100, TimeUnit.MILLISECONDS,  // timeout
+    2000                          // capacity
+).uid("feature-lookup");
+```
+
+Параметры:
+- `timeout=100ms` — strict latency budget. Если Redis ответил medленнее, throw timeout exception → handled через side output (см. ниже).
+- `capacity=2000` — max in-flight requests per subtask. Tune под Redis QPS / parallelism. С 32 subtasks × 2000 = 64k concurrent requests — Redis cluster нужен для такой нагрузки.
+- L1 Caffeine cache — снижает Redis hit rate на 70-90% для hot users. TTL 30s — trade off stale vs traffic.
+
+---
+
+## Часть 3: ML_PREDICT inline в Streaming SQL (Flink 2.2)
+
+Это где Flink 2.2 меняет game. ML_PREDICT — SQL function для вызова ML модели прямо из стримингового запроса.
+
+### Регистрация модели
+
+```sql
+-- Самый простой случай — OpenAI/Anthropic remote endpoint
+CREATE MODEL recommender
+INPUT (
+    user_features ROW<views_5min INT, ctr_5min DOUBLE, recent_products ARRAY<STRING>>,
+    product_features ROW<category STRING, price DECIMAL(10,2), avg_rating DOUBLE>
+)
+OUTPUT (
+    score DOUBLE,
+    confidence DOUBLE
+)
+WITH (
+    'provider' = 'openai',
+    'task' = 'chat-completion',
+    'endpoint' = 'https://api.openai.com/v1/chat/completions',
+    'api-key' = '${OPENAI_API_KEY}',
+    'model' = 'gpt-4-turbo',
+    'system-prompt' = 'You are a recommendation engine. Score 0-1.'
+);
+
+-- Self-hosted TensorFlow Serving:
+CREATE MODEL ranker_tf
+INPUT (features ROW<...>)
+OUTPUT (score DOUBLE)
+WITH (
+    'provider' = 'tensorflow-serving',
+    'endpoint' = 'http://tf-serving:8501/v1/models/ranker:predict',
+    'signature' = 'serving_default'
+);
+
+-- ONNX Runtime для embedded inference (низкая latency):
+CREATE MODEL fast_ranker_onnx
+INPUT (features ROW<...>)
+OUTPUT (score DOUBLE)
+WITH (
+    'provider' = 'onnx',
+    'model-uri' = 's3://models/ranker-v3.onnx',
+    'inference-mode' = 'embedded'
+);
+```
+
+### Использование в SQL
+
+```sql
+-- Real-time scoring stream
+INSERT INTO user_recommendations
+SELECT
+    a.user_id,
+    a.product_id,
+    ML_PREDICT(
+        recommender,
+        ROW(uf.views_5min, uf.ctr_5min, uf.recent_products),
+        ROW(pf.category, pf.price, pf.avg_rating)
+    ).score AS score,
+    a.event_time
+FROM enriched_actions AS a
+JOIN user_features FOR SYSTEM_TIME AS OF a.event_time AS uf ON a.user_id = uf.user_id
+JOIN product_features FOR SYSTEM_TIME AS OF a.event_time AS pf ON a.product_id = pf.product_id
+WHERE a.action = 'view';
+```
+
+Под капотом Flink:
+- ML_PREDICT — это **AsyncTableFunction**. Не блокирует main thread.
+- Batched requests — Flink группирует несколько records в один HTTP call (если provider поддерживает batching).
+- Built-in retry, timeout, circuit breaker.
+- Metrics: prediction latency, error rate, batch size — emit-аются как стандартные Flink metrics.
+
+---
+
+## Часть 4: VECTOR_SEARCH для semantic similarity (FLIP-540)
+
+Recommendations часто строятся на embedding similarity — «похожие продукты», «next-best-action». Flink 2.2 добавил **VECTOR_SEARCH** который работает поверх векторных индексов (Pinecone, Weaviate, Qdrant, OpenSearch k-NN).
+
+```sql
+-- Векторный индекс зарегистрирован как table
+CREATE TABLE product_vectors (
+    product_id STRING,
+    embedding ARRAY<FLOAT>,
+    metadata MAP<STRING, STRING>
+) WITH (
+    'connector' = 'qdrant',
+    'collection' = 'products',
+    'dimension' = '1536',
+    'index-type' = 'hnsw'
+);
+
+-- Найти top-10 похожих продуктов
+SELECT
+    a.user_id,
+    a.recently_viewed_id,
+    similar.product_id AS recommendation_id,
+    similar.distance
+FROM enriched_actions AS a,
+LATERAL TABLE(
+    VECTOR_SEARCH(
+        TABLE product_vectors,
+        DESCRIPTOR(embedding),
+        (SELECT embedding FROM product_vectors WHERE product_id = a.recently_viewed_id),
+        10  -- top-K
+    )
+) AS similar
+WHERE a.action = 'view';
+```
+
+VECTOR_SEARCH под капотом — это async lookup в vector DB через native client. Latency 5-20ms depending on индекс size, parallelism — тысячи concurrent searches per subtask.
+
+---
+
+## Полный pipeline в одном SQL
+
+Combining all together — fraud-resistant, real-time, personalized:
+
+```sql
+INSERT INTO user_recommendations
+WITH enriched AS (
+    SELECT
+        a.user_id,
+        a.product_id,
+        a.event_time,
+        uf.views_5min,
+        uf.ctr_5min,
+        uf.recent_products,
+        pf.category,
+        pf.price,
+        pf.embedding AS product_embedding
+    FROM user_actions AS a
+    JOIN user_features FOR SYSTEM_TIME AS OF a.event_time AS uf
+        ON a.user_id = uf.user_id
+    JOIN product_catalog FOR SYSTEM_TIME AS OF a.event_time AS pf
+        ON a.product_id = pf.product_id
+    WHERE a.action = 'view'
+)
+SELECT
+    e.user_id,
+    similar.product_id AS recommended_id,
+    ML_PREDICT(
+        recommender,
+        ROW(e.views_5min, e.ctr_5min, e.recent_products),
+        ROW(similar.category, similar.price, similar.avg_rating)
+    ).score AS personalized_score,
+    similar.distance AS embedding_distance,
+    e.event_time
+FROM enriched AS e,
+LATERAL TABLE(
+    VECTOR_SEARCH(
+        TABLE product_vectors,
+        DESCRIPTOR(embedding),
+        e.product_embedding,
+        50
+    )
+) AS similar
+WHERE similar.distance < 0.3
+ORDER BY personalized_score DESC
+LIMIT 10;
+```
+
+Один SQL — three ML operations: temporal feature lookup, semantic similarity search, ML inference scoring. Раньше это требовало 3 separate Java jobs, microservices, custom orchestration.
+
+<Callout type="note">
+Flink 2.2 ML functions работают как обычные SQL functions — они могут быть в WHERE, ORDER BY, projection. Это даёт SQL planner optimization opportunities (predicate pushdown, batching). Performance — async batched, не blocks pipeline.
+</Callout>
+
+---
+
+## Production architecture — full picture
+
+| Layer | Component | Tech |
+|---|---|---|
+| Event source | Clickstream | Kafka, ~1M events/sec |
+| Streaming features | Real-time aggregates | Flink Materialized Tables |
+| Offline features | Batch features | Spark/dbt → Paimon |
+| Feature store | Low-latency lookup | Redis Cluster / Cassandra |
+| Vector store | Embeddings | Qdrant / Pinecone / OpenSearch |
+| ML inference | Online scoring | ML_PREDICT (Flink 2.2) |
+| Output | Recommendations | Kafka → frontend / email |
+| Observability | Metrics | OTel exporter → Prometheus + Grafana |
+
+Все три «store»-а (feature, vector, model) интегрированы через декларативные Flink connectors. Pipeline почти полностью описан в SQL + минимум Java для custom UDFs/source.
+
+---
+
+## Production gotchas
+
+- **Feature freshness mismatch** — streaming features 5s freshness vs offline features daily. Recommendation может использовать stale lifetime_value (вчерашний) с current ctr. Document expectations, alerting на stale features (last_updated > N seconds).
+- **Async I/O capacity tuning** — слишком высокий capacity = Redis cluster overload (latency spikes). Слишком низкий = backpressure. Monitor `currentOutputWatermark` и `numRecordsOutPerSecond` для balance. Start с 1000, tune.
+- **ML_PREDICT cost** — gpt-4-turbo при 100k inferences/sec = $X per hour. Используйте `inference-mode: batched` (batch 100 records per call), pre-filter cheap rules first (если score < 0.1 без ML — skip).
+- **Cold start без features** — новый user без history → feature lookup возвращает null/defaults. Решение: COALESCE с default features (median values), explicit «cold start» branch в pipeline.
+- **Model versioning** — `CREATE MODEL recommender` immutable name. New version → `CREATE MODEL recommender_v2`, A/B через CASE WHEN. Без model registry это — поинт боли. Recommend setup MLflow + model URI references.
+- **Cache invalidation на feature update** — если product price changed, recommendations используют stale embedding до cache TTL. Solution: cache TTL ≤ refresh interval feature store, или event-driven invalidation через Redis Streams.
+- **Inference latency budget** — pipeline budget 100ms end-to-end? ML_PREDICT timeout = 30ms (с retries), feature lookup = 10ms, остальное — Flink overhead и network. Critical: timeout settings strict, fallback path обязателен.
+- **VECTOR_SEARCH стоимость** — top-K=50 на каждый event. На 100k events/sec → 5M k-NN queries/sec. Vector DB должен scale (Pinecone shards, Qdrant cluster). Pre-filter through cheaper conditions (category match) before vector search.
+- **Async functions + savepoint compatibility** — async function в-flight requests на savepoint trigger могут потеряться (Flink 2.2 fix: async checkpoint coordination). Verify savepoint test recovers cleanly.
+
+<Callout type="warning">
+ML_PREDICT с remote endpoints (OpenAI, Anthropic) — это **external dependency** в critical path. Outage у provider = downtime у recommendation engine. Production setup должен иметь: (1) circuit breaker (опускать на rule-based fallback после N consecutive failures); (2) multi-provider strategy (failover OpenAI → Anthropic → self-hosted); (3) cost budgets и kill switches; (4) caching identical requests через `predictions_cache_ttl`.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: e-commerce recommendation engine. 500k events/sec, target latency 50ms end-to-end (event → recommendation в Kafka). Budget на ML inference $1000/day. Architecture choice: (a) ML_PREDICT с OpenAI gpt-4-turbo; (b) ML_PREDICT с ONNX embedded inference; (c) гибрид. Какие compromises?"
+  answer="Анализ: (a) GPT-4-turbo: pros — нет инфраструктуры, model updates автоматические; cons — latency 200-500ms per call (NOT в budget), стоимость 100k events/sec × $0.01/1k tokens × 500 tokens = $3500/hour (NOT в budget). Inappropriate для high-throughput inference. (b) ONNX embedded: pros — latency 1-5ms (хорошо в budget), zero per-inference cost (только compute), полностью under control; cons — model должен fit в memory TM-а (model 100MB × 32 TMs = OK; model 10GB — нет), need MLOps для training/conversion ONNX. Хороший choice для production scale. (c) Гибрид (RECOMMENDED): two-tier — first ONNX embedded для cheap pre-ranking (на каждый event, < 5ms), затем GPT-4 для finalization top-10% candidates (только важные decisions). Стоимость снижается 100x. Latency budget: 500k events × 5ms ONNX = OK; top-10% = 50k/sec × 200ms GPT-4 batched (50 records/batch) = 1000 batches/sec — feasible. Cost: 50k/sec × $0.01/1k × 100 tokens = $180/hour = $4.3k/day. Все ещё over budget — нужно cut в 4x. Solution: GPT-4 только для top-1% (5k/sec), Anthropic Haiku или GPT-3.5 для остальных. Дополнительно: predictions cache (same user-product pair) с TTL 1 min — снижает QPS в 5-10x для popular pairs. Final architecture: 99% ONNX (fast, cheap), 0.9% GPT-3.5 batched, 0.1% GPT-4 для new/important users + cache. Это reality production recommendation systems — multi-tier ML, не one-size-fits-all."
+/>

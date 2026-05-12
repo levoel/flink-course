@@ -1,0 +1,400 @@
+---
+title: "Iceberg и Paimon sinks — анатомия 2PC через manifests"
+description: "SinkWriter writes Parquet → Pre-commit (compaction) → Committer (data + manifest) → Post-commit (catalog publish). Sequence для обоих lakehouses"
+order: 7
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Iceberg", "Paimon", "Lakehouse", "SinkV2", "Manifest", "PostCommitTopology"]
+---
+
+# Iceberg и Paimon sinks — анатомия 2PC через manifests
+
+Iceberg и Paimon — два главных streaming-friendly lakehouse формата 2026. Оба integrate в Flink через SinkV2 API и реализуют exactly-once через **manifest-based commits**: data files написаны и явно зарегистрированы атомарно через transactional metadata layer. Этот урок препарирует sink anatomy для обоих и показывает, почему architectural decomposition SinkV2 (Writer + PreCommit + Committer + PostCommit) идеально fit на эту задачу.
+
+Apache Iceberg (proven в Netflix, Apple) и Apache Paimon (рождён в Flink community, optimized для streaming) имеют разные internals, но **same SinkV2 wiring**.
+
+---
+
+## Архитектура — общая для Iceberg и Paimon
+
+<DiagramContainer title="Lakehouse sink — 4 stages SinkV2" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. SinkWriter (parallel N)"
+        tooltip="Записывает Parquet (Iceberg) или Parquet/ORC (Paimon) data files в bucket directory. На barrier emit-ит WriterResult с file paths и stats (row count, min/max per column для metadata)."
+      >
+        Parquet files per bucket
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="WriterResult (paths + stats)" />
+    <FlowRow>
+      <DataBox
+        label="2. PreCommitTopology — compaction"
+        tooltip="Small file compaction между Writer и Committer. KeyBy partition path, window накапливает 10+ small files, ProcessFunction reads и merges в один large (256MB+). Эмитит compacted committable. Опциональна, но critical для производительности query engine."
+      >
+        Compact 10 small → 1 large
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Committable per partition" />
+    <FlowRow>
+      <DataBox
+        label="3. Committer (parallel 1 typically)"
+        tooltip="На notifyCheckpointComplete — атомарно регистрирует data files в catalog. Iceberg: append к metadata.json с new snapshot. Paimon: bump snapshot ID, write snapshot file. Single subtask чтобы избежать race condition с catalog."
+      >
+        Atomic snapshot commit
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Snapshot committed" />
+    <FlowRow>
+      <DataBox
+        label="4. PostCommitTopology"
+        tooltip="После snapshot commit — publish manifest list, update Hive metastore (если configured), notify external systems. Для Iceberg — это manifest list rewrite для query optimization. Не EOS — должен быть idempotent."
+      >
+        Publish manifest + Hive update
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Decomposition даёт **independent scaling**:
+- Writer parallelism — proportional throughput
+- Committer parallelism — typically 1 (atomic commits)
+- Pre/post topology — independent
+
+---
+
+## Iceberg sink — internals
+
+Iceberg model: **table = list of snapshots**. Each snapshot points to **manifest list**, which points to **manifest files**, which point to **data files**.
+
+```
+catalog (Glue, Hive, Nessie, JDBC)
+    ↓ pointer to current metadata.json
+metadata/v3.metadata.json
+    ↓ list of snapshots
+[snapshot-1, snapshot-2, snapshot-3]
+    ↓ each → manifest list
+metadata/snap-{snapshotId}.avro
+    ↓ list of manifest files
+[manifest-a.avro, manifest-b.avro]
+    ↓ each → list of data files + stats
+data/00000-0-{uuid}.parquet
+data/00001-0-{uuid}.parquet
+```
+
+Commit = atomic CAS-update catalog pointer to new `metadata.json`. Это single point of atomicity.
+
+### Iceberg FlinkSink (org.apache.iceberg.flink)
+
+```java
+import org.apache.iceberg.flink.sink.FlinkSink;
+
+FlinkSink.forRowData(dataStream)
+    .tableLoader(TableLoader.fromCatalog(catalogLoader, TableIdentifier.of("db", "events")))
+    .writeParallelism(16)
+    .equalityFieldColumns(Arrays.asList("user_id"))  // upsert mode
+    .overwrite(false)                                 // append mode
+    .distributionMode(DistributionMode.HASH)
+    .append();
+```
+
+Internally:
+1. **IcebergStreamWriter** (SinkWriter) — writes Parquet per partition spec, emits `WriteResult` (data files list).
+2. **IcebergFilesCommitter** (Committer) — receives WriteResults, accumulates buffer, on `notifyCheckpointComplete` calls Iceberg API `table.newAppend().appendFile(...).commit()`.
+3. Iceberg API делает CAS update metadata pointer:
+   ```
+   table.refresh();  // get current metadata
+   AppendFiles append = table.newAppend();
+   for (DataFile f : files) append.appendFile(f);
+   append.commit();  // CAS update catalog
+   ```
+4. CAS conflict → retry (другой writer обновил catalog между read и write).
+
+### Equality deletes — для upsert
+
+Iceberg v2 supports **equality deletes**: delete files with `(user_id, event_time)` patterns. Flink sink с `equalityFieldColumns` пишет equality delete records при upsert mode, plus data files. На read merge-on-read joins delete + data.
+
+```java
+.equalityFieldColumns(Arrays.asList("user_id"))
+```
+
+Каждый record `delete(user_id=X)` + `insert(user_id=X, ...)`. Старая запись помечена deleted, новая appended. Compaction позже physically merge.
+
+---
+
+## Paimon sink — internals
+
+Paimon (formerly Flink Table Store) — born в Flink community, designed для streaming-first. Внутри LSM-tree поверх Parquet/ORC.
+
+### Architecture differences vs Iceberg
+
+| Aspect | Iceberg | Paimon |
+|---|---|---|
+| Storage | flat list of immutable files | LSM-tree (levels с compaction) |
+| Update | equality deletes (merge-on-read) | UPSERT через primary key, native merge |
+| Snapshot | metadata.json + manifest list | snapshot file + manifest |
+| Read | full scan + merge deletes | sorted merge через LSM |
+| Compaction | external action | continuous, integrated |
+| Streaming read | через snapshot deltas | through changelog producer |
+
+### Paimon FlinkSink
+
+```java
+import org.apache.paimon.flink.sink.FlinkSinkBuilder;
+
+CatalogContext context = CatalogContext.create(new Path("s3://lakehouse/paimon"));
+Catalog catalog = CatalogFactory.createCatalog(context);
+Table table = catalog.getTable(Identifier.create("db", "events"));
+
+FlinkSinkBuilder.<RowData>forTable(table)
+    .withInput(dataStream)
+    .withParallelism(16)
+    .build();
+```
+
+Internally:
+1. **StoreWriteOperator** — writes records в LSM MemTable. На barrier flushes к L0 files.
+2. **StoreCommitOperator** — collects committables, на `notifyCheckpointComplete` bumps snapshot ID, writes snapshot manifest pointing to new files.
+3. Paimon атомарность через **filesystem rename** snapshot file:
+   ```
+   write snapshot-{N+1} to temp path
+   rename to snapshot/{N+1}
+   update LATEST file (atomic file write)
+   ```
+
+### Compaction — integrated
+
+Paimon writers могут trigger inline compaction:
+
+```yaml
+table.options:
+  compaction.min.file-num: 5
+  compaction.max.file-num: 50
+  compaction.early-max.file-num: 12
+```
+
+Если L0 > threshold — writer thread compacts L0→L1 sync или async. Это **отличается** от Iceberg, где compaction = separate procedure.
+
+---
+
+## SinkV2 wiring — Iceberg example
+
+Полная реализация Iceberg FlinkSink через SinkV2 interfaces:
+
+```java
+public class IcebergSink<T> implements
+    TwoPhaseCommittingSink<T, IcebergCommittable>,
+    SupportsPreCommitTopology<IcebergWriteResult, IcebergCommittable>,
+    SupportsPostCommitTopology<IcebergCommittable> {
+
+    @Override
+    public PrecommittingSinkWriter<T, IcebergWriteResult> createWriter(WriterInitContext ctx) {
+        return new IcebergStreamWriter<>(tableSupplier, taskWriterFactory);
+    }
+
+    @Override
+    public Committer<IcebergCommittable> createCommitter(CommitterInitContext ctx) {
+        return new IcebergFilesCommitter(tableSupplier, catalogProperties);
+    }
+
+    @Override
+    public DataStream<IcebergCommittable> addPreCommitTopology(
+            DataStream<IcebergWriteResult> writeResults) {
+        return writeResults
+            .keyBy(IcebergWriteResult::getPartitionPath)
+            .transform("compaction",
+                IcebergCommittableTypeInfo.INSTANCE,
+                new SmallFileCompactionOperator(targetFileSize))
+            .setParallelism(8);
+    }
+
+    @Override
+    public void addPostCommitTopology(DataStream<IcebergCommittable> committed) {
+        committed
+            .global()  // single subtask чтобы catalog не race
+            .transform("manifest-publish",
+                Types.VOID,
+                new ManifestPublishOperator(hiveCatalogConfig))
+            .setParallelism(1);
+    }
+}
+```
+
+Каждый stage — independent operator с own state, own parallelism.
+
+---
+
+## Sequence — что happens на barrier
+
+<DiagramContainer title="Iceberg/Paimon sink — barrier sequence" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. barrier(N) at SinkWriter"
+        tooltip="Записывает текущий Parquet batch в filesystem. Файлы named .inprogress.{uuid}. Emit-ит WriteResult с paths, stats (row count, file size, min/max per column)."
+      >
+        Write Parquet, emit WriteResult
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="2. PreCommitTopology"
+        tooltip="ProcessFunction накапливает WriteResults в operator state. Когда threshold reached (10 files в bucket), reads them, merges в один large file, emits compacted Committable. Старые small files marked для cleanup."
+      >
+        Compaction → consolidated committable
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="3. Committer — collect"
+        tooltip="Committables buffered в operator state. Single subtask (parallelism=1) чтобы избежать catalog race. Подсчитывает size, checks для small file threshold."
+      >
+        Buffer committables в state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="notifyCheckpointComplete(N)" />
+    <FlowRow>
+      <DataBox
+        label="4. Committer.commit()"
+        tooltip="Iceberg: table.newAppend().appendFile(...).commit() — атомарный CAS обновляет metadata. Paimon: bump snapshot ID, write snapshot file, atomic rename LATEST. После этого данные visible для всех readers."
+      >
+        Atomic snapshot commit
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="5. PostCommit — publish"
+        tooltip="После snapshot commit — Hive metastore update (alter partition add), broadcast notification, manifest list rewrite. Side effects — должны быть идемпотентны."
+      >
+        Hive update + notifications
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Real-world latency для checkpoint(N) → data visible: 100ms-2s typically. Snapshot commit самый медленный — CAS retry на conflict + filesystem write metadata.
+
+---
+
+## Catalog choices — где живёт metadata
+
+### Iceberg catalogs
+
+| Catalog | Storage | Atomicity | Production-ready |
+|---|---|---|---|
+| Hive | Hive metastore Postgres/MySQL | DB transaction | ✅ legacy |
+| Glue (AWS) | AWS Glue Data Catalog | AWS internal lock | ✅ AWS |
+| Nessie | Git-like branching catalog | DB transaction | ✅ для multi-table txns |
+| JDBC | any RDBMS | DB transaction | ✅ K8s simple |
+| REST | HTTP service | server-managed | ✅ multi-tenant |
+
+Best choice: Nessie если нужны branches/tags (data version control), Glue если на AWS, JDBC для simple setup.
+
+### Paimon catalogs
+
+| Catalog | Storage |
+|---|---|
+| Filesystem (HDFS/S3) | only filesystem — atomic rename |
+| Hive | Hive metastore reference |
+| JDBC | any RDBMS |
+
+Paimon филесистем catalog работает в standalone setups (single source-of-truth = filesystem).
+
+---
+
+## Iceberg vs Paimon — when to use what
+
+**Iceberg**:
+- Multi-engine read (Spark, Trino, Snowflake, Flink) — широчайшая совместимость
+- Slowly changing dim tables — append-heavy с occasional updates
+- Historical data lake — time travel, schema evolution
+- AWS S3-first deployments — Glue + Iceberg = mature combo
+
+**Paimon**:
+- Streaming-first workloads — created from Flink team
+- High update rate (CDC sink) — LSM-tree handles updates natively
+- Need changelog stream — Paimon emits changelog для downstream Flink consumers
+- Latency-sensitive (snapshot every few minutes) — LSM compaction integrated
+
+В практике многие team используют ОБА: Paimon для streaming pipelines, Iceberg для exploratory analytics. Или Paimon → Iceberg conversion для long-term storage.
+
+---
+
+## Production gotchas
+
+### 1. Committer parallelism > 1 → catalog race
+
+Если установить committer parallelism к 8, multiple subtasks parallelly call `table.newAppend().commit()` → catalog CAS conflicts → most retry, slow throughput.
+
+**Fix**: committer parallelism = 1. Iceberg/Paimon defaults to это.
+
+### 2. Без pre-commit compaction → millions of small files
+
+64MB Parquet × 16 subtasks × 60 checkpoints/hour × 24h = 22GB но 23,000 файлов. Query latency degrades 10-100x.
+
+**Fix**: добавить pre-commit compaction. Target size 128-256MB per file.
+
+### 3. Glue catalog rate limits
+
+AWS Glue имеет rate limits (50 calls/sec per account). Committer на каждый checkpoint делает несколько Glue calls. С 12 jobs, каждый checkpoint каждые 60s — close to limit. Burst может throttle.
+
+**Fix**: либо реже checkpoints (5min interval), либо REST catalog с Apache Polaris.
+
+### 4. Paimon LSM compaction lag
+
+Paimon writers могут sync-compact L0→L1 — это блокирует write thread. Если compaction expensive (CPU/IO bound), throughput drops.
+
+**Fix**: configure `compaction.async=true` (write thread continues, compaction в background). Может lead к temporary L0 buildup.
+
+### 5. Iceberg equality deletes на full table scan
+
+Equality deletes мердж-on-read — каждый scan читает delete files + data files, applies deletes. На high update rate (millions deletes), scan slow.
+
+**Fix**: regular `RewriteFiles` action для merge deletes в data files (physical delete). Schedule daily/hourly.
+
+### 6. Metadata.json explosion
+
+Каждый snapshot adds entry в metadata.json. После 100k snapshots — metadata file MB-size, slow to read.
+
+**Fix**: `table.expireSnapshots()` regular cleanup. Iceberg `metadata.retain-last` config = 100. Снимки старше 7 days physically deleted.
+
+### 7. PostCommit operations не EOS
+
+Если post-commit Hive metastore update fails и restart → recommit для already-committed snapshot. Hive add partition должен быть idempotent (`IF NOT EXISTS`).
+
+**Fix**: idempotent post-commit operations. Wrap external calls в try-catch для duplicate handling.
+
+---
+
+## Cheat sheet
+
+```
+Iceberg sink anatomy (SinkV2):
+    Writer  : Parquet files per partition spec
+    PreCommit: compact small files (10×64MB → 1×256MB)
+    Committer: table.newAppend().commit() → atomic snapshot
+    PostCommit: Hive update, manifest rewrite
+
+Paimon sink:
+    Writer  : LSM MemTable → L0 SST на barrier
+    PreCommit: optional compaction
+    Committer: snapshot file write + rename
+    PostCommit: notifications
+
+Catalog atomicity:
+    Iceberg: CAS на metadata.json pointer
+    Paimon : atomic filesystem rename snapshot file
+
+Committer parallelism = 1 (avoid catalog race)
+```
+
+---
+
+<KnowledgeCheck
+  question="Production pipeline: Iceberg sink в Flink, 32 sink writer parallelism, no pre-commit compaction, 60s checkpoint, daily volume 1TB. После месяца Trino query latency на этой Iceberg table выросла с 5s до 5min. metadata.json занимает 200MB, есть 8 миллионов small Parquet files. Step-by-step как исправить?"
+  answer="Three-pronged remediation. **Step 1 — immediate: snapshot expiration**. Run `CALL system.expire_snapshots(table => 'db.events', older_than => DATE_SUB(CURRENT_DATE, 7), retain_last => 10)`. Это physically удаляет старые snapshots и orphan data files. metadata.json shrinks с 200MB до KB scale. Effect immediate на planning time. **Step 2 — file compaction**. Run `CALL system.rewrite_data_files(table => 'db.events', strategy => 'binpack', options => map('target-file-size-bytes', '268435456'))` (256MB). Compactit миллионы small files в десятки тысяч large. Этот procedure читает small files, writes new merged, commit-ит как single snapshot. Может быть expensive (TB of IO) — schedule в off-peak. Trino latency drops с 5min обратно к 5s. **Step 3 — preventive: add pre-commit compaction в FlinkSink**. Migrate sink config: использовать `FlinkSink.builder().equalityFieldColumns(...)` с `distributionMode(HASH)` для distribution by partition, plus enable `write.target-file-size-bytes=268435456` в table properties. Это encourages Writer batches до 256MB pre-flush. Альтернатива — implement custom SupportsPreCommitTopology: keyBy partition, window для compaction. Дополнительно: (a) reduce writer parallelism с 32 до 8 — меньше fanout per partition, fewer small files; (b) increase checkpoint interval до 5min — less frequent commits, larger batches; (c) schedule daily `rewrite_data_files` action в Airflow для ongoing compaction; (d) schedule daily `expire_snapshots` для metadata health; (e) monitor `iceberg.table.snapshot.size` и `iceberg.table.data.file.count` метрики. Для new deployments — consider Paimon вместо Iceberg для streaming-heavy workloads — у него compaction native интегрирована, не требует separate procedure runs."
+/>

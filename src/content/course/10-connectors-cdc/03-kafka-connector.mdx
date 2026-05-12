@@ -1,0 +1,392 @@
+---
+title: "Kafka connector: KafkaSource (FLIP-27) и KafkaSink (SinkV2)"
+description: "Глубокий разбор Kafka connector в Flink 2.x: KafkaSource (FLIP-27), KafkaSink (FLIP-191 SinkV2), dynamic partition discovery, OffsetsInitializer, serialization, transactional sink с exactly-once"
+order: 3
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Kafka", "KafkaSource", "KafkaSink", "FLIP-191 SinkV2", "Transactional Sink", "Exactly-Once", "OffsetsInitializer"]
+---
+
+# Kafka connector — primary Flink connector
+
+Kafka — самый частый source/sink в Flink production. Flink Kafka connector implements FLIP-27 (Source) и FLIP-191 SinkV2 — это modern, unified, supports exactly-once. Старые `FlinkKafkaConsumer`/`FlinkKafkaProducer` removed в 2.0.
+
+Этот урок разбирает: KafkaSource с dynamic partition discovery, OffsetsInitializer variants, deserialization, KafkaSink с transactional EOS, configuration tuning, production gotchas.
+
+---
+
+## KafkaSource — FLIP-27 implementation
+
+```java
+KafkaSource<Order> source = KafkaSource.<Order>builder()
+    .setBootstrapServers("kafka-broker1:9092,kafka-broker2:9092")
+    .setTopics("orders", "premium-orders")             // или setTopicPattern(Pattern.compile("orders-.*"))
+    .setGroupId("order-processor")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setValueOnlyDeserializer(new OrderDeserializer())
+    .setProperty("partition.discovery.interval.ms", "30000")  // dynamic discovery
+    .build();
+
+DataStream<Order> stream = env.fromSource(
+    source,
+    WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+        .withTimestampAssigner((o, ts) -> o.getOrderTime())
+        .withIdleness(Duration.ofMinutes(1)),
+    "kafka-orders"
+);
+```
+
+### Architecture
+
+- **SplitEnumerator** = `KafkaSourceEnumerator` runs на JM. Discovers partitions через `AdminClient.listTopics() + describeTopics()`. Periodic discovery каждые `partition.discovery.interval.ms`.
+- **Split** = `KafkaPartitionSplit` — `(topic, partition, startingOffset, stoppingOffset)`.
+- **SourceReader** = `KafkaSourceReader` per subtask. Owns assigned splits, uses `KafkaConsumer` для fetching.
+
+### Dynamic partition discovery
+
+Это **major improvement** over legacy FlinkKafkaConsumer:
+
+```
+T=0:   discover [orders-0, orders-1, ..., orders-7] → assign к 8 subtasks
+T=30s: discover [orders-0, ..., orders-7, orders-8, orders-9] → assign new partitions
+T=60s: ...
+```
+
+Когда Kafka admin adds partitions (или новый topic matches pattern), Flink picks them up без restart. Property `partition.discovery.interval.ms` controls interval (default disabled — `-1`, must enable explicitly).
+
+**Production:** always enable дискавери для long-running jobs:
+
+```java
+.setProperty("partition.discovery.interval.ms", "30000")
+```
+
+---
+
+## OffsetsInitializer variants
+
+Контроль откуда начинать reading:
+
+```java
+// Earliest available — full backfill
+.setStartingOffsets(OffsetsInitializer.earliest())
+
+// Latest — только new events
+.setStartingOffsets(OffsetsInitializer.latest())
+
+// From specific timestamp (event time)
+.setStartingOffsets(OffsetsInitializer.timestamp(1735689600000L))
+
+// From committed offsets, fallback earliest if no commit
+.setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
+
+// Custom (например per-partition)
+.setStartingOffsets(OffsetsInitializer.offsets(Map.of(
+    new TopicPartition("orders", 0), 100L,
+    new TopicPartition("orders", 1), 200L
+)))
+```
+
+### Stopping offsets — для BOUNDED
+
+```java
+.setBounded(OffsetsInitializer.latest())         // stop at current end → BOUNDED source
+.setBounded(OffsetsInitializer.timestamp(...))   // stop at timestamp
+```
+
+С `setBounded()` source становится BOUNDED → Flink treats job как batch (когда runtime mode = BATCH). Used для backfill jobs.
+
+```java
+// Unbounded (streaming):
+.setStartingOffsets(...)                         // ← no setBounded
+
+// Bounded (batch backfill):
+.setStartingOffsets(...)
+.setBounded(OffsetsInitializer.latest())
+```
+
+---
+
+## Deserialization
+
+Three styles:
+
+### 1. Value-only
+
+```java
+.setValueOnlyDeserializer(new SimpleStringSchema())
+.setValueOnlyDeserializer(new JsonDeserializationSchema<>(Order.class))
+.setValueOnlyDeserializer(new AvroDeserializationSchema<>(Order.SCHEMA))
+```
+
+Если нужно только value — most common.
+
+### 2. With key, headers, metadata
+
+```java
+.setDeserializer(KafkaRecordDeserializationSchema.of(
+    new KafkaDeserializationSchemaWrapper(...)
+))
+```
+
+Полный access к ConsumerRecord (key, value, headers, topic, partition, offset, timestamp).
+
+### 3. Confluent Schema Registry
+
+```java
+.setValueOnlyDeserializer(ConfluentRegistryAvroDeserializationSchema.forSpecific(
+    Order.class, "http://schema-registry:8081"
+))
+```
+
+Avro schema fetched dynamically, supports schema evolution.
+
+---
+
+## KafkaSink — FLIP-191 SinkV2 implementation
+
+```java
+KafkaSink<Alert> sink = KafkaSink.<Alert>builder()
+    .setBootstrapServers("kafka-broker1:9092")
+    .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+        .setTopic("alerts")
+        .setValueSerializationSchema(new AlertSerializationSchema())
+        .build())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("fraud-detector-tx")
+    .setProperty("transaction.timeout.ms", "900000")
+    .build();
+
+stream.sinkTo(sink);
+```
+
+### DeliveryGuarantee semantics
+
+| Mode | Behaviour | Use case |
+|---|---|---|
+| `NONE` | Fire-and-forget — может lose events | Metrics, non-critical |
+| `AT_LEAST_ONCE` | Producer flushes on checkpoint, duplicates на failure | Idempotent consumer downstream |
+| `EXACTLY_ONCE` | Two-Phase Commit через Kafka transactions | Strict EOS |
+
+### Exactly-once anatomy
+
+<DiagramContainer title="Two-Phase Commit для exactly-once" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Normal processing"
+        tooltip="Flink streams records. KafkaSink wraps each record в open Kafka transaction. Records NOT yet committed — consumers с isolation.level=read_committed их не видят."
+      >
+        records → KafkaProducer.send() inside open Tx
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="checkpoint barrier arrives" />
+    <FlowRow>
+      <DataBox
+        label="Pre-commit phase (Phase 1)"
+        tooltip="На barrier: KafkaSink calls producer.flush() — все pending records written к brokers (но не committed). Then producer.commitTransaction()? Нет — only pre-commits via flush. Производит SinkV2.Committable объект — это transactional.id + offset (recoverable handle)."
+      >
+        flush() + Committable produced
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="all operators ack checkpoint" />
+    <FlowRow>
+      <DataBox
+        label="Commit phase (Phase 2)"
+        tooltip="После того как Flink JobManager confirms checkpoint complete (notifyCheckpointComplete callback), KafkaSink calls producer.commitTransaction() для каждого Committable. Records становятся visible для read_committed consumers."
+      >
+        commitTransaction() → records visible
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="failure scenarios" />
+    <FlowRow>
+      <DataBox
+        label="Crash before commit"
+        tooltip="Если crash после pre-commit но до commit: Flink recovers from checkpoint, replays pre-commit phase, then commits. Все Committable persisted в checkpoint."
+      >
+        Recovery → re-commit pending Tx
+      </DataBox>
+      <DataBox
+        label="Transaction timeout"
+        tooltip="Если Tx open longer than transaction.timeout.ms (default 60s) — Kafka rolls back. Production: SET 900000ms (15 min) для safe headroom — больше чем max checkpoint interval."
+      >
+        transaction.timeout.ms = 900000
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### transactionalIdPrefix — critical for recovery
+
+```java
+.setTransactionalIdPrefix("fraud-detector-tx")
+```
+
+Flink uses pattern `{prefix}-{subtask}-{checkpointId}` для transactional.id. На recovery Flink lists transactions matching prefix, aborts orphaned, resumes valid. **Prefix must be unique per job** — если две jobs use same prefix, они interfere → data loss / corruption.
+
+---
+
+## SinkWriter, Committer, GlobalCommitter в SinkV2
+
+FLIP-191 SinkV2 introduces three components:
+
+```java
+public interface Sink<InputT> extends Serializable {
+    SinkWriter<InputT> createWriter(InitContext context);
+}
+
+// Stateful variant с pre-commit:
+public interface StatefulSink<InputT, WriterStateT> extends Sink<InputT> {
+    StatefulSinkWriter<InputT, WriterStateT> createWriter(InitContext context);
+    StatefulSinkWriter<InputT, WriterStateT> restoreWriter(InitContext context, Collection<WriterStateT> state);
+    SimpleVersionedSerializer<WriterStateT> getWriterStateSerializer();
+}
+
+// Two-phase commit variant:
+public interface TwoPhaseCommittingSink<InputT, CommT> extends Sink<InputT> {
+    PrecommittingSinkWriter<InputT, CommT> createWriter(InitContext context);
+    Committer<CommT> createCommitter() throws IOException;
+    SimpleVersionedSerializer<CommT> getCommittableSerializer();
+}
+```
+
+Для exactly-once с Kafka: `TwoPhaseCommittingSink` — pre-commit produces `Committable` (handle к transaction), Committer calls `commitTransaction`.
+
+Это **strict improvement** over legacy `TwoPhaseCommitSinkFunction` — clearer interfaces, decoupled writer от committer, easier to test.
+
+---
+
+## Configuration tuning
+
+### Throughput-критичные properties
+
+```java
+.setProperty("max.partition.fetch.bytes", "10485760")    // 10MB per fetch
+.setProperty("fetch.min.bytes", "1048576")               // wait until 1MB available
+.setProperty("fetch.max.wait.ms", "500")                 // max wait 500ms
+.setProperty("max.poll.records", "5000")                 // max records per poll
+```
+
+### Sink throughput
+
+```java
+.setProperty("batch.size", "65536")                      // 64KB batches
+.setProperty("linger.ms", "10")                          // wait up to 10ms для batch
+.setProperty("compression.type", "lz4")                  // compress
+.setProperty("buffer.memory", "67108864")                // 64MB buffer
+```
+
+### Transactional sink
+
+```java
+.setProperty("transaction.timeout.ms", "900000")         // 15 min — MUST > checkpoint interval
+.setProperty("max.in.flight.requests.per.connection", "5")
+.setProperty("enable.idempotence", "true")                // mandatory для EOS
+```
+
+---
+
+## Сравнительная таблица: AT_LEAST_ONCE vs EXACTLY_ONCE
+
+| Aspect | AT_LEAST_ONCE | EXACTLY_ONCE |
+|---|---|---|
+| Mechanism | Flush на checkpoint | Two-Phase Commit Kafka Tx |
+| Latency overhead | Minimal | +1 round-trip к Kafka coordinator |
+| Throughput | ~95% of NONE | ~70-90% of NONE |
+| Recovery semantics | Possible duplicates | Никаких duplicates |
+| Kafka requirement | Idempotent producer | Transactional + isolation.level=read_committed |
+| Configuration complexity | Low | Higher (transactional.id prefix, timeouts) |
+| Use case | Idempotent consumers | Strict accounting / financial |
+
+---
+
+## Production gotchas
+
+### 1. `transaction.timeout.ms` < checkpoint interval → data loss
+
+Если checkpoint takes longer than transaction timeout — Kafka aborts transaction, but Flink думает it's still alive → records lost.
+
+```java
+// Checkpoint interval = 10 min
+env.enableCheckpointing(600_000);
+
+// ❌ Default transaction.timeout.ms = 60s — too short!
+// ✅ Set explicitly:
+.setProperty("transaction.timeout.ms", "900000")    // 15 min — safe margin
+```
+
+Plus Kafka broker has `transaction.max.timeout.ms` (default 15min) — client cannot exceed this.
+
+### 2. `transactionalIdPrefix` shared across deployments → corruption
+
+Если две Flink jobs (или старая+новая deployment) use same prefix:
+- Kafka transactional.id уникальный per producer instance
+- Two producers с same transactional.id → Kafka aborts other (zombie fencing)
+- Records lost / inconsistent state
+
+**Fix:** unique prefix per job, encode environment (`prod-fraud-tx`, `staging-fraud-tx`).
+
+### 3. Dynamic partition discovery disabled by default
+
+```java
+// ❌ Не подхватит новые partitions:
+KafkaSource.<T>builder()
+    .setTopics("orders")
+    .build()
+// 
+// ✅ Discovery enabled:
+    .setProperty("partition.discovery.interval.ms", "30000")
+```
+
+Legacy FlinkKafkaConsumer had it enabled by default. FLIP-27 KafkaSource — disabled. Easy миграция bug.
+
+### 4. Group ID reused across Flink jobs
+
+Если несколько Flink jobs use same `setGroupId("processor")`:
+- Kafka thinks они в одной consumer group
+- Re-assigns partitions между ними
+- Both jobs не получают полный данные
+
+Также Flink NOT использует Kafka committed offsets для recovery — он uses Flink checkpoint state. Group ID matters только для observability (lag monitoring) and committed offsets visibility.
+
+**Practice:** unique group ID per Flink job, even в case-ях рестарта (хотя same job restart should reuse).
+
+### 5. Watermark idleness для idle partitions
+
+```java
+WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withIdleness(Duration.ofMinutes(1))    // ← critical
+```
+
+Если один partition idle (no events) — без idleness watermark stuck в last seen ts → downstream operators (CEP, windows) wait forever.
+
+### 6. Schema evolution с Avro — careful
+
+При rolling schema evolution в Confluent registry:
+- Producers write новой schema
+- Flink consumers с старой schema decoder → могут fail
+- Use forward/backward compatible changes (add optional field, не remove)
+
+```java
+.setValueOnlyDeserializer(ConfluentRegistryAvroDeserializationSchema.forSpecific(
+    Order.class, "http://schema-registry:8081", schemaRegistryConfig))
+```
+
+Test schema evolution на staging перед production deploy.
+
+---
+
+## Key takeaways
+
+- **KafkaSource** — FLIP-27 implementation, **KafkaSink** — FLIP-191 SinkV2.
+- **Dynamic partition discovery** через `partition.discovery.interval.ms` — must enable explicitly.
+- **OffsetsInitializer** controls start (earliest/latest/timestamp/committed/custom) и stop (BOUNDED via setBounded).
+- **EXACTLY_ONCE** через Two-Phase Commit Kafka transactions — `transactionalIdPrefix` must be unique per job, `transaction.timeout.ms` > checkpoint interval.
+- **SinkV2 TwoPhaseCommittingSink** clearly separates writer (pre-commit) и committer (commit) — strict improvement over legacy.
+- **withIdleness** обязателен для production с multiple partitions / sources.
+
+---
+
+<KnowledgeCheck
+  question="У вас KafkaSink с DeliveryGuarantee.EXACTLY_ONCE и enableCheckpointing(300_000) — 5 min checkpoint interval. Default transaction.timeout.ms. На production случаются duplicate events. Что причина?"
+  answer="Default transaction.timeout.ms = 60 секунд, но checkpoint interval 5 минут. Когда checkpoint takes longer than 60s (что часто happens с large state), Kafka aborts transaction. Flink does pre-commit (flush) но commit phase never вызывается успешно — records либо lost (rolled back) либо при recovery commits старые transactions, что может create duplicates. Fix: setProperty('transaction.timeout.ms', '900000') (15 min) — must быть significantly больше max checkpoint duration. Также verify Kafka broker config transaction.max.timeout.ms >= 900000 (broker default 15min — может быть бутылочное горлышко). Production rule of thumb: transaction.timeout.ms = max(2 × checkpoint_interval, 900_000)."
+/>

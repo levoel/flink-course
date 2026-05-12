@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/03-schema-evolution-pojo-avro",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-03",
+    "description": "Quiz for Schema evolution lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-03-q1",
+      "type": "multiple-choice",
+      "question": "Какие schema evolutions Flink делает automatically для POJO state?",
+      "options": [
+        { "id": "a", "text": "Любые изменения — rename, type change, restructure" },
+        { "id": "b", "text": "Add nullable field (default null), remove field (data silently dropped). Field rename NOT supported (Flink matches by name). Type change limited (long ↔ int sometimes works, most cases fail)" },
+        { "id": "c", "text": "Никаких — нужен manual migration always" },
+        { "id": "d", "text": "Только rename через annotations" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "POJO evolution supported для: add nullable field (auto-default null), remove field (data dropped). NOT supported: rename (Flink matches by name — rename = remove old + add new = data lost), incompatible type change (some primitive widenings work, most fail), class hierarchy changes, FQN changes. Avro supports more (aliases для rename, promoted types, explicit defaults). Kryo (fallback для не-POJO не-Avro) — NO evolution support — schema change breaks restore.",
+      "studyHint": "Повторите урок — POJO evolution: что Flink делает + rules",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m14-03-q2",
+      "type": "multiple-choice",
+      "question": "Custom typed classes (UserId, TransactionId) с final fields constructor-based. Schema change breaks restore. Diagnosis?",
+      "options": [
+        { "id": "a", "text": "Bug в Flink runtime" },
+        { "id": "b", "text": "Custom classes не POJO compliant (нет no-arg constructor, final fields), не Avro, fall back to Kryo serializer. Kryo НЕ поддерживает schema evolution — любое изменение class breaks. Fix: refactor к POJO (public no-arg constructor + setters), или Avro, или custom TypeSerializer" },
+        { "id": "c", "text": "Java version incompatibility" },
+        { "id": "d", "text": "Network connectivity issue" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic gotcha. Constructor-based immutable classes с final fields breaking PojoSerializer rules → Kryo fallback. Kryo НЕ поддерживает schema evolution — schema change = deserialization fails. Detection: startup logs «cannot be used as a POJO type because not all fields are valid POJO fields, processed as GenericType». Fixes (preferred order): (1) Refactor к POJO — public no-arg constructor + setters, accept mutability; (2) Migrate к Avro — schema-based with aliases, promoted types; (3) Custom TypeSerializer — full control, high effort; (4) State Processor API migration — one-time when automatic fails.",
+      "studyHint": "Повторите урок — Kryo и Java serialization: schema evolution NOT supported + KnowledgeCheck",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-03-q3",
+      "type": "multiple-choice",
+      "question": "Production state с долгосрочной schema evolution. Что recommend в 2026?",
+      "options": [
+        { "id": "a", "text": "POJO + Java serialization" },
+        { "id": "b", "text": "Avro с schema registry (Confluent SR): centralized schema management, aliases для rename, promoted types, explicit defaults, cross-language compatibility. Best long-term для production" },
+        { "id": "c", "text": "Kryo — он default" },
+        { "id": "d", "text": "Custom TypeSerializer для каждого state class" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Avro best для production long-term: (1) Centralized schema management (registry); (2) Aliases enable rename без migration; (3) Promoted types (int→long, float→double); (4) Explicit defaults для all new fields; (5) Cross-language — Java Flink + Python consumers ML pipeline; (6) Setup effort окупается через год evolution. POJO good для simple cases, но rename проблематичен. Kryo — never для state (no evolution). Custom serializer — edge cases only (high effort). Avro requires upfront work (schema files, generated classes, registry integration), but pays back в long-term operations.",
+      "studyHint": "Повторите урок — Avro evolution + Production tip",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-03-q4",
+      "type": "true-false",
+      "question": "При startup Flink logs обычно содержат warnings о fallback к Kryo serializer для классов которые не POJO compliant. Проверять эти logs обязательно для production stateful jobs.",
+      "correctAnswer": true,
+      "explanation": "True. Flink type extractor reports warnings: 'Class X cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on Data Types & Serialization for details of the effect on performance.' Это сигнал: class falls к Kryo → no schema evolution → bomb waiting to explode при schema change. Always check startup logs production stateful jobs. Common causes: missing no-arg constructor, private fields без getters, final fields in constructor-based class. Fix BEFORE deploying к production.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

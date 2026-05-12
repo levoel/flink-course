@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/04-sinkv2-api",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-04",
+    "description": "Quiz for SinkV2 API lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-04-q1",
+      "type": "multiple-choice",
+      "question": "Какие четыре основных stages в SinkV2 architecture для transactional sink с full features (Iceberg-like)?",
+      "options": [
+        { "id": "a", "text": "Source, Filter, Map, Sink" },
+        { "id": "b", "text": "(1) SinkWriter — записывает records, emit Committables на barrier; (2) PreCommitTopology (optional, SupportsPreCommitTopology) — compaction, dedup, aggregation; (3) Committer — атомарно commits на notifyCheckpointComplete; (4) PostCommitTopology (optional, SupportsPostCommitTopology) — Iceberg manifest publish, Hive update. Каждый stage — отдельный operator с own parallelism и state" },
+        { "id": "c", "text": "Connect, Send, Receive, Disconnect" },
+        { "id": "d", "text": "Create, Read, Update, Delete" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SinkV2 (FLIP-191) decomposition — это foundational design improvement vs old SinkFunction (monolithic) и TwoPhaseCommitSinkFunction (Writer+Committer в одном operator). **Stage 1 — SinkWriter**: PrecommittingSinkWriter interface, write() per record, prepareCommit() on barrier returns Collection<Committable>. **Stage 2 — PreCommitTopology**: optional через SupportsPreCommitTopology<WriterResult, Committable>. Full DataStream API между Writer и Committer — keyBy partition, window, compactor process function. Используется для small file compaction (Iceberg), aggregation, dedup. **Stage 3 — Committer**: separate operator, receives Committables, commits на notifyCheckpointComplete. Typically parallelism=1 для transactional sinks (avoid catalog race). **Stage 4 — PostCommitTopology**: optional через SupportsPostCommitTopology<Committable>. Terminal DataStream — Iceberg manifest list rewrite, Hive metastore update, notifications. НЕ EOS — должна быть idempotent.",
+      "studyHint": "Повторите урок — секция 'Архитектура SinkV2'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m07-04-q2",
+      "type": "multiple-choice",
+      "question": "Use case: streaming pipeline пишет в S3 Parquet файлы. Production видит миллионы small files (4MB avg), query engine slow. Какой SinkV2 mechanism решит проблему?",
+      "options": [
+        { "id": "a", "text": "Увеличить sink parallelism" },
+        { "id": "b", "text": "SupportsPreCommitTopology — между Writer и Committer добавить compaction operator: keyBy(bucket) → window → process function которая reads многие small files в одном bucket и merges их в один large (256MB target), emit-ит consolidated committable. Committer финализирует уже compacted files" },
+        { "id": "c", "text": "SupportsPostCommitTopology — compact после commit" },
+        { "id": "d", "text": "Только switch на Iceberg" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic small file problem решается через SupportsPreCommitTopology. Implementation: (1) extending FileSink с SupportsPreCommitTopology<WriterResult, Committable>; (2) Override addPreCommitTopology(DataStream<WriterResult>): keyBy на bucket path для grouping; (3) Window operator (e.g., GlobalWindow с CountTrigger of 10 files) accumulates writer results; (4) ProcessFunction reads small files, opens new Parquet writer, merges, returns committable с consolidated file path; (5) Committer финализирует уже compacted committable. Преимущества: (a) compaction happens между Writer и Committer — small files никогда не финализируются; (b) state minimal (window operator state); (c) reuses Flink scheduling и backpressure. Post-commit compaction — анти-паттерн: files уже committed, второй pass переписывает их, double work + transient state inconsistency. Iceberg switch — отдельное архитектурное решение, не обязательно.",
+      "studyHint": "Повторите урок — секция 'SupportsPreCommitTopology — small file compaction'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-04-q3",
+      "type": "multiple-choice",
+      "question": "В SinkV2 CommitRequest API какие три способа respond?",
+      "options": [
+        { "id": "a", "text": "ACK, NACK, RETRY" },
+        { "id": "b", "text": "(1) Возврат без exception — committable treated как success; (2) retryLater() — будет retry на next notifyCheckpointComplete (n.b., infinite loop possible если committer всегда retries — нужен max retry counter); (3) signalFailedWithKnownReason/UnknownReason — fatal error, job fails. Plus signalAlreadyCommitted для idempotency и updateAndRetryLater для evolving committable" },
+        { "id": "c", "text": "OK, FAIL, IGNORE" },
+        { "id": "d", "text": "ACK, NACK без retry" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "CommitRequest API даёт fine-grained control над commit semantics. **Implicit success**: просто вернуться из commit() без exception — committable removed from state. **retryLater()**: committable остаётся в state, retry на next notifyCheckpointComplete. Полезно для transient errors (network blip, broker temporary unavailable). PITFALL: infinite retry loop возможен если committer всегда retries — state grows unbounded. Best practice — track numberOfRetries (CommitRequest.getNumberOfRetries()) и после N retries call signalFailedWithKnownReason. **signalFailedWithKnownReason(Throwable)** — fatal, JM detects, job restart per restart strategy. Used для unrecoverable conditions (schema mismatch, auth failure). **signalAlreadyCommitted()** — idempotency: prior attempt committed successfully, treat as no-op. Critical для recoverAndCommit scenarios. **updateAndRetryLater(updated)** — committable mutated (e.g., compacted), retry with new committable. Edge case used in некоторых sinks.",
+      "studyHint": "Повторите урок — секция 'Committer'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-04-q4",
+      "type": "true-false",
+      "question": "PostCommitTopology operations exactly-once гарантированы — Flink replay их после restart.",
+      "correctAnswer": false,
+      "explanation": "False. PostCommitTopology — НЕ EOS. Operations выполняются ПОСЛЕ sink commit. Если post-commit operator падает: commit уже finalized в external system, state recovery приведёт к повторному запуску post-commit для already-committed транзакций. Side effects (Hive metastore update, telegram notification, manifest publish) дублируются. Это design choice: Flink не может rollback already-committed external transaction. Implications: PostCommitTopology operations должны быть **идемпотентны**. Iceberg manifest publish — idempotent (manifest UUID, существующий manifest skip-ed). Hive add partition — idempotent с IF NOT EXISTS. HTTP notification — usually НЕ idempotent (Telegram bot шлёт два сообщения). Fix patterns: (1) wrap external calls в try-catch для duplicate detection; (2) deduplication store (Redis with TTL по transaction ID); (3) avoid non-idempotent operations в post-commit, использовать downstream consumer для notifications instead. Это same logic как Side Effects в processElement — Flink не гарантирует EOS для них.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

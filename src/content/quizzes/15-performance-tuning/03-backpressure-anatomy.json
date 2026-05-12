@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/03-backpressure-anatomy",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-03",
+    "description": "Quiz for backpressure anatomy lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-03-q1",
+      "type": "multiple-choice",
+      "question": "Какая тройка метрик появилась в Flink 1.13 (FLIP-179) для backpressure диагностики и как они связаны?",
+      "options": [
+        { "id": "a", "text": "isBackPressured (boolean 0/1) — единственный indicator" },
+        { "id": "b", "text": "busyTimeMsPerSecond (% активной работы), idleTimeMsPerSecond (% ожидания upstream), backPressuredTimeMsPerSecond (% блокирован downstream). Сумма ≈ 1000ms/sec — это полный 1-second budget каждого subtask" },
+        { "id": "c", "text": "throughput / latency / utilization" },
+        { "id": "d", "text": "CPU / memory / disk metrics" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-179 'Expose Standardized Operator Metrics' (1.13). Each subtask continuously в одном из трёх состояний: busy (активная работа), idle (нет данных из upstream), backpressured (downstream не принимает). Сумма ≈ 1000ms/sec с погрешностью ~30ms из-за scheduling overhead. До 1.13 был только бинарный isBackPressured: 0/1, который врал в edge cases. Сейчас — детерминированный flow диагностики, не угадывание.",
+      "studyHint": "Повторите урок — тройка метрик",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-03-q2",
+      "type": "multiple-choice",
+      "question": "Web UI color coding operator-боксов: что означает чёрный (или розовый) цвет?",
+      "options": [
+        { "id": "a", "text": "Operator failed" },
+        { "id": "b", "text": "backPressuredTime > 50% — operator не может писать вниз. Downstream slow. Двигайтесь по DAG вниз к sink для поиска bottleneck" },
+        { "id": "c", "text": "busy > 90% (CPU-bound)" },
+        { "id": "d", "text": "idle > 50% (waiting upstream)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Color mapping: зелёный (busy 0-50% healthy), жёлтый (busy 50-90% working), красный (busy > 90% CPU bottleneck), синий (idle > 50% waiting upstream — bottleneck выше по DAG), чёрный/розовый (backpressured > 50% — bottleneck ниже по DAG). Чёрный значит operator пытается выводить данные но downstream не принимает (no credit). Это направляет diagnostic flow: чёрный → искать bottleneck по DAG вниз.",
+      "studyHint": "Повторите урок — color coding в Web UI",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-03-q3",
+      "type": "multiple-choice",
+      "question": "Сценарий: KeyedProcess 70% busy 30% backpressured колеблется с 30-секундным periodом, throughput sawtooth pattern. Какой наиболее вероятный root cause?",
+      "options": [
+        { "id": "a", "text": "Источник медленный" },
+        { "id": "b", "text": "RocksDB compaction stall pattern. Period 30s + sawtooth — обычно L0→L1 compaction triggers. RocksDB stuck на state access во время compaction (busy внешне, реально I/O wait). Fix: state.backend.rocksdb.thread.num: 8 (default 1-2), либо включить ForSt (FLIP-427), либо ZGC для GC pauses" },
+        { "id": "c", "text": "Network buffers insufficient" },
+        { "id": "d", "text": "JIT compilation cycles" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sawtooth с periodом 30s — характерный RocksDB pattern. busyTime включает state access wait — subtask waiting для disk I/O показывается как busy с точки зрения mailbox processor. Diagnose: state.backend.rocksdb.metrics.compaction-pending-bytes корреляция с throughput dips. iostat -x 1 на TaskManager — disk %util высокий во время bursts. Fix: больше compaction threads, или migration к ForSt (compaction уезжает на S3). Альтернативы: GC pauses (G1 mixed coll 30s coincidence — switch к ZGC) или checkpoint barrier alignment (включить unaligned).",
+      "studyHint": "Повторите урок — Сценарии диагностики, scenario 4",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-03-q4",
+      "type": "true-false",
+      "question": "busyTime метрика учитывает только CPU activity — если subtask ждёт state I/O (RocksDB read), он показывается как idle.",
+      "correctAnswer": false,
+      "explanation": "False. busyTime включает state access wait. Subtask может быть в busy состоянии и ждать RocksDB I/O — с точки зрения mailbox processor это активная работа (subtask занят), но реально это disk I/O wait. Симптом: busy=90%, CPU usage 20%, disk I/O wait высокий. Diagnose: iostat -x 1 на TaskManager host — disk %util? Высокий → confirmed I/O bottleneck. Fix: RocksDB tuning (block cache, async IO в ForSt) или disaggregated state (S3). Это важный gotcha — busy ≠ CPU-bound automatically.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

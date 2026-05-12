@@ -1,0 +1,470 @@
+---
+title: "ForSt — disaggregated state на S3 (FLIP-427)"
+description: "ForSt backend Flink 2.0: primary storage S3/HDFS/GCS, локальный диск только cache, async I/O. Recovery time independent of state size. Async State API V2 ОБЯЗАТЕЛЕН. VLDB 2025 paper benchmarks"
+order: 8
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["ForSt", "FLIP-427", "Disaggregated State", "Cloud-Native", "Async I/O", "VLDB 2025"]
+---
+
+# ForSt — disaggregated state на S3 (FLIP-427)
+
+ForSt — flagship feature Flink 2.0 (март 2025), фундаментально меняющий cloud deployment модель. State больше не tied к локальному диску TaskManager. Это disruptive в том же смысле как Snowflake decoupling compute от storage был disruptive для data warehouses.
+
+Этот урок — самый important в курсе. Без understanding ForSt вы не понимаете куда Flink идёт.
+
+---
+
+## Проблема с RocksDB на K8s
+
+Classic Flink: RocksDB state на local disk TaskManager. Это работает, но имеет fundamental problems в cloud:
+
+### Problem 1: Local disk size limits state
+
+```
+TaskManager pod:
+  CPU: 4 cores
+  Memory: 16GB
+  Local disk: 100GB SSD (PVC или ephemeral)
+```
+
+Если state > 100GB → нужно бigger disk → больший pod → меньше utilisation. Если state = 1TB, нужны TaskManager с 1TB+ дисками — expensive, locked-in resources.
+
+### Problem 2: Recovery time scales linearly с state
+
+Pod migrates к other node (K8s reschedule):
+- Old disk gone
+- Download all SST от S3 checkpoint → restore RocksDB
+- 1TB state @ 1Gbps = 8000 секунд = 2.2 часа downtime
+
+**Recovery time linear в state size — main K8s deployment pain point.**
+
+### Problem 3: Compute и storage tied
+
+Hot day: 2x events/sec. Хочу scale compute (+50% TaskManager). Но state на local disks тех existing TaskManager — rebalance state нужен. Это full restart, hours downtime.
+
+Cool день: low load. Хочу scale down. State релокация снова.
+
+В cloud-native we want **independent scaling** compute от storage. Couldn't do с local-disk RocksDB.
+
+---
+
+## ForSt: disaggregated solution
+
+<DiagramContainer title="ForSt architecture: primary state на S3, cache локально" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink job code"
+        tooltip="User operators с keyed state. API identical к RocksDB — те же ValueState, MapState, ListState. Async State API V2 ОБЯЗАТЕЛЕН для acceptable performance."
+      >
+        Stateful operators
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="state.asyncValue() через AEC" />
+    <FlowRow>
+      <DataBox
+        label="ForSt backend"
+        tooltip="LSM-tree engine (forked from RocksDB), но с async I/O и remote storage support. Maintains in-memory MemTables, manages local cache, transparently fetches from S3 на cache miss."
+      >
+        LSM engine + remote-aware
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="check local cache first" />
+    <FlowRow>
+      <DataBox
+        label="Local cache (NVMe)"
+        tooltip="Cache hot blocks/SSTs. Configurable size (1GB-100GB+). LRU eviction. Cache hit: 10-100μs. Cache miss → S3 GET. Size critical for performance: too small → high miss rate → S3 latency пропускает throughput."
+      >
+        /tmp/forst-cache (LRU)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="on cache miss → async S3 GET" />
+    <FlowRow>
+      <DataBox
+        label="S3 / HDFS / GCS"
+        tooltip="Primary state storage. All SST files live here. Latency 50-100ms per GET. Bandwidth virtually unlimited. Cost ~$23/TB/month S3 Standard. Recovery doesn't need download — TaskManager pulls SST on demand."
+      >
+        Object storage (primary)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Key properties
+
+| Property | RocksDB | ForSt |
+|---|---|---|
+| Primary state | Local disk | S3/HDFS/GCS |
+| Cache | Block Cache в RAM | Local NVMe + Block Cache |
+| Disk requirement | = state size (TB) | = cache size (10-100GB) |
+| Recovery time | Linear with state | **Constant** (just metadata) |
+| Independent scaling | No | **Yes** |
+| Async I/O required | No (helpful) | **YES** (mandatory) |
+| Cost model | Bigger TaskManager nodes | Smaller TM + S3 storage |
+
+---
+
+## Configuration
+
+```yaml
+# Switch backend:
+state.backend.type: forst
+
+# Storage:
+state.backend.forst.primary-dir: s3://my-bucket/state
+state.backend.forst.local-dir: /tmp/forst-cache
+
+# Cache:
+state.backend.forst.cache.size: 4gb               # LRU cache size
+state.backend.forst.cache.reserved-size: 1gb      # reserved для filter/index blocks
+
+# I/O:
+state.backend.forst.io.parallelism: 16            # S3 concurrent requests
+state.backend.forst.io.max-batch-size: 32         # batch S3 reads
+
+# Checkpoint:
+state.checkpoints.dir: s3://my-bucket/checkpoints
+state.backend.incremental: true                   # works similarly к RocksDB
+
+# CRITICAL:
+state.backend.execution.async-state: true         # enable async API V2
+```
+
+S3 credentials через standard AWS SDK chain — IAM role на K8s pod (recommended).
+
+---
+
+## Async State API V2 — mandatory
+
+С S3 latency 50-100ms на cache miss, **sync state API через ForSt = catastrophe**. Mailbox thread блокируется на каждый miss.
+
+```java
+// ❌ Sync через ForSt — incompatible (Flink throws):
+Long v = state.value();   // blocks 100ms on cache miss
+
+// ✅ Async через ForSt — required:
+state.asyncValue().thenAccept(v -> { ... });
+```
+
+Без `state.backend.execution.async-state: true` job не запускается с ForSt. AEC routes requests к ForSt в parallel via I/O thread pool, mailbox непрерывно работает.
+
+Numbers (Apache benchmarks, Flink 2.0):
+- ForSt sync: 200 events/sec (катастрофа)
+- ForSt async: 30,000 events/sec
+- 150x difference
+
+---
+
+## Recovery: constant time
+
+```
+RocksDB recovery (1TB state):
+  1. TaskManager pod ready
+  2. Download 1TB SST files from S3      ← 2 hours @ 1Gbps
+  3. Open RocksDB
+  4. Resume from last checkpoint
+  Total: 2+ hours
+
+ForSt recovery (1TB state):
+  1. TaskManager pod ready
+  2. Read checkpoint metadata             ← 1 second
+  3. Open ForSt (points к S3 SST files)
+  4. Resume processing
+  5. (Background) populate local cache    ← async, on-demand
+  Total: ~5 seconds
+```
+
+Сначала reads have S3 latency (no cache), но job already processing. Cache warms up over time. Within minutes typical workloads see good cache hit rate.
+
+This is **the killer feature**: recovery independent of state size. Enables true elastic scaling.
+
+---
+
+## VLDB 2025 paper findings
+
+«ForSt: A Disaggregated State Store for Cloud-Native Streaming» (VLDB 2025).
+
+### Key benchmarks
+
+**Test setup**: TPC-H Q5 streaming version, 4.8GB state, EC2 m5.2xlarge (8 vCPU, 32GB RAM), Gp3 NVMe local + S3.
+
+| State size | Cache | RocksDB throughput | ForSt throughput |
+|---|---|---|---|
+| 1.2GB | 1GB cache | 100k events/sec | 120k events/sec (**120%**) |
+| 2.4GB | 1GB cache | 80k | 95k (**118%**) |
+| 4.8GB | 1GB cache | 50k | 38k (**76%**) |
+| 4.8GB | 2GB cache | 50k | 48k (**96%**) |
+| 4.8GB | 4GB cache | 50k | 52k (**104%**) |
+
+**Insights**:
+- Up к cache size, ForSt matches or **exceeds** RocksDB throughput
+- Beyond cache size (working set > cache), throughput drops к S3 bandwidth-bound
+- Cache size = working set → ~100% RocksDB throughput
+- Cache size > working set → ForSt actually **faster** (better async I/O parallelism)
+
+### Recovery benchmark
+
+Failure simulation, fresh node:
+
+| State size | RocksDB recovery time | ForSt recovery time |
+|---|---|---|
+| 100GB | 14 minutes | **8 seconds** |
+| 500GB | 70 minutes | **9 seconds** |
+| 1TB | 2.5 hours | **12 seconds** |
+
+ForSt recovery scales with metadata complexity, not state size. Constant-time recovery.
+
+---
+
+## Cache strategies
+
+ForSt has tunable cache behavior:
+
+```yaml
+state.backend.forst.cache.size: 8gb
+state.backend.forst.cache.reserved-size: 2gb            # filter/index pinned
+state.backend.forst.cache.eviction-policy: LRU          # or LFU
+state.backend.forst.cache.prefetch-enabled: true        # speculative reads
+state.backend.forst.cache.prefetch-block-count: 4       # adjacent blocks
+```
+
+### Cache sizing rule of thumb
+
+- **Working set** = data accessed in last hour (estimate via access pattern)
+- **Cache size** = working set × 1.2-1.5 (overhead для cold spikes)
+- **Cache miss rate target**: <10% для production
+
+If working set unknown, start с 4-8GB cache, monitor `cache_hit_rate` metric, tune.
+
+---
+
+## I/O parallelism
+
+ForSt дrastically benefits от parallel S3 requests:
+
+```yaml
+state.backend.forst.io.parallelism: 16        # concurrent S3 requests
+state.backend.forst.io.max-batch-size: 32     # group requests
+```
+
+S3 supports millions concurrent connections per bucket. Один S3 GET = 50ms latency, 16 parallel = 50ms wall clock for 16 GETs. Setting high (16-32) = significant throughput gain.
+
+For local disk RocksDB — parallelism less important. For ForSt — critical.
+
+---
+
+## Cost model
+
+Approximate AWS costs для 1TB state (us-east-1):
+
+### Local NVMe RocksDB
+
+```
+TaskManager pod sized for 1TB disk:
+  m5d.2xlarge (75GB local NVMe) × insufficient
+  Need larger: m5d.4xlarge × 2 ($0.45/hr × 2 = $0.90/hr × 720 = $648/month)
+S3 checkpoint storage: 1TB × 1.1 = 1.1TB × $0.023 = $25/month
+Total: ~$673/month
+```
+
+### ForSt
+
+```
+TaskManager pod sized для cache:
+  m5d.xlarge (75GB NVMe sufficient для 50GB cache) × 1
+  $0.226/hr × 720 = $163/month
+S3 primary state: 1TB × $0.023 = $23/month
+S3 requests (estimate 1k GET/sec × 86400 × $0.0004/1000 GETs) = $36/month
+Total: ~$222/month
+```
+
+**ForSt: ~3x cheaper для TB-scale state.**
+
+Savings come from:
+- Smaller compute (don't need huge local disks)
+- S3 cheaper than EBS/local SSD per GB
+- Better utilization (storage decoupled)
+
+---
+
+## When ForSt makes sense
+
+| Scenario | RocksDB | ForSt |
+|---|---|---|
+| Small state (<10GB) | ✅ | Overkill |
+| Medium state (10-100GB), low recovery time | ✅ | ✅ |
+| Large state (>100GB) | OK с большими nodes | ✅ better |
+| TB+ state | Painful | ✅ excellent |
+| Elastic scaling required | ❌ | ✅ |
+| K8s ephemeral storage | ❌ | ✅ |
+| Multi-region failover | Hard | ✅ (replicate S3) |
+| Strict latency P99 < 1ms | ✅ | OK with large cache |
+| Cold state, occasional access | Wasteful disk | ✅ pay per GET |
+
+---
+
+## Migration RocksDB → ForSt
+
+Не straightforward — different binary format. Migration path:
+
+```bash
+# Step 1: Stop job with canonical savepoint:
+flink stop --savepoint-format canonical --savepointPath s3://bucket/sp <jobId>
+
+# Step 2: Change config:
+# state.backend.type: forst
+# state.backend.forst.primary-dir: s3://bucket/state
+
+# Step 3: Resume from canonical savepoint:
+flink run -s s3://bucket/sp -d job.jar
+```
+
+Canonical format is backend-agnostic — bridges RocksDB → ForSt. Native format is backend-specific.
+
+Migration is one-way: easier RocksDB → ForSt than reverse.
+
+---
+
+## Production gotchas
+
+### 1. Async API V2 not enabled
+
+```yaml
+state.backend.type: forst
+# state.backend.execution.async-state: false  # ❌ catastrophe
+```
+
+Without async API, ForSt syncronously blocks mailbox на каждый S3 GET. Throughput ~200 events/sec. Symptoms: massive backpressure, near-zero throughput.
+
+Fix: enable `async-state: true` (it's required для ForSt, не optional).
+
+### 2. Cache too small
+
+```yaml
+state.backend.forst.cache.size: 512mb   # too small для 50GB working set
+```
+
+Cache hit rate < 50% → most reads hit S3 → latency 50ms per access → throughput <5k events/sec.
+
+Monitor `forst_cache_hit_rate`. Target >85%.
+
+### 3. S3 credentials misconfigured
+
+ForSt requires S3 access via AWS SDK chain (IAM role on K8s, или env vars `AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`).
+
+К8s deployment: use IRSA (IAM Role for Service Account). Hardcode credentials only для testing.
+
+### 4. S3 cost из частых GET
+
+If working set huge или cache small, S3 GETs cost can dominate. 1B GETs/month × $0.0004/1000 = $400/month just GETs.
+
+Optimization: increase cache, batch reads (`io.max-batch-size: 64`), use S3 Express One Zone for hot prefixes.
+
+### 5. Network bandwidth to S3
+
+ForSt assumes high network bandwidth к S3 (multi-Gbps). On bad connectivity (< 1Gbps), throughput suffers.
+
+Run TaskManager в same AZ as S3 bucket. Use S3 VPC endpoint to avoid egress charges и latency.
+
+### 6. Cache eviction storm
+
+Sudden hot key shift (e.g., trending product) → cache misses on shifted keys → S3 GETs spike → cache fills with new hot data, evicts old → cycle repeats.
+
+Mitigate: bigger cache, adaptive eviction policy.
+
+### 7. Multi-region disaster recovery
+
+ForSt primary state on S3 = inherent multi-AZ durability. For multi-region DR, use S3 Cross-Region Replication для primary-dir.
+
+Recovery in DR region: spin up Flink в other region, point к replicated S3 → resume. Replication lag matters (eventual consistency).
+
+---
+
+## Limitations (Flink 2.2)
+
+- ForSt **still maturing** — Flink 2.0 release (March 2025), Flink 2.2 production-ready (December 2025).
+- **Async State API V2 mandatory** — sync state не supported.
+- **State Processor API limited** — некоторые operations expensive due to S3 latency.
+- **Window state** на ForSt has variable latency — sliding windows с many keys = many S3 GETs per event.
+- **Cost monitoring**: S3 GET costs can sneak up если working set unknown.
+
+---
+
+## Performance metrics
+
+```
+flink_taskmanager_state_forst_cache_hit
+flink_taskmanager_state_forst_cache_miss
+flink_taskmanager_state_forst_s3_get_count
+flink_taskmanager_state_forst_s3_get_latency_p99
+flink_taskmanager_state_forst_in_flight_requests
+```
+
+Healthy:
+- `cache_hit / (hit + miss)` > 0.85
+- `s3_get_latency_p99` < 200ms
+- `in_flight_requests` < `io.parallelism`
+
+---
+
+## Future: Flink 2.x roadmap
+
+- **Flink 2.3** (2026): ForSt production-default для new deployments.
+- **Tiered Storage**: hot cache в NVMe, warm в EBS, cold в S3 — multi-tier.
+- **Cross-region replication**: первый-class support через ForSt.
+- **Compute-storage scaling** independently: API to scale storage без compute.
+
+---
+
+## Decision tree: RocksDB vs ForSt
+
+```
+Start: choose state backend
+  │
+  ├─ State size < 10GB?
+  │    └─ RocksDB (simpler, no S3 dependency)
+  │
+  ├─ State size 10-100GB и predictable load?
+  │    └─ RocksDB OK, but consider ForSt для cost savings
+  │
+  ├─ State size > 100GB?
+  │    └─ ForSt strongly recommended
+  │
+  ├─ Need recovery time independent of size?
+  │    └─ ForSt
+  │
+  ├─ Need elastic scaling (frequent scale up/down)?
+  │    └─ ForSt
+  │
+  ├─ Strict P99 < 1ms latency?
+  │    └─ RocksDB (более predictable) с big cache
+  │
+  └─ Default modern recommendation:
+       └─ Start с ForSt, benchmark RocksDB if needed
+```
+
+---
+
+<Callout type="tip">
+ForSt — это «Snowflake moment» Flink: decoupling state storage от compute. Это не оптимизация — это новая deployment модель. Если строите новый production Flink 2.x job в cloud — start с ForSt. Migration позже от RocksDB possible, но native deployment proper way.
+</Callout>
+
+---
+
+## Lab idea
+
+Setup ForSt с MinIO (S3 mock):
+1. Run MinIO container локально.
+2. Configure Flink job с `state.backend.type: forst`, primary-dir на MinIO.
+3. Run state-heavy workload (counter per key).
+4. Measure cache hit rate, S3 GET latency, throughput.
+5. Kill TaskManager, observe recovery time (should be seconds).
+6. Compare к RocksDB equivalent — bandwidth saved, recovery time.
+
+---
+
+<KnowledgeCheck
+  question="Production Flink 2.x job, 800GB state, K8s deployment. Текущий setup — RocksDB на local NVMe. Recovery после pod migration = 90 minutes. Хотим уменьшить до <30 секунд. Какой стек миграции?"
+  answer="Migration к ForSt — это primary решение для recovery time. Plan: (1) Verify Async State API V2 usage в job code — все state access должен быть state.asyncValue().thenAccept(...) (mandatory для ForSt). Migrate sync calls. (2) Provision S3 bucket с appropriate region (same as TaskManager EKS cluster). Configure IAM role для pod через IRSA. (3) Set up MinIO или real S3 dev environment, тест migration в staging с representative state size. (4) Update flink-conf.yaml: state.backend.type: forst, state.backend.forst.primary-dir: s3://bucket/state, state.backend.forst.local-dir: /tmp/forst-cache, state.backend.forst.cache.size: 16gb (estimate working set), state.backend.execution.async-state: true. (5) Migration via canonical savepoint: stop --savepoint-format canonical, change config, resume from savepoint. ForSt reads from canonical, creates ForSt-native SSTs in S3 lazy on demand. (6) Post-migration validation: recovery test (kill pod, observe time — should be <30s), throughput baseline (compare к RocksDB pre-migration, target 100%+ с adequate cache), cache hit rate >85%. Cost analysis: RocksDB needed 1TB NVMe pods (m5d.2xlarge ~$648/mo), ForSt needs 100GB NVMe pods (m5d.xlarge ~$163/mo) + S3 storage 800GB × $0.023 = $18/mo + S3 GETs ~$40/mo = $221/mo total — 3x cost savings. Real benefit: 90 min → 12 seconds recovery, plus elastic scaling (compute independent от storage), plus stronger DR с S3 replication. Caveats: ensure network к S3 multi-Gbps (use S3 VPC endpoint), cache sizing critical (working set analysis), monitor cache_hit_rate в production. Flink 2.2 production-ready."
+/>

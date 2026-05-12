@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/07-incremental-checkpointing",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-07",
+    "description": "Quiz for incremental checkpointing lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-07-q1",
+      "type": "multiple-choice",
+      "question": "Какое property LSM-tree enables incremental checkpointing?",
+      "options": [
+        { "id": "a", "text": "Compaction" },
+        { "id": "b", "text": "SST files immutable — once written, никогда не modified. Поэтому SST в checkpoint N можно reuse в checkpoint N+1 if still alive. Incremental = upload только NEW SSTs since last checkpoint" },
+        { "id": "c", "text": "Bloom filter" },
+        { "id": "d", "text": "MemTable skiplist" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SST immutability — fundamental LSM-tree property — enables incremental checkpointing. Once written, SST никогда не modified (compaction creates NEW SST files, leaves originals untouched until garbage collected). Это значит SST 00010.sst в checkpoint N — тот же файл что в checkpoint N+1 (if not yet compacted away). Flink эксплуатирует это: upload SST только если новый, reference shared SST из previous checkpoints через SharedStateRegistry. Сильно reduces bandwidth (typical 1-5% per checkpoint) и storage (1.05-1.2x state size vs N×state без incremental).",
+      "studyHint": "Повторите урок — Базовая идея",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m04-07-q2",
+      "type": "multiple-choice",
+      "question": "Что такое SharedStateRegistry?",
+      "options": [
+        { "id": "a", "text": "RocksDB internal cache" },
+        { "id": "b", "text": "Centralized registry на JobManager — tracks all SST files в active checkpoints с reference counts. Когда checkpoint disposed → decrement refcounts. Когда refcount=0 → delete SST from S3. Это garbage collection mechanism для shared SST" },
+        { "id": "c", "text": "Network buffer pool" },
+        { "id": "d", "text": "Watermark coordinator" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SharedStateRegistry — JobManager component для tracking SST file usage across multiple incremental checkpoints. Maps SST file identifier → reference count. При checkpoint creation: register new SST (refcount=1) или reuse existing (refcount++). При checkpoint disposal (subsumed by later checkpoint): unregister SST (refcount--). Когда refcount→0 → file deleted from S3. Это elegant garbage collection: ensures SST stays available пока хотя бы один active checkpoint references it. Critical для correctness — без registry SST могли бы быть deleted prematurely → restore broken.",
+      "studyHint": "Повторите урок — SharedStateRegistry deeper dive",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-07-q3",
+      "type": "multiple-choice",
+      "question": "Job, 500GB state, incremental checkpoints каждые 60 сек. Storage savings vs full checkpoints?",
+      "options": [
+        { "id": "a", "text": "10% savings — небольшой gain" },
+        { "id": "b", "text": "~98% savings. Full: 500GB × num-retained × frequency = huge. Incremental: 500GB × 1.05 ≈ 525GB total (shared SST reuse). Bandwidth: full 500GB/60s = 8.3 GB/s sustained. Incremental: 5-25GB/60s = 0.4 GB/s avg" },
+        { "id": "c", "text": "50% savings" },
+        { "id": "d", "text": "No savings, just different format" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Massive savings. Math: Full checkpoints с num-retained=3 = 1.5TB storage steady-state, 500GB upload per checkpoint = 8.3GB/s sustained bandwidth (infeasible на most networks). Incremental: typical 1-5% state changes between checkpoints (новые SST от MemTable flush + compaction). Upload per checkpoint: 5-25GB. Storage: 500GB × 1.05 (через shared SST reuse в SharedStateRegistry) = 525GB. Bandwidth steady-state: 0.4GB/s avg. Cost reduction ~95-98%. Recovery time не improves with incremental (need full SST set от download) — для constant-time recovery нужен ForSt.",
+      "studyHint": "Повторите урок — Storage savings example",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m04-07-q4",
+      "type": "true-false",
+      "question": "Incremental checkpoint enables recovery time independent of state size.",
+      "correctAnswer": false,
+      "explanation": "False. Incremental saves UPLOAD bandwidth/storage, не download/recovery time. При recovery от incremental checkpoint Flink download FULL set of SST files (shared + private) — same total bytes as full checkpoint. 1TB state = 1TB download. Recovery time ~ linear с state size. Для recovery time INDEPENDENT of state size нужен ForSt (disaggregated state на S3 — primary storage, recovery = metadata only ~5 секунд для TB state). Incremental — bandwidth optimization, ForSt — recovery optimization. Together они addressing different dimensions same problem.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

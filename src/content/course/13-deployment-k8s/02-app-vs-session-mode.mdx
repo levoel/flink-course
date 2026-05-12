@@ -1,0 +1,343 @@
+---
+title: "Application mode vs Session mode (Per-job removed)"
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Application Mode", "Session Mode", "Per-job removed", "Deployment Lifecycle", "Flink 2.x"]
+---
+
+# Application mode vs Session mode
+
+В Flink 2.x остались **только два** режима deployment-а: **Application mode** и **Session mode**. Третий режим — **Per-job** — окончательно **удалён в Flink 2.0** (FLIP-419). Это структурное упрощение: per-job был middle-ground решением, которое жило в полу-shadow между двумя другими, имело subtle bugs и confusing семантику. В этом уроке мы разберём оставшиеся два mode-а с точки зрения production deployment-а на Kubernetes: lifecycle, изоляцию ресурсов, blast radius при сбоях и когда выбирать какой.
+
+Внимание: тема пересекается с уроком 01-architecture/05 (где режимы рассматриваются в контексте архитектуры). Здесь фокус на **deployment**: K8s integration, FlinkDeployment manifests, lifecycle при upgrade/rescale, операционные последствия выбора.
+
+---
+
+## Один screenshot краткого сравнения
+
+| Аспект | Application mode | Session mode | Per-job (UDALEN в 2.0) |
+|---|---|---|---|
+| Cluster lifecycle | Один cluster = одна job | Long-running, shared | Один cluster = одна job |
+| main() компилируется | В JobManager pod | На клиенте | На клиенте |
+| Isolation | Hard (dedicated JM+TM) | Soft (shared slots) | Hard |
+| K8s native? | Да (FlinkDeployment) | Да (FlinkSessionJob → FlinkDeployment session) | n/a |
+| Cold start | 10-60s (pod create) | менее 2с (slot allocate) | 10-60s |
+| Production default | Да | Только для специальных кейсов | n/a |
+
+Per-job mode был фактически Application mode минус «main() inside JM». В 2.0 разработчики решили: «зачем два почти одинаковых режима» — и оставили только Application. Все workflow, которые раньше использовали per-job, теперь конфигурируются как Application.
+
+---
+
+## Application mode: how it actually works
+
+В Application mode **main() метод вашей JAR-ки запускается внутри JobManager-а**. Клиент upload-ит JAR (или image содержит его), JobManager стартует, main() выполняется в pod-е JobManager-а, генерирует StreamGraph → JobGraph, JobMaster берёт JobGraph и deploy-ит tasks. Когда job завершается (FINISHED или CANCELED) — весь cluster (JM + TM-ы) shutdown.
+
+<DiagramContainer title="Application mode lifecycle: один cluster = одна job" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="kubectl apply -f FlinkDeployment.yaml"
+        tooltip="GitOps pattern — manifest в репо, ArgoCD/Flux синхронизируют. Operator получает create event и реконсилирует desired state."
+      >
+        Submission
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Operator creates resources" />
+    <FlowRow>
+      <DataBox
+        label="JobManager pod boots"
+        tooltip="Docker image содержит ваш JAR в /opt/flink/usrlib/. JM JVM стартует, ResourceManager component поднимается, Dispatcher REST на 8081, начинается leader election (если HA)."
+      >
+        JM pod (JVM start)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="main() invoked inside JM" />
+    <FlowRow>
+      <DataBox
+        label="StreamGraph → JobGraph"
+        tooltip="Компиляция internal, не зависит от клиентского environment (Java версия, Maven). Если main() кидает exception — JM logs показывают это, pod restart-ится по K8s рестарт-политике."
+      >
+        Job compiled
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="JobMaster created" />
+    <FlowRow>
+      <DataBox
+        label="ResourceManager requests TM pods"
+        tooltip="Active mode integration с K8s: RM напрямую создаёт TM pods (KubernetesResourceManagerDriver). Standby mode (static cluster) не используется в Application mode."
+      >
+        TM pods created
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="tasks deployed" />
+    <FlowRow>
+      <DataBox
+        label="Job RUNNING"
+        tooltip="Subtasks бегут на TM-ах. JM координирует checkpoints, watermark progress. Web UI доступен через Service на 8081."
+      >
+        steady state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="job FINISHED / CANCELED / FAILED" />
+    <FlowRow>
+      <DataBox
+        label="Full teardown"
+        tooltip="Operator удаляет TM pods, потом JM. Persistent state (checkpoints/savepoints в S3) остаётся. FlinkDeployment CR помечен Completed/Failed, остальная state — в external storage."
+      >
+        cluster gone
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Production FlinkDeployment manifest (Application mode)
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector
+  namespace: streaming-prod
+spec:
+  image: registry.example.com/fraud-detector:1.42.0
+  flinkVersion: v2_2
+  imagePullPolicy: IfNotPresent
+  serviceAccount: flink
+
+  flinkConfiguration:
+    # State backend — ForSt для disaggregated state на S3
+    state.backend.type: forst
+    state.checkpoints.dir: s3://flink-prod/checkpoints/fraud-detector
+    state.savepoints.dir: s3://flink-prod/savepoints/fraud-detector
+
+    # HA через K8s ConfigMaps
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://flink-prod/ha/fraud-detector
+
+    # Checkpointing
+    execution.checkpointing.interval: 60s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: 10min
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+
+    # Adaptive Scheduler — обязательно для elastic rescale
+    jobmanager.scheduler: adaptive
+
+    # Restart strategy
+    restart-strategy: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: 10s
+    restart-strategy.exponential-delay.max-backoff: 2min
+
+  jobManager:
+    replicas: 2          # 1 active + 1 standby (HA)
+    resource:
+      cpu: 2
+      memory: 4096m
+
+  taskManager:
+    resource:
+      cpu: 4
+      memory: 8192m
+
+  job:
+    jarURI: local:///opt/flink/usrlib/fraud-detector.jar
+    entryClass: com.example.fraud.FraudDetectorJob
+    parallelism: 8
+    upgradeMode: savepoint     # savepoint при apply нового image
+    state: running
+    savepointTriggerNonce: 0   # увеличить для manual savepoint
+```
+
+`local:///opt/flink/usrlib/` — JAR уже встроен в Docker image. Это **best practice для production**: каждый deploy = новый immutable image с конкретной версией JAR. Альтернатива — `s3://bucket/path/job.jar` — JM скачает при старте (медленнее, и есть risk что bucket недоступен).
+
+### Преимущества Application mode
+
+- **Hard resource isolation** — каждая job получает dedicated JM + TM pods. K8s namespace quotas, resource limits, NetworkPolicy — всё работает per-application. Один heavy state job не «крадёт» CPU и RAM у соседа.
+- **Failure blast radius = одна app** — если JM crash из-за OOM, восстанавливается только эта app. Другие jobs не затронуты.
+- **main() в JobManager pod** — компиляция не зависит от клиентского environment. CI/CD pipeline просто `kubectl apply` манифеста, никаких java/maven на runner-е.
+- **Lifecycle clean** — job FINISHED → cluster teardown. Никаких zombie clusters. Operator автоматизирует garbage collection.
+- **Independent versioning** — каждая app может работать на своей версии Flink (image tag). Можно постепенно migrate jobs на новый minor release без big-bang.
+
+### Недостатки Application mode
+
+- **Per-job overhead** — каждый JM ~2GB RAM минимум + ~1 CPU. Для 1000 small jobs это 2TB RAM на JM-ы — неоправданно.
+- **Cold start 10-60s** — pod create + JVM warmup + main() compile. Заметно на CI/CD redeploy chains.
+- **Один JobGraph per cluster** — если хочется submit несколько jobs в одну application (multi-job pattern), Application mode неудобен. Это редкий case.
+
+---
+
+## Session mode: shared cluster
+
+В Session mode cluster — это **long-running shared infrastructure**, на которую submit-ятся jobs через REST API. JM и TM-ы работают 24/7 независимо от наличия jobs.
+
+<DiagramContainer title="Session mode: cluster живёт отдельно от jobs" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Session FlinkDeployment"
+        tooltip="kind=FlinkDeployment без spec.job — это означает session cluster. Operator поднимает JM + TM pods, но не запускает никакую job. Slots в pool готовы принять submissions."
+      >
+        1 JM + N TMs idle
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="cluster ready (idle slots)" />
+    <FlowRow>
+      <DataBox
+        label="FlinkSessionJob A"
+        tooltip="kind=FlinkSessionJob ссылается на deploymentName session cluster. Operator delegates submission через Dispatcher REST. main() компилируется на operator-е (фактически client-side)."
+      >
+        submit Job A
+      </DataBox>
+      <DataBox
+        label="FlinkSessionJob B"
+        tooltip="Второй job в том же cluster-е. Получает свои slots из pool. State хранится в общем DFS, но логически изолирован per-job UUID."
+      >
+        submit Job B
+      </DataBox>
+      <DataBox
+        label="FlinkSessionJob C"
+        tooltip="Третий. Все три бегут параллельно, могут share TaskManager-ы. CPU/RocksDB cache shared, isolation soft."
+      >
+        submit Job C
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="jobs run concurrently" />
+    <FlowRow>
+      <DataBox
+        label="Job A FINISHED"
+        tooltip="Slots возвращаются в pool. Cluster продолжает работать. JM не shutdown. Никакой teardown — только освобождение ресурсов."
+      >
+        slots → pool
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Session cluster + Session jobs manifest
+
+```yaml
+# 1. Session cluster (long-running)
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: streaming-session
+  namespace: streaming-dev
+spec:
+  image: flink:2.2.0-java17
+  flinkVersion: v2_2
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend.type: rocksdb
+    state.checkpoints.dir: s3://flink-dev/checkpoints
+  jobManager:
+    resource: { cpu: 2, memory: 4096m }
+  taskManager:
+    resource: { cpu: 4, memory: 8192m }
+    replicas: 5   # 5 TMs × 4 slots = 20 slots в pool
+  # ВАЖНО: spec.job отсутствует — это маркер session mode
+
+---
+# 2. Submit jobs в этот cluster
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkSessionJob
+metadata:
+  name: analytics-job-1
+  namespace: streaming-dev
+spec:
+  deploymentName: streaming-session
+  job:
+    jarURI: https://artifacts.example.com/analytics-1.0.jar
+    parallelism: 4
+    upgradeMode: savepoint
+```
+
+### Преимущества Session mode
+
+- **Resource sharing** — много jobs делят cluster, утилизация лучше. Для развития/staging — отлично.
+- **Fast submit** — JM уже запущен, новый job — 1-2 секунды.
+- **Ad-hoc workflows** — SQL CLI submissions, interactive notebooks (Zeppelin), exploration.
+- **Low overhead per job** — нет дополнительного JM на job.
+
+### Недостатки Session mode
+
+- **Soft isolation** — heavy state job на 50GB RocksDB голодает соседей по managed memory. CPU shared — bursting один subtask тормозит другие.
+- **Blast radius = весь cluster** — JM crash валит все running jobs. Recovery через HA, но все одновременно.
+- **One Flink version per cluster** — нельзя smoothly migrate один job на новую версию Flink без отдельного cluster-а.
+- **Dispatcher bottleneck** — при много submissions/sec REST endpoint становится узким горлом.
+
+---
+
+## Per-job mode: что было и почему removed
+
+До Flink 2.0 существовал **per-job mode**. Он был похож на Application: тоже один cluster = одна job, тоже dedicated JM. Различие: **main() компилировался на клиенте**, не в JM. Это значило:
+
+1. `flink run -t kubernetes-application ...` или `-t kubernetes-per-job ...` — два почти идентичных flags
+2. Per-job требовал клиента с Java и зависимостями — нельзя «fire and forget» через CI/CD
+3. Subtle bugs: если client environment отличался от JM (Java версия, dependencies в classpath) — main() мог скомпилировать другой JobGraph чем тот, который реально работал
+4. Для большого JAR (сотни MB) клиент тратил много памяти на компиляцию
+
+В Flink 1.15-1.16 community начала обсуждение «зачем два», к 1.18 пер-job уже был deprecated, в **2.0 (март 2025) полностью removed по FLIP-419**. Все use cases per-job → Application mode.
+
+<Callout type="warning">
+Если в вашем legacy коде/scripts встречается `cluster.mode: per-job`, `-t kubernetes-per-job` или `PerJobMiniClusterFactory` — это уже не работает в 2.x. Мигрируйте: `-t kubernetes-application`, FlinkDeployment manifest с `spec.job`, JAR в Docker image как `local:///opt/flink/usrlib/...`.
+</Callout>
+
+---
+
+## Lifecycle differences: важно для production
+
+Lifecycle разный, и это влияет на operational complexity:
+
+| Событие | Application mode | Session mode |
+|---|---|---|
+| Job submit | `kubectl apply` FlinkDeployment → cluster create | `kubectl apply` FlinkSessionJob → REST submission |
+| Job FINISHED | Cluster teardown (JM+TM удаляются) | Slots → pool, cluster живёт |
+| Job FAILED | Cluster teardown, FlinkDeployment status=Failed | Slots → pool, FlinkSessionJob status=Failed |
+| Upgrade (new image) | Savepoint → teardown old → new cluster from savepoint | Savepoint → cancel job → submit new в тот же cluster |
+| Rescale | In-place через Adaptive Scheduler ИЛИ savepoint+restart | Same, но cluster продолжает работать |
+| JM crash | Restart pod, recovery via HA | Restart pod, recovery all jobs via HA |
+| Resource exhaustion | OOM kills конкретную app | OOM kill TM кладёт несколько jobs |
+
+---
+
+## Когда какой mode
+
+### Application mode — production default
+
+- 24/7 streaming pipelines (Kafka → process → Kafka).
+- Каждая job критична, имеет own SLA.
+- State heavy (>100GB) — нужен dedicated managed memory.
+- CI/CD через GitOps (ArgoCD/Flux) — каждая FlinkDeployment в репе.
+- Multi-tenant K8s где разные jobs принадлежат разным командам — isolation важен.
+
+### Session mode — специфичные cases
+
+- **SQL CLI / ad-hoc queries** — много мелких queries, поднимать cluster per query абсурд.
+- **Interactive notebooks** — Zeppelin / Jupyter с Flink SQL kernel.
+- **Many small stateless jobs** — 100+ stateless transforms parallelism=1, slot-share между ними даёт хорошую утилизацию.
+- **Development environment** — один dev-кластер для команды, разработчики submit-ят jobs из IDE.
+- **Batch SQL fleet** — много коротких ETL queries (Flink batch mode), для каждого свой cluster — overhead неоправдан.
+
+---
+
+## Production gotchas
+
+- **Mixed approach** — реальный production обычно сочетает Application для stateful streaming + Session для ad-hoc/SQL. Не догматизируйте «only Application».
+- **Session + heavy state** — anti-pattern. Heavy state job в shared cluster ломает соседей. Выносите в Application.
+- **Application + many small jobs** — overhead JM (2GB × 100 jobs = 200GB) неоправдан. Объединяйте мелкие jobs в один или используйте Session.
+- **upgradeMode: stateless vs savepoint** — для Application указывайте `savepoint` для stateful, `stateless` только для truly stateless (parse JSON, transform, sink). Default — `stateless`, легко проигнорировать и потерять state.
+- **JM `replicas: 2` для HA** — без этого JM crash = downtime до K8s рестарт pod-а (10-30s). С replicas=2 standby моментально подхватывает (через leader election).
+- **Per-job mode в legacy scripts** — если вы поддерживаете 1.x → 2.x миграцию, обновите все `cluster.mode: per-job` → `application`. Иначе deploy не запустится.
+- **`local://` vs `s3://` для jarURI** — `local://` (JAR в image) надёжнее. `s3://` создаёт runtime dependency на S3 access (может задержать или сорвать старт).
+
+<Callout type="tip">
+Mature setup на K8s в 2026: **Application mode + Flink Kubernetes Operator + FlinkDeployment per job + GitOps**. Каждая job — один YAML в репозитории, ArgoCD синхронизирует с cluster-ом. Upgrade — bump image tag в PR, merge, ArgoCD apply, operator делает savepoint-based blue/green. Session mode используется только для dev/staging environments и SQL Gateway.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="У вас 30 jobs в production: 20 stateless transforms (parse JSON, route в разные Kafka topics, parallelism=2, ~10k msg/s каждый) и 10 stateful с RocksDB state ~80GB каждый (parallelism=8, ~100k msg/s). Какая deployment стратегия оптимальна и почему?"
+  answer="Mixed approach: Application mode для 10 stateful jobs + один Session cluster для 20 stateless. Stateful jobs идут в Application: (1) 80GB RocksDB требует dedicated managed memory (минимум 6-8GB) — конфликт с другими jobs неприемлем; (2) failure blast radius — recovery 80GB state занимает минуты, не должен валить соседей; (3) independent rescaling — каждый можно отдельно scale без согласования; (4) version isolation — апгрейд одного на новый Flink не должен ждать других; (5) GitOps friendly — FlinkDeployment per job в репо. Stateless 20 идут в Session: (1) JM overhead 2GB × 20 = 40GB чистая трата для тривиальных transforms; (2) slot sharing повышает утилизацию при низкой нагрузке; (3) deploy/cancel/scale быстрый через REST; (4) common Flink version не критична для parse-and-route. Anti-patterns: only Application — 30 JM pod-ов overhead, медленные deploy для мелочи. Only Session — heavy state jobs голодают по managed memory, JM crash валит всех 30, версионирование заблокировано. Mixed = optimal trade-off."
+/>

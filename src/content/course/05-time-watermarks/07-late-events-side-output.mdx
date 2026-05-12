@@ -1,0 +1,479 @@
+---
+title: "Late events и side output: production-critical pattern"
+description: "allowedLateness, sideOutputLateData, getSideOutput. Без side output поздние события silently dropped. Production must-have для critical pipelines."
+order: 7
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Late Events", "Side Output", "allowedLateness", "Production Pattern", "Data Loss"]
+---
+
+# Late events и side output — production-critical
+
+Late events — события, прибывшие с timestamp меньше current watermark. Без правильной обработки они **silently dropped** — Flink не выдаёт error, не log warning, просто молча игнорирует. Это причина 80% incidents «у нас не хватает данных в дашборде».
+
+Этот урок — production-grade discussion: что такое late events, как настроить allowedLateness, обязательное использование side output, monitoring и alerts.
+
+---
+
+## Что такое late event
+
+<DiagramContainer title="Жизненный цикл late event" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Window [10:00, 10:05)"
+        tooltip="Tumbling event-time window 5 минут. Closes when watermark > 10:05. Aggregates events с timestamp в этом интервале."
+      >
+        Active window
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Watermark = 10:05:30" />
+    <FlowRow>
+      <DataBox
+        label="Window FIRES — emit result"
+        tooltip="Watermark пересёк windowEnd → trigger.onEventTime() returns FIRE → window function invoked → result emitted downstream. State либо удерживается (allowedLateness > 0), либо удаляется."
+      >
+        result_window_1 emitted
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Event arrives with ts=10:03 (late!)" />
+    <FlowRow>
+      <DataBox
+        label="WM=10:05:30, ts=10:03 → late"
+        tooltip="Событие должно было попасть в [10:00, 10:05), но прибыло после fire. Это late event. Что произойдёт зависит от .allowedLateness() и .sideOutputLateData()."
+      >
+        Late event detection
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="If allowedLateness 0 + no side output" />
+    <FlowRow>
+      <DataBox
+        label="SILENTLY DROPPED"
+        tooltip="Default behaviour. numLateRecordsDropped++ метрика, но никакого error, никакого callback. Событие исчезло. Если это transaction — financial data loss."
+      >
+        Data loss
+      </DataBox>
+      <DataBox
+        label="If allowedLateness > 0"
+        tooltip="Window state ещё жив. Event добавляется в window, trigger fires again → new emit (incremental result). Downstream получает second emit для того же window — должен handle (idempotent или update semantics)."
+      >
+        Window re-fires
+      </DataBox>
+      <DataBox
+        label="If side output configured"
+        tooltip="Event captured в OutputTag stream. Можно sink в dead letter queue, log, или отдельный pipeline. Operational visibility — alerts на rate of late events."
+      >
+        Captured for processing
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## API: allowedLateness + sideOutputLateData
+
+### Минимальный production-grade pattern
+
+```java
+import org.apache.flink.util.OutputTag;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+
+OutputTag<Event> lateTag = new OutputTag<Event>("late-events"){};   // anonymous subclass для type inference
+
+SingleOutputStreamOperator<Result> mainStream = stream
+    .keyBy(Event::getUserId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Duration.ofMinutes(2))
+    .sideOutputLateData(lateTag)
+    .process(new MyProcessWindowFunction());
+
+DataStream<Event> lateStream = mainStream.getSideOutput(lateTag);
+
+// Main stream — normal pipeline
+mainStream.sinkTo(mainKafkaSink);
+
+// Late stream — dead letter queue or recovery pipeline
+lateStream.sinkTo(deadLetterKafkaSink);
+```
+
+### Key concepts
+
+| Concept | Meaning |
+|---|---|
+| `allowedLateness(Duration)` | Time after windowEnd when window state удерживается, повторно fires на late events |
+| `sideOutputLateData(OutputTag)` | Tag для capture events позже allowedLateness — то, что было бы dropped |
+| `getSideOutput(tag)` | Получить DataStream late events для отдельной обработки |
+
+### OutputTag — anonymous subclass для type info
+
+```java
+// ✅ Anonymous subclass — preserves generic type info
+OutputTag<Event> lateTag = new OutputTag<Event>("late-events"){};
+
+// ❌ Direct instantiation — type erasure, compilation error в runtime
+OutputTag<Event> badTag = new OutputTag<>("late-events");
+```
+
+Anonymous subclass нужен для Flink TypeInformation extraction через reflection.
+
+---
+
+## Поведение по фазам
+
+### Phase 1: WM < windowEnd
+
+Window открыто. Events добавляются нормально.
+
+```
+WM=10:04, ts=10:03 → normal add to window state
+```
+
+### Phase 2: WM ≥ windowEnd, ≤ windowEnd + allowedLateness
+
+Window FIRES (initial emit). State удерживается. Late events добавляются и **trigger re-fire**.
+
+```
+WM=10:05:30, window fires → emit result_1
+ts=10:04 arrives (late!) → add to state → fire AGAIN → emit result_2 (updated)
+```
+
+**Поведение downstream** должен быть idempotent или поддерживать updates. KafkaSink emit duplicate records (different value, same key). OLAP DB должен delete-then-insert или upsert.
+
+### Phase 3: WM > windowEnd + allowedLateness
+
+Window state cleared. Late events не affect window, идут в side output.
+
+```
+WM=10:08, allowedLateness=2min → state cleared
+ts=10:03 arrives → NOT processed in main → side output stream
+```
+
+---
+
+## Real production scenario: financial fraud detection
+
+```java
+public class FraudDetectionJob {
+
+    private static final OutputTag<Transaction> LATE_TX = new OutputTag<Transaction>("late-transactions"){};
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(60_000);
+
+        KafkaSource<Transaction> source = KafkaSource.<Transaction>builder()
+            .setBootstrapServers("kafka:9092")
+            .setTopics("transactions")
+            .setGroupId("fraud-detector")
+            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setValueOnlyDeserializer(new TransactionDeserializer())
+            .build();
+
+        DataStream<Transaction> transactions = env.fromSource(
+            source,
+            WatermarkStrategy
+                .<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+                .withTimestampAssigner((tx, ts) -> tx.getEventTime())
+                .withIdleness(Duration.ofMinutes(1)),
+            "transactions-source"
+        );
+
+        SingleOutputStreamOperator<FraudAlert> alerts = transactions
+            .keyBy(Transaction::getUserId)
+            .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+            .allowedLateness(Duration.ofMinutes(10))   // accept events до 10 минут late
+            .sideOutputLateData(LATE_TX)
+            .process(new FraudDetectorWindowFunction());
+
+        // Main pipeline — alerts in real-time
+        alerts.sinkTo(alertKafkaSink());
+
+        // Late transactions — separate processing pipeline
+        DataStream<Transaction> lateStream = alerts.getSideOutput(LATE_TX);
+        lateStream
+            .keyBy(Transaction::getUserId)
+            .process(new LateTransactionHandler())   // catch-up fraud detection
+            .sinkTo(lateAlertKafkaSink());
+
+        // Metric — counter late events per minute
+        lateStream
+            .windowAll(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+            .aggregate(new CountAgg())
+            .addSink(new MetricsSink("late.transactions.per.minute"));
+
+        env.execute("Fraud Detection");
+    }
+}
+```
+
+### Дизайн решения
+
+1. **Main pipeline** — fast, low-latency alerts. allowedLateness 10 min обеспечивает coverage для most events.
+2. **Late stream** — separate fraud detector for catch-up. Может быть slower (batch-like), но не теряет данные.
+3. **Metric pipeline** — counter late events, alert если > threshold (например, > 100/min → upstream problem).
+
+---
+
+## Allowed lateness tuning
+
+| allowedLateness | Effect | Когда use |
+|---|---|---|
+| **0** (default) | All late events to side output (or dropped) | Real-time strict — alerts based on tight WM |
+| **30s — 5 min** | Small re-fires for slightly-late events | Standard — handles network jitter |
+| **5 min — 1 hour** | Major re-fires, state heavy | Catch-up tolerant — analytics |
+| **24h+** | Window state stored full day | Very rare — almost always wrong choice |
+
+### State size implications
+
+Window state удерживается до `WM > windowEnd + allowedLateness`. Это **multiplies state by lateness fraction**:
+
+```
+TumblingWindow(5 min) + allowedLateness(1 min):
+  Without lateness: state per window лежит 5 минут
+  With 1 min lateness: state лежит 6 минут → +20% state
+  With 10 min lateness: state лежит 15 минут → +200% state
+```
+
+На large state (100GB+) это значимо.
+
+---
+
+## Late event downstream consistency
+
+При re-fire window emit second result для того же window. Downstream должен handle:
+
+### Option 1: Idempotent overwrite (Kafka with key)
+
+```java
+// Kafka sink с message key = window_start + user_id
+KafkaSink.<FraudAlert>builder()
+    .setRecordSerializer(KafkaRecordSerializationSchema.<FraudAlert>builder()
+        .setTopic("fraud-alerts")
+        .setKeySerializationSchema(alert -> 
+            (alert.windowStart + "_" + alert.userId).getBytes())
+        .setValueSerializationSchema(...)
+        .build())
+    .build();
+```
+
+Compacted topic — only latest message per key. Re-fire overrides initial fire.
+
+### Option 2: Upsert OLAP DB
+
+```sql
+-- ClickHouse with ReplacingMergeTree
+CREATE TABLE fraud_alerts (
+    user_id String,
+    window_start DateTime,
+    alert_score Double,
+    inserted_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(inserted_at)
+ORDER BY (user_id, window_start);
+```
+
+ReplacingMergeTree keeps last by `inserted_at`. Each re-fire = new row, deduplicated on merge.
+
+### Option 3: Update via primary key (JDBC sink)
+
+```java
+JdbcSink.<FraudAlert>builder()
+    .withQueryStatement(
+        "INSERT INTO alerts (user_id, window_start, score) VALUES (?, ?, ?) " +
+        "ON CONFLICT (user_id, window_start) DO UPDATE SET score = EXCLUDED.score")
+    ...
+```
+
+Postgres ON CONFLICT — upsert. Each re-fire updates existing row.
+
+### Option 4: Append-only with version
+
+```java
+FraudAlert alert = new FraudAlert(userId, windowStart, score, fireVersion);
+// fireVersion = 1 for initial, 2+ for re-fires
+```
+
+Downstream knows initial vs update. Choose based on requirements.
+
+---
+
+## ProcessWindowFunction знает о late context
+
+```java
+public class FraudDetectorWindowFunction
+    extends ProcessWindowFunction<Transaction, FraudAlert, Long, TimeWindow> {
+
+    public void process(Long userId, Context ctx,
+                       Iterable<Transaction> txs, Collector<FraudAlert> out) {
+        long firingCount = ctx.windowState()
+            .getState(new ValueStateDescriptor<>("fires", Long.class))
+            .value();
+
+        if (firingCount == null) firingCount = 0L;
+
+        if (firingCount > 0) {
+            // Re-fire on late event — recompute and emit updated alert
+            FraudAlert updated = computeFraudScore(txs, /* isLate */ true);
+            out.collect(updated);
+        } else {
+            // Initial fire
+            FraudAlert initial = computeFraudScore(txs, /* isLate */ false);
+            out.collect(initial);
+        }
+
+        ctx.windowState().update(firingCount + 1);
+    }
+}
+```
+
+`Context.windowState()` — state, привязанный к этому конкретному window. Cleared при `WM > windowEnd + allowedLateness`. Useful для distinguishing initial vs late fires.
+
+---
+
+## Monitoring late events
+
+### Built-in метрики
+
+```
+Flink Operator metrics:
+  - numLateRecordsDropped: counter — события dropped без side output
+  - numRecordsLateSideOutput: counter — события captured в side output (если configured)
+```
+
+Через UI или Prometheus exporter.
+
+### Custom metric для business logic
+
+```java
+public class LateAwareProcessFunction extends ProcessWindowFunction<...> {
+    private transient Counter lateCounter;
+    private transient Counter onTimeCounter;
+
+    public void open(OpenContext openContext) {
+        lateCounter = getRuntimeContext().getMetricGroup().counter("late_fires");
+        onTimeCounter = getRuntimeContext().getMetricGroup().counter("on_time_fires");
+    }
+
+    public void process(...) {
+        if (isLateFire) lateCounter.inc();
+        else onTimeCounter.inc();
+        ...
+    }
+}
+```
+
+### Alerts (Prometheus → Grafana)
+
+```promql
+rate(flink_taskmanager_job_task_operator_numLateRecordsDropped[5m]) > 100
+```
+
+Alert если dropped > 100 events за 5 min — что-то не так upstream.
+
+---
+
+## Production gotchas
+
+### 1. Забыл `.sideOutputLateData()` — silent data loss
+
+Default behaviour:
+- `allowedLateness=0` + no side output = all late events **dropped**
+- `allowedLateness>0` + no side output = late events fire window, но those past lateness — **dropped**
+
+В production это причина «странных пропусков» в дашбордах. **ALWAYS** configure side output для critical pipelines.
+
+### 2. allowedLateness > outOfOrderness в WatermarkStrategy
+
+```java
+.forBoundedOutOfOrderness(Duration.ofSeconds(20))   // WM = max_ts - 20s
+...
+.allowedLateness(Duration.ofMinutes(10))   // accept до 10 minutes late
+```
+
+Это **wasted lateness**. Watermark уже на 20 sec позади maxObservedTs — events с ts > WM не late. Lateness работает только для events between WM и WM - outOfOrderness, которые опоздали relative to WM в момент emit.
+
+Sensible ratio: `allowedLateness >= outOfOrderness × 2`.
+
+### 3. Side output не consumed
+
+`getSideOutput(tag)` возвращает DataStream. Если не подключить sink — late events просто discarded в этот DataStream без processing. Always sink late events куда-то (DLQ minimum).
+
+### 4. Multiple side outputs — same tag = conflict
+
+Один operator может иметь несколько side outputs. Каждый tag unique. Same `OutputTag` instance — same stream.
+
+```java
+// ✅ Unique tags
+OutputTag<Event> lateTag = new OutputTag<Event>("late"){};
+OutputTag<Event> errorTag = new OutputTag<Event>("error"){};
+
+// In process function
+ctx.output(lateTag, lateEvent);
+ctx.output(errorTag, errorEvent);
+```
+
+### 5. Side output type не matches OutputTag type
+
+```java
+OutputTag<Event> tag = new OutputTag<Event>("tag"){};
+ctx.output(tag, "some string");   // ❌ compilation error, type mismatch
+```
+
+Type-safe — compile-time check.
+
+### 6. ProcessFunction also supports side output
+
+Не только window operators. Любой `ProcessFunction` / `KeyedProcessFunction` может emit side output:
+
+```java
+public class MyProcessFunction extends KeyedProcessFunction<Long, Event, Event> {
+    private static final OutputTag<Event> ERROR_TAG = new OutputTag<Event>("errors"){};
+
+    public void processElement(Event event, Context ctx, Collector<Event> out) {
+        if (event.isValid()) {
+            out.collect(event);
+        } else {
+            ctx.output(ERROR_TAG, event);   // ← side output
+        }
+    }
+}
+```
+
+Полезно для error handling, splitting streams по condition.
+
+### 7. Late events after windowEnd + allowedLateness в SAME job restart
+
+После restart Flink восстанавливает state. Window state до `WM > windowEnd + allowedLateness` сохранён. Если restart короткий (минуты), watermark возможно reset на checkpoint position, и late events могут «опять стать on-time» — re-emit. Downstream должен handle re-emit (idempotency).
+
+---
+
+## Cheat sheet
+
+```java
+// Production-grade pattern (must для critical pipelines)
+OutputTag<Event> lateTag = new OutputTag<Event>("late-events"){};
+
+SingleOutputStreamOperator<Result> main = stream
+    .keyBy(...)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Duration.ofMinutes(10))   // 2-3x outOfOrderness
+    .sideOutputLateData(lateTag)
+    .process(new MyFunction());
+
+// Always consume side output
+DataStream<Event> late = main.getSideOutput(lateTag);
+late.sinkTo(deadLetterQueue);
+
+// Monitor
+late.windowAll(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+    .aggregate(new CountAgg())
+    .map(count -> "late_rate=" + count)
+    .print();
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: команда жалуется, что real-time dashboard 'orders per 5min' иногда показывает на 10-20% меньше чем reconciliation batch job через 1 час. Реализация Flink: TumblingEventTimeWindows.of(Time.minutes(5)), allowedLateness не указан, side output не настроен, WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(30)). Что происходит и как fix?"
+  answer="Это classic silent data loss. Корень — отсутствие allowedLateness и sideOutputLateData. Что происходит: WatermarkStrategy outOfOrderness=30s обеспечивает coverage только событий, прибывших до 30s after maxObservedTs. Любое событие, опоздавшее > 30s (network jitter, Kafka retry, replay из upstream, downstream backpressure → producer paused) приходит когда WM уже past windowEnd → silently dropped (numLateRecordsDropped++ метрика растёт, но никто на неё не смотрит). 10-20% discrepancy: ~10-20% events опаздывают > 30s. Это нормально для production setup с networks, retries, multi-region. Reconciliation batch job не имеет watermark — reads all events from Kafka, не теряет. Fixes (порядок reasoning): (1) IMMEDIATE: добавить .allowedLateness(Duration.ofMinutes(5)) + .sideOutputLateData(lateTag) — window state удерживается 5 мин past WM, late events re-fire window (downstream видит updates через 1-5 мин delay). Это покрывает 95%+ late events. Discrepancy snижается до <2%. (2) Diagnose root cause: проверить почему events опаздывают > 30s — это abnormal. Возможные причины: (a) network issues между Kafka и Flink TM; (b) checkpoint в Kafka producer на upstream pauses; (c) producer retry с backoff; (d) replay events out-of-order; (e) idle partition resurrection (если withIdleness без alignment). Per-cause fixes: (a) Network — Flink side ничего, инфра; (b) Upstream — увеличить producer batch.size, проверить max.in.flight.requests; (c) Producer retry — settings; (d) Multi-source ordering — добавить withWatermarkAlignment FLIP-217; (e) Resurrection — withIdleness короче, alignment для multi-partition. (3) Increase outOfOrderness: если bulk событий late >30s, может правильно настроен tolerance — увеличить до 1-2min. Trade-off: window latency 30s → 1-2min. (4) Capture side output stream: lateStream.sinkTo(deadLetterTopic) + alerting на rate of late events. Если > 100/sec → upstream проблема. (5) Downstream consistency: re-fires emit multiple results per window. Если sink не idempotent (например, INSERT в DB без UPSERT) — duplicates вместо updates. Использовать compacted Kafka topic с key=(window_start, user_id), или ReplacingMergeTree в ClickHouse, или ON CONFLICT в Postgres. (6) Monitoring добавить flink_taskmanager_job_task_operator_numLateRecordsDropped — должно быть = 0 после fix. Alert if > 0. Production правило: every windowed pipeline MUST have .allowedLateness и .sideOutputLateData — это не optional, это required для not-losing-data."
+/>

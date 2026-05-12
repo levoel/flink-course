@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/03-quantifiers-contiguity",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-03",
+    "description": "Quiz для quantifiers и contiguity modes"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-03-q1",
+      "type": "multiple-choice",
+      "question": "Чем отличаются next, followedBy и followedByAny?",
+      "options": [
+        { "id": "a", "text": "Только синтаксисом — semantics одинаковая" },
+        { "id": "b", "text": "next — strict (нет other events между); followedBy — relaxed (other events допускаются, single match); followedByAny — non-deterministic relaxed (other events допускаются, all matching combinations эмитятся)" },
+        { "id": "c", "text": "next — для KeyedStream, followedBy — для DataStream, followedByAny — для broadcast" },
+        { "id": "d", "text": "next deprecated в Flink 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Три contiguity modes — фундаментальное deviation Pattern API. next: strict, любой mismatch между states ломает pattern (например 'A.next(B)' на [A,X,B] = no match). followedBy: relaxed, между A и B могут быть other events ('A.followedBy(B)' на [A,X,B] = match (A,B)), но только first match per A. followedByAny: non-deterministic relaxed — every matching A paired со every matching B (cartesian product), combinatorial explosion possible.",
+      "studyHint": "Повторите урок — секция Contiguity modes",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m09-03-q2",
+      "type": "multiple-choice",
+      "question": "Pattern '3 ERROR подряд' написали как .where(level==ERROR).times(3). Production показывает false positives на logs 'ERROR, INFO, INFO, ERROR, INFO, ERROR'. Что не так?",
+      "options": [
+        { "id": "a", "text": "Pattern API не работает с String comparison" },
+        { "id": "b", "text": "Default contiguity для quantifiers — relaxed (followedBy-like): допускает other events между repetitions. Нужно добавить .consecutive() для strict (no gaps): .times(3).consecutive()" },
+        { "id": "c", "text": "Нужно использовать timesOrMore(3) вместо times(3)" },
+        { "id": "d", "text": "В times(3) первый аргумент — это min, нужно writing times(3,3)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Quantifiers внутри pattern имеют свой contiguity. Default — relaxed (followedBy-like) — допускает other events между repetitions. Это даёт false positive на 'ERROR, INFO, ERROR, INFO, ERROR' — 3 ERRORs with gaps все matched. Fix: .times(3).consecutive() для strict, или .times(3).allowCombinations() для non-deterministic. consecutive() — production-correct для 'строго подряд'.",
+      "studyHint": "Повторите урок — секция Contiguity внутри quantifiers",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-03-q3",
+      "type": "multiple-choice",
+      "question": "У вас pattern .followedByAny(B) на sequence где 10000 matching A и 10000 matching B в одном within window. Сколько matches будет эмитировано?",
+      "options": [
+        { "id": "a", "text": "1 match — followedByAny эмитит лучший match" },
+        { "id": "b", "text": "10000 — один match на каждый A" },
+        { "id": "c", "text": "100,000,000 (10000 × 10000) — cartesian product всех A×B pairs. Это classic combinatorial trap followedByAny" },
+        { "id": "d", "text": "Pattern не скомпилируется при таком масштабе" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "followedByAny — non-deterministic relaxed — каждый A создаёт partial match с каждым subsequent B. N×M matches. 10000 × 10000 = 100M matches → JVM OOM. Реальный production incident: видеоплатформа использовала followedByAny для watch_start/end pairs, traffic spike → 100M matches → out of memory. Mitigation: использовать followedBy (single match per A) unless genuinely need overlapping. Если нужны — добавить extra predicates чтобы reduce candidates, или migrate к MATCH_RECOGNIZE с tight WITHIN.",
+      "studyHint": "Повторите урок — Production gotchas: followedByAny",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-03-q4",
+      "type": "true-false",
+      "question": "oneOrMore() в pattern API — greedy: пытается match как можно больше events, и match emit-ится только когда watermark пересекает границу within(). Это может вызывать неожиданную latency.",
+      "correctAnswer": true,
+      "explanation": "Правда. oneOrMore (как и timesOrMore) greedy по умолчанию — продолжает matching пока могут matching events. Match только когда NFA уверен что не будет больше matching events — это значит watermark должен пройти within() границу первого event-а. Для длинных streaks с wide within (15 min) это даёт 15+ min latency. Если нужна low-latency — рассмотреть times(min, max) с tight bound или custom KeyedProcessFunction со state machine с custom emit logic.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/04-prometheus-integration",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-04",
+    "description": "Quiz for Prometheus integration lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-04-q1",
+      "type": "multiple-choice",
+      "question": "PrometheusReporter vs PushGateway — когда какой?",
+      "options": [
+        { "id": "a", "text": "Всегда PushGateway" },
+        { "id": "b", "text": "PrometheusReporter (pull) — default для long-running streaming jobs. Flink exposes /metrics HTTP endpoint, Prometheus scrapes каждые 15s. Auto-discovery через K8s annotations. PushGateway — ONLY для short-lived batch jobs (Boundedness.BOUNDED) — jobs exit прежде чем Prometheus scrape. Streaming с PushGateway — antipattern, ненужный hop" },
+        { "id": "c", "text": "Только OTel reporter" },
+        { "id": "d", "text": "Эквивалентны" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pull (PrometheusReporter): standard для streaming. Configure: metrics.reporter.prom.factory.class + port 9249. K8s annotations: prometheus.io/scrape=true, prometheus.io/port=9249. Service discovery picks up new TMs automatically. Push (PushGateway): metrics push в HTTP gateway, persists между job runs. Configure: randomJobNameSuffix=true (unique runs), deleteOnShutdown=false (persist after exit). PushGateway accumulates metrics forever если не cleanup — нужно TTL script. Use только для batch.",
+      "studyHint": "Повторите урок — PrometheusReporter + PushGateway",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-04-q2",
+      "type": "multiple-choice",
+      "question": "Какая стандартная Kubernetes service discovery setup для Flink Prometheus scraping?",
+      "options": [
+        { "id": "a", "text": "Static targets в prometheus.yml" },
+        { "id": "b", "text": "kubernetes_sd_configs role: pod. Relabel rules: keep если pod label app=flink, target_label __address__ от prometheus.io/port annotation. Pod annotations: prometheus.io/scrape=true, prometheus.io/port=9249, prometheus.io/path=/metrics. Pod labels: app=flink, component=taskmanager. Auto-discovery — новый TM pod автоматически scraped" },
+        { "id": "c", "text": "Manual update prometheus.yml каждый deploy" },
+        { "id": "d", "text": "Flink Operator только handles это" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Standard pattern для K8s. relabel_configs: keep если pod label соответствует, target_label __address__ от port annotation (через regex replacement), preserve labels namespace/pod для filtering. Это elastic — autoscaling TMs автоматически discovered. Если Flink K8s Operator (recommended 2.x): operator автоматически apply annotations к JM и TM pods через podTemplate. Поверх — Prometheus picks up. Каждый scrape: 15s interval, 1-2KB metrics endpoint, low overhead. NetworkPolicy должен позволять Prometheus IP scrape port 9249.",
+      "studyHint": "Повторите урок — Kubernetes service discovery",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-04-q3",
+      "type": "multiple-choice",
+      "question": "Production scenario: 50 jobs × 100 subtasks × 50 metrics = 250k series. После года: Prometheus queries timeout, disk full. План?",
+      "options": [
+        { "id": "a", "text": "Just add more disk" },
+        { "id": "b", "text": "(1) Quick wins: metrics.reporter.prom.scope.variables.excludes: subtask_index — reduces series 10-50×. metric_relabel_configs drop noisy Shuffle metrics. (2) Medium-term: migrate Prometheus → VictoriaMetrics (high cardinality optimized, 5-10× lower disk, 3× faster queries, Prometheus-compatible). (3) Long-term: tiered storage — Tier 1 hot (7 days, VM single), Tier 2 cold (1 year, S3 backend). OTel reporter for new jobs (unified stack)" },
+        { "id": "c", "text": "Disable все metrics" },
+        { "id": "d", "text": "Increase Prometheus replica count" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "High cardinality observability требует proper tooling. Vanilla Prometheus great для small-medium, но не scales enterprise streaming platforms. Quick win: drop subtask_index label — metrics aggregate per operator вместо per subtask. Lose subtask-level granularity (skew detection harder), keep operator-level. VictoriaMetrics: high cardinality optimized, Prometheus-compatible (Grafana plug-and-play), better compression. Migration: dual-write период (remote_write from Prometheus к VM), verify consistency, switchover Grafana, decommission Prometheus. 1-2 weeks staged. Long-term: split tiers для cost efficiency.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-04-q4",
+      "type": "true-false",
+      "question": "Port 9249 hardcoded — нельзя использовать port range для multi-TM на одном host.",
+      "correctAnswer": false,
+      "explanation": "False. metrics.reporter.prom.port: 9249-9259 — port range syntax. Каждый TM picks first available port в range. Это нужно когда несколько TaskManagers на одном host (старые non-K8s deployments). Prometheus scrape config должен охватывать range (relabel rule extracts port от annotation). В K8s обычно один TM per pod — port range не нужен, just 9249. Но для bare-metal / Docker compose deployments — multi-TM common pattern, range mandatory во избежание port conflicts.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

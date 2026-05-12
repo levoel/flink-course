@@ -1,0 +1,542 @@
+---
+title: "Materialized Tables — FLIP-435 declarative streaming"
+description: "CREATE MATERIALIZED TABLE с FRESHNESS INTERVAL. Apache Paimon backend. Auto-generated refresh job. ALTER → новая refresh strategy"
+order: 5
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Materialized Tables", "FLIP-435", "Paimon", "Auto-refresh", "Declarative SQL"]
+---
+
+# Materialized Tables — FLIP-435 declarative streaming
+
+Materialized Tables — flagship feature Flink 2.0 GA (FLIP-435). Это declarative way определить streaming pipeline без manual job lifecycle management. Один SQL statement — `CREATE MATERIALIZED TABLE ... AS SELECT ...` — создаёт table и автоматически spawn-ит refresh job который keeps её up-to-date. Backend storage — Apache Paimon (streaming-first lakehouse). Этот урок разбирает internals, lifecycle, refresh modes и production patterns.
+
+Это disruptive feature: workflow становится «declare what you want», вместо «manage how to compute». Comparable с dbt модель в batch ETL — но native real-time.
+
+---
+
+## Concept — что это значит
+
+Classic streaming pipeline:
+1. Define source DDL.
+2. Define sink DDL.
+3. Write INSERT INTO query.
+4. Submit job, manage lifecycle manually (savepoints, restart, monitoring).
+
+Materialized Table approach:
+```sql
+CREATE MATERIALIZED TABLE user_metrics
+FRESHNESS = INTERVAL '30' SECOND
+AS SELECT user_id,
+   COUNT(*) AS event_count,
+   AVG(amount) AS avg_amount,
+   MAX(event_time) AS last_seen
+FROM events
+GROUP BY user_id;
+```
+
+One statement creates:
+- Physical Paimon table `user_metrics` в catalog.
+- Refresh job in JobManager auto-deployed.
+- Continuous updates с freshness ≤ 30 seconds.
+
+No separate sink DDL, no INSERT INTO, no job submit. Declarative.
+
+---
+
+## Anatomy — что Flink делает under the hood
+
+<DiagramContainer title="Materialized Table — lifecycle" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. CREATE MATERIALIZED TABLE"
+        tooltip="User submits DDL. Flink parses, validates query, infers schema from SELECT. Calculates needed sources, time attributes, watermark strategy."
+      >
+        DDL → planner
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="2. Catalog registration"
+        tooltip="Flink создаёт metadata entry в catalog (HiveCatalog, JdbcCatalog, или дефолтный). Materialized table имеет special TYPE='MATERIALIZED_TABLE' и stores SELECT query + refresh strategy."
+      >
+        Register catalog entry
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="3. Paimon backend table"
+        tooltip="Physical storage в Apache Paimon (default). Filesystem path в configured warehouse. Schema из SELECT result. Bucket/partition strategy auto-determined из query (e.g., GROUP BY keys → buckets)."
+      >
+        Create Paimon table
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="4. Refresh job generation"
+        tooltip="Flink generates streaming job: source(s) → query operators → Paimon sink. Job submitted to cluster. JobMaster manages lifecycle. Materialized table tracks job ID."
+      >
+        Submit refresh job
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="5. Continuous update"
+        tooltip="Refresh job runs continuously. Каждое source event triggers update в Paimon table. Snapshot commit interval matches FRESHNESS. Consumers видят latest snapshot."
+      >
+        Streaming updates
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Materialized Table — это **named pipeline** где Flink manages всю lifecycle.
+
+---
+
+## CREATE MATERIALIZED TABLE syntax
+
+Full syntax:
+
+```sql
+CREATE MATERIALIZED TABLE [catalog_name.][db_name.]mt_name
+[
+  (
+    PRIMARY KEY (col1, col2, ...) NOT ENFORCED,
+    INDEX (col3),                   -- optional
+    -- partition spec:
+  )
+]
+[PARTITIONED BY (col1, col2)]
+[WITH (
+    'paimon.bucket' = '8',
+    'paimon.merge-engine' = 'partial-update',
+    ...
+)]
+[COMMENT 'description']
+FRESHNESS = INTERVAL 'value' UNIT
+[REFRESH_MODE = AUTOMATIC | FULL]
+[AS SELECT ...];
+```
+
+Key parameters:
+- **FRESHNESS** — max staleness. INTERVAL '30' SECOND, '5' MINUTE, etc.
+- **REFRESH_MODE** — AUTOMATIC (Flink chooses streaming vs batch) или explicit.
+- **WITH** — Paimon options (bucket count, merge engine, retention).
+- **PARTITIONED BY** — output partitioning.
+
+---
+
+## Refresh modes — AUTOMATIC vs FULL
+
+### AUTOMATIC
+
+```sql
+CREATE MATERIALIZED TABLE m
+FRESHNESS = INTERVAL '30' SECOND
+AS SELECT ...;
+```
+
+Flink выбирает best strategy:
+- **Streaming mode** — continuous incremental updates. Used для freshness < minutes.
+- **Batch mode** — periodic full refresh. Used для freshness > hours, simple aggregations.
+
+Default mode для most use cases. Flink decides based on freshness and query complexity.
+
+### FULL — periodic batch refresh
+
+```sql
+CREATE MATERIALIZED TABLE daily_summary
+FRESHNESS = INTERVAL '1' DAY
+REFRESH_MODE = FULL
+AS SELECT date, COUNT(*) AS daily_count
+FROM events
+GROUP BY DATE_FORMAT(event_time, 'yyyy-MM-dd');
+```
+
+Daily batch job overwrites table. Useful для:
+- Daily/weekly aggregations.
+- Heavy queries (cross-product, MATCH_RECOGNIZE) не efficient incrementally.
+- Cost-sensitive (batch cheaper than streaming).
+
+### Hybrid в практике
+
+```sql
+CREATE MATERIALIZED TABLE real_time_dashboard
+FRESHNESS = INTERVAL '10' SECOND       -- streaming mode
+AS SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+
+CREATE MATERIALIZED TABLE daily_report
+FRESHNESS = INTERVAL '1' DAY            -- batch mode (chosen automatically)
+AS SELECT date, COUNT(*) FROM events
+GROUP BY DATE_FORMAT(event_time, 'yyyy-MM-dd');
+```
+
+Two MTs serve different use cases в одной codebase.
+
+---
+
+## ALTER MATERIALIZED TABLE — update refresh strategy
+
+```sql
+-- Change freshness
+ALTER MATERIALIZED TABLE user_metrics
+SET FRESHNESS = INTERVAL '1' MINUTE;
+
+-- Suspend (stop refresh job)
+ALTER MATERIALIZED TABLE user_metrics SUSPEND;
+
+-- Resume
+ALTER MATERIALIZED TABLE user_metrics RESUME;
+
+-- Refresh on-demand
+ALTER MATERIALIZED TABLE user_metrics REFRESH;
+```
+
+Behavior:
+- **SET FRESHNESS** — старый refresh job stop-with-savepoint, новый starts с тем же state.
+- **SUSPEND** — stop refresh job. Table остаётся в catalog, последний state preserved.
+- **RESUME** — restart refresh job from suspended state.
+- **REFRESH** — one-time full refresh (для FULL mode tables).
+
+State preservation: между ALTER операциями state не теряется — same job ID transferred к new job.
+
+### ALTER schema?
+
+Adding columns:
+```sql
+ALTER MATERIALIZED TABLE m ADD COLUMN new_col INT;
+```
+
+Adding columns supported. **Dropping columns** или **changing types** — обычно требует drop+recreate.
+
+---
+
+## DROP — cleanup
+
+```sql
+DROP MATERIALIZED TABLE m;          -- stop job, delete catalog entry, delete data
+DROP MATERIALIZED TABLE IF EXISTS m;
+```
+
+Full cleanup: job stopped, Paimon storage deleted, catalog entry removed.
+
+---
+
+## Apache Paimon backend — почему именно он
+
+Why Paimon (vs Iceberg) для materialized tables:
+1. **Streaming-first design** — Paimon LSM-tree handles continuous updates natively. Iceberg equality deletes accumulate, нужен external rewrite.
+2. **Changelog producer** — Paimon emit-ит changelog stream для downstream consumers — consume MT как regular changelog source.
+3. **Partial update merge engine** — multiple sources update different columns of same row.
+4. **Native upsert via PK** — efficient for keyed aggregations.
+5. **Smaller snapshots** — frequent commits don't cause manifest explosion.
+
+Default warehouse path:
+```yaml
+# flink-conf.yaml
+table.catalog-store.kind: paimon
+table.catalog-store.paimon.warehouse: s3://lakehouse/paimon
+```
+
+---
+
+## Practical examples
+
+### Example 1 — Real-time user dashboard
+
+```sql
+-- Source: user events from Kafka
+CREATE TABLE events (
+    user_id STRING,
+    event_type STRING,
+    amount DECIMAL(10, 2),
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'events',
+    ...
+);
+
+-- Materialized aggregation для dashboard
+CREATE MATERIALIZED TABLE user_metrics (
+    user_id STRING,
+    event_count BIGINT,
+    total_spend DECIMAL(15, 2),
+    last_event TIMESTAMP(3),
+    PRIMARY KEY (user_id) NOT ENFORCED
+)
+FRESHNESS = INTERVAL '10' SECOND
+AS SELECT
+    user_id,
+    COUNT(*) AS event_count,
+    SUM(amount) AS total_spend,
+    MAX(event_time) AS last_event
+FROM events
+GROUP BY user_id;
+```
+
+Dashboard reads `user_metrics` каждые несколько секунд и shows latest stats. No separate aggregation job to manage.
+
+### Example 2 — Sessionization
+
+```sql
+CREATE MATERIALIZED TABLE user_sessions (
+    user_id STRING,
+    session_start TIMESTAMP(3),
+    session_end TIMESTAMP(3),
+    event_count BIGINT,
+    PRIMARY KEY (user_id, session_start) NOT ENFORCED
+)
+FRESHNESS = INTERVAL '1' MINUTE
+AS SELECT
+    user_id,
+    SESSION_START(event_time, INTERVAL '30' MINUTE) AS session_start,
+    SESSION_END(event_time, INTERVAL '30' MINUTE) AS session_end,
+    COUNT(*) AS event_count
+FROM events
+GROUP BY user_id, SESSION(event_time, INTERVAL '30' MINUTE);
+```
+
+Continuous sessionization. Sessions emerge naturally without sessionization library.
+
+### Example 3 — Join enrichment
+
+```sql
+CREATE MATERIALIZED TABLE enriched_orders (
+    order_id BIGINT,
+    user_id STRING,
+    user_name STRING,
+    amount_usd DECIMAL(15, 2)
+)
+FRESHNESS = INTERVAL '30' SECOND
+AS SELECT
+    o.order_id,
+    o.user_id,
+    u.name AS user_name,
+    o.amount * r.rate AS amount_usd
+FROM orders AS o
+JOIN user_profile_cdc FOR SYSTEM_TIME AS OF o.order_time AS u
+  ON o.user_id = u.user_id
+JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
+  ON o.currency = r.currency;
+```
+
+Multi-stream enrichment в одном MT. Temporal joins ensure correctness.
+
+### Example 4 — Daily reports (batch mode)
+
+```sql
+CREATE MATERIALIZED TABLE daily_revenue (
+    `date` STRING,
+    total_revenue DECIMAL(15, 2),
+    order_count BIGINT,
+    PRIMARY KEY (`date`) NOT ENFORCED
+)
+FRESHNESS = INTERVAL '1' DAY
+REFRESH_MODE = FULL
+AS SELECT
+    DATE_FORMAT(order_time, 'yyyy-MM-dd') AS `date`,
+    SUM(amount) AS total_revenue,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY DATE_FORMAT(order_time, 'yyyy-MM-dd');
+```
+
+Daily batch refresh. Cheaper than streaming when latency не critical.
+
+---
+
+## Hierarchy — chaining MTs
+
+```sql
+-- Level 1: hourly per-user aggregation
+CREATE MATERIALIZED TABLE hourly_user_stats
+FRESHNESS = INTERVAL '5' MINUTE
+AS SELECT user_id, DATE_FORMAT(event_time, 'yyyy-MM-dd-HH') AS hour,
+   COUNT(*) AS events, SUM(amount) AS spend
+FROM events
+GROUP BY user_id, DATE_FORMAT(event_time, 'yyyy-MM-dd-HH');
+
+-- Level 2: daily per-segment aggregation (читает Level 1)
+CREATE MATERIALIZED TABLE daily_segment_stats
+FRESHNESS = INTERVAL '1' HOUR
+AS SELECT u.segment, SUBSTR(h.hour, 1, 10) AS `date`,
+   SUM(h.events) AS total_events, SUM(h.spend) AS total_spend
+FROM hourly_user_stats AS h
+JOIN user_profile_cdc FOR SYSTEM_TIME AS OF h.event_time AS u
+  ON h.user_id = u.user_id
+GROUP BY u.segment, SUBSTR(h.hour, 1, 10);
+```
+
+Level 2 reads Level 1 — Flink generates incremental update job для Level 2 когда Level 1 changes. Like dbt models в batch — но real-time.
+
+---
+
+## Performance optimization
+
+### Bucket count
+
+```sql
+WITH ('paimon.bucket' = '16')
+```
+
+Buckets — parallelism granularity. Default = -1 (single bucket, dynamic). Production: set explicitly = sink parallelism × 2 для balanced load.
+
+### Merge engine
+
+```sql
+WITH ('paimon.merge-engine' = 'partial-update')
+```
+
+Options:
+- **deduplicate** (default) — overwrite по PK
+- **partial-update** — multiple sources update different columns
+- **aggregation** — merge через aggregate function (sum, max, etc.)
+- **first-row** — keep first record per PK
+
+### Compaction
+
+```sql
+WITH (
+  'paimon.compaction.min.file-num' = '5',
+  'paimon.compaction.max.file-num' = '50',
+  'paimon.changelog-producer' = 'input'  -- emit changelog stream
+)
+```
+
+`changelog-producer=input` — pass through changelog stream к downstream Flink consumers (CDC-like).
+
+---
+
+## Production gotchas
+
+### 1. FRESHNESS too aggressive → checkpoint overhead
+
+```sql
+FRESHNESS = INTERVAL '1' SECOND
+```
+
+Triggers checkpoint каждую секунду — overhead grows, especially для large state. Throughput drops 30-50%.
+
+**Fix**: 10-30 seconds minimum для production. Faster только если real-time SLA требует.
+
+### 2. Без PRIMARY KEY → unbounded changelog state
+
+```sql
+CREATE MATERIALIZED TABLE m
+FRESHNESS = INTERVAL '1' MINUTE
+AS SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+```
+
+Без explicit PK Paimon backend uses append mode, state growth unbounded. Plus query результата treated as retract stream.
+
+**Fix**: add PRIMARY KEY:
+```sql
+CREATE MATERIALIZED TABLE m (
+    user_id STRING,
+    cnt BIGINT,
+    PRIMARY KEY (user_id) NOT ENFORCED
+)
+FRESHNESS = INTERVAL '1' MINUTE
+AS SELECT user_id, COUNT(*) FROM events GROUP BY user_id;
+```
+
+### 3. SUSPEND без resume → stale data
+
+```sql
+ALTER MATERIALIZED TABLE m SUSPEND;
+-- ... operator forgets to RESUME
+```
+
+Refresh job stopped, table reads return stale data. Consumers don't know.
+
+**Fix**: monitor `MaterializedTable.lastRefreshTimestamp` metric, alert if stale > 2 × freshness.
+
+### 4. ALTER FRESHNESS не сохраняет state в edge cases
+
+```sql
+ALTER MATERIALIZED TABLE m SET FRESHNESS = INTERVAL '1' SECOND;
+-- From INTERVAL '1' DAY (batch mode) → switch to streaming mode
+```
+
+Mode switch (batch ↔ streaming) requires job recreation. State lost.
+
+**Fix**: stay в same mode through alterations, или accept state recompute.
+
+### 5. Cascading MT updates → cascade latency
+
+```sql
+-- Level 1 freshness=1min, Level 2 reads Level 1, Level 3 reads Level 2
+```
+
+End-to-end freshness = sum of freshness вверх по chain. Level 3 stale by ~3 minutes.
+
+**Fix**: balance freshness в hierarchy. Don't chain more than 2-3 levels.
+
+### 6. Paimon warehouse path lock-in
+
+Switching catalog backend (Paimon → Hive Iceberg) requires recreating MTs.
+
+**Fix**: stable catalog choice from start. Use Paimon для MTs, Iceberg для long-term storage если нужно.
+
+### 7. Concurrent DDL — race conditions
+
+Two pipelines CREATE MATERIALIZED TABLE simultaneously с same name — catalog catalog race.
+
+**Fix**: IF NOT EXISTS or coordination через CI/CD.
+
+### 8. Tables в DEFAULT catalog vs explicit catalog
+
+```sql
+CREATE MATERIALIZED TABLE m ...   -- ambiguous default catalog
+```
+
+After catalog reconfiguration, find в wrong catalog или missing.
+
+**Fix**: always full qualified names `catalog.db.table`.
+
+---
+
+## Cheat sheet
+
+```
+CREATE MATERIALIZED TABLE [catalog.db.]name
+  (PRIMARY KEY (cols) NOT ENFORCED)
+  [PARTITIONED BY (cols)]
+  [WITH (paimon options)]
+  FRESHNESS = INTERVAL 'n' UNIT
+  [REFRESH_MODE = AUTOMATIC | FULL]
+  AS SELECT ...;
+
+Lifecycle:
+  ALTER ... SET FRESHNESS = ...
+  ALTER ... SUSPEND / RESUME
+  ALTER ... REFRESH                   -- one-time refresh
+  DROP ...
+
+Auto-managed:
+  - Refresh job в JobManager
+  - State через checkpoints
+  - Paimon backend (default)
+  - Changelog emission optional
+
+Use cases:
+  - Real-time dashboards (FRESHNESS 10-30s)
+  - Sessionization (1-5min)
+  - Multi-stage enrichment (chain MTs)
+  - Daily reports (FULL mode)
+```
+
+---
+
+<KnowledgeCheck
+  question="Compare three approaches для real-time user dashboard (100k events/sec, freshness 30s, query-time read patterns): (1) traditional Flink INSERT INTO + Paimon sink; (2) Materialized Table (FLIP-435); (3) Kafka Streams equivalent. Какие trade-offs и когда какой подход правильный?"
+  answer="**Approach 1 — Traditional Flink INSERT INTO Paimon**: Manual control over everything. (a) Create source DDL; (b) Create sink DDL (Paimon table) с PK + bucket spec; (c) Write INSERT INTO ... SELECT; (d) Submit job, manage lifecycle (savepoint, restart, scaling). Pros: maximum control, all advanced features available, can mix DataStream API custom processing. Cons: (a) lifecycle complexity — separate job to manage, savepoint coordination на schema changes; (b) no declarative semantics — every change is operational; (c) errors prone (forget to add PK, wrong watermark); (d) state TTL needs manual setting. **Approach 2 — Materialized Table (FLIP-435)**: `CREATE MATERIALIZED TABLE m FRESHNESS = INTERVAL '30' SECOND AS SELECT ...`. Pros: (a) **declarative** — describe what, не how; (b) auto lifecycle — Flink manages refresh job, state, checkpoints; (c) ALTER for evolution — change FRESHNESS without manual savepoint dance; (d) cleaner CI/CD — DDL as code в Git, deploy = apply DDL; (e) hierarchical composition (MT reads MT); (f) **same SQL works в Flink и batch engines** (Spark/Trino read Paimon table); (g) automatic optimization choices (streaming vs batch refresh). Cons: (a) **abstraction limits** — advanced patterns (custom triggers, complex side outputs) requires fallback к INSERT INTO; (b) Paimon backend lock-in for now; (c) less control over backpressure handling. **Approach 3 — Kafka Streams equivalent**: KStream → ktable aggregation → output topic. Pros: library, no separate cluster, simpler deployment. Cons: (a) **limited state size** — bounded by node disk, can't scale to TBs; (b) **no exactly-once с Paimon** — output к Kafka only, downstream consumers must dedup; (c) windowing limitations (no sessions, limited interval joins); (d) Java/Scala only (no SQL DDL); (e) limited horizontal scaling (rebalancing painful); (f) backpressure manual; (g) no time travel или historical queries on output. **Decision matrix**: **Use MT when**: real-time dashboards, declarative pipelines, analyst-readable SQL, dbt-like model hierarchy, не need custom triggers. **Use INSERT INTO when**: advanced custom processing (UDFs, side outputs, custom triggers), need granular control, mixing DataStream/Table APIs, legacy pipeline migration. **Use Kafka Streams when**: simple stateless transformations, single-team owns producer + transform + consumer, no Flink cluster overhead желательно, bounded state, single-engine deployment. **For this use case (100k events/sec, dashboard, freshness 30s)** — **Materialized Table is right choice**. Reason: dashboard query needs Paimon-stored aggregations (readable from Trino/Grafana queries), declarative SQL matches analyst skills, lifecycle management automated saves DevOps time, scaling 100k events/sec well-supported. Caveat: if business adds non-SQL requirements (e.g., ML feature engineering with complex Python UDFs), might need fallback to INSERT INTO с PyFlink UDFs."
+/>

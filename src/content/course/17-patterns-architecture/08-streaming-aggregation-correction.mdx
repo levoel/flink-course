@@ -1,0 +1,376 @@
+---
+title: "Streaming aggregation correction — handling drift и late events"
+description: "Streaming aggregates неминуемо drift-ят от ground truth (late events, schema changes, bugs). Correction patterns: allowed lateness + side outputs, periodic batch reconciliation, watermark adjustments, upsert sink design."
+order: 8
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Aggregation", "Late Events", "Allowed Lateness", "Reconciliation", "Watermarks"]
+---
+
+# Streaming aggregation correction — handling drift и late events
+
+«Real-time count of orders per minute» звучит просто: TumblingEventTimeWindow + count(). Но в production через несколько недель discovers: streaming aggregate показывает 1247 orders за 14:00-14:01 окно, а batch reconciliation (next day) показывает 1252. Разница маленькая (0.4%), но при scale это десятки тысяч событий. Финансы не toleruют такое.
+
+Причины drift в streaming aggregations многочисленны: late events после watermark, bugs в business logic deployed между окнами, schema changes между producer и consumer, network duplicates без proper idempotency, или просто **fundamental tradeoff between latency и correctness**.
+
+Этот урок — patterns для управления этой реальностью: позднее обнаружение late events, allowed lateness + side outputs, periodic batch reconciliation, watermark adjustments, idempotent upsert sinks с corrections.
+
+---
+
+## Источники drift
+
+<DiagramContainer title="Источники aggregation drift в streaming" color="orange">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Late events"
+        tooltip="Event с event_time T приходит после watermark прошёл T. По умолчанию dropped — окно уже emitted результат. Это classic source drift."
+      >
+        Late events dropped
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Duplicate events"
+        tooltip="Producer retry без proper idempotency → event дважды. Если sink at-least-once → aggregate inflated. Если sink EOS — нет drift, но producer-side dedup нужен."
+      >
+        Duplicates inflate
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Watermark too aggressive"
+        tooltip="forBoundedOutOfOrderness(5s) при actual lag 30s → 25% events dropped как late. Watermark должен учитывать realistic worst-case lag."
+      >
+        Aggressive watermark
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Schema drift"
+        tooltip="Producer emit-ит V2 schema, Flink job всё ещё на V1 schema. Events с new fields dropped/mis-parsed. Aggregate wrong."
+      >
+        Schema mismatch
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Bug in logic"
+        tooltip="Aggregate computed with bug в коде. Deploy fix — но old windows already emitted с wrong numbers. Нужен mechanism для retroactive correction."
+      >
+        Code bug history
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Pattern 1: Allowed lateness + side output
+
+Самый basic correction mechanism — Flink built-in allowed lateness.
+
+```java
+OutputTag<Event> lateEventsTag = new OutputTag<Event>("late-events"){};
+
+SingleOutputStreamOperator<Aggregation> result = events
+    .keyBy(Event::userId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .allowedLateness(Time.minutes(10))   // wait 10min beyond watermark
+    .sideOutputLateData(lateEventsTag)
+    .reduce(new CountAggregator())
+    .uid("count-window");
+
+// Late events идут в side output для post-hoc обработки
+DataStream<Event> lateStream = result.getSideOutput(lateEventsTag);
+
+// Их можно (1) логировать в archive, (2) делать manual reconciliation, (3) или применить как corrections
+lateStream
+    .map(e -> Correction.from(e))
+    .sinkTo(kafkaSinkCorrections);
+```
+
+Semantics:
+1. Window closes когда watermark passes window end.
+2. Если `allowedLateness=10min`, window остаётся «open» ещё 10 минут (state retained). Late events apply к existing aggregation, window re-emits updated result.
+3. После 10 минут window state cleared. Late events после — dropped в side output.
+
+**Pros**: built-in, простой.
+**Cons**: window state живёт дольше — memory cost. Re-emit окна означает downstream может видеть множественные обновления для одного window.
+
+---
+
+## Pattern 2: Idempotent upsert sink + corrections
+
+Если sink поддерживает upsert (Iceberg/Paimon/Postgres on conflict), allowed lateness становится мощным.
+
+```java
+// Window emits result + late updates
+windowedStream
+    .reduce(new CountAggregator(), new EmitTriggerWindowFunction())
+    .sinkTo(IcebergSink.<Aggregation>builder()
+        .upsertMode(true)
+        .equalityFields(List.of("window_start", "user_id"))
+        .build());
+```
+
+Каждое re-emission window (initial + late updates) — это UPSERT по `(window_start, user_id)`. Downstream queries видят latest value. Это **eventual consistency model** — initial value может быть wrong, но через `allowedLateness` корректируется.
+
+Это работает для финансовых aggregates если:
+- Downstream queries говорят «values as of <when>» concept.
+- Reconciliation reports запускаются после `allowedLateness` past — т.е. читают «settled» windows.
+
+---
+
+## Pattern 3: Periodic batch reconciliation
+
+Streaming делает hot path, batch — gold standard.
+
+```
+Streaming: per-minute aggregates в Iceberg (с allowedLateness=10min)
+                  ↓
+Batch (nightly): re-aggregate full day из raw events,
+                  compare to streaming aggregates,
+                  emit corrections для discrepancies
+```
+
+```python
+# Daily reconciliation job (Spark/PySpark)
+streaming_view = spark.read.table("warehouse.aggregates_streaming")
+raw_events = spark.read.table("warehouse.events_raw")
+
+batch_aggregate = (raw_events
+    .filter(F.col("event_time").between(yesterday_start, yesterday_end))
+    .groupBy(F.window("event_time", "1 minute"), "user_id")
+    .count()
+)
+
+corrections = (streaming_view.alias("s")
+    .join(batch_aggregate.alias("b"), ["window_start", "user_id"], "outer")
+    .where(F.col("s.count") != F.col("b.count"))
+    .select(
+        F.col("window_start"),
+        F.col("user_id"),
+        F.col("s.count").alias("streaming"),
+        F.col("b.count").alias("batch"),
+        (F.col("b.count") - F.col("s.count")).alias("delta")
+    )
+)
+
+# Emit corrections к authoritative table
+corrections.write.mode("overwrite").saveAsTable("warehouse.aggregates_corrected")
+```
+
+Downstream reporting reads `aggregates_corrected` для accurate reports.
+
+<Callout type="note">
+В этой архитектуре streaming aggregates — это **fast estimate**, не authoritative source. Этот mental model критичен — иначе будете удивляться, почему «streaming не сходится с batch».
+</Callout>
+
+---
+
+## Pattern 4: Watermark adjustments
+
+Часто drift — это просто слишком aggressive watermark. Mitigation:
+
+```java
+// Был
+.forBoundedOutOfOrderness(Duration.ofSeconds(5))
+
+// Стало (на основе measurements)
+.forBoundedOutOfOrderness(Duration.ofMinutes(2))
+```
+
+Trade-off: latency окна emits — 2 минуты вместо 5 секунд. Это OK для real-time analytics, не OK для fraud detection.
+
+**Как measure proper bounded out-of-orderness:**
+
+```sql
+-- Metrics из Flink или batch analysis
+SELECT
+    PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY processing_time - event_time) AS p99_lag,
+    PERCENTILE_CONT(0.999) WITHIN GROUP (ORDER BY processing_time - event_time) AS p999_lag,
+    MAX(processing_time - event_time) AS max_lag
+FROM events;
+```
+
+Set `bounded out-of-orderness = p99 lag × 1.5` для good balance.
+
+---
+
+## Pattern 5: Watermark Alignment между sources
+
+При multi-source pipeline один slow source мог двинуть watermark и cause drift в aggregations.
+
+```java
+.forBoundedOutOfOrderness(Duration.ofSeconds(20))
+.withWatermarkAlignment(
+    "multi-source-group",
+    Duration.ofSeconds(30),  // max-allowed-drift
+    Duration.ofSeconds(1)
+);
+```
+
+Если sources drift > 30s, Flink pauses fast source чтобы slow догнал. Это **prevents aggregations from incorporating future events from one source без events from another**, что сделало бы aggregates inconsistent.
+
+---
+
+## Pattern 6: Compensating actions
+
+Иногда drift detected post-fact: «вчера мы видели 1000 fraudulent orders, нужно отозвать их». Streaming pipeline не может «un-emit» records, но может **emit compensating events**.
+
+```java
+// Manual correction event injected в Kafka
+{
+  "type": "correction",
+  "originalWindowStart": "2026-05-11T14:00:00Z",
+  "delta": -125,
+  "reason": "Schema drift bug fix, recovered missing events"
+}
+
+// Downstream aggregations process corrections
+correctionsStream
+    .keyBy(c -> c.originalWindowStart)
+    .process(new ApplyCorrectionFunction());
+```
+
+Это event-sourcing approach к corrections — никогда не mutate history, только append correction events. Downstream consumers агрегируют corrections со streaming values.
+
+---
+
+## Best practices flowchart
+
+<DiagramContainer title="Decision tree для aggregation correction" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Step 1: Profile lag"
+        tooltip="Measure event_time → processing_time delay distribution. P99 / max определят proper bounded out-of-orderness."
+      >
+        Measure actual lag
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Step 2: Set watermark"
+        tooltip="bounded out-of-orderness ≥ p99 lag × 1.5. Если sources разные lag — withWatermarkAlignment."
+      >
+        Conservative watermark
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Step 3: allowedLateness"
+        tooltip="Allow late events 5-30 min depending на business tolerance. Re-emit updates window. Idempotent sink upsert обязателен."
+      >
+        Allowed lateness window
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Step 4: Side output"
+        tooltip="Events past allowedLateness — в archive Kafka topic + alerting. Не silent drop. Manual review для systemic issues."
+      >
+        Side output → archive
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Step 5: Batch reconciliation"
+        tooltip="Nightly Spark job — re-compute aggregates из raw events, compare with streaming, emit corrections в authoritative table."
+      >
+        Nightly batch reconcile
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Когда batch reconciliation обязателен
+
+| Scenario | Streaming-only OK? | Batch reconciliation? |
+|---|---|---|
+| Real-time dashboards (best effort) | ✓ | Optional |
+| Real-time fraud detection | ✓ | No (latency critical) |
+| Financial reporting (regulator) | ✗ | Required |
+| Billing / invoicing | ✗ | Required |
+| Ad attribution | ✗ | Required (high accuracy needed) |
+| Service-level monitoring | ✓ | Optional |
+| Operational metrics | ✓ | Optional |
+
+---
+
+## Production code pattern
+
+```java
+public class OrdersAggregationJob {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        OutputTag<Order> lateOrdersTag = new OutputTag<Order>("late-orders"){};
+
+        DataStream<Order> orders = env.fromSource(
+            KafkaSource.<Order>builder()
+                .setTopics("orders")
+                .build(),
+            WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofMinutes(2))
+                .withTimestampAssigner((o, ts) -> o.eventTime())
+                .withWatermarkAlignment("orders-group", Duration.ofMinutes(1), Duration.ofSeconds(1)),
+            "orders-source"
+        ).uid("orders-source");
+
+        SingleOutputStreamOperator<OrderAggregate> aggregated = orders
+            .keyBy(Order::userId)
+            .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+            .allowedLateness(Time.minutes(15))
+            .sideOutputLateData(lateOrdersTag)
+            .aggregate(new OrderCountAggregator(), new EmitContextFunction())
+            .uid("orders-window");
+
+        // Primary write — idempotent upsert в Iceberg
+        aggregated.sinkTo(buildIcebergUpsertSink()).uid("iceberg-sink");
+
+        // Side output — archive для investigation
+        DataStream<Order> lateOrders = aggregated.getSideOutput(lateOrdersTag);
+        lateOrders.sinkTo(buildKafkaArchiveSink()).uid("late-archive");
+
+        // Metrics для observability
+        aggregated.map(new MetricsEmitter()).uid("metrics");
+
+        env.execute("Orders Aggregation");
+    }
+}
+```
+
+---
+
+## Production gotchas
+
+- **Silent late event drop** — без `sideOutputLateData`, late events просто disappear. Это hidden drift. Always configure side output, alerting на counter `numLateRecordsDropped`.
+- **`allowedLateness` × window memory** — для tumbling 5min window с allowedLateness 60min, state retained 65min. На high cardinality keyBy — память значимая. Calculate: `cardinality × state_per_key × (window_size + allowed_lateness)`.
+- **Re-emit без idempotent sink** — sink at-least-once + re-emission = duplicates. Sink должен быть idempotent (upsert по window_start + key) или EOS transactional.
+- **Watermark generators reset на restart** — после restart watermark начинается с минимума, может temporarily drop late events. Mitigation: `forMonotonousTimestamps` если timestamps strictly monotonic, иначе bounded out-of-orderness с margin.
+- **Schema evolution breaking aggregation** — events V2 schema, deserializer V1 → records dropped silently. Schema registry с strict compatibility check is must. Alerting на deserialization error rate.
+- **Batch reconciliation reads streaming-mutating data** — если batch reads Iceberg snapshot while streaming пишет, можно увидеть mid-window state. Solution: snapshot lock — batch reads `SNAPSHOT 'before-yesterday-end'`, не latest.
+- **Drift accumulates без correction loop** — без batch reconciliation streaming aggregates слегка off forever. Implement automated reconciliation, не «вручную раз в месяц».
+- **Multi-stage pipelines compound drift** — aggregate of aggregates. Stage 1 drift 0.5%, Stage 2 на этом же → 1%, Stage 3 → 1.5%. Hard to debug. Минимизируйте stages, и иногда — recompute from raw events каждый stage.
+
+<Callout type="warning">
+**Streaming aggregations никогда не совпадут byte-by-byte с batch для same data** в общем случае. Из-за late events, time-based windows boundary detection, ordering guarantees, watermark approximations — есть fundamental fuzz. Goal — bound drift на acceptable level (например, < 0.1% для analytics, 0% для billing после reconciliation), не достичь strict equality.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: streaming aggregate hourly orders per merchant используется для billing (merchants получают invoice based on order count). На follow-up audit обнаруживается: streaming aggregate показывает 47218 orders за час, but batch re-aggregation из raw Kafka events shows 47245. Delta 27 orders × $X commission — financial impact $X*27. Что вы должны сделать, и как prevent на будущее?"
+  answer="Immediate: (1) NOT use streaming aggregate для billing — обходите authoritative reconciled view. Streaming = preview, batch reconcile = settle. (2) Run batch re-aggregation в Spark, compute corrections, emit corrected invoices to affected merchants (refund/charge depending on direction). (3) Investigate 27 missing events — likely late events past allowedLateness OR schema mis-match OR producer-side duplicates. Check `numLateRecordsDropped` metric и side output Kafka topic. Root cause analysis prevents recurrence. Prevention: (1) **Always have batch reconciliation для money-critical aggregates** — это non-negotiable для billing/invoicing pipelines. Streaming aggregate good for dashboard, batch — для invoice. (2) **Architecture pattern** — Iceberg lakehouse с three layers: raw events (Kafka backfill через MirrorMaker → Iceberg), streaming aggregates (Flink → Iceberg with eos), reconciled aggregates (Spark daily batch overwrites). Billing reads только reconciled. (3) **Watermark proper tuning** — measure p99 producer-to-Flink lag, set bounded out-of-orderness = p99 × 1.5. (4) **Allowed lateness 30-60min для billing accuracy critical aggregates** — costs memory, but reduces drift dramatically. (5) **Side output все late events** — alerting на count, manual review periodic. (6) **Schema registry с strict compatibility** + deserialization error rate alerting. (7) **Idempotent upsert sink** через equality fields (window_start, merchant_id) — re-emits don't create duplicates. (8) **Reconciliation automation** — nightly Spark job, compare streaming vs raw re-aggregation, alert на discrepancies > threshold. Lesson: streaming aggregations для money — never authoritative without batch reconcile loop. Это design discipline, не option."
+/>

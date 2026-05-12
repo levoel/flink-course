@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/06-network-stack",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-06",
+    "description": "Use IDs: flink-m01-06-q1, flink-m01-06-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-06-q1",
+      "type": "multiple-choice",
+      "question": "Что такое credit-based flow control в Flink, и почему он лучше old TCP-window blocking подхода (до 1.5)?",
+      "options": [
+        { "id": "a", "text": "Это синонимы, различие только терминологическое" },
+        { "id": "b", "text": "Credit-based: consumer объявляет credits (= количество свободных buffers). Producer не шлёт больше. Old TCP-window: producer блокировался на socket.write(), это блокировало control plane — checkpoint barriers застревали в backpressured channels, checkpoints stuck. Credit-based разделяет data и control channels — backpressure не блокирует barriers" },
+        { "id": "c", "text": "Credit-based использует UDP вместо TCP" },
+        { "id": "d", "text": "Credit-based работает только для batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical архитектурное изменение в Flink 1.5 (FLIP-1 era). Old TCP-window: data shared один socket с control messages. Slow consumer → блокированный socket.write на producer → блокировались и checkpoint barriers → catastrophic checkpoint stuck. Credit-based: consumer заранее объявляет N credits per channel. Producer send-ит только если credit > 0. Data и control messages идут separate logical channels через один TCP. Backpressure ограничивает throughput, но не блокирует control plane.",
+      "studyHint": "Повторите урок 06 — раздел 'Old TCP-window blocking'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-06-q2",
+      "type": "multiple-choice",
+      "question": "В Web UI у вас: Source busy=400 bp=500, Map busy=300 bp=600, Window busy=950 bp=20, Sink busy=200 idle=800. Где bottleneck?",
+      "options": [
+        { "id": "a", "text": "Sink (он медленный, idle=800)" },
+        { "id": "b", "text": "Source (самый upstream backpressured)" },
+        { "id": "c", "text": "Window — CPU-bound (busy=950, почти 100% CPU). Sink имеет idle=800 → downstream OK. Source и Map высокий bp — cascading: они вынуждены замедляться, потому что Window не успевает потреблять. Fix: increase Window parallelism, optimize CPU, или use Async I/O для external lookups" },
+        { "id": "d", "text": "Map (промежуточный)" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Bottleneck определяется как subtask с высоким busy (CPU-bound) и низким bp — это значит он сам не успевает, не блокируется downstream-ом. Window busy=950 → почти всё время в CPU/state access. Backpressure cascade: Window output buffers fills → no credits to Map → Map bp=600 → Source bp=500. Sink idle=800 → ждёт работы, downstream OK. НЕ нужно увеличивать Source parallelism — это усугубит cascade. Правильные fixes: parallelism Window up, optimize processWindow, state backend tuning, или Async I/O если есть external lookup.",
+      "studyHint": "Повторите урок 06 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-06-q3",
+      "type": "multiple-choice",
+      "question": "Что такое buffer debloating (FLIP-183, Flink 1.14+), и зачем включать в production?",
+      "options": [
+        { "id": "a", "text": "Это deprecated фича, удалена в 2.0" },
+        { "id": "b", "text": "Adaptive size network buffers в зависимости от throughput. При низком throughput — small effective buffers (fast barrier propagation, лучше checkpoint duration). При высоком — big buffers (throughput-optimal). Снижает checkpoint duration 5-10x для backpressured jobs. Cost ~1-2% CPU" },
+        { "id": "c", "text": "Это про disk buffers, не network" },
+        { "id": "d", "text": "Уменьшает memory footprint TM-а" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Buffer debloating адаптивно регулирует effective size network buffers через target time (default 1 sec data in buffer). Проблема без него: при backpressure большие buffers (32 KB) почти полны → checkpoint barrier ждёт processing предшествующих records → checkpoint duration растёт линейно с buffer fill. С debloating: при низком throughput buffers effective малы → barriers propagate fast. Минимальный CPU cost (~1-2%) для drastically лучше checkpoint behaviour. Рекомендуется включать в production по умолчанию вместе с unaligned checkpoints.",
+      "studyHint": "Повторите урок 06 — раздел 'Buffer debloating'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m01-06-q4",
+      "type": "true-false",
+      "question": "Backpressure в healthy production pipeline всегда означает проблему — нужно немедленно scale up upstream.",
+      "correctAnswer": false,
+      "explanation": "Backpressure — это REGULATION mechanism, не failure. В healthy production pipeline нормально иметь sustained bp=100-300 ms/s — это значит downstream немного медленнее upstream, и система регулирует throughput. Проблема, когда bp=900+ ms/s (источник почти не вычисляет). Также НИКОГДА не нужно scale up upstream — это усугубит проблему (downstream ещё больше backpressure). Если bp высокий, scale up DOWNSTREAM (где bottleneck) или оптимизировать его CPU/state.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

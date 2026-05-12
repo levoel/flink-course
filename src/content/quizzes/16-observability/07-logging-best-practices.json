@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "16-observability/07-logging-best-practices",
+  "moduleId": "16-observability",
+  "_meta": {
+    "idPrefix": "flink-m16-07",
+    "description": "Quiz for logging best practices lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m16-07-q1",
+      "type": "multiple-choice",
+      "question": "Главное правило production logging в Flink — что НЕЛЬЗЯ делать и какие alternatives?",
+      "options": [
+        { "id": "a", "text": "Логировать всё через INFO" },
+        { "id": "b", "text": "АНТИПАТТЕРН: per-record logging (LOG.info внутри map/processElement). 100k records/sec × 1KB = 100MB/sec disk write → disk full, log pipeline overload, $$$ cost. Alternatives: (1) Sampled logging (1 of 100k через counter % SAMPLE_RATE); (2) Error-only logging (errors rare); (3) Event-driven (rare events: state transitions, alerts). Production volume rule: < 100 log lines/sec per TM в steady state" },
+        { "id": "c", "text": "Использовать только printf" },
+        { "id": "d", "text": "Отключить logging полностью" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Per-record logging — main cause production 'logs flood incident'. Один разработчик добавил LOG.info('Processing: ' + record) → 1M records/sec × 1KB = 1GB/sec log volume → disk full, ELK overload. Code reviews должны explicitly catch это. processElement/map/flatMap — only WARN/ERROR. INFO для rare lifecycle events (job start, checkpoint complete). DEBUG/TRACE никогда в production (OFF). Sampled pattern: counter % SAMPLE_RATE == 0 — 1 of 100k = 10 lines/sec на 1M throughput. Acceptable volume.",
+      "studyHint": "Повторите урок — Главное правило",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-07-q2",
+      "type": "multiple-choice",
+      "question": "Structured JSON logging в Flink 2.3+ — что даёт vs plain text?",
+      "options": [
+        { "id": "a", "text": "Просто красивее в UI" },
+        { "id": "b", "text": "Каждое поле — search-able key в Elasticsearch/Loki. Plain text: 'найти все checkpoint triggers где duration > 60s' невозможно без custom parsers. JSON: query 'checkpoint_id:123 AND duration_ms:>60000' — точно. Plus MDC context (user_id, event_id, trace_id) автоматически attached к log lines внутри scope. Plus slf4j 2.x key-value pairs — explicit fields" },
+        { "id": "c", "text": "Compression только" },
+        { "id": "d", "text": "Faster writes" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Plain text logs — grep-friendly но searchable hard. Structured JSON: каждое поле individually searchable. Modern observability (Loki, Elasticsearch, OTel Logs) требует JSON. Configuration log4j2: appender.json.layout.type = JsonTemplateLayout, eventTemplateUri = classpath:LogstashJsonEventLayoutV1.json. MDC pattern: MDC.put('user_id', userId) внутри try → all log lines attach user_id. Modern slf4j 2.x: LOG.atWarn().addKeyValue('user_id', x).log() — explicit. Production стандарт modern observability — JSON logs обязателен.",
+      "studyHint": "Повторите урок — Structured logging (JSON)",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m16-07-q3",
+      "type": "multiple-choice",
+      "question": "Production incident: TaskManager OOMKilled, investigation показывает disk full на TM host. /flink/logs занимает 9GB на 10GB disk. Latest deploy включал verbose logging в fraud detector. Immediate fix + long-term plan?",
+      "options": [
+        { "id": "a", "text": "Increase disk size" },
+        { "id": "b", "text": "Immediate: identify offending log source (find /flink/logs -size +100M), emergency log rotation (truncate big file или delete TM pod, replicate recreates), stop bleeding via config override или rollback deployment. Long-term: (1) Log level discipline — processElement only WARN/ERROR, never INFO в hot path. (2) Async appender bounded queue. (3) Aggressive rotation 50MB × 3 files. (4) Logs ship к Loki/ES real-time через Promtail/Fluentd. (5) Code review checklist 'no INFO в hot path'. (6) Alert disk >70%. (7) PR template question about logging" },
+        { "id": "c", "text": "Disable logging" },
+        { "id": "d", "text": "Migrate к syslog" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic per-record logging incident. Immediate fix focuses на stopping bleeding и cluster recovery. Long-term focus на prevention через discipline и tooling. Critical insights: (1) In streaming с millions events/sec basic logging principles от batch systems don't transfer. (2) Code review должен caught — make it explicit checklist item. (3) Disk-based safeguards — aggressive rotation, async appender. (4) Real-time shipping — TM disk doesn't need long retention. (5) Observability strategy clarity: metrics для high-volume aggregate, traces для sampled per-record, logs для rare events. Treat logs as scarce resource.",
+      "studyHint": "Повторите урок — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m16-07-q4",
+      "type": "true-false",
+      "question": "log4j2 default sync writing — async appender оптимизация, обычно не нужна.",
+      "correctAnswer": false,
+      "explanation": "False. По умолчанию log4j2 writes synchronously — на high write rate disk I/O blocks mailbox thread. Critical для production: async appender. Config: appender.async.type = Async, appenderRef.ref = JsonFile, queueSize = 4096, includeLocation = false. Async wrapper offloads IO к dedicated thread, mailbox продолжает processing. Critical для high-throughput jobs. Logback также имеет AsyncAppender с bounded queue — на overflow drops или blocks. Monitor queue depth. Production rule: ВСЕГДА async appender для production Flink jobs, не sync default.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

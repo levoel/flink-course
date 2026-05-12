@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/04-graph-transformation",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-04",
+    "description": "Use IDs: flink-m01-04-q1, flink-m01-04-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-04-q1",
+      "type": "multiple-choice",
+      "question": "Какая правильная последовательность 4-х уровней graph transformation в Flink?",
+      "options": [
+        { "id": "a", "text": "JobGraph → StreamGraph → ExecutionGraph → Physical" },
+        { "id": "b", "text": "StreamGraph (API calls) → JobGraph (chaining optimization) → ExecutionGraph (parallelism expansion) → Physical execution (slot allocation)" },
+        { "id": "c", "text": "Physical → ExecutionGraph → JobGraph → StreamGraph" },
+        { "id": "d", "text": "Только StreamGraph и ExecutionGraph" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Правильная последовательность: (1) StreamGraph — отрисовка API-вызовов в DAG на клиенте/JM; (2) JobGraph — применяет operator chaining (соседние операторы со совместимым parallelism и forward partitioning сливаются); (3) ExecutionGraph — раскрывает каждый JobVertex в N ExecutionVertex по parallelism; (4) Physical execution — Scheduler выделяет slots каждому ExecutionVertex. Каждый уровень — своя оптимизация и своё место хранения (StreamGraph — на клиенте/JM, ExecutionGraph — в JobMaster).",
+      "studyHint": "Повторите урок 04 — четыре раздела о каждом уровне",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-04-q2",
+      "type": "multiple-choice",
+      "question": "Pipeline: `source → map → filter → keyBy → process → sink`, все parallelism=4 кроме sink (par=2). Сколько JobGraph vertices получится и где chaining ломается?",
+      "options": [
+        { "id": "a", "text": "1 vertex со всеми операторами" },
+        { "id": "b", "text": "6 vertices (нет chaining)" },
+        { "id": "c", "text": "3 vertices: [source+map+filter] (par=4, forward) → shuffle → [process] (par=4, после keyBy) → rebalance → [sink] (par=2). Chaining ломается дважды: после filter (hash shuffle), после process (rebalance из-за mismatch parallelism)" },
+        { "id": "d", "text": "2 vertices" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Chaining требует: same parallelism + forward (или rescale) partitioning + same slot sharing group. После filter — keyBy переключает на hash partitioning (несовместимо с chaining), break. После process — sink имеет par=2 vs process par=4, Flink делает rebalance (round-robin), снова break chain. Итого 3 chained tasks. ExecutionGraph expansion даёт 4+4+2=10 subtasks (ExecutionVertex). С default slot sharing достаточно 4 slots для всего pipeline (sink тоже в default group).",
+      "studyHint": "Повторите урок 04 — раздел 'Условия chaining' и KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m01-04-q3",
+      "type": "multiple-choice",
+      "question": "Чем отличается operator chaining от slot sharing group? Это синонимы?",
+      "options": [
+        { "id": "a", "text": "Это синонимы" },
+        { "id": "b", "text": "Chaining объединяет операторы в один task (один thread, нет сериализации) — внутри task. Slot sharing позволяет нескольким tasks делить slot (свои threads, но общий memory budget) — между tasks. Два независимых уровня оптимизации" },
+        { "id": "c", "text": "Chaining работает на runtime, slot sharing — на compile time" },
+        { "id": "d", "text": "Slot sharing — это deprecated концепт" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Chaining vs Slot Sharing — независимые оптимизации. Chaining: операторы со совместимыми properties (forward partitioning, same parallelism) выполняются в ОДНОМ thread без сериализации (как method calls). Slot Sharing: несколько RAZNYX tasks (после chaining) могут делить один slot — это позволяет N copy полного pipeline-а вместить в N slots вместо M*N. Один уровень — внутри task (chaining), другой — между tasks (sharing). Можно отключать независимо.",
+      "studyHint": "Повторите урок 04 — раздел 'Slot Sharing Groups' и Callout note",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-04-q4",
+      "type": "true-false",
+      "question": "Chained операторы можно scale независимо: указать map.parallelism=4 и chain'нутый с ним filter.parallelism=8.",
+      "correctAnswer": false,
+      "explanation": "Chained операторы работают в ОДНОМ thread, поэтому невозможно scale-ить их независимо — у них один и тот же parallelism (это одно из условий chaining!). Если нужны разные parallelism — disable chaining через .disableChaining() или .startNewChain(). Это часто причина, почему disable chaining оправдан: если у вас map (lightweight) + heavy-process (CPU-heavy), их independent scaling требует break chain.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

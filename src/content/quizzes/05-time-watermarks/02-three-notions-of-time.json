@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/02-three-notions-of-time",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-02",
+    "description": "Quiz for three notions of time lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-02-q1",
+      "type": "multiple-choice",
+      "question": "Какие три понятия времени поддерживал Flink исторически, и какое из них removed как отдельный mode в 2.x?",
+      "options": [
+        { "id": "a", "text": "Event time, processing time, ingestion time. Ingestion time removed как TimeCharacteristic в 2.0 (можно эмулировать через TimestampAssigner)" },
+        { "id": "b", "text": "Event time, processing time, UTC time. Processing time removed" },
+        { "id": "c", "text": "Только event time и processing time, ingestion time никогда не было" },
+        { "id": "d", "text": "Wall clock, monotonic clock, event clock — все три актуальны" }
+      ],
+      "correctAnswer": "a",
+      "explanation": "Flink исторически поддерживал три типа времени: event time (embedded в record, время когда событие произошло), processing time (System.currentTimeMillis() на TaskManager в момент обработки), ingestion time (wall clock на момент входа в Flink Source). Ingestion time deprecated с 1.12 и removed как TimeCharacteristic в 2.0 — эмулируется через TimestampAssigner возвращающий current time. Это редко правильный выбор — теряет преимущества event time без выигрыша processing time.",
+      "studyHint": "Повторите урок — раздел 'Три типа времени'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m05-02-q2",
+      "type": "multiple-choice",
+      "question": "Why event time критичен для reprocessing/backfill scenarios?",
+      "options": [
+        { "id": "a", "text": "Event time быстрее обрабатывается" },
+        { "id": "b", "text": "При replay из 30-дневной давности с event time, windows закроются как в оригинале (детерминированно). С processing time все события попадут в текущее окно по wall clock — aggregations broken" },
+        { "id": "c", "text": "Event time использует меньше memory" },
+        { "id": "d", "text": "Только event time поддерживает joins" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "При reprocessing 30-дневной истории через replay из Kafka: с event time — события 30-дневной давности обрабатываются с их оригинальными timestamps, окна закрываются корректно, результат bit-exact identical original processing (modulo fixes). С processing time — все эти события processed по current wall clock, попадают в одно текущее окно, aggregations broken, side effects неправильные. Event time = detrministic reprocessing = lambda architecture без lambda (один pipeline для stream и batch).",
+      "studyHint": "Повторите урок — раздел 'Почему event time'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-02-q3",
+      "type": "multiple-choice",
+      "question": "В каких сценариях processing time всё-таки правильный выбор?",
+      "options": [
+        { "id": "a", "text": "Никогда — event time всегда лучше" },
+        { "id": "b", "text": "Service-level monitoring (req/sec за минуту wall clock), rate limiting/throttling (emit не чаще раз в N сек), TTL cleanup state — где wall clock — это сама бизнес-семантика" },
+        { "id": "c", "text": "Только для batch jobs" },
+        { "id": "d", "text": "Только для Python pipelines" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Processing time правильный когда wall clock — сама бизнес-семантика. Service metrics (req/sec) — 'минута' это wall clock минута. Rate limiting — 'emit не чаще раз в 1 sec' — wall clock. State TTL cleanup — 'удалить если ничего не приходило 1 час' — wall clock час. Для бизнес-агрегаций (sum, count в временном окне), stateful detection, joins — event time. Правило: бизнес-логика → event time, инфраструктура → processing time.",
+      "studyHint": "Повторите урок — раздел 'Когда processing time'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m05-02-q4",
+      "type": "true-false",
+      "question": "TimestampAssigner может возвращать null или Long.MIN_VALUE для bad records без последствий — Flink автоматически handles edge cases.",
+      "correctAnswer": false,
+      "explanation": "False. Если TimestampAssigner возвращает Long.MIN_VALUE (или очень старый timestamp), watermark не движется или застрял в прошлом — окна не закрываются никогда. Это classic source of stuck watermark. Production защита: validate timestamp в assigner, fallback на recordTs (Kafka log timestamp) при invalid event time: `.withTimestampAssigner((event, recordTs) -> event.getEventTime() > 0 ? event.getEventTime() : recordTs)`. Возврат null — compilation OK (long не nullable, autoboxing к Long.MIN_VALUE), но логически badly broken — semantically Long.MIN_VALUE.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

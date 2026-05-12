@@ -1,0 +1,461 @@
+---
+title: "Flink Kubernetes Operator: CRDs, reconciliation, full manifest"
+order: 4
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Flink Kubernetes Operator", "CRDs", "FlinkDeployment", "FlinkSessionJob", "Reconciliation", "GitOps"]
+---
+
+# Flink Kubernetes Operator
+
+**Flink Kubernetes Operator** — official Apache project, который превращает Flink на K8s из набора низкоуровневых API calls в declarative resource model. Operator определяет два CRD — `FlinkDeployment` и `FlinkSessionJob` — и controller, который реконсилирует desired state с actual cluster state. Это **mandatory компонент** для production Flink в 2026: 90% операционной сложности (savepoint management, upgrades, HA observation, autoscaler integration) делегируется operator-у.
+
+В этом уроке: архитектура operator-а, CRD структура, полный walkthrough production-ready FlinkDeployment YAML, lifecycle reconciliation, integration points с autoscaler / savepoint workflow.
+
+---
+
+## Зачем Operator
+
+Native K8s integration (урок 03) даёт raw building blocks: JM создаёт TM pods, ConfigMap-ы хранят metadata. Но без operator-а вы вручную делаете:
+
+- Trigger savepoint перед upgrade → wait → submit new job → restore
+- Detect JM crash → start recovery procedure
+- Scale parallelism → write code для savepoint + restart
+- Monitor metrics → solo react на degradation
+- Manage multiple jobs → custom scripts/CI logic
+
+Operator автоматизирует всё это через **reconciliation pattern**: вы декларируете desired state в YAML, controller сам делает actions для приведения cluster к этому состоянию.
+
+| Operation | Без Operator | С Operator |
+|---|---|---|
+| Submit job | `flink run-application ...` команда | `kubectl apply FlinkDeployment.yaml` |
+| Upgrade image | savepoint → stop → start new manually | bump image tag, operator делает blue/green |
+| Rescale | stop with savepoint → start с новым parallelism | bump parallelism, operator делает (или autoscaler) |
+| HA | работает, но JM crash recovery — manual observation | автоматически detect + report |
+| Multi-job management | scripts/CI | many FlinkDeployment manifests, GitOps native |
+| Savepoint policy | cron + scripts | declarative `periodicSavepointInterval` |
+
+---
+
+## Архитектура: что такое Operator под капотом
+
+<DiagramContainer title="Flink Kubernetes Operator: controller loop" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="User / GitOps"
+        tooltip="ArgoCD/Flux синхронизируют FlinkDeployment manifests из git репозитория в cluster. kubectl apply работает identically."
+      >
+        kubectl apply FlinkDeployment.yaml
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="K8s API server stores CR" />
+    <FlowRow>
+      <DataBox
+        label="Operator pod (controller)"
+        tooltip="Один operator pod на cluster (или N replicas для HA). Watch event stream от K8s API на изменения CRD. Использует Java Operator SDK + fabric8 kubernetes-client."
+      >
+        flink-kubernetes-operator
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="reconcile loop" />
+    <FlowRow>
+      <DataBox
+        label="Observe phase"
+        tooltip="Operator читает текущее состояние Flink JM (через REST API на 8081), checkpoint state, HA ConfigMaps, pod status. Compares с CR spec."
+      >
+        observe current state
+      </DataBox>
+      <DataBox
+        label="Plan phase"
+        tooltip="Если spec != actual: какие actions нужны? Submit new job? Trigger savepoint? Scale parallelism? Update image? Outputs concrete sequence of operations."
+      >
+        compute delta + plan
+      </DataBox>
+      <DataBox
+        label="Execute phase"
+        tooltip="Поэтапно: trigger savepoint REST call → wait done → cancel job → create new JM Deployment → wait ready → submit job from savepoint. Status пишется в CR."
+      >
+        execute actions
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="status updated → user observes" />
+    <FlowRow>
+      <DataBox
+        label="FlinkDeployment status"
+        tooltip="JobStatus.state (RUNNING/SUSPENDED/FINISHED), ReconciliationStatus, lifecycleState, savepointInfo, current image version, etc. Доступно через kubectl get flinkdeployment -o yaml."
+      >
+        kubectl get flinkdeployment
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Operator — это **controller pattern**: один component watches CRDs, реконсилирует state. Это та же модель, что и K8s native controllers (Deployment, StatefulSet). Operator не magic — он просто делает за вас то, что вы бы сами делали через REST API и shell scripts.
+
+---
+
+## CRDs: FlinkDeployment и FlinkSessionJob
+
+Operator вводит два custom resource definitions:
+
+### 1. `FlinkDeployment`
+
+Описывает **Flink cluster** + optionally **job** в нём.
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: <cluster-id>
+spec:
+  image: <docker image>
+  flinkVersion: <v2_2 / v1_20 / etc>
+  flinkConfiguration: { ... }   # все flink-conf properties
+  jobManager: { resource, replicas, ... }
+  taskManager: { resource, replicas, ... }
+  job: { ... }                  # опционально — если есть, mode = Application
+                                # если нет — mode = Session
+spec.podTemplate: { ... }       # advanced
+spec.ingress: { ... }           # ingress for Web UI
+```
+
+Если `spec.job` указан → Application mode (один cluster = одна job).
+Если `spec.job` отсутствует → Session mode (cluster без job, ждёт FlinkSessionJob submissions).
+
+### 2. `FlinkSessionJob`
+
+Описывает **job в Session cluster**.
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkSessionJob
+metadata:
+  name: <job-name>
+spec:
+  deploymentName: <session-cluster-name>   # references FlinkDeployment
+  job:
+    jarURI: <s3:// or https://>
+    parallelism: 4
+    upgradeMode: savepoint
+```
+
+---
+
+## Production-ready FlinkDeployment: полный walkthrough
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector
+  namespace: streaming-prod
+  labels:
+    team: streaming
+    tier: critical
+    cost-center: fraud-prevention
+spec:
+  # ---- IMAGE ----
+  image: registry.example.com/flink-jobs/fraud-detector:1.42.0
+  flinkVersion: v2_2
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: regcred
+
+  serviceAccount: flink
+
+  # ---- FLINK CONFIGURATION ----
+  flinkConfiguration:
+    # State backend — disaggregated state на S3
+    state.backend.type: forst
+    state.checkpoints.dir: s3://flink-prod/checkpoints/fraud-detector
+    state.savepoints.dir: s3://flink-prod/savepoints/fraud-detector
+    state.backend.forst.primary-dir: s3://flink-prod/state/fraud-detector
+    state.backend.forst.cache.dir: /opt/flink/forst-cache
+    state.backend.forst.cache.size-based-limit: 20gb
+
+    # Checkpoint configuration
+    execution.checkpointing.interval: 60s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: 10min
+    execution.checkpointing.max-concurrent-checkpoints: 1
+    execution.checkpointing.min-pause: 30s
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    execution.checkpointing.unaligned: true
+
+    # HA через K8s ConfigMaps
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://flink-prod/ha/fraud-detector
+
+    # Adaptive Scheduler + Autoscaler
+    jobmanager.scheduler: adaptive
+    job.autoscaler.enabled: "true"
+    job.autoscaler.target.utilization: "0.7"
+    job.autoscaler.metrics.window: 5min
+    job.autoscaler.stabilization.interval: 5min
+
+    # Restart strategy
+    restart-strategy: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: 10s
+    restart-strategy.exponential-delay.max-backoff: 2min
+    restart-strategy.exponential-delay.backoff-multiplier: "2"
+    restart-strategy.exponential-delay.reset-backoff-threshold: 1h
+
+    # Metrics — Prometheus
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+
+    # Networking buffers — depends on parallelism
+    taskmanager.memory.network.fraction: "0.15"
+    taskmanager.memory.network.min: 256mb
+    taskmanager.memory.network.max: 1gb
+
+  # ---- JOB MANAGER ----
+  jobManager:
+    replicas: 2          # HA = 1 active + 1 standby
+    resource:
+      cpu: 2
+      memory: 4096m
+    podTemplate:
+      spec:
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app: fraud-detector
+                      component: jobmanager
+                  topologyKey: kubernetes.io/hostname
+        tolerations:
+          - key: streaming
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+
+  # ---- TASK MANAGER ----
+  taskManager:
+    resource:
+      cpu: 4
+      memory: 8192m
+    podTemplate:
+      spec:
+        containers:
+          - name: flink-main-container
+            volumeMounts:
+              - name: forst-cache
+                mountPath: /opt/flink/forst-cache
+        volumes:
+          - name: forst-cache
+            emptyDir:
+              sizeLimit: 50Gi
+
+  # ---- JOB SPEC ----
+  job:
+    jarURI: local:///opt/flink/usrlib/fraud-detector.jar
+    entryClass: com.example.fraud.FraudDetectorJob
+    args:
+      - "--bootstrap-servers"
+      - "kafka.streaming-prod.svc:9092"
+      - "--input-topic"
+      - "transactions"
+      - "--output-topic"
+      - "fraud-alerts"
+    parallelism: 8
+    upgradeMode: savepoint            # savepoint-based upgrade на изменение
+    state: running                    # или suspended для pause
+    savepointTriggerNonce: 0          # инкремент для manual savepoint trigger
+
+  # ---- INGRESS for Web UI ----
+  ingress:
+    template: "fraud-detector.streaming.example.com"
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+```
+
+Каждый блок — критически важная часть:
+
+- **`image`** — immutable artifact, каждый bump = новая deploy
+- **`flinkConfiguration`** — все flink-conf.yaml properties доступны
+- **`jobManager.replicas: 2`** — обязательно для HA, 1 active + 1 standby
+- **`taskManager`** — НЕ указывайте `replicas` для Application mode + Adaptive Scheduler (TMs создаются динамически по требованию parallelism + autoscaler)
+- **`job.upgradeMode: savepoint`** — operator делает savepoint при изменении spec и restore нового job
+- **`job.state: running` / `suspended`** — управление активностью без удаления CR
+
+---
+
+## Lifecycle: что operator делает при изменении CR
+
+### Сценарий 1: Initial deploy (`kubectl apply` нового FlinkDeployment)
+
+```text
+1. CR создан в K8s API
+2. Operator получает CREATE event
+3. Observe: cluster не существует
+4. Plan: создать всё с нуля
+5. Execute:
+   a. Создать ServiceAccount (если не существует)
+   b. Создать ConfigMap с flink-conf.yaml
+   c. Создать JM Deployment (2 replicas если HA)
+   d. Создать REST Service + headless Service
+   e. Wait for JM ready (probes)
+   f. JM сам через native integration создаёт TM pods
+   g. JM submit job из main()
+6. Update CR.status: state=DEPLOYED, jobStatus.state=RUNNING
+```
+
+### Сценарий 2: Image upgrade (bump `spec.image` tag)
+
+```text
+1. CR updated в K8s API
+2. Operator получает UPDATE event
+3. Observe: текущий image != spec.image
+4. Plan: savepoint-based upgrade (потому что upgradeMode: savepoint)
+5. Execute:
+   a. Trigger savepoint через REST API (POST /jobs/{id}/savepoints)
+   b. Poll savepoint status, wait DONE (может занять минуты для большого state)
+   c. Cancel running job
+   d. Update JM Deployment с новым image
+   e. Wait for new JM Pod ready
+   f. Submit job из main() с restore flag --fromSavepoint <path>
+   g. Wait for job RUNNING
+   h. Optionally — keep old savepoint (configurable retention)
+6. Update CR.status: lastReconciledSpec=new spec
+```
+
+### Сценарий 3: Manual savepoint trigger (`savepointTriggerNonce++`)
+
+```text
+1. spec.job.savepointTriggerNonce: 0 → 1
+2. Operator detects nonce changed
+3. POST /jobs/{id}/savepoints
+4. Status updated: savepointInfo.formatType, location, triggerNonce
+```
+
+### Сценарий 4: Suspend (`spec.job.state: suspended`)
+
+```text
+1. spec.job.state: running → suspended
+2. Operator triggers savepoint (если upgradeMode: savepoint)
+3. Cancel job, delete TM pods
+4. JM Deployment scaled to 0 replicas (опционально)
+5. CR.status: state=SUSPENDED, last savepoint path saved
+```
+
+`suspended` — отличный pattern для cost optimization на staging: ночью suspend dev jobs, утром resume (savepoint-based восстановление, нет потери state).
+
+---
+
+## upgradeMode: важная декларация
+
+```yaml
+spec.job.upgradeMode: <stateless | savepoint | last-state>
+```
+
+| Mode | Поведение при upgrade |
+|---|---|
+| **stateless** | Cancel job → start новый job из main() (state НЕ переносится). Для stateless transforms. |
+| **savepoint** | Trigger savepoint → cancel → start новый из savepoint. Production default для stateful. |
+| **last-state** | Используется last completed checkpoint (НЕ savepoint). Быстрее, но может потерять последние секунды state. Для tolerable data loss scenarios. |
+
+**Production rule**: для stateful jobs всегда `savepoint`. `last-state` приемлем только если потеря 30-60 секунд state не критична (analytics dashboards и т.п.).
+
+---
+
+## FlinkSessionJob workflow
+
+Если используете Session cluster:
+
+```yaml
+# 1. Сначала session cluster (один на всех)
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: sql-session
+spec:
+  image: flink:2.2.0-java17
+  flinkVersion: v2_2
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend.type: rocksdb
+  jobManager:
+    resource: { cpu: 2, memory: 4096m }
+  taskManager:
+    resource: { cpu: 4, memory: 8192m }
+  # spec.job отсутствует → session cluster
+
+---
+# 2. Submit jobs
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkSessionJob
+metadata:
+  name: hourly-aggregation
+spec:
+  deploymentName: sql-session    # ссылка на cluster выше
+  job:
+    jarURI: https://artifacts.example.com/hourly-agg-3.1.jar
+    entryClass: com.example.HourlyAggJob
+    parallelism: 4
+    upgradeMode: savepoint
+```
+
+Operator слушает оба CRD: FlinkDeployment (cluster) и FlinkSessionJob (jobs внутри). При создании session job operator делает REST POST в Dispatcher на нужном cluster-е.
+
+---
+
+## Periodic savepoints — declarative
+
+```yaml
+spec:
+  job:
+    autoSavepointSeconds: 3600    # savepoint каждый час
+    savepointHistory:
+      maxCount: 10                # keep last 10
+      maxAgeHours: 168            # delete старше 7 дней
+```
+
+Без operator-а вы бы написали cron job → trigger savepoint → cleanup. С operator — две строки в YAML.
+
+---
+
+## Установка Operator
+
+```bash
+helm repo add flink-operator-repo https://downloads.apache.org/flink/flink-kubernetes-operator-1.10.0/
+
+helm install flink-kubernetes-operator flink-operator-repo/flink-kubernetes-operator \
+  --namespace flink-operator-system \
+  --create-namespace \
+  --set webhook.create=true \
+  --set defaultConfiguration.create=true \
+  --set defaultConfiguration.append=true
+```
+
+После этого работают `kubectl apply -f my-flinkdeployment.yaml`. Operator pod в `flink-operator-system` namespace, jobs могут быть в любом namespace (если RBAC настроен).
+
+---
+
+## Production gotchas
+
+- **Operator version vs Flink version** — Operator 1.10 поддерживает Flink 1.16-2.2. Проверяйте compatibility matrix перед upgrade Flink.
+- **`upgradeMode: stateless` для stateful job** — silent data loss. Operator не предупредит. Code review должен ловить.
+- **Без `restart-strategy`** — default — `none`. При сбое job FAILED и больше не пытается. Всегда явно указывайте `exponential-delay` для production.
+- **`savepointTriggerNonce` — это integer** — увеличивайте монотонно. Operator считает «значение изменилось» = trigger. Если откатили на меньшее → no-op.
+- **HA storageDir не shared между jobs** — каждая FlinkDeployment имеет свой path. Конфликт path → JM crash. Включайте имя job в path.
+- **`flinkVersion` enum** — `v2_2`, `v2_1`, `v1_20`. Опечатка → CR rejected webhook-ом (если webhook включён) или operator log error.
+- **podTemplate merge surprises** — те же gotchas что и в уроке 03. Container name `flink-main-container` обязателен.
+- **Operator pod down → существующие jobs работают** — operator не on hot path. Но новые changes (upgrade, scale) не применятся пока operator не вернётся. Monitor operator availability.
+- **`spec.job.args` иногда игнорируется** — некоторые users ожидают что они passed как `String[] args` в main, но реально passed через `-Dargs.values`. Проверьте entryClass.main(String[] args) сигнатуру.
+
+<Callout type="tip">
+В 2026 mature production setup: **Flink Kubernetes Operator + GitOps (ArgoCD/Flux) + один Git репозиторий с FlinkDeployment YAML manifests per job + автоматический autoscaler через FLIP-271 + Prometheus monitoring**. Каждое изменение spec — Pull Request, code review, merge, ArgoCD apply. Audit trail через git log. Roll-back через git revert.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Команда сделала PR, который меняет в FlinkDeployment два поля одновременно: `spec.image: v1.42 → v1.43` и `spec.job.parallelism: 8 → 16`. Что произойдёт когда ArgoCD apply merge?"
+  answer="Operator увидит изменение spec и начнёт reconciliation. Поскольку spec.image изменился, и upgradeMode: savepoint, operator: (1) Trigger savepoint на текущей версии (с parallelism=8); (2) Wait savepoint DONE; (3) Cancel job; (4) Update JM Deployment с новым image v1.43; (5) Wait JM pod ready; (6) Submit new job с parallelism=16 (новое значение), restore from savepoint. Savepoint canonical format → parallelism rescale работает (state перераспределяется по новым key groups). Если используется native format → может fail если parallelism change incompatible с native backend (savepoint format rigid). Critical: проверьте maxParallelism — если default 128 и хотите scale до 200+, restart fail (см. урок 14.5). Также: один PR с двумя изменениями = атомарная reconciliation, но execution sequential — savepoint сначала, потом upgrade. Если savepoint timeout → entire reconciliation rolled back, job продолжит работать на v1.42, parallelism=8. Best practice: разделять concerns на два PR (сначала image, потом parallelism), легче debug если что-то ломается."
+/>

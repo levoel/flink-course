@@ -1,0 +1,89 @@
+{
+  "moduleId": "04-rocksdb-forst",
+  "title": "Module 04 Exam — RocksDB + ForSt",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m04-exam",
+    "description": "Integrated exam for RocksDB + ForSt module"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-exam-q1",
+      "type": "multiple-choice",
+      "question": "Production write-heavy job (200k writes/sec), 1TB state на NVMe SSD. Текущий setup: Leveled compaction, WA=60x, SSD будет dead через 2 года. Best action?",
+      "options": [
+        { "id": "a", "text": "Buy more SSDs" },
+        { "id": "b", "text": "Switch к Universal compaction: WA drops to 10-15x → SSD endurance extends ~6x. Trade-offs: read P99 increases (1ms vs 0.5ms), space amp +50%, compaction spikes. Plus consider ForSt для disaggregated storage — removes local SSD dependency entirely" },
+        { "id": "c", "text": "Increase MemTable size" },
+        { "id": "d", "text": "Disable compaction" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Universal compaction specifically для write-heavy с SSD endurance concerns. Math: Leveled WA=60x → 200k × value × 60 = enormous disk I/O. Universal WA=10-15x → 5-6x меньше disk wear. Config: compaction.style: UNIVERSAL, universal.max-merge-width: -1, thread.num: 8. Trade-offs: read P99 higher, space amp 1.8x, compaction CPU spikes. Alternative architectural — ForSt: primary storage на S3 means local SSD не bears state writes, только cache writes. SSD endurance no longer concern. Recovery time becomes constant. Combination: switch к ForSt + Async API V2 — best long-term solution для cloud-native deployment с large state.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-exam-q2",
+      "type": "multiple-choice",
+      "question": "TaskManager OOM-Killed через 6 часов после deploy custom RocksDBOptionsFactory. До этого PredefinedOptions.FLASH_SSD_OPTIMIZED работал. Root cause?",
+      "options": [
+        { "id": "a", "text": "Java heap leak" },
+        { "id": "b", "text": "Custom factory не extends DefaultConfigurableOptionsFactory → WriteBufferManager injection lost. Каждая CF allocates own MemTable без shared budget. 10 CF × 4 slots × 128MB MemTable = 5GB+ native memory → exceeds managed budget → OS OOM-Killer" },
+        { "id": "c", "text": "Compaction too slow" },
+        { "id": "d", "text": "Network buffer overflow" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Самый частый production bug в Flink. Mechanism: Flink's DefaultConfigurableOptionsFactory injects WriteBufferManager в DBOptions через super.createDBOptions(). Custom factory без super() или extending Default = WBM lost. Без WBM: каждая Column Family allocates own MemTable (default 64-128MB) без global coordination. На state-heavy operator с 10 state primitives × 4 slots × 128MB = 5GB pure MemTable memory, plus Block Cache fragmentation (8MB per CF × 10 × 4 = 320MB), plus immutable MemTables awaiting flush. Direct memory grows linearly, exceeds managed budget, OS OOM-Killer terminates. Diagnosis: Status.JVM.Memory.Direct.MemoryUsed linear growth + size-all-mem-tables > write-buffer-ratio × managed. Fix: extend DefaultConfigurableOptionsFactory и call super.createDBOptions(opts, handles) FIRST before applying overrides, OR use flink-conf properties вместо custom factory (state.backend.rocksdb.thread.num: 8 instead of factory).",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-exam-q3",
+      "type": "multiple-choice",
+      "question": "Какое property LSM-tree enables incremental checkpointing, и какое savings vs full checkpoints для 500GB state?",
+      "options": [
+        { "id": "a", "text": "Bloom filter; 10% savings" },
+        { "id": "b", "text": "SST immutability — once written, никогда не modified. Поэтому SST в checkpoint N можно reuse в N+1. ~98% bandwidth savings (5-25GB upload vs 500GB), ~98% storage savings (1.05x state size vs N×state). SharedStateRegistry tracks references" },
+        { "id": "c", "text": "Compaction; 50% savings" },
+        { "id": "d", "text": "MemTable; no savings" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SST immutability — fundamental LSM property. Incremental exploits this: SST в previous checkpoint reusable в next checkpoint (if not compacted away). Flink uploads только NEW SSTs (typical 1-5% per checkpoint). SharedStateRegistry на JobManager tracks SST file references — когда checkpoint disposed, ref count decremented, file deleted from S3 when refcount=0. Math для 500GB state: Full requires 500GB upload/checkpoint × num-retained × frequency = huge bandwidth + storage. Incremental: 5-25GB upload, total storage ~525GB (1.05x via reuse). Bandwidth 0.4GB/s avg vs 8.3GB/s sustained для full. NOTE: incremental не improves recovery time — нужен ForSt для constant-time recovery independent of size.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-exam-q4",
+      "type": "multiple-choice",
+      "question": "Production Flink 2.x, 800GB state, K8s. Recovery после pod migration = 90 minutes (RocksDB). Target: <30 секунд. Solution?",
+      "options": [
+        { "id": "a", "text": "Increase network bandwidth" },
+        { "id": "b", "text": "Migrate к ForSt. Recovery time becomes constant ~10 sec (read checkpoint metadata, point к existing S3 SST). REQUIRES Async State API V2. Plus benefits: 3x cost savings, elastic scaling, multi-region DR. Migrate via canonical savepoint" },
+        { "id": "c", "text": "Switch к Universal compaction" },
+        { "id": "d", "text": "Reduce state size" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt — main решение для constant-time recovery. Plan: (1) Code audit — verify all state access async (state.asyncValue().thenAccept). Mandatory for ForSt. (2) Stop с canonical savepoint (backend-portable). (3) Update flink-conf: state.backend.type: forst, forst.primary-dir: s3://bucket, forst.local-dir: /tmp/cache, forst.cache.size: 16gb (estimate working set), async-state: true. (4) Resume from canonical. (5) Validate: kill pod test (recovery <30s), cache hit rate >85%, throughput baseline. Numbers: RocksDB recovery 90 min для 800GB. ForSt: ~12 seconds (checkpoint metadata read, SST уже на S3, lazy cache warming). Cost: RocksDB needs m5d.4xlarge ~$648/mo, ForSt needs m5d.xlarge + S3 ~$221/mo (3x savings). Caveats: ensure multi-Gbps к S3 (use VPC endpoint), cache sizing critical, monitor cache_hit_rate. Flink 2.2 production-ready.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-exam-q5",
+      "type": "multiple-choice",
+      "question": "10 logically related counters per user. Какой state design?",
+      "options": [
+        { "id": "a", "text": "10 ValueState<Long>, separate CF каждый — лучшая isolation" },
+        { "id": "b", "text": "1 MapState<String, Long>, единая CF. Меньше CF metadata overhead, better cache locality, single compaction lifecycle. Lookup per counter ~10μs RocksDB. Cost: small overhead на mapKey serialization" },
+        { "id": "c", "text": "ListState<Tuple2<String, Long>>" },
+        { "id": "d", "text": "ValueState<HashMap<String, Long>>" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MapState для logically related counters. Each CF in RocksDB ~50KB JVM metadata, 10 CF = 500KB overhead vs 1 CF. Plus 10 separate compactions vs single. Cache locality: blocks одного CF accessed together чаще hit cache. MapState composite key (kgId, ns, userKey, stateName, mapKey) — small serialization overhead для mapKey. Avoid ValueState<HashMap> (option d) — это антипаттерн: каждый state.value() deserializes весь map, update serializes back — катастрофа на RocksDB. Avoid ListState (linear scan для lookup). Use separate ValueState только если каждый counter имеет different access pattern, TTL, или semantic isolation requirement.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m04-exam-q6",
+      "type": "true-false",
+      "question": "FLIP-424/425 (Async State API V2) и FLIP-427 (ForSt) — это two parts of single stack. Async API V2 mandatory для ForSt из-за S3 latency 50-100ms на cache miss.",
+      "correctAnswer": true,
+      "explanation": "True. Это flagship feature pair Flink 2.0 (March 2025). Async State API V2 developed specifically для ForSt: S3 latency 50-100ms на cache miss блокирует mailbox thread sync API — throughput drops до 200 events/sec. С Async API V2 mailbox делегирует state requests AEC (Asynchronous Execution Controller), continues processing. AEC parallelizes I/O в worker pool (default 8 threads). Per-key ordering preserved через RequestBuffer. Throughput jumps до 30k+ events/sec. Apache benchmarks: ForSt+sync 200 events/sec vs ForSt+async 30k events/sec — 150x разница. Без Async API V2 ForSt unusable. Flink enforces это: throws exception if attempt ForSt без async-state: true. Local RocksDB также benefits от async (10-20% gain), но не critically dependent.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

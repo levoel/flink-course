@@ -1,0 +1,264 @@
+---
+title: "Graph transformation: StreamGraph → JobGraph → ExecutionGraph → Physical"
+description: "4 уровня графа Flink. Operator chaining (forward partitioning, compatible parallelism), slot sharing groups. Что происходит между .execute() и deployed tasks."
+order: 4
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["StreamGraph", "JobGraph", "ExecutionGraph", "Operator Chaining", "Slot Sharing"]
+---
+
+# Graph transformation: 4 уровня от API до Physical
+
+Когда вы вызываете `env.execute()`, Flink не сразу запускает задачи на TaskManager-ах. Между API-вызовами и работающими тасками лежат **четыре уровня графа** — StreamGraph → JobGraph → ExecutionGraph → Physical execution. Каждый уровень применяет свой класс оптимизаций и от него зависит, как именно ваш код будет выполняться.
+
+Понимание этой трансформации — критично для production debugging. «Почему два моих оператора слились в один task?», «Почему scaling этого оператора не работает?», «Почему checkpoint slow?» — ответы лежат в graph transformation.
+
+---
+
+## Уровень 1: StreamGraph
+
+StreamGraph строится из **API-вызовов** на клиенте, ещё до отправки в кластер. Каждый `.map()`, `.filter()`, `.keyBy()`, `.process()` — это `StreamTransformation`, добавляемая в граф.
+
+```java
+DataStream<Tx> source = env.fromSource(kafka, ...)
+    .map(parseJson)                    // StreamTransformation: OneInputTransformation
+    .filter(tx -> tx.amount > 0)       // OneInputTransformation
+    .keyBy(Tx::getUserId)              // PartitionTransformation (hash)
+    .process(fraudDetector)            // OneInputTransformation (keyed)
+    .sinkTo(kafkaSink);                // SinkTransformation
+```
+
+На уровне StreamGraph каждый оператор — отдельная нода со своим parallelism, type info, state backend. Никаких оптимизаций пока нет — это просто отрисовка вызовов в виде DAG.
+
+```bash
+# Посмотреть StreamGraph до отправки
+System.out.println(env.getExecutionPlan());   // JSON отрисовка
+```
+
+---
+
+## Уровень 2: JobGraph (chaining optimization)
+
+При `env.execute()` StreamGraph трансформируется в JobGraph. Главное, что происходит — **operator chaining**: соседние операторы со совместимыми properties склеиваются в один task.
+
+<DiagramContainer title="Operator chaining в JobGraph" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="StreamGraph: 5 операторов"
+        tooltip="Source → Map → Filter → KeyBy → Process → Sink. На уровне StreamGraph каждый оператор — отдельный нод с собственными settings."
+      >
+        Source • Map • Filter • KeyBy • Process • Sink
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="chaining optimizer" />
+    <FlowRow>
+      <DataBox
+        label="JobGraph: 3 chained vertices"
+        tooltip="Source → Map → Filter сливаются в один Task A (forward partitioning, same parallelism). KeyBy → Process — отдельный Task B (после shuffle). Sink — отдельный Task C если у него другой parallelism."
+      >
+        [Source → Map → Filter]  →shuffle→  [KeyBy → Process]  →forward→  [Sink]
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Условия chaining
+
+Два оператора `A → B` склеятся в один task, если все условия выполнены:
+
+1. **A и B в одной slot sharing group** — default group или явно одна и та же.
+2. **Совместимый partitioning** — forward (1-к-1) или rescale, не hash и не rebalance.
+3. **Совместимый parallelism** — `A.parallelism == B.parallelism`.
+4. **Chaining enabled** — `env.enableOperatorChaining()` (default true) и `B.chainingStrategy != NEVER`.
+5. **A не блокирует chaining** — `A.chainingStrategy != NEVER_END`.
+
+Если хоть одно условие нарушено — между ними **shuffle boundary**: данные сериализуются и шлются по network/local channel.
+
+### Зачем chaining
+
+Chained операторы выполняются в **одном thread, без сериализации, без network**. Это огромная экономия:
+
+```
+Без chaining: map → serialize → channel → deserialize → filter
+С chaining:   map.process(elem) → filter.process(elem)  // прямой method call
+```
+
+В типичной job chaining даёт 3-10x ускорение по сравнению с отключённым.
+
+### Управление chaining
+
+```java
+// Disable chain полностью у оператора
+stream.map(...).disableChaining();    // никто не chain'aется с этим map
+
+// Начать новый chain — break с предыдущим, но allow с следующим
+stream.map(...).startNewChain();
+
+// Глобально отключить chaining (debugging)
+env.disableOperatorChaining();
+
+// Слить два оператора в один chain принудительно (если совместимы)
+stream.map(parserA).map(parserB);    // default: уже chained
+```
+
+<Callout type="warning">
+**Когда disable chaining**: операторы с очень разными CPU/memory profile (например, lightweight parser + heavy ML inference). В одном thread они конкурируют, заставляя GC pauses синхронизировать оба. Disable chaining = два отдельных thread + хорошая GC isolation, ценой serialization overhead.
+</Callout>
+
+---
+
+## Уровень 3: ExecutionGraph (parallelism expansion)
+
+JobGraph — это **logical** граф. На уровне ExecutionGraph каждый JobVertex раскрывается в N ExecutionVertex (по parallelism). Это уже **physical execution plan**, но ещё без привязки к slot-ам.
+
+<DiagramContainer title="ExecutionGraph expansion" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobGraph: 3 vertices"
+        tooltip="Task A (chained source+map+filter, parallelism=4), Task B (keyed process, parallelism=4), Task C (sink, parallelism=2)."
+      >
+        A (par=4) → B (par=4) → C (par=2)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="expand by parallelism" />
+    <FlowRow>
+      <DataBox
+        label="Task A subtasks"
+        tooltip="4 ExecutionVertex для Task A. Каждая получит свой slot, прочитает свою партицию Kafka."
+      >
+        A0 • A1 • A2 • A3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="hash shuffle by userId" />
+    <FlowRow>
+      <DataBox
+        label="Task B subtasks"
+        tooltip="4 ExecutionVertex для Task B. Каждый владеет 25% ключевого пространства (через key groups). Принимает данные от всех A через 4×4=16 channels."
+      >
+        B0 • B1 • B2 • B3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rebalance shuffle" />
+    <FlowRow>
+      <DataBox
+        label="Task C subtasks"
+        tooltip="2 ExecutionVertex (parallelism=2). Получают данные от B через 4×2=8 channels. Rebalance (round-robin) равномерно распределяет нагрузку."
+      >
+        C0 • C1
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+ExecutionGraph держится в JobMaster-е и обновляется при изменениях состояния. Это **source of truth** для текущего состояния job — какие subtasks RUNNING/FINISHED/FAILED, на каких TaskManager-ах они задеплоены, какие checkpoints привязаны.
+
+---
+
+## Уровень 4: Physical execution (slot allocation)
+
+Финальный шаг — раздать ExecutionVertex-ы в **слоты**. Это делает Scheduler (DefaultScheduler / AdaptiveScheduler) через SlotPool, который запрашивает у ResourceManager-а.
+
+### Slot Sharing Groups
+
+По умолчанию все операторы job — в slot sharing group `"default"`. Это значит: **один slot может содержать по одной ExecutionVertex от каждого оператора**.
+
+```
+Slot 0:  A0, B0  (один полный pipeline-slice)
+Slot 1:  A1, B1
+Slot 2:  A2, B2
+Slot 3:  A3, B3
+```
+
+Это огромная оптимизация: 4 параллельных копии полного pipeline-а помещаются в 4 slot-а вместо 8 (= 4 + 4 если бы они были в разных group). Также — locality: A0 и B0 в одном slot означают, что forward partitioning между ними локален.
+
+```java
+// Все в "default" — sharing включён
+stream.keyBy(...).process(opA).process(opB);
+
+// Изолировать heavy state operator в свою group
+stream.keyBy(...).process(heavyState).slotSharingGroup("heavy-state");
+
+// Теперь heavyState requires extra slots отдельно от остальных
+```
+
+### Когда нужны разные slot sharing groups
+
+- **State isolation** — heavy RocksDB instance изолируется в свой slot, чтобы не конкурировать за managed memory с другими операторами.
+- **CPU isolation** — CPU-intensive operator (ML inference, parsing) в свой slot, чтобы не голодать соседей.
+- **Resource profiles (FLIP-156)** — разные операторы могут требовать разные CPU/memory profiles. Через `setResources(...)` каждый sharing group получает свой профиль ресурса.
+
+<Callout type="note">
+Slot sharing groups — это **независимое расширение** chaining. Chaining объединяет операторы в один task (один thread, нет сериализации). Slot sharing позволяет нескольким tasks делить slot (своя threads, но один memory budget). Один уровень — внутри task, другой — между tasks.
+</Callout>
+
+---
+
+## Forward vs Hash partitioning
+
+| Partitioning | Когда применяется | Chaining-compatible |
+|---|---|---|
+| **Forward** | Default между operators с одинаковым parallelism, без keyBy | Yes |
+| **Hash** | После `keyBy(...)` | No (shuffle между partitions) |
+| **Rebalance** | После `.rebalance()` или при mismatch parallelism | No |
+| **Rescale** | После `.rescale()` (round-robin внутри local subtasks) | Partial (compatible если parallelism совместим) |
+| **Broadcast** | После `.broadcast()` (каждая запись во все downstream) | No |
+| **Custom** | После `.partitionCustom(partitioner, key)` | No |
+
+```java
+// Forward: chained
+stream.map(a).map(b)               // [a → b] in one task
+
+// Hash: shuffle, separate tasks
+stream.map(a).keyBy(...).map(b)    // [a] -shuffle-> [b]
+
+// Rebalance: shuffle, even distribution
+stream.map(a).rebalance().map(b)
+```
+
+---
+
+## Что выглядит в Web UI
+
+Web UI показывает **JobGraph** (chained tasks). Чтобы увидеть полную ExecutionGraph:
+
+1. Web UI → Job → **Subtasks** tab — там видны все ExecutionVertex (subtasks) каждого task-а.
+2. Web UI → Job → **Plan** — диаграмма JobGraph с chained operators в одной box.
+3. REST `/jobs/{jobid}/plan` — JSON с ExecutionGraph metadata.
+
+---
+
+## Production gotchas
+
+- **Chained operators невозможно scale независимо** — если у вас map + heavy-process chained, нельзя сказать «map=4, process=16». Они работают в одном thread. Disable chaining для independent scaling.
+- **`disableChaining()` на критическом hot path** — может ускорить (CPU isolation) или замедлить (serialization cost) в зависимости от соотношения CPU/throughput. Профилируйте до и после.
+- **Hash shuffle через network — не chain-friendly** — после keyBy всегда break chain. Это значит, что serialization overhead неизбежен. Используйте Avro/Protobuf вместо POJO для крупных объектов.
+- **Slot sharing group `"default"` блокирует rescaling** — все операторы должны fit в N slots. Если parallelism одного оператора нужно увеличить независимо — выделите ему свой sharing group.
+- **`startNewChain()` после source** — стандартный pattern для разделения tip-of-the-spear parsing от downstream processing. Source IO + parse имеют разные latency profiles.
+- **Forward shuffle между неравными parallelism** — Flink преобразует в rebalance (round-robin), а это лишний CPU cost. Проверьте `env.getExecutionPlan()` на unexpected rebalance.
+
+<Callout type="tip">
+**Debug command**: `System.out.println(env.getExecutionPlan())` ДО `env.execute()` выводит JSON StreamGraph. Через `https://flink.apache.org/visualizer` можно загрузить JSON и увидеть, как выглядит граф. Незаменимо для понимания chaining.
+</Callout>
+
+---
+
+## Comparison vs Spark
+
+| Аспект | Flink graph levels | Spark equivalent |
+|---|---|---|
+| API level | StreamGraph | DAG of DataFrame transformations |
+| Logical optimization | JobGraph (chaining) | Logical Plan optimization |
+| Physical expansion | ExecutionGraph | Physical Plan with stage divisions |
+| Deployment | Physical execution | Task assignment to executors |
+| Reoptimization | Adaptive Scheduler (FLIP-160) | AQE (Adaptive Query Execution) |
+| Chaining | Operator chaining = whole stage codegen в Spark | WholeStageCodeGen генерирует Java |
+| Shuffle boundary | После keyBy, rebalance | Между stages (shuffle write/read) |
+
+---
+
+<KnowledgeCheck
+  question="У вас pipeline: `source → parse → filter → keyBy(userId) → aggregate → sink`. Все операторы parallelism=4 кроме sink (parallelism=2). Сколько JobGraph vertices получится, сколько ExecutionVertex после expansion, и почему chaining ломается ровно дважды?"
+  answer="JobGraph vertices: 3. Chain 1 = [source + parse + filter] (parallelism=4, forward partitioning). Затем shuffle при keyBy → chain 2 = [aggregate] (parallelism=4). Затем rebalance при mismatch parallelism (4→2) → chain 3 = [sink] (parallelism=2). Chaining ломается дважды: (1) после filter, при keyBy — hash partitioning несовместима с chaining, потому что shuffle требует, чтобы данные сериализовались и распределялись по hash(key) % N; (2) после aggregate, потому что parallelism падает с 4 до 2 — Flink делает rebalance (round-robin) для равномерного распределения нагрузки на sink, что тоже требует shuffle. ExecutionVertex count: source+parse+filter chain → 4 subtasks (A0-A3), aggregate → 4 subtasks (B0-B3), sink → 2 subtasks (C0-C1). Total 10 ExecutionVertex. С точки зрения slot sharing (default group): 4 slots могут разделить (A0+B0), (A1+B1), (A2+B2), (A3+B3) — sink требует extra slots (2 для C0, C1) ИЛИ может deploy в существующих slots если все в default group (sink тоже в default). Итог: 4 slots достаточно для всего job. Если sink в отдельной slotSharingGroup, нужно 4+2=6 slots."
+/>

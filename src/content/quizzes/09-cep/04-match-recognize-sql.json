@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/04-match-recognize-sql",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-04",
+    "description": "Quiz для MATCH_RECOGNIZE SQL standard"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-04-q1",
+      "type": "multiple-choice",
+      "question": "В чём разница между PREV(price) и PREV(B.price) в DEFINE clause?",
+      "options": [
+        { "id": "a", "text": "Никакой разницы — это синонимы" },
+        { "id": "b", "text": "PREV(price) — physical предыдущий row in ORDER BY; PREV(B.price) — последний row, который matched variable B (может быть много назад). Это разные semantics — частый источник bugs" },
+        { "id": "c", "text": "PREV(price) для столбца price, PREV(B.price) для variable B (нельзя комбинировать)" },
+        { "id": "d", "text": "PREV(B.price) deprecated в SQL:2016" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Subtle SQL:2016 semantics. PREV(price) без variable references physical previous row in ORDER BY — независимо от того matched ли previous row. PREV(B.price) — previous row которая matched specific variable B (может быть много назад если другие variables matched между). Пример: для downtrend 'DOWN AS DOWN.price < PREV(price)' = текущий ниже physical previous; 'DOWN AS DOWN.price < PREV(DOWN.price)' = текущий ниже last matched DOWN. Это разные patterns — выбор зависит от smysla.",
+      "studyHint": "Повторите урок — секция DEFINE и Production gotcha #4",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m09-04-q2",
+      "type": "multiple-choice",
+      "question": "В чём разница между AFTER MATCH SKIP PAST LAST ROW и AFTER MATCH SKIP TO NEXT ROW?",
+      "options": [
+        { "id": "a", "text": "SKIP PAST LAST ROW continue с row immediately after LAST matched row (disjoint non-overlapping matches, safe default); SKIP TO NEXT ROW continue с row immediately after FIRST matched row (overlapping matches possible, может infinite-loop если pattern admits empty match)" },
+        { "id": "b", "text": "Они эквивалентны" },
+        { "id": "c", "text": "SKIP PAST LAST ROW для batch, SKIP TO NEXT ROW для streaming" },
+        { "id": "d", "text": "SKIP PAST LAST ROW не существует в SQL:2016" }
+      ],
+      "correctAnswer": "a",
+      "explanation": "Это два самых частых SKIP variants. PAST LAST ROW (default & safe): после match continue с row после last matched — non-overlapping disjoint matches. Production default. TO NEXT ROW: continue с row после FIRST matched — каждый row может start new match, overlapping. Используется когда нужны все sub-matches. Danger: если pattern admits empty match (например PATTERN (A?)) с TO NEXT ROW — infinite loop, Flink validates это и throws error. Также есть SKIP TO FIRST var и SKIP TO LAST var для controlled overlapping.",
+      "studyHint": "Повторите урок — секция AFTER MATCH SKIP",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m09-04-q3",
+      "type": "multiple-choice",
+      "question": "Когда выбирать MATCH_RECOGNIZE vs Pattern API?",
+      "options": [
+        { "id": "a", "text": "Pattern API всегда быстрее, MATCH_RECOGNIZE deprecated" },
+        { "id": "b", "text": "MATCH_RECOGNIZE — для SQL pipelines с aggregations (FIRST/LAST/SUM) и joins; Pattern API — для programmatic generation patterns (когда патtern derive из config) и сложных IterativeCondition. Engine один (NFA), perf эквивалентна" },
+        { "id": "c", "text": "MATCH_RECOGNIZE только для batch, Pattern API только для streaming" },
+        { "id": "d", "text": "Pattern API только для Java, MATCH_RECOGNIZE только для Python" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Engine один — NFA, performance эквивалентна. Trade-offs API-based: MATCH_RECOGNIZE преимущества — fully SQL (embeds в pipelines), native FIRST/LAST/SUM aggregates, schema evolution через DDL, declarative. Pattern API преимущества — programmatic generation (patterns из user config), complex IterativeCondition с running state, type safety на compile time. Production: MATCH_RECOGNIZE для most production cases с aggregations, Pattern API для programmatic / dynamic / Java-heavy contexts.",
+      "studyHint": "Повторите урок — Сравнительная таблица",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-04-q4",
+      "type": "true-false",
+      "question": "В streaming mode MATCH_RECOGNIZE можно использовать ORDER BY любым column, не только event-time attribute.",
+      "correctAnswer": false,
+      "explanation": "False. В streaming MATCH_RECOGNIZE требует ORDER BY event_time_attribute (rowtime). ORDER BY произвольным column → compilation error. Причина: NFA должен matching events в temporal order, и в unbounded streaming это event time (когда событие произошло), а не processing time или arbitrary column. В batch mode допустим любой ORDER BY column (потому что данные all-at-once). Это структурный constraint streaming engine, не arbitrary restriction.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

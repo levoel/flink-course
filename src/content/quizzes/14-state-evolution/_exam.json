@@ -1,0 +1,89 @@
+{
+  "moduleId": "14-state-evolution",
+  "title": "Module 14 Exam — State Evolution",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m14-exam",
+    "description": "Integrated exam for State Evolution module"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-exam-q1",
+      "type": "multiple-choice",
+      "question": "Production job 1.5TB state, parallelism=32, maxParallelism=128 (default). Autoscaler logs 'cannot scale beyond maxParallelism'. Что делать?",
+      "options": [
+        { "id": "a", "text": "Просто increase pipeline.max-parallelism: 1024 в config и restart" },
+        { "id": "b", "text": "maxParallelism IMMUTABLE — нельзя изменить direct. Stop с canonical savepoint, run State Processor API batch job (read с old maxParallelism=128, write с new maxParallelism=2048 для headroom), 1.5TB занимает 3-4 часа, restart streaming с new savepoint. Lesson learned: ALWAYS setMaxParallelism(1024+) при first deploy" },
+        { "id": "c", "text": "Использовать --allowNonRestoredState" },
+        { "id": "d", "text": "Изменить config во flink-conf.yaml" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic production trap. maxParallelism = number of key groups (atomic state distribution units). Изменение = вся hash distribution invalid (keyGroupId = murmurHash(key) % maxParallelism). Не fixable on live job. Only State Processor API offline rebootstrap: canonical savepoint → batch job reads old state, writes new savepoint с new maxParallelism — 1.5TB ~3-4h. Production rule: setMaxParallelism(1024) при first deploy = ~1% overhead, saves potential hours/days migration later. Free insurance.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-exam-q2",
+      "type": "multiple-choice",
+      "question": "Custom typed классы (UserId, TransactionId) с final fields + constructor. Restore from savepoint после code change FAILS. Diagnosis + fix?",
+      "options": [
+        { "id": "a", "text": "Java version mismatch" },
+        { "id": "b", "text": "Classes не POJO-compliant (final fields, constructor-based) → Flink fall back к Kryo serializer. Kryo НЕ поддерживает schema evolution — любое изменение = breaks. Fixes: (1) Refactor к POJO (public no-arg constructor + setters); (2) Migrate к Avro с schema registry; (3) Custom TypeSerializer; (4) State Processor API one-time migration. Detection: startup logs 'cannot be used as POJO type'" },
+        { "id": "c", "text": "RocksDB corruption" },
+        { "id": "d", "text": "Network issue" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Common gotcha. Constructor-based с final fields breaks PojoSerializer rules (нужен no-arg constructor + setters/public fields). Flink falls к Kryo. Kryo serialization rigid — schema change = deserialization fails. Always check startup logs для 'cannot be used as a POJO type' warnings — это signal что class falls к Kryo = bomb. 2026 production best practice: Avro state с schema registry. Setup effort upfront окупается через год evolution. Кastruck-free для long-term production.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-exam-q3",
+      "type": "multiple-choice",
+      "question": "RocksDB → ForSt migration: что critical в подготовке?",
+      "options": [
+        { "id": "a", "text": "Просто change state.backend.type" },
+        { "id": "b", "text": "(1) CANONICAL savepoint обязательно (native не работает cross-backend); (2) ForSt config — primary-dir external (S3), cache 5-10% state, async I/O 8-16 threads, Async API V2 enabled (sync API + ForSt = catastrophe); (3) Staging test 1-2 недели; (4) Keep RocksDB canonical savepoint 30 days — same canonical works on both backends для symmetric rollback" },
+        { "id": "c", "text": "Только Kubernetes config update" },
+        { "id": "d", "text": "Запустить параллельно RocksDB и ForSt" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Cross-backend migration multi-faceted. Canonical mandatory (native locked к backend). ForSt config critical: primary-dir определяет disaggregation (without — local default defeats purpose), cache size affects hit rate (1GB cache for 200GB state = 99% miss = disaster), async I/O thread pool hides S3 latency, Async API V2 mandatory (sync + ForSt = 200 events/sec catastrophe vs async 30k). Staging 1-2 weeks — catch config issues, throughput baseline. Symmetric rollback through canonical — keep insurance 30 days.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-exam-q4",
+      "type": "multiple-choice",
+      "question": "PR: rename UID 'enrichment' → 'enrichment-v2' (claim no logic change). Concerns?",
+      "options": [
+        { "id": "a", "text": "Нет concerns" },
+        { "id": "b", "text": "DANGEROUS — UID rename = state continuity broken. 'enrichment' state в savepoint не маппится к 'enrichment-v2'. State LOSS даже без logic change. Options: (1) State Processor API migration (read old UID, write new UID) — preserves state; (2) --allowNonRestoredState — explicitly accept state loss only если operator stateless or loss acceptable. Code review must catch" },
+        { "id": "c", "text": "Bumped version is good practice" },
+        { "id": "d", "text": "Только performance concern" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "UID — fundament state continuity. Rename без migration = state lost. Even 'no logic change' = behavior change через state loss. Production discipline: change UIDs only deliberately, с state migration plan. UID versioning (v1→v2) appropriate when schema breaking change requires migration, but rename itself doesn't preserve state. Code review must enforce. Enable `pipeline.auto-generate-uids: false` to catch missing UIDs at submit, plus manual review для UID changes.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-exam-q5",
+      "type": "multiple-choice",
+      "question": "Friday deploy v1.43. Monday discover subtle bug. Rollback challenges?",
+      "options": [
+        { "id": "a", "text": "Simple kubectl patch" },
+        { "id": "b", "text": "Multi-layer challenges: (1) Pre-upgrade savepoint 65h old — retention covers, OK; (2) Data forward time — replay 65h events с v1.42, downstream duplicates, EOS sink transactional.id.prefix bump required для избежания 2PC conflicts; (3) Kafka log retention — events expired могут отсутствовать; (4) Business coordination — alerts duplicates" },
+        { "id": "c", "text": "Невозможно — Friday deploy permanent" },
+        { "id": "d", "text": "Только code rollback enough" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production-realistic incident. Pre-upgrade savepoint от Friday 65h ago — retention 7-30 дней default OK. Critical: data forward time — rollback к Friday savepoint = reprocess 65h events with v1.42. Downstream consumers see duplicate alerts. EOS Kafka sink — same transactional.id.prefix как v1.43 used → 2PC conflicts → sink crashes. Bump prefix (add suffix) at rollback. Kafka log retention — if < 65h, events expired = gap. Forward compatibility OK (savepoint old schema, v1.42 reads fine). Decision: rollback vs forward fix (v1.43.1 hotfix). Trade-offs business-driven.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m14-exam-q6",
+      "type": "true-false",
+      "question": "В production 2026 для state evolution: Avro с schema registry + UIDs на всех stateful operators + canonical savepoint при major changes + 30-day retention для upgrade savepoints + quarterly rollback drill — это full discipline stack.",
+      "correctAnswer": true,
+      "explanation": "True. Full production discipline в 2026: (1) Avro state с Confluent Schema Registry — best long-term evolution support с aliases, promoted types, defaults, cross-language; (2) `.uid('descriptive-name')` на всех stateful operators + `pipeline.auto-generate-uids: false` enforcement → state continuity guaranteed; (3) Canonical savepoint при backend migrations, major version upgrades, State Processor API jobs — universal format; (4) Tiered retention: hourly 7d, upgrades 30d, weekly 90d glacier, monthly 1y, annual forever — covers всё detection lag scenarios; (5) Quarterly drill verifies rollback procedure actually works — без drill procedure decays. Это comprehensive stack для production-grade state evolution discipline.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

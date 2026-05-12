@@ -1,0 +1,446 @@
+---
+title: "Async functions в PyFlink (Flink 2.2)"
+description: "Flink 2.2 async functions в PyFlink. async def UDF для external API calls (LLM, embedding). ML inference в PyFlink без async I/O wrapper."
+order: 8
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Async UDF", "PyFlink 2.2", "LLM inference", "asyncio", "External API"]
+---
+
+# Async functions в PyFlink (Flink 2.2)
+
+PyFlink исторически имел значительный gap с Java DataStream API в одной критически важной capability: **async I/O**. Java имеет `AsyncDataStream.unorderedWait` (см. модуль 02, урок 06), позволяющий non-blocking external lookups с capacity-based concurrent in-flight requests. В Python это раньше отсутствовало — UDF был synchronous, blocking, external API call (Redis, REST, LLM inference) делал per-record HTTP request, упирался в latency.
+
+**Flink 2.2 решает это через async UDFs**. Python `async def` функция с asyncio integrated в Flink runtime. Каждый Python interpreter (process slot) maintains event loop, concurrently handling множество in-flight requests. Это **killer feature** для современных PyFlink workloads — LLM inference, embedding APIs, real-time ML scoring, external knowledge graph lookups.
+
+В этом уроке: async UDF API в Flink 2.2, asyncio integration, real-world patterns (OpenAI/Anthropic API calls, Pinecone embeddings), capacity/timeout sizing, production patterns для LLM-heavy pipelines.
+
+---
+
+## Зачем async — проблема blocking
+
+```python
+import time
+import requests
+
+@udf(input_types=[DataTypes.STRING()], result_type=DataTypes.STRING())
+def llm_classify(text):
+    """SYNCHRONOUS — blocks Python interpreter."""
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        json={"model": "gpt-4", "messages": [...]},
+        timeout=30
+    )
+    # Typical OpenAI latency: 1-3 seconds
+    return response.json()["choices"][0]["message"]["content"]
+```
+
+Anti-pattern: synchronous external call в UDF. Python interpreter blocks 1-3 seconds per record. Throughput collapses к 0.3-1 record/sec/slot. На 100 slots — 100 records/sec total — useless для real-time pipeline.
+
+В Java аналогичный pattern требует `AsyncDataStream.unorderedWait` с non-blocking client. До Flink 2.2 Python не имел эквивалента — blocking call неизбежен.
+
+---
+
+## Async UDF в Flink 2.2
+
+```python
+from pyflink.table.udf import async_udf
+from pyflink.table import DataTypes
+import aiohttp
+
+
+@async_udf(input_types=[DataTypes.STRING()],
+           result_type=DataTypes.STRING())
+async def llm_classify_async(text):
+    """NON-BLOCKING — uses asyncio."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.openai.com/v1/chat/completions",
+            json={"model": "gpt-4", "messages": [...]},
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            data = await response.json()
+            return data["choices"][0]["message"]["content"]
+
+
+t_env.create_temporary_function("llm_classify", llm_classify_async)
+
+t_env.execute_sql("""
+    INSERT INTO classified_events
+    SELECT 
+        event_id,
+        text,
+        llm_classify(text) AS classification
+    FROM raw_events
+""")
+```
+
+Key points:
+
+- **`@async_udf`** decorator вместо `@udf` — Flink 2.2 specific.
+- **`async def`** — Python native coroutine.
+- **`aiohttp`** — non-blocking HTTP client (вместо blocking `requests`).
+- **`await`** — yields control back к event loop while waiting.
+
+---
+
+## Архитектура async execution
+
+<DiagramContainer title="Async UDF execution в PyFlink 2.2" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink JVM operator"
+        tooltip="Async operator wrapping Python async UDF. Maintains in-flight requests queue (similar to Java AsyncDataStream). Sends records to Python interpreter for async processing."
+      >
+        AsyncOperator (JVM)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Submit record + result future" />
+    <FlowRow>
+      <DataBox
+        label="Python asyncio event loop"
+        tooltip="Per slot Python interpreter has asyncio event loop. Receives records, schedules await coroutine. Multiple in-flight coroutines concurrently — limited by capacity setting."
+      >
+        Event loop (per slot)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="aiohttp / asyncpg / etc." />
+    <FlowRow>
+      <DataBox
+        label="External service"
+        tooltip="OpenAI API, Pinecone, Redis, etc. Non-blocking HTTP/2 connections multiplexed. Latency 100ms-3s, but concurrent requests fill pipeline."
+      >
+        External system
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="up" label="Response complete" />
+    <FlowRow>
+      <DataBox
+        label="Future resolution"
+        tooltip="When coroutine completes, result future resolved. JVM operator forwards result to next operator. Order configurable (unordered fastest, ordered preserves input sequence)."
+      >
+        Future → result
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Configuration
+
+```yaml
+python:
+  fn-execution.async.framework: ASYNC      # включить async support (Flink 2.2)
+  fn-execution.async.capacity: 100         # max concurrent in-flight requests per subtask
+  fn-execution.async.timeout: 30000        # ms per request
+  fn-execution.async.ordering: UNORDERED   # UNORDERED (fast) или ORDERED (preserves order)
+  fn-execution.async.framework.execution-mode: PROCESS  # PROCESS или THREAD
+```
+
+Per-UDF configuration:
+
+```python
+@async_udf(input_types=[DataTypes.STRING()],
+           result_type=DataTypes.STRING(),
+           capacity=200,                  # per-UDF override
+           timeout=10000,
+           ordering='UNORDERED')
+async def my_udf(text):
+    ...
+```
+
+### Capacity sizing
+
+`capacity = throughput_per_subtask × p99_latency_external_system`
+
+Example: target 1000 events/sec/subtask, OpenAI p99 latency 3000ms → capacity = 1000 × 3 = **3000 concurrent in-flight**. Round up до 4000 для headroom.
+
+Trade-offs:
+
+- **Too low (10)**: throughput limited by capacity, ignoring concurrent capability of external.
+- **Optimal**: matches external system capacity.
+- **Too high (10000)**: may OOM external service or exhaust connection pool.
+
+### Timeout
+
+`timeout = 3× p99_latency` for tail absorption. Example: OpenAI p99=3s → timeout 10s minimum.
+
+---
+
+## Real-world example: LLM-powered fraud detection
+
+```python
+from pyflink.table.udf import async_udf
+from pyflink.table import DataTypes
+import aiohttp
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class LLMFraudClassifier:
+    """Async UDF класс с lifecycle hooks."""
+
+    def __init__(self):
+        self.session = None
+        self.api_key = None
+
+    async def open(self, function_context):
+        """Called once per slot before processing."""
+        import os
+        self.api_key = os.environ["ANTHROPIC_API_KEY"]
+
+        # Reuse single aiohttp session — connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=200,                    # max connections
+            limit_per_host=200,
+            ttl_dns_cache=300
+        )
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=15)
+        )
+
+    async def eval(self, transaction_text: str) -> str:
+        """Async UDF — called per record, runs concurrently."""
+        if not transaction_text:
+            return "unknown"
+
+        try:
+            async with self.session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01"
+                },
+                json={
+                    "model": "claude-3-5-haiku-latest",
+                    "max_tokens": 50,
+                    "messages": [{
+                        "role": "user",
+                        "content": f"Classify this transaction as fraud/legit/uncertain: {transaction_text}"
+                    }]
+                }
+            ) as response:
+                if response.status != 200:
+                    logger.warning(f"API error: {response.status}")
+                    return "uncertain"
+                data = await response.json()
+                return data["content"][0]["text"].strip().lower()
+        except asyncio.TimeoutError:
+            logger.warning("LLM call timeout")
+            return "uncertain"
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return "uncertain"
+
+    async def close(self):
+        """Cleanup при slot shutdown."""
+        if self.session:
+            await self.session.close()
+
+
+# Register
+llm_fraud_udf = async_udf(
+    LLMFraudClassifier(),
+    input_types=[DataTypes.STRING()],
+    result_type=DataTypes.STRING(),
+    capacity=500,
+    timeout=15000,
+    ordering='UNORDERED'
+)
+
+t_env.create_temporary_function("llm_fraud_check", llm_fraud_udf)
+
+# Use в pipeline
+t_env.execute_sql("""
+    INSERT INTO fraud_alerts
+    SELECT *
+    FROM (
+        SELECT
+            tx_id,
+            user_id,
+            amount,
+            description,
+            llm_fraud_check(description) AS llm_verdict
+        FROM transactions
+        WHERE amount > 10000     -- Pre-filter for cost control
+    ) WHERE llm_verdict = 'fraud'
+""")
+```
+
+This is production-grade async UDF. Key elements:
+
+1. **Class-based** для state (session reuse, lazy init).
+2. **`async def open()` / `close()`** lifecycle hooks.
+3. **Connection pooling** через `aiohttp.TCPConnector`.
+4. **Error handling** — catch timeouts, log, return fallback.
+5. **Capacity=500** — concurrent in-flight LLM calls per subtask.
+
+Throughput math: 500 concurrent × (1/3 second per request) = 166 records/sec/subtask. С 8 parallelism = 1333 records/sec total. Compared with synchronous: 1 record / 3 sec = 0.33/sec/subtask → 2.6/sec total. **500x improvement**.
+
+---
+
+## Example: vector embedding lookup
+
+```python
+@async_udf(input_types=[DataTypes.STRING()],
+           result_type=DataTypes.ARRAY(DataTypes.FLOAT()),
+           capacity=300, timeout=5000)
+async def get_embedding(text: str) -> list:
+    """Get embedding vector from OpenAI."""
+    global _session
+    async with _session.post(
+        "https://api.openai.com/v1/embeddings",
+        json={"input": text, "model": "text-embedding-3-small"}
+    ) as response:
+        data = await response.json()
+        return data["data"][0]["embedding"]
+
+
+# Используем для real-time RAG search
+t_env.execute_sql("""
+    INSERT INTO relevant_docs
+    SELECT
+        query_id,
+        query_text,
+        get_embedding(query_text) AS embedding
+    FROM user_queries
+""")
+
+-- Then use в VECTOR_SEARCH (Flink 2.2 FLIP-540)
+SELECT 
+    q.query_text,
+    VECTOR_SEARCH(doc_embedding_table, q.embedding, 10) AS top_10_docs
+FROM relevant_docs q
+```
+
+Embedding API latency ~100-500ms, capacity 300 → throughput ~600 embeddings/sec/subtask.
+
+---
+
+## Example: ML inference микросервис
+
+```python
+@async_udf(input_types=[DataTypes.DOUBLE()] * 50,
+           result_type=DataTypes.DOUBLE(),
+           capacity=1000, timeout=2000)
+async def fraud_score_remote(*features):
+    """Call internal ML inference service."""
+    global _session
+    async with _session.post(
+        "http://ml-inference-svc.production:8080/score",
+        json={"features": list(features)}
+    ) as response:
+        result = await response.json()
+        return result["fraud_probability"]
+```
+
+Internal service вместо embedded model — gives flexibility (model retrained без redeploy Flink job, model team manages independent), pay async cost. Latency 10-50ms typical → capacity 1000 → 20-50k records/sec/subtask achievable.
+
+---
+
+## Ordering: UNORDERED vs ORDERED
+
+```python
+@async_udf(..., ordering='UNORDERED')   # default, fast
+```
+
+```python
+@async_udf(..., ordering='ORDERED')     # slow, preserves input order
+```
+
+UNORDERED: Results emitted в order responses arrive. If LLM-A takes 3s, LLM-B takes 1s, B emits first. Watermark preserved (no records cross watermark boundary), но within watermark — any order.
+
+ORDERED: Strict input order preserved. Если record N slow, records N+1..N+K буферизуются в emit queue даже если их responses ready. Head-of-line blocking → lower throughput.
+
+**Production rule**: UNORDERED default. ORDERED только когда downstream строго requires order (rare — usually downstream может tolerate reordering within watermark).
+
+---
+
+## Comparison: Async UDF vs alternatives
+
+| Approach | Throughput | Latency | Complexity |
+|---|---|---|---|
+| Sync UDF + external API | 0.3-3 rec/sec (per subtask) | Per record | Trivial |
+| Pandas UDF + batched API | 10-100x sync (if batch API exists) | Per batch | Medium |
+| **Async UDF (2.2)** | 500-5000 rec/sec | ms-seconds | Medium |
+| Java + Async I/O (внешний service для Python ML) | 5000+ rec/sec | ms | High (two pipelines) |
+| Embedded model (Pandas UDF) | 100k+ rec/sec | ms | High (model deployed) |
+
+Async UDF — sweet spot когда external service IS your inference path, и you want Python-native pipeline.
+
+---
+
+## Production gotchas
+
+- **`@udf` вместо `@async_udf`** — silent bug, async def function executed как sync, blocks. Check decorator.
+- **Blocking call внутри async** — `requests.post()` (sync) внутри async def blocks event loop, defeats purpose. Use aiohttp/httpx async clients.
+- **`asyncio.sleep` vs `time.sleep`** — `time.sleep` blocks; `await asyncio.sleep(...)` yields.
+- **Session creation per call** — `async with aiohttp.ClientSession()` per record создаёт новые connection pool каждый раз. Always single session в open(), reuse в eval().
+- **Connection pool too small** — default aiohttp limit 100 connections. С capacity=1000 — bottleneck. Configure `TCPConnector(limit=2000, limit_per_host=2000)`.
+- **DNS lookup overhead** — каждое HTTPS connection — DNS lookup. Use `TCPConnector(ttl_dns_cache=300)` to cache.
+- **HTTP/2 keep-alive** — long-lived connections reduce overhead. aiohttp supports automatically.
+- **External rate limits** — OpenAI имеет TPM (tokens per minute) limits. Backpressure через `aiohttp.ClientResponseError` 429 → exponential backoff. Without backoff — request cascade failure.
+- **Timeout cascade** — если timeout < server side timeout, client closes connection but server continues processing → wasted compute. Sync timeouts to server contract.
+- **Error handling — fail vs fallback** — `resultFuture.completeExceptionally` (Java analog) → record fails → operator restarts depending strategy. Better: catch exceptions, emit fallback value (e.g., "uncertain"), preserve pipeline continuity.
+- **Watermark progress** — async UDFs block watermark до in-flight requests complete (within watermark boundary). Long timeouts → watermark stalls. Monitor watermark gap.
+- **Cost control** — каждый LLM call $$. Async UDF easy чтобы fire millions of calls. Always pre-filter в SQL `WHERE` clause + monitor spend.
+- **Idempotency** — at-least-once semantics — на recovery in-flight requests re-issued. Если LLM has side effects (creates resources), use idempotency keys.
+
+<Callout type="warning">
+Async UDF — at-least-once semantics для external system. Checkpoints persist in-flight request list. На recovery requests re-issued — duplicate side effects possible. Production patterns: (1) Pure read operations safe (idempotent by nature). (2) Side-effect operations — use idempotency keys (e.g., `x-idempotency-key: {tx_id}-{retry_count}`). (3) Cost-sensitive APIs — pre-filter aggressively, cache common results в Redis (separate cache key generation).
+</Callout>
+
+<Callout type="tip">
+Async UDF — best for **external-bound workloads**: LLM inference, ML microservices, vector DB lookups, Redis cache fetches. For local computation (numpy ops, sklearn predict) — Pandas UDFs win. Decision rule: if external network latency > 10ms — async UDF makes sense. If purely local computation — async overhead non-trivial, prefer thread mode или Pandas UDF.
+</Callout>
+
+---
+
+## Architectural pattern: PyFlink + LLM + RAG
+
+Modern AI/ML pipeline на PyFlink 2.2:
+
+```sql
+-- 1. Real-time embedding
+INSERT INTO query_embeddings
+SELECT
+    query_id,
+    query_text,
+    get_embedding(query_text) AS embedding
+FROM user_queries;
+
+-- 2. Vector search (FLIP-540 VECTOR_SEARCH built-in to 2.2)
+INSERT INTO retrieved_context
+SELECT
+    q.query_id,
+    q.query_text,
+    VECTOR_SEARCH(knowledge_base, q.embedding, 5) AS context
+FROM query_embeddings q;
+
+-- 3. LLM call with retrieved context
+INSERT INTO llm_responses
+SELECT
+    query_id,
+    query_text,
+    llm_generate(query_text, context) AS response
+FROM retrieved_context;
+
+-- 4. Side effects (write to user-facing system)
+INSERT INTO user_responses
+SELECT * FROM llm_responses;
+```
+
+Full RAG pipeline в pure PyFlink: embeddings, vector search, LLM generation. All steps async, concurrent, with backpressure handling. Production capability в Flink 2.2.
+
+---
+
+<KnowledgeCheck
+  question="Design async UDF-based PyFlink pipeline для real-time customer support: incoming customer messages → semantic understanding via OpenAI embedding → vector search in Pinecone (10k tickets) → LLM-generated response → output к webhook. Target 100 messages/sec, max latency 5 sec. Опишите architecture, async UDF code, capacity tuning, and production safeguards."
+  answer="**Architecture overview**: Kafka source (customer messages) → async UDF embedding → Pinecone vector search async → async UDF LLM response → HTTP sink via async UDF webhook call. All steps in single PyFlink job using Flink 2.2 async UDFs. **Step 1 — Embedding UDF**: ```python\\n@async_udf(input_types=[DataTypes.STRING()],\\n           result_type=DataTypes.ARRAY(DataTypes.FLOAT()),\\n           capacity=300, timeout=2000, ordering='UNORDERED')\\nasync def embed_message(text):\\n    async with global_session.post(\\n        'https://api.openai.com/v1/embeddings',\\n        json={'model':'text-embedding-3-small','input':text}\\n    ) as r:\\n        return (await r.json())['data'][0]['embedding']\\n```. OpenAI embedding latency ~100-500ms p99, capacity 300 → 600/sec/subtask. Connection pool: aiohttp.TCPConnector(limit=400, limit_per_host=400, ttl_dns_cache=300). **Step 2 — Pinecone search**: ```python\\n@async_udf(input_types=[DataTypes.ARRAY(DataTypes.FLOAT())],\\n           result_type=DataTypes.ARRAY(DataTypes.STRING()),\\n           capacity=500, timeout=1500)\\nasync def pinecone_search(vector):\\n    async with global_session.post(\\n        'https://api.pinecone.io/query',\\n        json={'vector': vector.tolist(), 'topK': 5}\\n    ) as r:\\n        data = await r.json()\\n        return [match['metadata']['ticket_text'] for match in data['matches']]\\n```. Pinecone p99 ~50-200ms. Capacity 500 → 2500/sec/subtask. **Step 3 — LLM response**: ```python\\n@async_udf(input_types=[DataTypes.STRING(), DataTypes.ARRAY(DataTypes.STRING())],\\n           result_type=DataTypes.STRING(),\\n           capacity=200, timeout=8000)\\nasync def generate_response(query, context):\\n    prompt = f'Customer: {query}\\\\nContext: {chr(10).join(context)}\\\\nRespond helpful:'\\n    async with global_session.post(\\n        'https://api.anthropic.com/v1/messages',\\n        json={'model':'claude-3-5-haiku','max_tokens':500,'messages':[{'role':'user','content':prompt}]}\\n    ) as r:\\n        return (await r.json())['content'][0]['text']\\n```. Claude Haiku p99 ~1-2s, capacity 200 → 100-200/sec/subtask (THIS IS BOTTLENECK). **Step 4 — Webhook sink**: ```python\\n@async_udf(..., capacity=500, timeout=3000)\\nasync def post_response(customer_id, response):\\n    async with global_session.post(\\n        f'https://customer-api/respond/{customer_id}',\\n        json={'response': response}\\n    ) as r:\\n        return r.status\\n```. **Pipeline SQL**: ```sql\\nINSERT INTO webhook_log\\nSELECT customer_id,\\n       post_response(customer_id, response_text) AS http_status\\nFROM (\\n  SELECT customer_id, query_text,\\n         generate_response(query_text, pinecone_search(embed_message(query_text))) AS response_text\\n  FROM customer_queries\\n)```. **Capacity calculation для target 100 msgs/sec**: bottleneck = LLM call (slowest). Per subtask = 100/sec / parallelism. With parallelism=4 (4 TM × 1 slot для GIL), per subtask = 25/sec. LLM at 1.5s p99 needs capacity = 25 × 1.5 = 38. Set capacity=200 для headroom (handle 4x spike). Embed and Pinecone capacities scaled up — they're not bottleneck. **Total latency budget**: embed 0.5s + pinecone 0.2s + LLM 2s + webhook 0.5s = 3.2s p99 — well within 5s target. **Production safeguards**: (1) **Rate limiting**: OpenAI TPM/RPM limits — implement client-side rate limiter (aiolimiter). Without — request cascade при traffic spikes. (2) **Cost control**: pre-filter в SQL `WHERE message_priority='HIGH' OR contains_urgent_keywords(text)` — don't call LLM for FAQ-answerable messages. Maintain cache в Redis для common queries (hash query → cached response 1h TTL). (3) **Error handling**: Each UDF wraps API call в try/except, returns fallback ('Unable to generate response, escalating to human'). NEVER let exception bubble — it crashes operator. (4) **Idempotency**: webhook target — include x-idempotency-key header with message_id. On retry after checkpoint recovery, server deduplicates. (5) **Backpressure**: if LLM rate-limited, Flink natural backpressure flows upstream. Monitor input lag via Kafka consumer group metrics. (6) **Observability**: per-UDF metrics — success rate, p50/p99 latency, error breakdown. Application-level: end-to-end latency Kafka source → webhook. Alert if p99 > 4s. (7) **Cost monitoring**: track API call count via UDF metrics, daily cost extrapolation, alert at budget threshold. (8) **Quality monitoring**: sample 1% responses for human review (separate side output for QA). **Production deployment**: Docker image с Python 3.11.7, aiohttp 3.9.x, anthropic SDK pinned versions. K8s pods: 4 TM × 2 CPU × 8GB. Flink Kubernetes Operator manages lifecycle. Secrets для API keys via K8s secrets, mounted as env vars. **Scaling strategy**: if traffic grows к 500/sec, increase parallelism к 20 (5 TM × 4 slots). Watch GIL contention при slots/TM > 2 — может switch to thread mode (PEMJA) для embed/pinecone (simple async), keep process для LLM (more deps)."
+/>

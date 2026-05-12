@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/02-app-vs-session-mode",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-02",
+    "description": "Quiz for Application vs Session mode lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-02-q1",
+      "type": "multiple-choice",
+      "question": "Per-job mode в Flink 2.x: что с ним?",
+      "options": [
+        { "id": "a", "text": "Default режим, рекомендуется для production" },
+        { "id": "b", "text": "Полностью удалён в 2.0 (FLIP-419). Все use cases теперь через Application mode" },
+        { "id": "c", "text": "Deprecated, но всё ещё работает" },
+        { "id": "d", "text": "Используется только для batch jobs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Per-job mode полностью удалён в Flink 2.0 (FLIP-419). Он был middle-ground между Application и Session — тоже создавал dedicated cluster per job, но компилировал main() на клиенте (не в JM). Различие было subtle, приводило к bugs (client environment ≠ JM environment). Application mode полностью его заменяет. Legacy `-t kubernetes-per-job` или `cluster.mode: per-job` в 2.x не работают.",
+      "studyHint": "Повторите урок — секция Per-job mode: что было и почему removed",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-02-q2",
+      "type": "multiple-choice",
+      "question": "Где компилируется main() в Application mode?",
+      "options": [
+        { "id": "a", "text": "На клиенте (flink CLI или CI/CD runner)" },
+        { "id": "b", "text": "В JobManager pod-е внутри cluster" },
+        { "id": "c", "text": "На отдельном compilation node" },
+        { "id": "d", "text": "В TaskManager-е перед запуском tasks" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "В Application mode main() выполняется ВНУТРИ JobManager pod-а. Клиент только uploads spec (FlinkDeployment manifest) — после submission client может disconnect. main() runs в JM pod, generates StreamGraph → JobGraph, JobMaster берёт его. Это даёт: (1) JobGraph compilation не зависит от client environment (Java версия, Maven dependencies); (2) CI/CD без Flink клиента — просто kubectl apply.",
+      "studyHint": "Повторите урок — секция Application mode: how it actually works",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-02-q3",
+      "type": "multiple-choice",
+      "question": "20 stateless transforms parallelism=2 + 10 stateful jobs со 80GB RocksDB state каждый. Оптимальная strategy?",
+      "options": [
+        { "id": "a", "text": "Все в Application mode — production default" },
+        { "id": "b", "text": "Все в Session mode — экономнее" },
+        { "id": "c", "text": "Mixed: 10 stateful в Application mode (isolation), 20 stateless в Session cluster (sharing)" },
+        { "id": "d", "text": "20 stateless в Application mode, 10 stateful в Session" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Mixed approach optimal. Stateful jobs: Application mode каждая — (1) 80GB RocksDB требует dedicated managed memory; (2) blast radius isolation — recovery 80GB не должен валить соседей; (3) independent scale/version. Stateless 20: Session cluster — (1) per-job JM overhead 2GB × 20 = 40GB трата; (2) slot sharing повышает utilization; (3) common Flink version не критична. Only Application = 30 JM-pods overhead. Only Session = stateful jobs голодают по memory + JM crash валит 30 jobs.",
+      "studyHint": "Повторите урок — секция Когда какой mode + Production gotchas",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-02-q4",
+      "type": "true-false",
+      "question": "В Application mode FlinkDeployment имеет `spec.job` указанным, в Session mode `spec.job` отсутствует (только сам cluster).",
+      "correctAnswer": true,
+      "explanation": "Это маркер mode в Flink Kubernetes Operator. Если в FlinkDeployment YAML есть `spec.job` с jarURI и entryClass — operator создаёт Application cluster (один cluster = одна job). Если `spec.job` отсутствует — это Session cluster (без job). Jobs в Session кластер submitted через отдельный CR `FlinkSessionJob` с `deploymentName` ссылкой.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

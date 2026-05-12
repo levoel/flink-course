@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "01-architecture/05-app-vs-session-mode",
+  "moduleId": "01-architecture",
+  "_meta": {
+    "idPrefix": "flink-m01-05",
+    "description": "Use IDs: flink-m01-05-q1, flink-m01-05-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m01-05-q1",
+      "type": "multiple-choice",
+      "question": "Сколько deployment режимов в Flink 2.x, и какой был удалён?",
+      "options": [
+        { "id": "a", "text": "Три: Application, Session, Per-job — все активные" },
+        { "id": "b", "text": "Два: Application mode и Session mode. Per-job mode УДАЛЁН в 2.0 (FLIP-419) — application полностью его заменил, главное отличие per-job-а (main() на клиенте vs JM) больше не оправдывает существование отдельного mode" },
+        { "id": "c", "text": "Один — только Application" },
+        { "id": "d", "text": "Четыре: Application, Session, Per-job, Standalone" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "В 2.x остались Application и Session. Per-job mode удалён в 2.0 — application mode полностью его покрывает (dedicated cluster per job). Отличие per-job vs application было тонким: per-job компилировал main() на клиенте (медленно для больших JARs), application — внутри JobManager. Per-job создавал unnecessary complexity без выгоды. Если legacy config содержит cluster.mode: per-job — это уже не работает в 2.x.",
+      "studyHint": "Повторите урок 05 — раздел 'Краткая ретроспектива'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-05-q2",
+      "type": "multiple-choice",
+      "question": "У вас 30 streaming jobs: 20 stateless ETL (par=2, 10k msg/s) + 10 stateful (par=8, RocksDB 50 GB, 100k msg/s). Какая mixed strategy оптимальна?",
+      "options": [
+        { "id": "a", "text": "Один Session cluster для всех 30 jobs" },
+        { "id": "b", "text": "Application mode для всех 30 — максимальная изоляция" },
+        { "id": "c", "text": "Application mode для 10 stateful (свой FlinkDeployment per job — hard isolation, dedicated managed memory для RocksDB, savepoint upgrades) + один Session cluster для 20 stateless (low JM overhead, shared slots, common Flink версия)" },
+        { "id": "d", "text": "Per-job mode для stateful, Application для stateless" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Mixed approach оптимален. Stateful jobs (10) → Application mode: dedicated JM+TMs, hard isolation managed memory для RocksDB (нельзя позволить sharing с другими jobs), independent versioning, savepoint-based upgrades. Stateless (20) → Session: per-job JM overhead (2GB×20=40GB) был бы пустой тратой, slot sharing повышает utilization, ad-hoc operations быстрее. Моноподходы плохи: only Application — 30 JM pod-ов overhead, медленный deploy small jobs. Only Session — heavy state jobs голодают друг друга по managed memory, один crash валит весь fleet.",
+      "studyHint": "Повторите урок 05 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m01-05-q3",
+      "type": "multiple-choice",
+      "question": "В Application mode где выполняется main() метод вашей jar-а?",
+      "options": [
+        { "id": "a", "text": "На клиенте (где `flink run` запускается)" },
+        { "id": "b", "text": "В JobManager-е после старта pod-а. Это означает: компиляция StreamGraph → JobGraph происходит inside cluster, не зависит от client environment (Java версия, dependencies). Client может отключиться после submit — cluster продолжит работать" },
+        { "id": "c", "text": "На TaskManager-е" },
+        { "id": "d", "text": "Параллельно на всех TM-ах" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Application mode: main() запускается inside JobManager pod. Преимущества: (1) компиляция не зависит от client (no Java mismatch), (2) client можно disconnect после submit, (3) main() имеет доступ ко всем cluster resources. В Session mode наоборот — main() выполняется на клиенте, который шлёт уже скомпилированный JobGraph через REST. Это основное internal различие между модами.",
+      "studyHint": "Повторите урок 05 — раздел 'Application mode: production default'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m01-05-q4",
+      "type": "true-false",
+      "question": "В production оptимально иметь один большой Session cluster со всеми 50 stateful streaming jobs — это даёт лучшую утилизацию ресурсов и упрощает ops.",
+      "correctAnswer": false,
+      "explanation": "Это anti-pattern. Один большой Session cluster со многими stateful jobs создаёт: (1) при JM crash recovery всех jobs одновременно (минуты+), (2) heavy job голодает других по managed memory / CPU, (3) одна Flink версия для всех — невозможно smooth migration, (4) failure blast radius huge — один TM crash убивает slots всех jobs на нём, (5) Dispatcher REST bottleneck при много submissions. Правильно — Application mode per job, isolated FlinkDeployment manifests, GitOps. Session mode оправдан для ad-hoc SQL, dev environment, или many small stateless jobs.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

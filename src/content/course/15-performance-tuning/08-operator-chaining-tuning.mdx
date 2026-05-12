@@ -1,0 +1,447 @@
+---
+title: "Operator chaining: когда disable, trade-offs"
+description: "When disable chaining (.disableChaining(), .startNewChain()), trade-offs: ноль serialization vs blocked independent scaling. Production patterns"
+order: 8
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Operator Chaining", "Performance", "Tuning", "Slot Sharing", "Diagnostics"]
+---
+
+# Operator chaining tuning
+
+Operator chaining — это оптимизация Flink, при которой соседние operators с compatible parallelism и forward partitioning объединяются в **один task** и выполняются в одном thread. Результат: zero network shuffle, zero serialization, минимальный latency overhead — данные передаются как Java object references.
+
+Но chaining не всегда win. В нескольких случаях chaining **вредит** performance или скрывает diagnostic data. В этом уроке — when disable chaining, какие trade-offs, и когда `startNewChain()` правильное решение.
+
+---
+
+## Что такое chaining
+
+```java
+stream
+    .map(parse)       // chained
+    .filter(valid)    // chained
+    .map(enrich);     // chained
+// → один task, один thread, zero serialization
+```
+
+Если operators имеют:
+- Same parallelism
+- Forward partitioning (нет keyBy/rebalance/shuffle между ними)
+- Same slot sharing group
+- Не explicit `disableChaining()` / `startNewChain()`
+
+→ Flink объединяет их в один **chained task**.
+
+В runtime каждый chained task:
+- Один thread (mailbox processor)
+- Один InputGate, один ResultPartition
+- Operators вызываются sequentially: `op1.processElement → op2.processElement → op3.processElement`
+
+Каждая запись пройдёт через 3 operator-а без сериализации, без shuffle — pure function call overhead.
+
+<DiagramContainer title="Chained vs non-chained execution" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Chained (default)"
+        tooltip="Map → Filter → Map в одном chained task. Один thread, zero serialization между операторами. Записи передаются как Java object references."
+      >
+        [Map → Filter → Map] = 1 task
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label=".disableChaining()" />
+    <FlowRow>
+      <DataBox
+        label="Map task"
+        tooltip="Отдельный task с собственным thread, InputGate, ResultPartition. Все записи сериализуются на выходе."
+      >
+        [Map] = task 1
+      </DataBox>
+      <DataBox
+        label="Filter task"
+        tooltip="Отдельный task. Сериализация при входе и выходе. Может scale independently от Map/Map."
+      >
+        [Filter] = task 2
+      </DataBox>
+      <DataBox
+        label="Map task"
+        tooltip="Отдельный task. Sink-side serialization. Может иметь свой parallelism (но требует repartitioning между tasks)."
+      >
+        [Map] = task 3
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Benefits chaining (default behavior)
+
+1. **Zero serialization cost**. Между chained operators — pure reference passing. На 10 операторов в chain экономия 10× sсерialize/deserialize cycles per record.
+
+2. **No network shuffle**. Не buffer-ы, не credit-based flow control между chained ops. Всё в одном thread, instant.
+
+3. **Less network buffer memory**. Меньше channels между tasks → меньше buffer аллокация.
+
+4. **Single Java method call overhead**. ~10-50 nanoseconds vs сотни микросекунд для serialization + buffer copy.
+
+Empirically chained vs non-chained: throughput x3-x10 на light operators.
+
+---
+
+## Когда отключать chaining
+
+### Случай 1: один operator в chain CPU-intensive — блокирует остальных
+
+```java
+stream
+    .map(parse)            // light: 1µs/record
+    .map(enrichExternal)   // heavy: 100µs/record (ML inference)
+    .map(format);          // light: 1µs/record
+```
+
+В chained task все три выполняются в одном thread. Heavy `enrichExternal` (100µs) блокирует thread → light operators не могут продвигаться.
+
+Если split chain:
+
+```java
+stream
+    .map(parse)
+    .map(enrichExternal).startNewChain()
+    .map(format).startNewChain();
+```
+
+Каждый operator получает свой thread. Throughput total = `min(parallelism × throughput_per_op)` для каждой стадии. Cost: 2× extra serialization, network buffers.
+
+**Trade-off**:
+- Chained: throughput = 10k/sec (limited by slowest op).
+- Non-chained: throughput = 10k/sec на slowest, но light ops уже не bottleneck. Если slowest = heavy, throughput same. Если bottleneck shifts на network — actually slower.
+
+**Verdict**: split chain помогает **только** если есть room scale slow operator parallelism отдельно (e.g., parallelism=8 для light + parallelism=32 для heavy).
+
+### Случай 2: profiling / diagnostics
+
+```java
+stream
+    .map(parse)            // busy 30%
+    .map(transform)        // busy 60%
+    .map(format);          // busy 10%
+```
+
+Если chained, Web UI показывает один `busyTimeMsPerSecond = 100%` для всего chained task. Непонятно кто внутри — bottleneck.
+
+**Temporary disable chaining** для diagnose:
+
+```java
+stream
+    .map(parse).disableChaining()
+    .map(transform).disableChaining()
+    .map(format).disableChaining();
+```
+
+Теперь каждый operator имеет separate metrics. Identify bottleneck → remove `.disableChaining()` после fix.
+
+### Случай 3: independent scaling
+
+```java
+stream
+    .map(parse).setParallelism(8)
+    .map(heavyTransform).setParallelism(32)
+    .map(format).setParallelism(8);
+```
+
+Different parallelism между chained operators невозможен — chaining требует same parallelism. Если хочется parallelism=32 для middle: chain автоматически breaks (auto-shuffle insert).
+
+Альтернатива: explicit:
+
+```java
+stream
+    .map(parse).setParallelism(8)
+    .rebalance()
+    .map(heavyTransform).setParallelism(32)
+    .rebalance()
+    .map(format).setParallelism(8);
+```
+
+`.rebalance()` форсирует shuffle round-robin → chain breaks → independent parallelism.
+
+### Случай 4: heavy state per operator
+
+```java
+stream
+    .keyBy(...).process(stateful1)   // 10GB state
+    .keyBy(...).process(stateful2);  // 8GB state
+```
+
+KeyBy уже ломает chain. Но если оба в одном slot sharing group → разделяют managed memory. State pressure на одной operator может убить другой.
+
+**Fix**: разные slot sharing groups:
+
+```java
+stream
+    .keyBy(...).process(stateful1)
+        .slotSharingGroup("state1")
+    .keyBy(...).process(stateful2)
+        .slotSharingGroup("state2");
+```
+
+Не про chaining, но связано — separate slot families = separate RocksDB instances.
+
+### Случай 5: чистая network в job graph (visual debugging)
+
+Для очень сложных job-ов с 50+ operators chaining делает DAG визуализацию в Web UI плотной. Hard to follow logic.
+
+`disableChaining()` на key points делает граф читаемым. Cost performance — minor.
+
+---
+
+## API: chaining control
+
+### `disableChaining()` — split before AND after
+
+```java
+stream
+    .map(op1)
+    .map(op2).disableChaining()   // op2 has own task, before и after split
+    .map(op3);
+```
+
+Result:
+
+```
+[op1]  [op2]  [op3]   (три task-а)
+```
+
+### `startNewChain()` — split before only
+
+```java
+stream
+    .map(op1)
+    .map(op2)
+    .map(op3).startNewChain()
+    .map(op4);
+```
+
+Result:
+
+```
+[op1 + op2 + op3]  [op4]   (два task-а — op3 начинает новый chain)
+```
+
+Wait — actually startNewChain breaks chain **before** the operator, so:
+
+```
+[op1 + op2]  [op3 + op4]   (op3 и op4 chained вместе)
+```
+
+### Global disable
+
+```java
+env.disableOperatorChaining();   // global, для всего job
+```
+
+Используется редко — обычно selective is better.
+
+---
+
+## Diagnostic flow: chaining decisions
+
+```
+1. Job медленный, Web UI показывает один chained task busy 100%:
+   - Temporary .disableChaining() на каждом op в chain
+   - Re-run, identify реальный bottleneck по individual metrics
+   - Apply targeted fix (e.g., increase parallelism для bottleneck)
+   - Re-enable chaining для остального (default)
+
+2. Want independent scaling для bottleneck operator:
+   - .setParallelism(higher) на operator
+   - Это автоматически break chain (require rebalance)
+   - OR explicit .rebalance() перед operator
+
+3. Hot operator с slow external I/O:
+   - Wrap в AsyncDataStream.unorderedWait — не блокирует thread
+   - Chaining можно оставить, async wait не блокирующий
+```
+
+---
+
+## Production patterns
+
+### Pattern 1: Standard pipeline — default chaining
+
+```java
+stream
+    .map(parse)
+    .filter(valid)
+    .map(enrich)
+    .keyBy(Event::getUserId)    // auto-break chain at keyBy
+    .process(stateful)
+    .map(format)
+    .sinkTo(sink);
+```
+
+Default chaining везде, кроме keyBy boundary. 95% jobs — этот pattern.
+
+### Pattern 2: ML inference operator — own task
+
+```java
+stream
+    .map(parse)
+    .map(modelInference).startNewChain()      // own task для CPU isolation
+    .map(format);
+```
+
+ML inference обычно CPU-bound — separate thread помогает.
+
+### Pattern 3: Heavy state operator — own slot sharing group
+
+```java
+stream
+    .keyBy(Event::getUserId)
+    .process(heavyStateful)
+        .setParallelism(32)
+        .slotSharingGroup("state-heavy")
+    .keyBy(Event::getCategory)
+    .process(otherStateful)
+        .slotSharingGroup("state-other");
+```
+
+Slot sharing group split (not chain split) — isolates managed memory.
+
+### Pattern 4: Production debug mode (temporary)
+
+```java
+boolean debugMode = config.getBoolean("debug.disable-chaining", false);
+if (debugMode) env.disableOperatorChaining();
+
+stream.map(...).map(...).map(...);
+```
+
+Toggle через config. В production debug mode disable chaining → granular metrics, easier troubleshooting.
+
+### Pattern 5: SQL/Table API — chaining automatic
+
+```sql
+SELECT user_id, COUNT(*)
+FROM events
+GROUP BY user_id, TUMBLE(rowtime, INTERVAL '5' MINUTES);
+```
+
+Table API планирует chain автоматически. Внешнее tuning через config:
+
+```yaml
+table.exec.operator-fusion-codegen.enabled: true   # 1.18+ fusion codegen
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: disableChaining() везде = performance disaster
+
+Anti-pattern: «disable chaining чтобы видеть metrics», и забывают enable обратно.
+
+Каждый operator теперь serializes/deserializes. Throughput x3-x10 хуже.
+
+**Fix**: disableChaining только во время diagnostics, повторно enable после.
+
+### Gotcha 2: chained task busy=100% — кто внутри?
+
+См. выше. Chaining hides per-operator bottleneck.
+
+**Fix**: temporary disable + measure + re-enable.
+
+### Gotcha 3: keyBy ломает chain автоматически
+
+```java
+stream
+    .map(op1)
+    .keyBy(...)
+    .map(op2);     // НЕ chained с op1
+```
+
+KeyBy = network shuffle (hash partitioning) → chain break. Не нужно `.disableChaining()` явно.
+
+### Gotcha 4: setParallelism разные → chain break
+
+```java
+stream
+    .map(op1).setParallelism(8)
+    .map(op2).setParallelism(16);   // chain breaks
+```
+
+Mismatched parallelism → rebalance required → chain break. Same effect как explicit disable.
+
+### Gotcha 5: Chained task blocks с sync external I/O
+
+```java
+.map(record -> {
+    return externalDB.lookup(record.id);   // sync block 50ms
+})
+```
+
+В chained task этот блокирует thread, downstream chain elements idle.
+
+**Fix**: использовать `AsyncDataStream.unorderedWait`:
+
+```java
+AsyncDataStream.unorderedWait(
+    stream,
+    new AsyncLookupFunction(),
+    Duration.ofSeconds(5).toMillis(),
+    TimeUnit.MILLISECONDS,
+    100   // capacity
+);
+```
+
+Async functions не блокируют mailbox.
+
+### Gotcha 6: Side outputs ломают chain
+
+```java
+SingleOutputStreamOperator<Event> processed = stream
+    .process(new ProcessFunction<Event, Event>() { ... });
+
+DataStream<Event> sideOut = processed.getSideOutput(tag);
+```
+
+Side outputs создают branching в DAG → не chained beyond branch point.
+
+### Gotcha 7: Connect/Union могут breaking chain
+
+```java
+stream1.connect(stream2)         // co-operator
+    .map(coMapFunction);
+```
+
+Co-operators (CoMap, CoFlatMap) могут не chain с предыдущим — verify в Web UI DAG.
+
+---
+
+## Diagnostic checklist
+
+1. **Web UI DAG**: какие operators chained (один box) vs separate?
+2. **busyTime per task** — если chained task красный, нужен диагноз внутри.
+3. **Temporary disableChaining** → per-operator metrics → identify bottleneck.
+4. **После diagnosis** — re-enable chaining, apply targeted fix.
+5. **Slot sharing groups** — не путать с chaining. Group = slot allocation, chain = task fusion.
+
+---
+
+<Callout type="note">
+Default chaining works для 95% production pipelines. Disable только когда: (1) явный bottleneck в одном operator chain; (2) temporary для diagnostics; (3) heavy operator нужно scale independent. В остальных случаях chaining = free performance, не трогайте.
+</Callout>
+
+---
+
+<Callout type="warning">
+Не путайте «chaining» (task fusion) и «slot sharing» (slot allocation). Chained operators живут в одном thread одного task. Slot sharing group — operators могут разделять slot (но в разных threads/tasks). Это орthogonal. Можно слот-share без chain (default at keyBy boundary), и можно chain без slot-share (rare, обычно одно следует за другим).
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production pipeline: Source → Map (JSON parse) → Map (schema validation) → Map (enrichment via async DB lookup) → KeyedProcess (stateful) → Map (format) → Sink. Все chained до keyBy. Web UI: chained task (Source-Map-Map-Map) busy 95%, KeyedProcess busy 40%, Sink 30%. Throughput plateau, повышение parallelism не помогает. Что делать?"
+  answer="Анализ: chained task busy 95%, но непонятно кто из 4 chained operators (Source, parse Map, validation Map, enrichment Map) bottleneck. Повышение parallelism всего chained task шкалирует всё одинаково — если bottleneck в одном operator (enrichment DB lookup), масштабирование source/parse тоже бесполезно (wasted work). Plan: (1) Temporary disable chaining для diagnose. Запустить новый run с .disableChaining() на каждом op (или env.disableOperatorChaining() глобально). НЕ для production, только diagnostic run. (2) Re-measure Web UI. Теперь каждый operator имеет separate busyTimeMsPerSecond. Expected discovery: вероятнее всего enrichment DB lookup busy 90%+ (sync blocking I/O), parse/validation 30-40%, source 60%. (3) Confirmed bottleneck в enrichment DB lookup. Fix: convert sync DB call к AsyncDataStream.unorderedWait. AsyncDataStream.unorderedWait(stream, new AsyncDbLookup(), 5000, TimeUnit.MILLISECONDS, 100) — capacity=100 in-flight requests, не блокирует mailbox thread. Throughput может увеличиться в 10-50× если DB latency был 50ms и DB может handle parallel requests. (4) Re-enable chaining (default). После async fix enrichment не блокирующий → chain снова OK, throughput высокий. (5) Альтернативные fixes если async не подходит: (a) Split chain: .map(parse).startNewChain().map(enrichment).startNewChain() — каждый operator own thread, но всё равно block если sync. (b) Cache enrichment с TTL — если данные не часто меняются, cache в RichFunction.open() loaded once, lookups через ConcurrentHashMap. (c) Broadcast enrichment data — если dataset мал (< 100MB) и обновляется редко: BroadcastStream + broadcast state + connect — каждый subtask имеет копию. (6) Verify post-fix: chained task busy < 70% sustained, throughput x5-x10 baseline. (7) Lesson learned: chaining hides bottlenecks. Add «temporary disable chaining» к standard diagnostic playbook. После fix не оставляйте .disableChaining() — это performance loss без выгоды. Production rule: chaining = default, disable только при profiling, restore после."
+/>

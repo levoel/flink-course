@@ -1,0 +1,541 @@
+---
+title: "Async State API V2 — FLIP-424/425, AEC, callback model"
+description: "Non-blocking state access через Asynchronous Execution Controller. ОБЯЗАТЕЛЕН для ForSt. Sync vs async семантика, migration patterns, ordering guarantees"
+order: 6
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Async State API V2", "AEC", "FLIP-424", "FLIP-425", "ForSt", "Non-blocking state"]
+---
+
+# Async State API V2 — FLIP-424/425
+
+Это самый важный API novelty Flink 2.x. Без понимания Async State API V2 нельзя использовать ForSt (disaggregated state на S3) — а это flagship feature 2.0.
+
+**TL;DR**: state access становится non-blocking через callbacks. Mailbox thread не блокируется на state I/O. AEC (Asynchronous Execution Controller) — новый компонент, оркестрирующий per-key ordering и concurrent access. Sync API через ForSt = катастрофа: каждый `state.value()` блокирует весь mailbox на 10-100ms (S3 GET).
+
+---
+
+## Проблема: sync state access на disaggregated storage
+
+В классическом RocksDB на local NVMe:
+- `state.value()` — read из block cache (если hit) или local SSD (если miss)
+- Latency: 1μs (cache hit) — 50μs (SSD miss)
+- Mailbox thread блокируется на 50μs — acceptable
+
+В ForSt с primary state на S3:
+- `state.value()` — read из local cache (hit) или S3 (miss)
+- Latency: 10μs (cache hit) — **50-100ms (S3 miss)**
+- Mailbox thread заблокирован на 100ms = весь subtask замораживается
+
+При 10k events/sec и 30% cache miss → 3000 reads/sec × 100ms = 300 seconds load/sec — невозможно.
+
+**Async API решает это**: state access начинается, mailbox thread продолжает работать с другими записями, callback срабатывает когда I/O завершён.
+
+---
+
+## Архитектура Asynchronous Execution Controller (AEC)
+
+<DiagramContainer title="AEC — оркестратор non-blocking state access" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Mailbox processor"
+        tooltip="Single-threaded loop, обрабатывает события и timers. До Async API любой state.value() блокировал этот thread на I/O latency. С AEC mailbox делегирует state I/O в pool, продолжает работать."
+      >
+        Single-thread event loop
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="processElement → state.asyncValue() → callback" />
+    <FlowRow>
+      <DataBox
+        label="AEC"
+        tooltip="Asynchronous Execution Controller. Принимает state request, отслеживает in-flight requests per key (для ordering), управляет concurrent access. Гарантирует per-key serializability и in-order callback execution."
+      >
+        Per-key request tracking
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Request submitted, mailbox continues" />
+    <FlowRow>
+      <DataBox
+        label="State backend pool"
+        tooltip="Worker threads (configurable, default 8) выполняют actual state I/O. Для RocksDB — sync JNI calls в worker. Для ForSt — async S3 GET/PUT, ByteBuffer pool, request batching."
+      >
+        Worker threads (I/O)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Callback when ready, scheduled to mailbox" />
+    <FlowRow>
+      <DataBox
+        label="Mailbox: callback execution"
+        tooltip="Callback (thenAccept/thenCompose) выполняется на mailbox thread, в context того же key. Это гарантирует, что user code state mutations не имеют race conditions."
+      >
+        thenAccept runs on mailbox
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Ключевые компоненты AEC
+
+1. **RequestBuffer per key** — упорядочивает requests одного key (in-order callback)
+2. **ParallelismController** — limits concurrent in-flight requests (back-pressure protection)
+3. **CompletionScheduler** — callbacks возвращаются на mailbox thread
+
+---
+
+## API сравнение: sync vs async
+
+### Old sync API (continues to work для HashMap/RocksDB backends)
+
+```java
+public class CounterFunction extends KeyedProcessFunction<Long, Event, Long> {
+    private transient ValueState<Long> count;
+
+    @Override
+    public void open(Configuration c) {
+        count = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("count", Long.class));
+    }
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Long> out)
+            throws Exception {
+        Long v = count.value();              // ← BLOCKING
+        long newVal = (v == null) ? 1L : v + 1;
+        count.update(newVal);                // ← BLOCKING
+        out.collect(newVal);
+    }
+}
+```
+
+### New async API V2
+
+```java
+public class AsyncCounterFunction extends KeyedProcessFunction<Long, Event, Long> {
+    private transient ValueState<Long> count;
+
+    @Override
+    public void open(OpenContext ctx) {
+        // Note: state declarations не меняются — backend решает sync vs async runtime
+        count = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("count", Long.class));
+    }
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Long> out)
+            throws Exception {
+        count.asyncValue().thenAccept(v -> {
+            long newVal = (v == null) ? 1L : v + 1;
+            count.asyncUpdate(newVal);
+            out.collect(newVal);
+        });
+    }
+}
+```
+
+Различия:
+- `asyncValue()` возвращает `StateFuture<Long>` вместо blocking `Long`
+- `thenAccept(v -> ...)` — callback, выполняется когда state ready
+- Mailbox продолжает обрабатывать next event без блокировки
+
+---
+
+## StateFuture API
+
+`StateFuture<T>` — Flink аналог `CompletableFuture<T>`, но интегрирован с AEC:
+
+```java
+StateFuture<Long> future = count.asyncValue();
+
+// Chain operations:
+future
+    .thenAccept(v -> { /* consume */ })            // void result
+    .thenApply(v -> v * 2)                         // map
+    .thenCompose(v -> otherState.asyncValue())     // flatMap
+    .thenCombine(otherFuture, (a, b) -> a + b);    // zip two futures
+```
+
+### Ordering guarantees
+
+```java
+public void processElement(Event e, Context ctx, Collector<Long> out) {
+    count.asyncValue().thenAccept(v -> {
+        count.asyncUpdate(v == null ? 1L : v + 1);
+    });
+    // Next event for same key:
+    //   AEC ждёт, пока предыдущий callback завершится,
+    //   ТОЛЬКО ТОГДА starts processing next event для same key.
+    // Different keys — fully concurrent.
+}
+```
+
+**Per-key ordering** строго соблюдается. **Different keys** — параллелятся через worker pool. Это критично: позволяет throughput, не нарушая semantics.
+
+---
+
+## Migration: sync → async
+
+### Step 1: Изменить OpenContext signature
+
+```java
+// Old:
+public void open(Configuration config) { ... }
+
+// New (для async-compatible):
+public void open(OpenContext ctx) { ... }
+```
+
+### Step 2: Заменить blocking calls на async
+
+```java
+// Old:
+Long v = state.value();
+state.update(v + 1);
+
+// New:
+state.asyncValue().thenAccept(v -> {
+    state.asyncUpdate(v + 1);
+});
+```
+
+### Step 3: Process sequential dependencies через chains
+
+Если нужно `state2.update(state1.value() + 1)`:
+
+```java
+// Old:
+state2.update(state1.value() + 1);
+
+// New:
+state1.asyncValue()
+    .thenAccept(v1 -> state2.asyncUpdate(v1 + 1));
+```
+
+### Step 4: Multiple state reads → combine
+
+```java
+state1.asyncValue()
+    .thenCombine(state2.asyncValue(),
+        (v1, v2) -> v1 + v2)
+    .thenAccept(sum -> state3.asyncUpdate(sum));
+```
+
+---
+
+## Concrete examples
+
+### Example 1: Threshold check
+
+```java
+public class ThresholdAlert extends KeyedProcessFunction<Long, Tx, Alert> {
+    private transient ValueState<Long> cumulativeSum;
+    private static final long THRESHOLD = 10_000_000L;
+
+    @Override
+    public void open(OpenContext ctx) {
+        cumulativeSum = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("sum", Long.class));
+    }
+
+    @Override
+    public void processElement(Tx tx, Context ctx, Collector<Alert> out) {
+        cumulativeSum.asyncValue().thenAccept(current -> {
+            long newSum = (current == null ? 0L : current) + tx.getAmount();
+            cumulativeSum.asyncUpdate(newSum);
+
+            if (newSum > THRESHOLD) {
+                out.collect(new Alert(tx.getUserId(), newSum));
+            }
+        });
+    }
+}
+```
+
+### Example 2: Map state lookup chain
+
+```java
+public class FraudDetector extends KeyedProcessFunction<Long, Tx, Alert> {
+    private transient MapState<String, Long> categoryStats;
+    private transient ValueState<UserProfile> profile;
+
+    @Override
+    public void processElement(Tx tx, Context ctx, Collector<Alert> out) {
+        // Two async reads, combined:
+        StateFuture<Long> categoryCount =
+            categoryStats.asyncGet(tx.getCategory());
+        StateFuture<UserProfile> userProfile =
+            profile.asyncValue();
+
+        categoryCount.thenCombine(userProfile, (count, prof) -> {
+            return computeScore(tx, count, prof);
+        }).thenAccept(score -> {
+            if (score > 0.8) {
+                out.collect(new Alert(tx, score));
+            }
+            categoryStats.asyncPut(tx.getCategory(),
+                (count == null ? 1L : count + 1));
+        });
+    }
+}
+```
+
+### Example 3: MapState async iteration
+
+```java
+public class TopK extends KeyedProcessFunction<Long, Event, TopKResult> {
+    private transient MapState<String, Long> counts;
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<TopKResult> out) {
+        // Increment один key:
+        counts.asyncGet(e.getName()).thenAccept(c -> {
+            counts.asyncPut(e.getName(), c == null ? 1L : c + 1);
+        });
+    }
+
+    public void onTimer(long ts, OnTimerContext ctx, Collector<TopKResult> out) {
+        // Async iterate всех entries:
+        StateIterator<Map.Entry<String, Long>> iter = counts.asyncEntries();
+        iter.onNext(entry -> {
+            // process each entry asynchronously
+        });
+    }
+}
+```
+
+---
+
+## ForSt + Async API V2 — обязательная пара
+
+ForSt — primary state на S3, локальный диск только cache. Каждый cache miss = S3 GET = 50-100ms.
+
+```java
+// С sync API на ForSt:
+state.value();  // 50ms блокирует mailbox
+// Throughput ограничен ~20 events/sec на subtask — катастрофа
+
+// С async API V2:
+state.asyncValue().thenAccept(v -> { ... });
+// Mailbox продолжает работать, AEC параллелит I/O в worker pool
+// Throughput: 1000+ events/sec на subtask
+```
+
+**Без async API ForSt не имеет смысла**. Поэтому FLIP-424/425 (async API) и FLIP-427 (ForSt) развивались вместе.
+
+```yaml
+# Configuration:
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://my-bucket/state
+state.backend.forst.local-dir: /tmp/forst-cache
+state.backend.forst.cache.size: 4gb
+
+# Async settings:
+state.backend.async.execution.in-flight-records-limit: 6000
+```
+
+---
+
+## In-flight records limit и back-pressure
+
+Без limit AEC мог бы submit 1M concurrent requests, переполняя worker pool. Параметр:
+
+```yaml
+state.backend.async.execution.in-flight-records-limit: 6000
+```
+
+Limits концurrent in-flight requests per subtask. Превышение → backpressure upstream, replay через mailbox.
+
+```yaml
+# Default values:
+state.backend.async.execution.in-flight-records-limit: 6000
+state.backend.async.execution.async-records-limit: 1000
+state.backend.async.execution.io-parallelism: 8
+```
+
+Tuning:
+- `in-flight-records-limit` — total budget records being processed. Чем больше, тем выше memory pressure, выше throughput.
+- `io-parallelism` — worker threads for actual I/O. Для ForSt — 8-16 (S3 supports high concurrency). Для RocksDB — 4 (local, less benefit).
+
+---
+
+## Timers и async
+
+Timers интегрированы с AEC:
+
+```java
+public void processElement(Event e, Context ctx, Collector<Result> out) {
+    state.asyncValue().thenAccept(v -> {
+        ctx.timerService().registerEventTimeTimer(e.getTimestamp() + 60_000);
+    });
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Result> out) {
+    state.asyncValue().thenAccept(v -> {
+        // process expiry
+        state.asyncClear();
+    });
+}
+```
+
+Timer fire тоже идёт через AEC — гарантирует per-key ordering relative to records и других timers.
+
+---
+
+## Side effects и async
+
+Side effects (например emit к Collector) **должны** происходить внутри callback:
+
+```java
+public void processElement(Event e, Context ctx, Collector<Result> out) {
+    // ❌ Wrong: emit ДО state read complete:
+    out.collect(new Result(e));
+    state.asyncValue().thenAccept(v -> { ... });
+
+    // ✅ Right: emit когда state available:
+    state.asyncValue().thenAccept(v -> {
+        out.collect(new Result(e, v));
+    });
+}
+```
+
+Иначе будет mismatch между state и output.
+
+---
+
+## Checkpointing с async API
+
+Checkpoint barrier взаимодействует с AEC специально. Когда barrier приходит:
+
+1. AEC останавливает submission новых state requests
+2. Waits для completion всех in-flight requests
+3. Snapshot state
+4. Resumes processing
+
+Это гарантирует, что snapshot consistent с processed records, без in-flight uncommitted writes.
+
+Это означает: **alignment latency** может быть выше с async API (если много in-flight). Tuning `in-flight-records-limit` влияет на checkpoint duration.
+
+---
+
+## Production gotchas
+
+### 1. Mixing sync и async — undefined behavior
+
+```java
+// ❌ Не миксуй в одном operator:
+state.update(state.value() + 1);                 // sync
+state.asyncValue().thenAccept(v -> ...);        // async
+```
+
+ForSt backend бросит exception при sync call. RocksDB будет работать, но per-key ordering нарушится. Choose one.
+
+### 2. Forgetting `thenAccept` — request dropped
+
+```java
+state.asyncValue();  // ← результат игнорируется
+// State был bы прочитан, но callback нигде не вызывается
+```
+
+Если не делаете callback, не делайте request. Каждый asyncValue должен chain в `thenAccept` или другой terminal.
+
+### 3. Exceptions внутри callback
+
+```java
+state.asyncValue().thenAccept(v -> {
+    throw new RuntimeException("oops");
+});
+// Exception propagates через AEC → fails subtask → triggers restart
+```
+
+Exception в callback = subtask failure. Используйте `exceptionally`:
+
+```java
+state.asyncValue()
+    .thenAccept(v -> { ... })
+    .exceptionally(ex -> {
+        logger.error("State access failed", ex);
+        return null;
+    });
+```
+
+### 4. Long-running computation в callback
+
+```java
+state.asyncValue().thenAccept(v -> {
+    // ❌ heavy computation блокирует mailbox:
+    expensiveCpuWork();
+});
+```
+
+Callbacks выполняются на **mailbox thread**. Heavy CPU в callback = блокирует event loop. Если CPU-heavy — используйте AsyncFunction (FLIP-79) или offload в worker thread manually.
+
+### 5. Memory growth с in-flight records
+
+Если `in-flight-records-limit` высокий (10k+), memory footprint растёт: каждый record в pipeline держит state I/O context. На constrained TaskManager это OOM.
+
+Monitor: `numAsyncInFlightRecords` метрика.
+
+### 6. State serialization внутри callback
+
+```java
+state.asyncValue().thenAccept(v -> {
+    state.asyncUpdate(modify(v));  // OK — async
+    // ❌ state.update(modify(v))  — sync call в async context, throws
+});
+```
+
+В async context используйте только async methods.
+
+### 7. Watermarks и async ordering
+
+```java
+state.asyncValue().thenAccept(v -> {
+    out.collect(new Result(...));
+    // Watermark может уйти ДО emit, если callback delay
+});
+```
+
+Watermarks propagate через mailbox. Если callback delayed, emit может быть после watermark. AEC решает это: watermark тоже scheduling-ed через AEC.
+
+---
+
+## Performance numbers (Apache benchmarks, Flink 2.0)
+
+| Backend + API | Throughput | Latency P99 |
+|---|---|---|
+| RocksDB sync | 50k events/sec | 5ms |
+| RocksDB async | 60k events/sec | 4ms |
+| ForSt sync (1GB cache) | 200 events/sec | 200ms |
+| ForSt async (1GB cache) | 30k events/sec | 15ms |
+| ForSt async (no cache) | 5k events/sec | 50ms |
+
+**Key takeaway**:
+- На local RocksDB async marginally better (10-20%)
+- На ForSt async — discontinuity. Without async ForSt unusable.
+
+---
+
+<Callout type="tip">
+Async State API V2 — paradigm shift, не «оптимизация». Если вы пишете новый Flink 2.x job — пишите async с самого начала, даже если используете RocksDB. Это futureproof (если позже migration на ForSt), нет penalty. Migration «потом» = переписать всю user-side state logic = риск багов.
+</Callout>
+
+---
+
+## Cheatsheet
+
+| Want to | Sync | Async V2 |
+|---|---|---|
+| Read value | `v = state.value()` | `state.asyncValue().thenAccept(v -> ...)` |
+| Update | `state.update(v)` | `state.asyncUpdate(v)` |
+| Map get | `m.get(k)` | `m.asyncGet(k).thenAccept(...)` |
+| Map put | `m.put(k, v)` | `m.asyncPut(k, v)` |
+| Map iterate | `m.entries()` | `m.asyncEntries().onNext(e -> ...)` |
+| Clear | `state.clear()` | `state.asyncClear()` |
+| Two reads → combine | `s1.value() + s2.value()` | `s1.asyncValue().thenCombine(s2.asyncValue(), (a,b) -> a+b)` |
+
+---
+
+<KnowledgeCheck
+  question="Почему ForSt backend ОБЯЗАТЕЛЬНО требует Async State API V2? Что произойдёт, если использовать sync API через ForSt? Дайте numerical reasoning."
+  answer="ForSt хранит primary state на S3 (или другом DFS), локальный диск только cache. Cache miss = S3 GET = 50-100ms latency. С sync API каждый state.value() блокирует mailbox thread на эту latency. Mailbox — single-threaded event loop subtask-а. Numerical: при 30% cache miss rate (типично для cold workload) и 10k events/sec, sync state access = 3000 misses/sec × 100ms = 300 секунд блокировки на каждую секунду wall clock. Это математически невозможно — subtask freezes, throughput падает до ~20 events/sec, backpressure упирается в source, checkpoint timeouts. С Async API V2 mailbox делегирует state requests в AEC, продолжает обрабатывать next records. AEC оркестрирует concurrent S3 I/O в worker pool (8 threads default), maintains per-key ordering through RequestBuffer. Real performance numbers (Apache benchmarks): ForSt+sync = 200 events/sec, ForSt+async = 30,000 events/sec — 150x разница. Это disruptive: без async API ForSt unusable, поэтому FLIP-424/425 (async) и FLIP-427 (ForSt) развивались как единый stack."
+/>

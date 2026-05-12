@@ -1,0 +1,222 @@
+---
+title: "Capstone — production readiness checklist"
+description: "Final review checklist: UIDs, watermark alignment, side output, state TTL, changelog backend, transaction timeout, autoscaler, observability, DR runbook. Что должно быть проверено перед production rollout."
+order: 9
+difficulty: "advanced"
+estimatedTime: 20
+topics: ["Production Readiness", "Checklist", "DR", "SLO"]
+---
+
+# Capstone — production readiness checklist
+
+Финальный review перед production rollout. Этот урок — comprehensive checklist всего, что должно быть verified, документировано, и approved до того, как pipeline начнёт обрабатывать production traffic.
+
+Production readiness — не one-time milestone. Это continuous responsibility, но first pass через checklist предотвращает 80% common production incidents.
+
+---
+
+## Checklist категории
+
+1. **Code quality** — UIDs, watermarks, idempotency, error handling.
+2. **State management** — TTL, sizing, recovery.
+3. **EOS verification** — sink configs, reconciliation.
+4. **Deployment** — K8s manifests, HA, autoscaling.
+5. **Observability** — metrics, alerts, dashboards, runbooks.
+6. **Performance** — latency, throughput SLOs.
+7. **Security** — secrets, network policies, authz.
+8. **DR** — runbooks, savepoint recovery.
+9. **Operational readiness** — on-call, escalation.
+
+---
+
+## 1. Code quality
+
+- [ ] **Все stateful операторы имеют explicit `.uid("name")`** — для savepoint compatibility при code changes.
+- [ ] **Operator names** через `.name("Human Readable Name")` — для web UI debug.
+- [ ] **Watermark strategy properly configured**: `forBoundedOutOfOrderness` с margin учитывающим P99 lag. `withIdleness` для idle partitions. `withWatermarkAlignment` для multi-source.
+- [ ] **All ProcessFunctions have proper exception handling** — `RuntimeException` should be expected; recoverable errors retry, unrecoverable fail loudly with context.
+- [ ] **Idempotency для command processing** — `requestId` deduplication через MapState с TTL.
+- [ ] **State serialization through proper TypeInformation** — Avoid generic POJOSerializer for stable schema evolution.
+- [ ] **Side outputs declared для late events** — `sideOutputLateData(tag)` на all windowed operators. Alerting on rate.
+- [ ] **No unbounded data structures в operator state** — lists, maps grow bounded. Watch для accidental retention.
+- [ ] **Resource closes properly в `close()`** — DB connections, HTTP clients, schemas closed.
+- [ ] **Code review by 2+ engineers** — production-critical code requires multi-eyes review.
+
+---
+
+## 2. State management
+
+- [ ] **State TTL configured для all keyed state** — без TTL — anti-pattern. Even «infinite» retention should be explicit.
+- [ ] **Cleanup strategies appropriate**: `cleanupInRocksdbCompactFilter(1000)` для RocksDB; `cleanupIncrementally(1000, true)` для heap; `cleanupFullSnapshot()` для snapshot-time cleanup.
+- [ ] **State backend choice justified**: ForSt для disaggregated (TBs state, fast recovery); RocksDB для smaller (< 100 GB); HashMap для truly tiny state.
+- [ ] **State size estimated и monitored** — calculate worst-case from cardinality × per-key overhead.
+- [ ] **maxParallelism set explicitly** — minimum 256 для future scaling.
+- [ ] **Changelog state backend (GIC) enabled** — для predictable checkpoint latency. `state.backend.changelog.enabled: true`.
+- [ ] **Savepoint strategy documented** — when to take savepoint, retention policy, location, encryption.
+- [ ] **State migration plan для known future changes** — schema evolution paths documented.
+
+---
+
+## 3. EOS verification
+
+- [ ] **`execution.checkpointing.mode: EXACTLY_ONCE`** explicitly set.
+- [ ] **Kafka source — replayable** через committed offsets.
+- [ ] **Sinks transactional или idempotent**:
+    - [ ] Paimon: `merge-engine: deduplicate` + primary-key + bucket-key.
+    - [ ] Iceberg: V2 spec + upsert mode.
+    - [ ] Kafka: `setDeliveryGuarantee(EXACTLY_ONCE)` + `transactional.id` prefix.
+    - [ ] ClickHouse: idempotent UPSERT по equality fields.
+- [ ] **Transaction timeout >= max downtime**: Kafka `transaction.timeout.ms: 900000` (15 min) for recovery from longest expected downtime.
+- [ ] **Reconciliation script in place** — periodically compares source vs sink counts, alerts on drift > threshold.
+- [ ] **EOS verified through chaos testing** — kill TM during processing, verify zero data loss.
+- [ ] **Late event handling defined** — allowedLateness configured, side output to archive, alerting on rate.
+
+---
+
+## 4. Deployment
+
+- [ ] **FlinkDeployment manifest committed to GitOps** — source of truth in Git, not manual kubectl.
+- [ ] **HA enabled**: `high-availability.type: kubernetes`, `jobManager.replicas: 2`, podAntiAffinity.
+- [ ] **Adaptive Scheduler enabled** — `jobmanager.scheduler: adaptive` для in-place rescaling.
+- [ ] **Autoscaler configured**: `job.autoscaler.enabled: true`, with min/max bounds для cost control.
+- [ ] **Resource requests/limits set** for all pods — prevent noisy-neighbor issues.
+- [ ] **Pod disruption budget** — `PodDisruptionBudget` allows max 1 TM disruption (during node maintenance).
+- [ ] **Image is pinned versioned tag** — not `latest`. Specific SHA preferred.
+- [ ] **Image signature verification** — via Cosign или similar для supply chain security.
+- [ ] **Secrets через K8s Secret или vault** — not in plain ConfigMap.
+- [ ] **Service account with minimum required RBAC**.
+- [ ] **Networkpolicies restrict ingress/egress** — Flink can only talk to required services (Postgres, Kafka, S3).
+
+---
+
+## 5. Observability
+
+- [ ] **OTel metrics + traces** configured и flowing.
+- [ ] **Prometheus scraping working** — verified в Grafana «up» queries.
+- [ ] **Loki logs collected** для всех pods.
+- [ ] **Grafana dashboards** — at least 12 charts canonical dashboard (см. урок 07).
+- [ ] **Alerts configured** with severity routing — critical → PagerDuty, warning → Slack.
+- [ ] **Runbooks linked from each alert** — on-call has actionable guidance.
+- [ ] **SLO defined и tracked**: latency P99, availability, data freshness.
+- [ ] **Cost monitoring** — S3 storage, K8s compute, Kafka network — track monthly.
+
+---
+
+## 6. Performance
+
+- [ ] **Load test in staging** matching production scale × 1.5.
+- [ ] **Latency P99 measured under load** — meets SLO (e.g. < 5s end-to-end для capstone).
+- [ ] **Throughput measured** — matches expected peak × 1.2 headroom.
+- [ ] **Backpressure investigations** — no sustained bp > 80% on any operator under normal load.
+- [ ] **Checkpoint duration < interval** — 60s checkpoint should complete in < 30s.
+- [ ] **Recovery time tested** — kill TM, measure recovery, document.
+- [ ] **State size projection** — extrapolate growth, plan storage capacity.
+
+---
+
+## 7. Security
+
+- [ ] **Secrets rotated** — passwords/API keys rotated regularly.
+- [ ] **TLS for all connections**: Kafka, Postgres, S3 — TLS verified в config.
+- [ ] **At-rest encryption** for S3, Paimon, Iceberg storage.
+- [ ] **Authentication для Flink Web UI** — not open access.
+- [ ] **Audit logging** — sensitive operations logged (savepoint creation, manual triggers).
+- [ ] **Dependency scanning** — image scan для CVE-s.
+- [ ] **Postgres replication user has minimum privileges** — REPLICATION + SELECT only.
+
+---
+
+## 8. Disaster Recovery
+
+- [ ] **DR runbook documented** — step-by-step procedures для:
+    - Complete region failure (failover к DR region).
+    - Total state corruption (restore from oldest reliable savepoint).
+    - Postgres source data loss (replay from Kafka archive).
+    - Operator skill gap (specific named on-call lead).
+- [ ] **Backup strategy**: savepoints to S3 + cross-region replication.
+- [ ] **Recovery objectives defined**:
+    - RTO (Recovery Time Objective) ≤ 5 min для node failure, ≤ 1 hour для DR.
+    - RPO (Recovery Point Objective) ≤ 1 min для node failure, ≤ 15 min для DR.
+- [ ] **Recovery procedure tested** — actual restore from old savepoint in staging. Not just theoretical.
+- [ ] **Cross-region failover tested** — if applicable, periodically.
+
+---
+
+## 9. Operational readiness
+
+- [ ] **On-call rotation** with primary + secondary engineers.
+- [ ] **Escalation paths defined** — who to call when.
+- [ ] **Runbooks comprehensive** — each alert has actionable instructions.
+- [ ] **Onboarding for new on-call** — shadow + dedicated training.
+- [ ] **Game day exercises** — quarterly chaos days с full team.
+- [ ] **Post-mortem culture** — blameless reviews, action items tracked.
+
+---
+
+## Pre-launch sign-offs
+
+Before going production:
+
+| Sign-off | Owner |
+|---|---|
+| Code review approved | Tech Lead |
+| Architecture review | Senior Engineer / Architect |
+| Security review | Security team |
+| Capacity review | SRE / Platform team |
+| Compliance review (if applicable) | Legal / Compliance |
+| On-call ready | On-call lead |
+| Stakeholder communication | Product Owner |
+
+---
+
+## Post-launch monitoring (first 2 weeks)
+
+Tight monitoring period после launch:
+
+- **Daily standup** — review metrics, anomalies, issues.
+- **War room для launch day** — full team available для immediate response.
+- **Increased alert sensitivity** — temporarily lower thresholds.
+- **Manual reconciliation runs** — verify EOS in production reality.
+- **Performance baseline collection** — establish normal patterns для future anomaly detection.
+
+After 2 weeks без major incidents, transition к regular operations cadence.
+
+---
+
+## Production gotchas (process-level)
+
+- **Checklist becomes ritual без deep engagement** — checking boxes without understanding. Counter: explain «why» each item, not just «what».
+- **Sign-offs delayed forever** — block production за detail. Counter: define «must have» vs «nice to have» — block only on must.
+- **Runbooks written but never tested** — stale by time needed. Counter: include в onboarding, periodic «runbook drills».
+- **«We'll add observability later»** — pipeline launches, breaks, no visibility. Counter: no production traffic until observability complete.
+- **«It works in staging»** — staging != production traffic patterns. Counter: gradual rollout, canary deployment.
+- **Late chaos testing** — discover issues after production launch. Counter: chaos before launch, ongoing schedule.
+- **Capacity planning через guesses** — under-sized → outages. Counter: measure in staging, extrapolate, add 50% buffer.
+- **Single-person tribal knowledge** — bus factor 1. Counter: documentation, knowledge sharing, multiple owners.
+
+<Callout type="warning">
+**Most production failures are foreseeable** — they appear in retrospect «obvious» issues that nobody verified. Checklist exists not because each item is rare, but because covering all of them is impossible to do mentally. Use it religiously. Trust the process, not vibes.
+</Callout>
+
+---
+
+## Capstone summary
+
+You've built:
+
+- **Source layer** — Flink CDC из Postgres, schema evolution propagation.
+- **Stateful layer** — UserAggregator с ValueState/MapState/timers, temporal joins, watermark alignment, side outputs для fraud и late events.
+- **Sink layer** — Paimon EOS + Iceberg mirror + ClickHouse, pre-commit compaction, retention policy.
+- **K8s deployment** — Flink Kubernetes Operator с autoscaler, HA, blue/green upgrades.
+- **Observability** — OTel + Prometheus + Grafana с 12 charts, alerting с severity routing, runbooks.
+- **Chaos verification** — 8 scenarios tested, EOS verified, recovery times measured.
+- **Production readiness** — comprehensive checklist completed.
+
+Это полноценная production-grade real-time pipeline. Скиллы переносимы на любой Flink production use case — fraud detection, real-time analytics, lakehouse ingestion, ML feature stores.
+
+---
+
+<KnowledgeCheck
+  question="Production readiness review: ваша команда хочет launch capstone в production через 1 неделю. Stakeholders pressure для quick launch. Going through checklist, вы видите: (1) Chaos testing — только 3 scenarios tested out of 8; (2) DR runbook — written but не tested; (3) State TTL — set, но reconciliation script показывает state growth 5% week-over-week (TTL eventually plateau, но not proven); (4) Side output для late events configured, но Kafka archive sink has no retention policy. Какие из этих — block launch, и какие plan для post-launch fix?"
+  answer="Risk-based prioritization. **BLOCK launch (must fix)**: (1) **Chaos testing incomplete** — 3/8 scenarios tested means 5 unknown failure modes. Production launch без knowing how pipeline reacts to JM crash, network partition, S3 slow — is taking blind risk. Если any of those happen в first week production → data loss / extended outage. Fix: complete remaining 5 scenarios in staging этой week. **Acceptable to launch (with monitoring)**: (3) **State TTL growth 5%/week** — это concerning trend но не blocker если: (a) extrapolated growth doesn't exceed capacity in next 90 days (calculate: current 200GB × 1.05^12 weeks = 360GB в 3 месяца, fine for ForSt + S3); (b) reconciliation continues running и alerts when 80% capacity reached; (c) post-launch action item: investigate WHY 5% growth — TTL not effective for some keys? Schema with unbounded data? Fix root cause в 2-4 weeks. (4) **No retention policy on archive Kafka topic** — late events archive growing unbounded. Не blocker (small relative to main data flow), but immediate Day-1 fix: set retention 30-90 days. Add к Day 1 post-launch tickets. **Plan for post-launch (within first month)**: (2) **DR runbook untested** — written but не tested = false confidence. Schedule game day exercise within first 2 weeks. Without tested DR, launch acceptable IF SLA is internal-only / not regulator-required. Critical SLA → block until tested. **Stakeholder communication**: 'Launch blocked: completing chaos test scenarios. ETA 4-7 days. Trade-off: complete launch readiness vs partial coverage + production risk. Recommend complete.' Set expectations clear — chaos testing is hours of work, completing this saves potentially days/weeks of production outage. **Lesson на process**: production launch pressure is constant. Checklist exists to provide objective criteria для go/no-go. Defer pressure with data — show specific scenarios что fall under untested categories, quantify risk. Stakeholder accept after seeing concrete potential incidents. 'Trust the process' > 'just launch faster'."
+/>

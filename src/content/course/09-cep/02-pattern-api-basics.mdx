@@ -1,0 +1,305 @@
+---
+title: "Pattern API basics: begin, where, next, within, times"
+description: "Flink CEP Pattern API — building blocks: Pattern.begin/where/next/within/times, PatternStream<T>, CEP.pattern(stream, pattern), select function для extracting matches"
+order: 2
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["CEP", "Pattern API", "PatternStream", "begin", "where", "next", "within", "times"]
+---
+
+# Pattern API basics — building blocks CEP
+
+Flink CEP Pattern API — это DSL для описания event patterns над KeyedStream. Внутри он компилируется в NFA (Non-deterministic Finite Automaton) и выполняется как stateful operator с per-key partial-match state. Этот урок разбирает атомарные primitives: `begin`, `where`, `next`, `within`, `times` — из них собираются всё более сложные patterns.
+
+CEP — это compromise между declarative SQL (`MATCH_RECOGNIZE`) и imperative state machine (`KeyedProcessFunction`). DSL быстрее писать, чем custom state machine, но даёт меньше control. Правильное понимание primitives — ключ к правильному выбору между этими тремя подходами.
+
+---
+
+## Anatomy одного pattern
+
+Минимальный pattern — это один state с predicate:
+
+```java
+Pattern<Event, ?> singleFail = Pattern.<Event>begin("fail")
+    .where(SimpleCondition.of(e -> "LOGIN_FAIL".equals(e.getType())));
+```
+
+Это описывает: «match событие где type=LOGIN_FAIL». State имеет name `"fail"` — мы будем использовать это name чтобы извлечь matched events позже (`match.get("fail")`).
+
+Уже здесь видны три ключевых building block:
+
+1. **`Pattern.<T>begin(name)`** — factory для нового pattern. Type parameter `T` — type of events в input stream. Name — symbolic identifier state-а.
+2. **`.where(IterativeCondition)`** — фильтр-predicate, который applies к каждому event-у. Может быть `SimpleCondition` (только сам event) или `IterativeCondition` (access ко всем previously matched events текущего partial-match).
+3. **Builder pattern returning `Pattern<T, F>`** — мы chain дальше operations.
+
+<Callout type="note">
+Pattern API использует Java generics с `Pattern<T, F>`: `T` — type of input events, `F` — refined type (`F extends T`). Refinement происходит через `subtype(Class)` — например `.subtype(LoginEvent.class)` сужает тип. На практике большинство кода работает с `Pattern<T, ?>` где wildcards скрывают refinement.
+</Callout>
+
+---
+
+## Связки между states: next, followedBy, followedByAny
+
+После первого state нужно описать **что идёт за ним**. Здесь начинаются три варианта contiguity (разбираются глубже в уроке 03):
+
+```java
+Pattern<Event, ?> threeFails = Pattern.<Event>begin("first")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .next("second")                                  // strict: следующий ровно за first
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .next("third")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()));
+```
+
+`next(name)` — strict contiguity: следующее event должно прийти **immediately after** previous (без других events между). Для нашего fail-fail-fail pattern это значит: если между двумя FAIL пришёл SUCCESS, pattern прерывается.
+
+В большинстве real-world задач strict contiguity — слишком жёсткое. Например fraud detection: «3 fails within 1 minute» — нам неважно, были ли между ними другие events. Тогда нужен `followedBy`:
+
+```java
+Pattern<Event, ?> threeFailsRelaxed = Pattern.<Event>begin("first")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .followedBy("second")                           // relaxed: другие events допускаются
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .followedBy("third")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .within(Duration.ofMinutes(1));
+```
+
+Между state `first` и `second` могут быть other events — но первый FAIL отстаёт от второго FAIL по времени.
+
+---
+
+## Window constraint: within
+
+`within(Duration)` ограничивает максимальное время от первого до последнего event-а в matched sequence. Это критичный component — без него pattern может matching-ить vечно, накапливая partial matches:
+
+```java
+.within(Duration.ofMinutes(1))    // max 1 minute от first до last event
+```
+
+Семантика `within`:
+- В event time mode: timestamp последнего event - timestamp первого event ≤ Duration
+- В processing time mode: то же но wall clock
+
+Без `within` Flink не может прунить partial matches → memory leak. На production без `within` patterns по факту неприменимы.
+
+<DiagramContainer title="Pattern lifecycle: from begin до match emit" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Input stream"
+        tooltip="KeyedStream<Event, K> — события partitioned by key (например userId). CEP runs per-key — каждый partial match изолирован per key."
+      >
+        keyBy(userId) → events
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="event arrives, NFA processes" />
+    <FlowRow>
+      <DataBox
+        label="NFA state engine"
+        tooltip="Maintains active states per key. На каждое event пробует продвинуть NFA: applies where() predicates, переходит между states. Partial matches хранятся в Flink keyed state (MapState). См. урок 05 для deep dive."
+      >
+        NFA + partial matches state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="full sequence matched OR within() expired" />
+    <FlowRow>
+      <DataBox
+        label="Match emitted"
+        tooltip="При полном match-е PatternStream получает Map<String, List<Event>> где ключи — names from begin/next/followedBy. .select() function превращает это в output event."
+      >
+        Map&lt;String, List&lt;Event&gt;&gt;
+      </DataBox>
+      <DataBox
+        label="Timeout (опционально)"
+        tooltip="Если pattern не завершился внутри within() и установлен .select(OutputTag, ...) — таймаут-кандидаты эмитятся в side output. Полезно для 'pattern не завершился вовремя' alerts."
+      >
+        side output (timeout)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Quantifier: times
+
+Вместо повторения `next(...).where(...)` N раз можно использовать `times(N)`:
+
+```java
+Pattern<Event, ?> threeFails = Pattern.<Event>begin("fail")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .times(3)                                        // ровно 3 раза
+    .within(Duration.ofMinutes(1));
+```
+
+Это equivalent трём `next("first")...next("second")...next("third")`, но компактнее. Когда match происходит, `match.get("fail")` вернёт `List<Event>` из 3 элементов.
+
+`times(min, max)` задаёт range:
+
+```java
+.times(2, 5)    // от 2 до 5 раз
+```
+
+Quantifiers глубже разобраны в уроке 03 — там же `oneOrMore`, `optional`, contiguity modes для repeated states.
+
+---
+
+## CEP.pattern + PatternStream + select
+
+Пример полного pipeline:
+
+```java
+DataStream<Event> input = env.fromSource(
+    kafkaSource, WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+        .withTimestampAssigner((e, ts) -> e.getEventTime()),
+    "events");
+
+Pattern<Event, ?> pattern = Pattern.<Event>begin("fail")
+    .where(SimpleCondition.of(e -> "LOGIN_FAIL".equals(e.getType())))
+    .times(3)
+    .within(Duration.ofMinutes(1));
+
+PatternStream<Event> patternStream = CEP.pattern(
+    input.keyBy(Event::getUserId),    // обязательно keyed!
+    pattern
+);
+
+DataStream<Alert> alerts = patternStream.select(
+    (Map<String, List<Event>> match) -> {
+        List<Event> fails = match.get("fail");
+        Event first = fails.get(0);
+        return new Alert(first.getUserId(), "3 login fails within 1 minute",
+                         first.getEventTime());
+    }
+);
+
+alerts.sinkTo(kafkaAlertsSink);
+```
+
+Ключевые моменты:
+
+1. **`input.keyBy(...)`** — CEP требует KeyedStream. NFA state isolated per key. Без keyBy все events в одном NFA — это редко то, что хотят.
+2. **`CEP.pattern(keyedStream, pattern)`** — factory создаёт `PatternStream<T>`. Внутри это `KeyedProcessFunction` с NFA logic.
+3. **`.select(SelectFunction)`** — функция превращает matched map в output event. Map keys — names из `begin`/`next`/`followedBy`. Values — `List<T>` (даже для one-event states, потому что quantifiers могут произвести list).
+4. **Timestamps в alerts** — обычно вы передаёте timestamp последнего event-а или первого, в зависимости от semantics.
+
+---
+
+## IterativeCondition: access к previously matched events
+
+`SimpleCondition` смотрит только на current event. `IterativeCondition` имеет access к ranges всех matched events в текущем partial-match:
+
+```java
+Pattern<Transaction, ?> escalating = Pattern.<Transaction>begin("first")
+    .where(SimpleCondition.of(tx -> tx.getAmount() > 100))
+    .followedBy("second")
+    .where(new IterativeCondition<Transaction>() {
+        @Override
+        public boolean filter(Transaction current, Context<Transaction> ctx) throws Exception {
+            // sum of all previously matched "first" amounts
+            double sum = 0;
+            for (Transaction prev : ctx.getEventsForPattern("first")) {
+                sum += prev.getAmount();
+            }
+            return current.getAmount() > sum;     // current > sum of all firsts
+        }
+    })
+    .within(Duration.ofHours(1));
+```
+
+Это позволяет patterns с running aggregations: «event whose value > average of previous N events», «N escalating amounts», и т.д.
+
+<Callout type="warning">
+`IterativeCondition` существенно дороже `SimpleCondition`. На каждое candidate-event для transition NFA iterates через все previously matched events — это O(N) per check. Для `oneOrMore` без bound это может deteriorate в O(N²) over всю sequence. Если можно — используйте `SimpleCondition` + хранение running aggregate в external operator state (через `KeyedProcessFunction` upstream).
+</Callout>
+
+---
+
+## Сравнительная таблица primitives
+
+| Construct | Тип | Что делает | Когда использовать |
+|---|---|---|---|
+| `Pattern.begin(name)` | Factory | Первый state pattern-а | Всегда — каждый pattern starts с begin |
+| `.where(condition)` | Filter | Predicate на event | Базовый фильтр matched events |
+| `.next(name)` | Contiguity | Strict: следующий ровно immediately | Когда последовательность строгая («ровно за этим») |
+| `.followedBy(name)` | Contiguity | Relaxed: допускает other events between | Большинство real-world (3 fails within window) |
+| `.followedByAny(name)` | Contiguity | Non-deterministic relaxed | Когда нужны overlapping matches |
+| `.within(Duration)` | Window | Max time от first до last event | **Обязательно** для production |
+| `.times(N)` | Quantifier | Ровно N раз | N идентичных events |
+| `.times(min, max)` | Quantifier | Range | Flexible count |
+| `.oneOrMore()` | Quantifier | 1+ раз (greedy) | Variable-length sequences |
+| `.optional()` | Quantifier | 0 или 1 раз | Optional event |
+| `.subtype(Class)` | Refinement | Narrows type | Когда stream имеет суперкласс events |
+
+---
+
+## Production gotchas
+
+### 1. keyBy перед CEP.pattern — обязательно
+
+```java
+// ❌ NON-keyed CEP — все events идут в один NFA
+PatternStream<Event> bad = CEP.pattern(input, pattern);
+
+// ✅ keyed CEP — изолированные NFAs per key
+PatternStream<Event> good = CEP.pattern(input.keyBy(Event::getUserId), pattern);
+```
+
+Non-keyed CEP допустим только для global patterns (типа «system-wide spike») и performance кошмар для high-throughput.
+
+### 2. within() — не optional на production
+
+Без `within` partial matches накапливаются вечно. Например pattern «A followedBy B» без within: каждый A создаёт partial match, который ждёт B forever. Если B никогда не приходит для конкретного key — state растёт linearly.
+
+```java
+// ❌ Memory leak waiting to happen
+.followedBy("end").where(...).select(...)
+
+// ✅ Bounded
+.followedBy("end").where(...).within(Duration.ofMinutes(10)).select(...)
+```
+
+### 3. Timestamps + watermarks → pattern emits
+
+CEP в event time mode ждёт watermark чтобы эмитить match. Если watermark stalled (idle source, неправильный WatermarkStrategy) — patterns matched, но не emit. Симптом: «pattern works в unit-test, но не в production».
+
+Mitigation: `WatermarkStrategy.withIdleness(Duration.ofMinutes(1))` чтобы idle partitions не блокировали watermark progression.
+
+### 4. select() vs flatSelect() vs process()
+
+- `.select(fn)` — emit ровно один event per match.
+- `.flatSelect(fn)` — emit zero or more events per match (через Collector).
+- `.process(PatternProcessFunction)` — full access к Context (timer service, side outputs, current watermark).
+
+Для timeouts используйте `.process()` с `processTimedOutMatch`:
+
+```java
+patternStream.process(new PatternProcessFunction<Event, Alert>() {
+    @Override
+    public void processMatch(Map<String, List<Event>> match, Context ctx,
+                             Collector<Alert> out) {...}
+
+    public void processTimedOutMatch(Map<String, List<Event>> match, Context ctx) {
+        // emit timeout alert
+    }
+});
+```
+
+---
+
+## Key takeaways
+
+- Pattern = chain of states (`begin`/`next`/`followedBy`) с predicates (`where`) и quantifiers (`times`/`oneOrMore`/`optional`).
+- **`within(Duration)` обязательно** на production — иначе memory leak.
+- **`keyBy()` обязательно перед `CEP.pattern()`** — иначе все events в одном NFA.
+- `SimpleCondition` дёшево, `IterativeCondition` дорого (O(N) per check).
+- `select` — один event per match, `flatSelect` — N events, `process` — full Context.
+- В event time mode patterns emit-ятся только когда watermark progresses → idleness handling важен.
+
+---
+
+<KnowledgeCheck
+  question="У вас pattern: '3 LOGIN_FAIL events followed by 1 LOGIN_SUCCESS within 5 минут'. Какие primitives Pattern API вы используете и почему?"
+  answer="Pattern.<Event>begin('fails').where(e -> 'LOGIN_FAIL'.equals(e.getType())).times(3).followedBy('success').where(e -> 'LOGIN_SUCCESS'.equals(e.getType())).within(Duration.ofMinutes(5)). begin('fails') — первый state. times(3) — quantifier ровно 3 раза для compactness вместо трёх next(). followedBy('success') — relaxed contiguity потому что между 3 fails и success могут быть другие events (например LOGIN_RECOVER attempts). within(5min) — bound для prevent memory leak и для semantic correctness (это suspicious brute-force pattern). keyBy(userId) перед CEP.pattern() обязателен для per-user isolation."
+/>

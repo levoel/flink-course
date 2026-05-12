@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/06-file-sinks-eos",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-06",
+    "description": "Quiz for File Sinks EOS lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-06-q1",
+      "type": "multiple-choice",
+      "question": "Три состояния file lifecycle в FileSink (FLIP-191):",
+      "options": [
+        { "id": "a", "text": "Open, Closed, Archived" },
+        { "id": "b", "text": "(1) In-progress — файл активно пишется, name '.inprogress.{uuid}', hidden от query engines; (2) Pending — rolling policy triggered, file closed но НЕ visible, transaction ID в Flink state; (3) Finished — после checkpoint commit атомарный rename → final name 'part-N-K', visible downstream" },
+        { "id": "c", "text": "Created, Modified, Deleted" },
+        { "id": "d", "text": "Stage1, Stage2, Stage3" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FileSink lifecycle implements EOS через atomic rename pattern. **In-progress (.inprogress.{uuid})**: leading dot makes file hidden в большинстве query engines (Hive, Trino skip hidden files). Records append-ятся по мере прихода. **Pending (.pending.{uuid})**: rolling policy triggered (size/time/inactivity for row format; checkpoint boundary for bulk format). SinkWriter renames .inprogress → .pending, closes file. Committable с pending path saved в Flink state. **Finished (part-N-K)**: Committer на notifyCheckpointComplete делает atomic rename .pending → final. Это последний step EOS commit. Файл visible. Hidden naming convention важен: query engines partial scans не подхватят in-progress/pending. Rollback path: на crash before commit — pending files exist на disk но Flink state не знает о них без committable, либо они re-emit через committable восстановление, либо clean up на recovery.",
+      "studyHint": "Повторите урок — секция 'File lifecycle'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m07-06-q2",
+      "type": "multiple-choice",
+      "question": "Почему DefaultRollingPolicy с maxPartSize/rolloverInterval НЕ работает для FileSink с Parquet (forBulkFormat)?",
+      "options": [
+        { "id": "a", "text": "Parquet не поддерживает streaming writes" },
+        { "id": "b", "text": "Columnar formats (Parquet, ORC) пишут metadata footer в конце файла. Нельзя 'append' к существующему Parquet файлу — каждый file должен быть закрыт целиком. FileSink rolls bulk format ТОЛЬКО на checkpoint boundary (OnCheckpointRollingPolicy effectively). Setting DefaultRollingPolicy для bulk silently ignored — default to OnCheckpointRollingPolicy" },
+        { "id": "c", "text": "Parquet требует другой sink" },
+        { "id": "d", "text": "Это deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это fundamental constraint columnar formats. Parquet file structure: [Data Blocks] [Footer Metadata (schema, statistics, row groups)] [Magic]. Footer написана только при close — содержит row group offsets, statistics per column, schema. **Cannot append**: добавление новых rows требует rewrite footer (it's at end). Streaming writers buffer данных в memory/temp, flush сразу batch с complete metadata. Implications для FileSink: (a) Bulk format MUST roll on checkpoint boundary — иначе metadata corrupted; (b) DefaultRollingPolicy.withMaxPartSize/withRolloverInterval ignored для bulk; (c) Effective rolling policy = OnCheckpointRollingPolicy для bulk. Implications для file count: 60s checkpoint × 16 subtasks × 24 buckets per hour = 23K files per day для bulk. Это small file problem. Solutions: (1) increase checkpoint interval до 5min — larger batches; (2) use SupportsPreCommitTopology для compaction; (3) switch на Iceberg/Paimon с native compaction. Row format (SimpleStringEncoder) поддерживает full rolling policy потому что каждая line independent — append-friendly.",
+      "studyHint": "Повторите урок — секция 'Two formats: forRowFormat vs forBulkFormat'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-06-q3",
+      "type": "multiple-choice",
+      "question": "На S3 (eventually consistent старая модель) FileSink EOS работает не через native rename. Какой mechanism используется?",
+      "options": [
+        { "id": "a", "text": "Symbolic links" },
+        { "id": "b", "text": "Multipart Upload approach: (1) In-progress = open multipart upload, parts uploaded incrementally; (2) Pending = complete multipart upload в pending object key; (3) Finished = atomic copy + delete pending → final key. Modern S3 (с 2020) strongly consistent, что делает этот pattern EOS-safe. Iceberg/Paimon escape S3 limitations через commit-log в metadata layer instead of filesystem rename" },
+        { "id": "c", "text": "AWS Lambda triggers" },
+        { "id": "d", "text": "Только HDFS поддерживается" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "S3 historically не имело atomic rename — `rename(a, b)` = `copy(a, b)` + `delete(a)`. Это не атомарно: race condition между copy и delete, может остаться один или оба. FileSink Multipart Upload approach: (1) **In-progress**: вызывается S3 CreateMultipartUpload API, returns uploadId. Parts uploaded через UploadPart (5MB+ chunks). Не visible как single object до complete. (2) **Pending**: CompleteMultipartUpload — собирает parts в один object в pending name. Это atomic от S3 perspective. (3) **Finished**: server-side copy + delete pending. На modern S3 (post Dec 2020 strong consistency) — этот copy atomically visible. **Iceberg/Paimon escape**: вместо filesystem rename, atomicity через metadata commit. Iceberg: append к metadata.json через CAS update catalog pointer. Paimon: snapshot file write + atomic LATEST file rename. Это smart pattern — единственный atomic operation на S3 — это object write (write Object happens at once). Metadata layer = single point of atomicity, data files immutable. Это why lakehouse formats outperform raw FileSink на S3.",
+      "studyHint": "Повторите урок — секция 'Filesystem atomicity gotchas'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-06-q4",
+      "type": "true-false",
+      "question": "DateTimeBucketAssigner создаёт directory structure compatible с Hive partitioning (yyyy-MM-dd/HH), что позволяет query engine partition pruning.",
+      "correctAnswer": true,
+      "explanation": "True. DateTimeBucketAssigner с pattern `yyyy-MM-dd/HH` (or similar) generates Hive-style partition layout: s3://data-lake/events/2026-05-12/14/part-0-0.parquet. Query engines (Hive, Trino, Spark, Presto) support partition pruning — push WHERE clause на partition keys, scan только нужные directories. Example query SELECT * FROM events WHERE date='2026-05-12' AND hour=14 — scan только этот directory, ignore остальные. Это order-of-magnitude performance improvement для time-range queries. Production patterns: (a) для daily partitioning: `yyyy-MM-dd` — partitions per day; (b) для hourly: `yyyy-MM-dd/HH`; (c) custom assigner для composite keys: 'region=us-east-1/date=2026-05-12'. Trade-off: чем мельче partition (hourly vs daily), тем меньше files per partition но больше total partition count — query planning slower на large partition count. Best balance для streaming: hourly partitions (good prune granularity, manageable count). DateTimeBucketAssigner uses Context.currentProcessingTime by default — для event-time partitioning нужен custom assigner с event timestamp extraction.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

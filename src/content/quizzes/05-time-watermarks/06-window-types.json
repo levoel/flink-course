@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/06-window-types",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-06",
+    "description": "Quiz for window types lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-06-q1",
+      "type": "multiple-choice",
+      "question": "Sliding window 24h с slide 1 min — какое state impact и почему это anti-pattern?",
+      "options": [
+        { "id": "a", "text": "State такой же как для tumbling 24h" },
+        { "id": "b", "text": "Overlap multiplier = size/slide = 1440. Каждое событие попадает в 1440 окон, state per key ×1440. Anti-pattern: 100K events/sec × 1440 windows = unbounded state growth. Fix: использовать AggregateFunction (running aggregate per window) вместо ProcessWindowFunction (raw events) или Table API CUMULATE" },
+        { "id": "c", "text": "Slide=1min делает окно невалидным" },
+        { "id": "d", "text": "Flink автоматически переключается на CUMULATE" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sliding window state multiplier = window_size / slide. 24h/1min = 1440. Каждое событие добавляется в 1440 windows' state. С ProcessWindowFunction (хранит raw events) — exponential state growth, RocksDB OOM. Fixes по эскалации: (1) AggregateFunction — Flink держит running aggregate (single double per window per key) вместо raw events, state стабилен; (2) Table API CUMULATE — built-in 'rolling' semantic с reset, O(1) state per window per key, не 1440; (3) Custom KeyedProcessFunction с MapState и manual emit/cleanup. CUMULATE — обычно лучший choice для 'last 24h with 1min updates' pattern.",
+      "studyHint": "Повторите урок — раздел 'Sliding Windows'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-06-q2",
+      "type": "multiple-choice",
+      "question": "Session window: что значит 'window merging'?",
+      "options": [
+        { "id": "a", "text": "Объединение окон разных keys" },
+        { "id": "b", "text": "Session windows dynamic: out-of-order event с timestamp между двумя existing sessions объединяет их в одну. Например, Window[10:00, 10:30] и Window[10:25, 10:55] merge в Window[10:00, 10:55]. MergingWindowAssigner делает logic, triggers получают onMerge() callback" },
+        { "id": "c", "text": "Merging происходит между разными jobs" },
+        { "id": "d", "text": "Это deprecated концепт из Flink 1.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Window merging — особенность session windows. При arrival out-of-order event Flink может comer что два уже-existing window должны merge. Пример: events arrive ts=10:00, потом ts=10:25, создавая Window[10:00, 10:30] и Window[10:25, 10:55]. Если приходит event с ts=10:28 (out-of-order, между этими session) — он extends обе window так что они overlap → MergingWindowAssigner объединяет в Window[10:00, 10:55]. Triggers получают onMerge() callback для consolidation state. Custom triggers должны handle merge — иначе old session state может остаться. Это why standard EventTimeTrigger correctly handles merging.",
+      "studyHint": "Повторите урок — раздел 'Session Windows'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-06-q3",
+      "type": "multiple-choice",
+      "question": "Trigger TriggerResult: разница FIRE, PURGE, FIRE_AND_PURGE?",
+      "options": [
+        { "id": "a", "text": "Они все синонимы" },
+        { "id": "b", "text": "FIRE: emit window result, state удерживается (для possible re-fires на late events). PURGE: clear state, без emit (rare use). FIRE_AND_PURGE: emit AND clear state. CONTINUE: ничего не делать. Default EventTimeTrigger возвращает FIRE на windowEnd (без PURGE — позволяет re-fires с allowedLateness)" },
+        { "id": "c", "text": "FIRE для emit, PURGE для shutdown" },
+        { "id": "d", "text": "PURGE deprecated в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "TriggerResult — четыре варианта: CONTINUE (wait, ничего не делать), FIRE (emit result, state удерживается), PURGE (clear state без emit, редко используется напрямую), FIRE_AND_PURGE (emit + clear). Default EventTimeTrigger.onEventTime() возвращает FIRE на windowEnd (allows re-fires with allowedLateness). С expiring через cleanup timer на windowEnd + allowedLateness — FIRE_AND_PURGE. Custom trigger pattern: early firing (FIRE на process time timer) + final firing (FIRE_AND_PURGE на event time timer). PurgingTrigger.of(otherTrigger) — wrapper, который превращает FIRE → FIRE_AND_PURGE для downstream.",
+      "studyHint": "Повторите урок — раздел 'Triggers'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m05-06-q4",
+      "type": "true-false",
+      "question": "State TTL config работает для window state — можно установить TTL=24h и Flink автоматически очистит старые windows.",
+      "correctAnswer": false,
+      "explanation": "False. State TTL (StateTTLConfig) НЕ работает для window state. Window state управляется отдельно через allowedLateness — окно state удерживается до WM > windowEnd + allowedLateness, потом cleared. State TTL — для keyed state (ValueState, MapState, etc.) с TimeCharacteristic.ProcessingTime или EventTime per state primitive. Это два разных mechanism. Применить TTL к window state — нет API, и нет правильного семантики (что значит 'TTL window'? Cleanup post-fire? Это уже сделано Flink-ом). Если нужен extended retention window state — используйте allowedLateness. Если нужен retention keyed state вне windows — StateTTLConfig.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

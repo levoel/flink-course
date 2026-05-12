@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/07-iceberg-paimon-anatomy",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-07",
+    "description": "Quiz for Iceberg/Paimon sinks anatomy lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-07-q1",
+      "type": "multiple-choice",
+      "question": "Как Iceberg sink achieves atomic commit при concurrent writes?",
+      "options": [
+        { "id": "a", "text": "Lock на entire table в catalog" },
+        { "id": "b", "text": "CAS (compare-and-swap) update на catalog pointer к metadata.json. table.newAppend().appendFile(...).commit() читает current metadata, builds new metadata file, atomic CAS update catalog pointer. На conflict (другой writer обновил между read и CAS) — retry. Это single point atomicity. Committer обычно parallelism=1 чтобы избежать частых retry" },
+        { "id": "c", "text": "Через distributed lock в ZooKeeper" },
+        { "id": "d", "text": "First-writer-wins, последующие fail" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Iceberg atomicity model — elegant single-source-of-truth pattern. Table state = catalog pointer к 'current metadata.json'. Каждый snapshot creates new metadata.json file. Commit sequence: (1) table.refresh() — reads current metadata version из catalog; (2) Build new metadata with appended files; (3) Write new metadata.json file (regular write, not atomic in itself); (4) CAS update catalog: 'IF current_pointer = X THEN update to Y'. Если другой writer updated между steps 1-4, CAS fails. Iceberg retries: re-read, re-build with merged state, re-CAS. Catalog implementations (Hive, Glue, Nessie, JDBC) provide CAS primitive: Hive metastore через locking, Glue via DynamoDB conditional write, Nessie via Git-like commits, JDBC via SQL transaction. Best practice: committer parallelism = 1 для streaming sink — multiple concurrent committers waste resources на CAS retries без real parallelism benefit. На high commit rate (per checkpoint) — даже parallelism 1 может conflict с external Spark batch writers. Solution: time-windowed commit или separate tables per writer.",
+      "studyHint": "Повторите урок — секция 'Iceberg sink — internals'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-07-q2",
+      "type": "multiple-choice",
+      "question": "Чем Paimon отличается от Iceberg для streaming workloads с frequent updates?",
+      "options": [
+        { "id": "a", "text": "Paimon только batch, Iceberg streaming" },
+        { "id": "b", "text": "Paimon — LSM-tree storage с native UPSERT через primary key, continuous integrated compaction. Iceberg v2 — flat list of files + equality deletes (merge-on-read). Для update-heavy workloads (CDC sink): Paimon native efficient, Iceberg накапливает delete files которые требуют отдельный rewrite_files procedure для consolidation. Paimon also emits changelog stream для downstream Flink consumers" },
+        { "id": "c", "text": "Никакой разницы — they're identical" },
+        { "id": "d", "text": "Paimon только для small data" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Архитектурные разницы для streaming updates. **Iceberg model**: flat list of immutable files. Update record = equality delete file (помечает старую запись deleted) + new data file. Read merges: scan data files, apply equality deletes, return remaining. Pros: simple architecture, multi-engine compatibility. Cons: (a) read amplification растёт с delete file count; (b) compaction = separate rewrite_files action which fully rewrites partitions; (c) latency between sink commit и optimal read structure. **Paimon model**: LSM-tree поверх Parquet/ORC. Records sorted by primary key, organized в levels (L0/L1/.../Ln). Update record = new entry, LSM merge consolidates over time. Compaction integrated: writer thread может trigger sync L0→L1 compact, или async background. Changelog producer feature: each commit Paimon emits stream of changes (INSERT/UPDATE/DELETE) для downstream Flink/Spark streaming consumers — essentially CDC из data lake. When use what: Paimon — CDC sink, frequent updates, latency-sensitive, single-engine (Flink-heavy). Iceberg — append-heavy, multi-engine reads (Spark, Trino, Snowflake), historical data lake, time-travel queries.",
+      "studyHint": "Повторите урок — секция 'Iceberg vs Paimon — when to use what'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m07-07-q3",
+      "type": "multiple-choice",
+      "question": "Production Iceberg streaming sink: 32 writer parallelism, 60s checkpoint, без pre-commit compaction, после месяца Trino query latency 5min (было 5s). metadata.json 200MB, 8M small Parquet files. Step-by-step fix?",
+      "options": [
+        { "id": "a", "text": "Только увеличить writer parallelism" },
+        { "id": "b", "text": "(1) IMMEDIATE: CALL system.expire_snapshots — удалить old snapshots, shrink metadata.json. (2) FILE COMPACTION: CALL system.rewrite_data_files с binpack strategy и target 256MB — merge millions of small files. (3) PREVENTIVE: add SupportsPreCommitTopology в FlinkSink для inline compaction. (4) Reduce writer parallelism до 8, increase checkpoint interval до 5min. (5) Schedule daily rewrite_data_files и expire_snapshots в Airflow" },
+        { "id": "c", "text": "Drop таблицу и пересоздать" },
+        { "id": "d", "text": "Migrate на Paimon" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Three-pronged remediation для classic small file + metadata bloat problem. **Phase 1 — immediate metadata cleanup**: `CALL system.expire_snapshots(table => 'db.events', older_than => DATE_SUB(CURRENT_DATE, 7), retain_last => 10)` — physically deletes old snapshot files + orphan data files. metadata.json shrinks от MBs до KBs. Query planning time drops immediately. Schedule этого daily. **Phase 2 — file compaction**: `CALL system.rewrite_data_files(table => 'db.events', strategy => 'binpack', options => map('target-file-size-bytes', '268435456'))` (256MB). Reads small files, writes merged большие, commit as single snapshot. Expensive (TB IO) — schedule off-peak. После: 8M files → ~30K files, query latency 5min → 5s. **Phase 3 — preventive sink changes**: implement SupportsPreCommitTopology для inline compaction (or use FlinkSink.distributionMode(HASH) для better batching). **Phase 4 — operational**: reduce sink parallelism (32 → 8) — less fanout per partition; increase checkpoint interval (60s → 5min) — larger batches per commit. **Phase 5 — ongoing**: schedule daily rewrite_data_files + expire_snapshots в Airflow. Monitor `iceberg.table.snapshot.size` и `iceberg.table.data.file.count`. New deployments should use Paimon если streaming-heavy — native compaction integrated.",
+      "studyHint": "Повторите урок — Production gotchas и cheat sheet",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m07-07-q4",
+      "type": "true-false",
+      "question": "Committer parallelism > 1 в Iceberg sink улучшает throughput для commit phase.",
+      "correctAnswer": false,
+      "explanation": "False. Iceberg commit involves CAS update на catalog pointer. Multiple parallel committers → multiple concurrent CAS attempts → most retry (only one wins per round) → effective parallelism = 1 без gain. На high commit rate это actually hurts: (a) wasted CAS retries cost CPU и catalog calls; (b) catalog backend (Hive metastore, Glue) rate-limit API calls; (c) increased latency от retry storm. Default committer parallelism = 1 для Iceberg FlinkSink. Same logic для: Paimon committer (atomic snapshot file rename, single point), Hive Streaming sink (table-level metadata), Delta Lake committer (atomic _delta_log file write). Что МОЖНО parallel: (a) Writer parallelism — proportional throughput, files written в parallel; (b) Pre-commit topology — compaction can scale; (c) Post-commit topology — non-atomic operations parallel OK. Single committer ограничивает overall commit throughput до ~1 commit/sec для Glue catalog, ~10/sec для Hive metastore. Если commit becomes bottleneck — batch larger transactions (longer checkpoint interval) instead of более parallel committers.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

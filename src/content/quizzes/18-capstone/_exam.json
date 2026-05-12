@@ -1,0 +1,145 @@
+{
+  "moduleId": "18-capstone",
+  "title": "Module 18 Exam — Capstone проект",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m18-exam",
+    "description": "10-question integrated exam for Module 18 (Capstone)"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-exam-q1",
+      "type": "multiple-choice",
+      "question": "Capstone design phase choice — direct Flink CDC без Kafka layer. Какие trade-offs и какие mitigations критичны?",
+      "options": [
+        { "id": "a", "text": "Нет trade-offs" },
+        { "id": "b", "text": "Trade-offs: меньше hops (latency, ops complexity, retention cost savings), simpler debugging, built-in schema evolution propagation. Cost: no Kafka buffer = replication slot pressure если Flink down. Mitigations critical: monitoring slot lag (alert > 5GB), max_slot_wal_keep_size guard (auto-drop slot если exceeded), recovery runbooks (re-snapshot vs new slot decision tree)" },
+        { "id": "c", "text": "Это always wrong choice" },
+        { "id": "d", "text": "Только для batch processing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Conscious architectural choice. Direct Flink CDC plusses: cost savings ($3-5k/month no Kafka retention для 30TB), latency, schema evolution built-in. Risk: replication slot fill-up if Flink down — Postgres disk crash possible. Mitigations transform risk: monitoring + alerting + bound guard + runbooks. Production responsibility design with guardrails, не unconscious choice. Production prod requires explicit risk assessment + mitigation per architectural decision.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-exam-q2",
+      "type": "multiple-choice",
+      "question": "ForSt state backend для capstone (500GB state) — почему critical, не RocksDB?",
+      "options": [
+        { "id": "a", "text": "RocksDB просто старый" },
+        { "id": "b", "text": "Disaggregated state — primary на S3, local cache. RocksDB requires 500GB local SSD × 8 TMs = 4TB SSD ($high). Recovery: RocksDB downloads full state из S3 minutes-hours; ForSt metadata-only ~30s даже для 500GB. Capstone RTO 5 min невозможно с RocksDB на 500GB. ForSt — enabler для cloud-native production scale" },
+        { "id": "c", "text": "Identical performance" },
+        { "id": "d", "text": "ForSt deprecated в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt (FLIP-427) revolutionizes large stateful jobs. Cost: 4TB local SSD provisioning eliminated. Recovery: bottleneck removed (state size independent). Critical для cloud-native architecture — pods can быть rescheduled без TB state download. Requirement: Async State API V2 (FLIP-424/425) — synchronous reads degrade ForSt к sync DFS access (catastrophic latency). Cost trade-off: S3 storage cheaper than provisioned SSD, but pay для S3 API calls. Net positive для large state production deployments.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-exam-q3",
+      "type": "multiple-choice",
+      "question": "Stateful layer UserAggregator с three separate states (ValueState<UserSummary>, MapState<Long, WindowCounter>, ValueState<Long> lastOrderTime) — design rationale?",
+      "options": [
+        { "id": "a", "text": "Random decomposition" },
+        { "id": "b", "text": "Different lifecycles + access patterns: UserSummary 90d TTL (GDPR), MapState 1d TTL (old windows useless), lastOrderTime separate ValueState (clean atomic updates). Single big state означал бы либо short TTL (losing summary) либо long TTL (огромный state). Decomposition allows per-component TTL — right size for each purpose" },
+        { "id": "c", "text": "Только performance" },
+        { "id": "d", "text": "Это deprecated approach" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "State decomposition by lifecycle pattern. Each piece of state has different requirements (retention, access frequency, mutation rate, cleanup strategy). Single big ValueState combining all forces single TTL — compromise across все use cases. Decomposed: cumulative metrics что нужно forever — 90d TTL; per-window counters that age out daily — 1d TTL; transient hot path data — efficient atomic updates. Per-state TTL optimal для each case. Pattern для production stateful operators — design states по lifecycle, not по conceptual grouping.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m18-exam-q4",
+      "type": "multiple-choice",
+      "question": "Sink layer с pre-commit compaction topology — что решает и какие config trade-offs?",
+      "options": [
+        { "id": "a", "text": "Sub-topology для cluster management" },
+        { "id": "b", "text": "Решает streaming sink small files problem: 23k+ files/day per partition без compaction. Pre-commit operator merges small files перед commit → 100-500 well-sized files. Query 10-100x faster. Trade-offs: aggressive compaction (min.file-num=2) = CPU overhead + slow commits; lazy (min.file-num=20) = query degradation. Default 5 reasonable starting point" },
+        { "id": "c", "text": "Только cosmetic" },
+        { "id": "d", "text": "Removed в SinkV2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical production concern. Streaming natural creates many small files (each commit = files per bucket). 60s checkpoint × 1440/day × 16 buckets = 23k files/day per partition. Query performance suffocates (per-file metadata read). Pre-commit compaction (FLIP-191 SupportsPreCommitTopology) merges перед commit — fewer, larger files. Tuning balance: aggressive compacting CPU/commit overhead vs lazy = query performance suffers. Production monitoring critical: paimon_compaction_lag_seconds, file_count per partition.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-exam-q5",
+      "type": "multiple-choice",
+      "question": "K8s deployment + Adaptive Scheduler + Autoscaler — какие compinents работают вместе и что critical?",
+      "options": [
+        { "id": "a", "text": "Они independent" },
+        { "id": "b", "text": "(1) Adaptive Scheduler (FLIP-160) — dynamic parallelism adjustment без full job restart; (2) In-place rescaling (FLIP-291) — only impacted slots restart, others continue; (3) Autoscaler (FLIP-271) — operator-level scaling decisions based на mailbox timings; (4) K8s Operator manages pod lifecycle. Combined: scaling event ~10-30s minor disruption vs 1-3 min traditional savepoint+restart. Critical: configure parallelism min/max bounds для cost control" },
+        { "id": "c", "text": "Только manual scaling" },
+        { "id": "d", "text": "Это identical to K8s HPA" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Modern Flink 2.x scaling stack. Pre-2.x: savepoint + stop + change parallelism + restart = minutes downtime, not viable для frequent scaling. New stack: Adaptive Scheduler detects available slots; in-place rescaling redistributes via key groups fast; autoscaler decides based on operator-level metrics; K8s operator manages pods. Together = practical autoscaling. Bounds parallelism.min/max prevent runaway (cost protection). Critical: K8s HPA inappropriate для Flink (pod-level metrics don't reflect operator-level work). Use Flink-specific autoscaler.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m18-exam-q6",
+      "type": "multiple-choice",
+      "question": "Observability stack для capstone — какие components и зачем?",
+      "options": [
+        { "id": "a", "text": "Только Prometheus" },
+        { "id": "b", "text": "OpenTelemetry (metrics + traces из Flink) → OTel Collector → (Prometheus метрики, Tempo/Jaeger traces, Loki logs) → Grafana (unified UI). AlertManager для routing severity: critical→PagerDuty, warning→Slack, info→dashboard. 12 top charts для full pipeline visibility. Runbooks linked from каждого alert. Each layer addresses different operational concern" },
+        { "id": "c", "text": "Только logs sufficient" },
+        { "id": "d", "text": "Manual Web UI monitoring" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Comprehensive observability covers metrics + traces + logs (three pillars). Flink 2.x native OTel exporter simplifies setup. Each component: metrics (Prometheus) для time series и alerts; traces (Tempo) для single event flow debugging; logs (Loki) для error context. Grafana unified UI correlates через trace_id. AlertManager severity routing prevents alert fatigue (critical paging vs warning notifications vs info dashboards). Runbooks linked = actionable response. Without comprehensive observability — incident response chaos.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-exam-q7",
+      "type": "multiple-choice",
+      "question": "Chaos testing scenarios — какие 8 базовые для capstone, и что verification критично?",
+      "options": [
+        { "id": "a", "text": "Только kill TM" },
+        { "id": "b", "text": "8 scenarios: (1) Kill TM; (2) Kill JM leader; (3) Network partition Flink↔Kafka; (4) Kafka broker down; (5) Postgres replication slot exceeded; (6) S3 slow; (7) OOM kill TM; (8) ClickHouse sink down. Verification: reconciliation script (source = sink + late events), recovery time within SLO, EOS holds (no duplicates), side outputs consistent. Each scenario tests specific failure mode" },
+        { "id": "c", "text": "Random failure injection" },
+        { "id": "d", "text": "Только в production game days" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Structured chaos coverage. Each scenario tests specific failure type — node failure (Kill TM), JM HA (Kill JM), network resilience (partition), upstream/downstream impact (Kafka/Postgres/S3/ClickHouse), resource exhaustion (OOM). Verification through reconciliation — automatic comparison source vs sink counts. Without verification — chaos testing doesn't verify EOS, gives false confidence. EOS bugs surface only under failure scenarios — chaos exposure essential. Schedule: weekly staging для key, monthly broader coverage.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-exam-q8",
+      "type": "multiple-choice",
+      "question": "Production readiness checklist — какие категории и почему comprehensive coverage важен?",
+      "options": [
+        { "id": "a", "text": "Только code review" },
+        { "id": "b", "text": "9 categories: code quality, state management, EOS verification, deployment, observability, performance, security, DR, operational readiness. Coverage important потому что mental tracking impossible — каждая category может contain production-critical concern. Missing any = blind spot. Checklist provides structured go/no-go decision criteria, overcomes vague stakeholder pressure" },
+        { "id": "c", "text": "Subjective list" },
+        { "id": "d", "text": "Только performance метрики" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Multi-dimensional production concerns. Each category covers distinct risk: code bugs (10-100x cheaper to catch early); state design (anti-patterns surface на scale); EOS (silent data loss possible); deployment (config issues common); observability (без её troubleshooting impossible); performance (capacity surprises); security (catastrophic breaches); DR (untested = false confidence); op readiness (без on-call = pipeline fails). Comprehensive coverage prevents tunneled launch focus. Process > vibes — concrete checklist beats individual memory.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-exam-q9",
+      "type": "multiple-choice",
+      "question": "Stakeholder pressure для launch через week, checklist shows 3/8 chaos scenarios + DR runbook untested + state growth 5%/week + no archive retention. Decision framework?",
+      "options": [
+        { "id": "a", "text": "Launch everything, fix later" },
+        { "id": "b", "text": "Risk-based prioritization: BLOCK chaos testing incomplete (5 unknown failure modes = production risk). State growth 5% — acceptable если capacity OK 3 months (post-launch investigation in 2-4 weeks). Archive retention — Day-1 quick fix. DR runbook — game day exercise в 2 weeks (acceptable if internal SLA). Stakeholder communication: concrete risk articulation + ETA for блокera resolution overcomes vague pressure" },
+        { "id": "c", "text": "Block everything until perfect" },
+        { "id": "d", "text": "Skip checklist entirely" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production readiness не black-or-white. Risk-based framework: (1) Identify hard blockers (chaos testing — unknown production behavior); (2) Acceptable risks with monitoring (state growth с capacity headroom); (3) Quick post-launch fixes (retention policy Day-1); (4) Planned deferrals (DR runbook game day in 2 weeks). Communication: concrete data ('5 untested failure modes = unknown production behavior') overcomes pressure ('just launch faster'). Process protects team — launches что pass checklist have dramatically better success rate. Trust process, not vibes.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-exam-q10",
+      "type": "true-false",
+      "question": "Capstone полностью покрывает skills нужные для senior Flink engineer role. After course, ready для unsupervised production responsibility.",
+      "correctAnswer": false,
+      "explanation": "Honest assessment: capstone — strong foundation, не complete senior expertise. Course teaches: design patterns, implementation patterns, deployment basics, observability foundations, chaos awareness. Need 6-12 months production for senior-level confidence: actual incident response (3 AM debugging across diverse failure modes), capacity planning + cost optimization (year of budget management), cross-team architecture decisions (stakeholder communication, technology evaluation, migrations), specific scale claims (actually done 50k events/sec exactly-once, not just designed it). Honest interview framing: 'Built capstone production-grade pipeline. Strong fundamentals, comfortable learning, hungry for production exposure.' Overclaiming = credibility risk. Course gives strong starting point, production experience completes path к senior.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

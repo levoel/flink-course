@@ -1,0 +1,387 @@
+---
+title: "Operator state vs Keyed state"
+description: "Два класса state в Flink — где живут, кто владеет, как редистрибутируются при rescaling, и когда какой выбирать"
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["State", "Operator State", "Keyed State", "ListState", "BroadcastState", "UnionListState"]
+---
+
+# Operator state vs Keyed state
+
+Flink делит state на два фундаментально разных класса. Это разделение — не academic, а инженерное: оно определяет, **кто** может читать state, **как** state redistributed при rescaling, и **какой** API доступен. Большинство production-багов в stateful pipelines рождаются из непонимания этой границы.
+
+Этот урок препарирует обе семьи state, их подвиды и concrete use cases.
+
+---
+
+## Базовое деление
+
+<DiagramContainer title="Два класса state в Flink" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Operator State"
+        tooltip="Per-parallel-subtask state. Один subtask = один scope. Доступен в любом операторе, даже без keyBy. Размер ограничен heap — не использует RocksDB. Redistribution через CheckpointedFunction snapshot/restore hooks."
+      >
+        Per parallel instance
+      </DataBox>
+      <DataBox
+        label="Keyed State"
+        tooltip="Per-key state, доступен только после keyBy(). Распределяется по key groups (hash(key) % maxParallelism). Может жить в любом state backend (HashMap, RocksDB, ForSt). Размер ограничен только storage backend."
+      >
+        Per key (after keyBy)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Совсем разные scopes, API, persistence" />
+    <FlowRow>
+      <DataBox
+        label="Common foundation"
+        tooltip="Оба класса persist через checkpoint, оба используют TypeSerializer для сериализации, оба recover при restart. Дальше — divergence по всем параметрам."
+      >
+        Checkpoint integration
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+| Параметр | Operator State | Keyed State |
+|---|---|---|
+| Scope | Per parallel subtask | Per key (after `keyBy`) |
+| Где использовать | Sources, sinks, broadcast | KeyedProcessFunction, RichFlatMap after keyBy |
+| API | `CheckpointedFunction`, `BroadcastState` | `RuntimeContext.getState(descriptor)` |
+| Storage | Всегда heap (in JVM memory) | Configurable (Hashmap, RocksDB, ForSt) |
+| Size limit | Practical: low MB per subtask | TBs (RocksDB) / unlimited (ForSt) |
+| Redistribution | Через `snapshotState`/`initializeState` hooks | Через key groups (automatic) |
+| Typical size | KB–MB | KB–TB |
+
+Дальше — детальный разбор каждого класса.
+
+---
+
+## Operator State — три подвида
+
+Operator state существует в трёх вариантах, отличающихся **redistribution strategy** при rescaling:
+
+### 1. ListState (split redistribution)
+
+Самый частый — `ListState<T>` с **split redistribution**. При rescaling Flink равномерно разделяет элементы списка между новыми subtask-ами.
+
+```java
+public class KafkaSourceFunction implements CheckpointedFunction {
+
+    private transient ListState<Long> offsetsState;
+    private List<Long> currentOffsets = new ArrayList<>();
+
+    @Override
+    public void initializeState(FunctionInitializationContext ctx) throws Exception {
+        ListStateDescriptor<Long> descriptor =
+            new ListStateDescriptor<>("kafka-offsets", Long.class);
+        // split redistribution — каждый offset попадёт в ОДИН subtask
+        offsetsState = ctx.getOperatorStateStore().getListState(descriptor);
+
+        if (ctx.isRestored()) {
+            for (Long offset : offsetsState.get()) {
+                currentOffsets.add(offset);
+            }
+        }
+    }
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext ctx) throws Exception {
+        offsetsState.clear();
+        for (Long offset : currentOffsets) {
+            offsetsState.add(offset);
+        }
+    }
+}
+```
+
+**Use case**: Kafka source offsets. Каждый split (partition assignment) — один элемент списка. При rescale Flink redistributes splits между новыми subtask-ами.
+
+### 2. UnionListState (broadcast-style redistribution)
+
+При rescaling **каждый** subtask получает **весь** список. Это semantically broadcast, но через operator state API.
+
+```java
+unionState = ctx.getOperatorStateStore().getUnionListState(descriptor);
+```
+
+**Use case**: глобальный counter, который нужно агрегировать across subtasks при restart. **Pitfall**: если список большой, при scale-up каждый subtask получит N×data — memory explosion. Используйте только для маленьких metadata.
+
+### 3. BroadcastState (broadcast partitioning side)
+
+Совсем другой API — для **broadcast pattern**: один stream rules/config broadcast на все subtasks, обогащает основной stream.
+
+```java
+MapStateDescriptor<String, Rule> rulesDescriptor =
+    new MapStateDescriptor<>("rules", String.class, Rule.class);
+
+BroadcastStream<Rule> rulesStream = env
+    .fromSource(rulesSource, ..., "rules")
+    .broadcast(rulesDescriptor);
+
+DataStream<Tx> txStream = env.fromSource(...).keyBy(Tx::getUserId);
+
+txStream
+    .connect(rulesStream)
+    .process(new KeyedBroadcastProcessFunction<Long, Tx, Rule, Alert>() {
+        @Override
+        public void processBroadcastElement(Rule rule, Context ctx, Collector<Alert> out) {
+            BroadcastState<String, Rule> state = ctx.getBroadcastState(rulesDescriptor);
+            state.put(rule.getId(), rule);  // ← каждый subtask получает копию
+        }
+        @Override
+        public void processElement(Tx tx, ReadOnlyContext ctx, Collector<Alert> out) {
+            ReadOnlyBroadcastState<String, Rule> state =
+                ctx.getBroadcastState(rulesDescriptor);
+            for (Map.Entry<String, Rule> entry : state.immutableEntries()) {
+                // apply rule
+            }
+        }
+    });
+```
+
+**Read-only в processElement** — критично. Только `processBroadcastElement` может мутировать broadcast state. Это гарантирует консистентность копий между subtask-ами.
+
+---
+
+## Снапшот стратегии для operator state
+
+<DiagramContainer title="Redistribution стратегии для operator state" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="List state (split)"
+        tooltip="Каждый элемент идёт в один subtask. Rescale 4→8: каждый subtask получает половину предыдущего объёма. Подходит для Kafka offsets, split assignments."
+      >
+        Split: items / N
+      </DataBox>
+      <DataBox
+        label="Union list state"
+        tooltip="Каждый subtask получает все элементы. Rescale 4→8: каждый subtask получает все N×items. Подходит только для маленьких metadata. Pitfall: scale-up взрывает memory."
+      >
+        Union: items × N
+      </DataBox>
+      <DataBox
+        label="Broadcast state"
+        tooltip="Identical копия broadcast state на всех subtasks. Updates только из processBroadcastElement. Подходит для rules/configs, которые обогащают keyed stream."
+      >
+        Broadcast: copy
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Когда какой выбрать
+
+| Stratey | Когда выбрать |
+|---|---|
+| `ListState` | Splits/partitions assignments, splittable units of work |
+| `UnionListState` | Global metadata < 1MB, нужное всем subtask после restart |
+| `BroadcastState` | Rules/configs broadcast в keyed stream |
+
+<Callout type="warning">
+`UnionListState` — самая опасная фича. При scale-up memory растёт квадратично (каждый из N subtask получает копию всех N×items). На больших job-ах это main source of OOM. По возможности избегайте, или ограничивайте размер до нескольких KB.
+</Callout>
+
+---
+
+## Keyed State — короткий обзор (детали в уроке 03)
+
+Keyed state доступен **только** после `keyBy()`. До keyBy в pipeline вы можете использовать только operator state. После keyBy появляется per-key scope.
+
+```java
+KeyedStream<Transaction, Long> keyed = stream.keyBy(Transaction::getUserId);
+
+keyed.process(new KeyedProcessFunction<Long, Transaction, Alert>() {
+    private ValueState<Long> lastSeenState;
+
+    @Override
+    public void open(Configuration config) {
+        ValueStateDescriptor<Long> descriptor =
+            new ValueStateDescriptor<>("last-seen", Long.class);
+        // ← ТОЛЬКО ПОСЛЕ keyBy() это работает
+        lastSeenState = getRuntimeContext().getState(descriptor);
+    }
+
+    @Override
+    public void processElement(Transaction tx, Context ctx, Collector<Alert> out) {
+        Long last = lastSeenState.value();
+        // ... per-user logic
+        lastSeenState.update(tx.getTimestamp());
+    }
+});
+```
+
+`lastSeenState.value()` возвращает state именно **для текущего key** — Flink меняет «current key context» при каждой записи под капотом.
+
+Урок 03 разбирает все 5 primitives (ValueState/ListState/MapState/ReducingState/AggregatingState) детально.
+
+---
+
+## Real example: Kafka source offsets как operator state
+
+Когда `KafkaSource` стартует с EARLIEST/LATEST или committed offsets, дальнейшие offsets — это **operator state**. Каждый subtask владеет несколькими Kafka partitions, для каждой держит current offset в memory, snapshot-ит как `ListState<KafkaPartitionState>`.
+
+При rescale 4→8:
+- Flink собирает все partitions assignment из всех 4 subtask
+- Объединяет в один список
+- Делит на 8 (split redistribution)
+- Новые 8 subtask получают по половине предыдущих assignments
+
+```java
+// Под капотом FLIP-27 Source API:
+public class KafkaSplitState {
+    private final TopicPartition partition;
+    private long offset;
+    private long timestamp;
+}
+// Snapshot list of split states:
+listState.update(currentSplits);
+```
+
+Почему operator state, а не keyed? Потому что в этом контексте **нет ключа** — есть только subtask, владеющий partition assignment. `keyBy` здесь не имеет смысла.
+
+---
+
+## Real example: BroadcastState для dynamic rules
+
+Use case: fraud detection с правилами, которые конфигурируются через UI и публикуются в Kafka topic `rules`:
+
+```java
+// Side stream: правила
+DataStream<Rule> rules = env.fromSource(rulesSource, ..., "rules");
+MapStateDescriptor<String, Rule> rulesDesc =
+    new MapStateDescriptor<>("rules", String.class, Rule.class);
+BroadcastStream<Rule> rulesBroadcast = rules.broadcast(rulesDesc);
+
+// Main keyed stream: транзакции
+KeyedStream<Tx, Long> txs = env.fromSource(txSource, ..., "txs")
+    .keyBy(Tx::getUserId);
+
+// Connect + process
+txs.connect(rulesBroadcast)
+   .process(new KeyedBroadcastProcessFunction<Long, Tx, Rule, Alert>() {
+       @Override
+       public void processBroadcastElement(Rule rule, Context ctx,
+                                           Collector<Alert> out) {
+           BroadcastState<String, Rule> state =
+               ctx.getBroadcastState(rulesDesc);
+           if (rule.isActive()) state.put(rule.getId(), rule);
+           else state.remove(rule.getId());
+       }
+
+       @Override
+       public void processElement(Tx tx, ReadOnlyContext ctx,
+                                   Collector<Alert> out) throws Exception {
+           ReadOnlyBroadcastState<String, Rule> rules =
+               ctx.getBroadcastState(rulesDesc);
+           for (Map.Entry<String, Rule> e : rules.immutableEntries()) {
+               if (e.getValue().matches(tx)) {
+                   out.collect(new Alert(tx, e.getValue()));
+               }
+           }
+       }
+   });
+```
+
+Каждый subtask держит копию **всех** правил, что позволяет O(1) lookup без shuffle. Update правил атомарно публикуется на каждый subtask через broadcast stream.
+
+---
+
+## Production gotchas
+
+### 1. `getKeyedState` вне KeyedStream
+
+```java
+// БАГ: пытаемся использовать keyed state в обычном map
+stream.map(new RichMapFunction<>() {
+    public void open(Configuration c) {
+        // ❌ NullPointerException или IllegalStateException
+        ValueState<Long> state =
+            getRuntimeContext().getState(new ValueStateDescriptor<>("v", Long.class));
+    }
+});
+```
+
+Keyed state **требует** KeyedStream. Без `keyBy` нет «current key», поэтому Flink не может resolve state. Используйте `CheckpointedFunction` + ListState для operator state, либо добавьте keyBy.
+
+### 2. `UnionListState` scale-up explosion
+
+```java
+unionState = ctx.getOperatorStateStore().getUnionListState(descriptor);
+// При scale 8→32:
+// Каждый из 32 subtask получает список со всех 8 предыдущих = 4x items на subtask
+// Heap usage растёт линейно в parallelism
+```
+
+При rescaling сначала проверьте total size union state. Если >1MB — пересмотрите дизайн.
+
+### 3. Broadcast state read/write asymmetry
+
+```java
+// ❌ В processElement state — read-only:
+public void processElement(Tx tx, ReadOnlyContext ctx, Collector<Alert> out) {
+    BroadcastState<String, Rule> state = ctx.getBroadcastState(...); // compile error
+    // Можно только ReadOnlyBroadcastState
+}
+
+// ✅ Только в processBroadcastElement state mutable:
+public void processBroadcastElement(Rule rule, Context ctx, Collector<Alert> out) {
+    BroadcastState<String, Rule> state = ctx.getBroadcastState(...);
+    state.put(rule.getId(), rule);  // OK
+}
+```
+
+Это намеренно — гарантирует, что copies state across subtasks остаются bit-identical.
+
+### 4. Operator state на heap только
+
+В отличие от keyed state, operator state **никогда** не идёт в RocksDB или ForSt. Он всегда на heap. Если ваш operator state >100MB на subtask — это design smell. Heavy state должен быть keyed.
+
+### 5. `CheckpointedFunction.snapshotState` runs synchronously
+
+Hooks `snapshotState`/`initializeState` блокируют mailbox thread. Если в snapshot вы делаете heavy serialization >100ms — checkpoint duration взлетает, end-to-end latency страдает. Держите hooks lightweight: copy references, не делайте deep copies или I/O.
+
+### 6. `ListState.update` vs `add` performance
+
+```java
+// ❌ Re-serializes ВЕСЬ список:
+offsetsState.clear();
+for (Long o : currentOffsets) offsetsState.add(o);
+// ИЛИ
+offsetsState.update(currentOffsets);
+
+// ✅ Если можно — append:
+offsetsState.add(newOffset);
+```
+
+`update`/`clear+add` re-serializes список целиком. На больших списках это main bottleneck snapshot phase.
+
+---
+
+<Callout type="tip">
+Простая эвристика: если вы делаете `keyBy` где-то в pipeline и нужно per-key state — используйте keyed state. Если нужно per-subtask state (Kafka offsets, watermark generator state, side configs) — operator state. Если broadcast rules/configs обогащает keyed stream — BroadcastState. Сомневаетесь — почти всегда keyed.
+</Callout>
+
+---
+
+## Сравнительная таблица
+
+| Сценарий | Тип state | Почему |
+|---|---|---|
+| Per-user historical transactions | Keyed `ListState` | Per-key scope, не per-subtask |
+| Kafka partition offsets | Operator `ListState` | Per-subtask split assignments |
+| Fraud rules broadcasted в pipeline | `BroadcastState` | Каждый subtask нужна полная копия |
+| Global error counter | `UnionListState` | Aggregate на restart from all subtasks |
+| Session window state per user | Keyed `MapState` | Per-key, multiple sessions |
+| Watermark drift checker | Operator `ListState` | Per-subtask state |
+| Schema registry cache | `BroadcastState` или Async I/O | Broadcast если schema редко меняется |
+
+---
+
+<KnowledgeCheck
+  question="Почему Kafka source offsets хранятся как operator state (ListState с split redistribution), а не как keyed state? Что происходит с этим state при rescaling parallelism source 4 → 8?"
+  answer="Kafka source offsets хранятся как operator state, потому что у них нет ключа — есть только subtask, владеющий некоторыми partition assignments. keyBy здесь semantically не имеет смысла. Каждый subtask держит список своих current offsets как ListState<KafkaSplitState>. При rescaling 4→8 Flink собирает все splits из всех 4 subtask, объединяет в один список, и split redistribution равномерно распределяет splits между новыми 8 subtask. Каждый новый subtask получает половину предыдущих partition assignments. Это работает корректно, потому что (a) ListState — split redistribution стратегия (не union), (b) splits stateless относительно offset — offset просто метка позиции в Kafka. Если бы хранили как keyed state — пришлось бы синтетически keyBy на partitionId, что добавило бы network shuffle без выгоды."
+/>

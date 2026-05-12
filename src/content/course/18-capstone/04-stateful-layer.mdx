@@ -1,0 +1,398 @@
+---
+title: "Capstone — stateful layer: aggregations, temporal joins, watermark alignment"
+description: "★ DEEP — ValueState/MapState per-user, temporal joins с dim tables, watermark alignment между sources, allowed lateness + side outputs. ProcessFunction implementations для capstone."
+order: 4
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Stateful Processing", "ValueState", "MapState", "Temporal Joins", "Watermark Alignment", "Side Outputs"]
+---
+
+# Capstone — stateful layer: aggregations, temporal joins, watermark alignment
+
+Phase 2 implementation: stateful processing над raw Paimon tables. Computes per-user behavior aggregates, anomaly detection state, dim table enrichment, real-time metrics. Это самая complex part pipeline — где state design influences full system performance, recovery, observability.
+
+Это `★ DEEP` урок. Мы пройдём через actual implementation — ProcessFunction classes, state primitives, watermark strategies, side outputs.
+
+---
+
+## Job graph stateful layer
+
+<DiagramContainer title="Stateful layer: enrichment, aggregation, anomaly detection" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Paimon source"
+        tooltip="Streaming read из fact_orders Paimon table. monitorInterval 5s для near-real-time. State: SourceSplit positions, current snapshot."
+      >
+        Paimon: fact_orders
+      </DataBox>
+      <DataBox
+        label="Dim source"
+        tooltip="Paimon streaming read из dim_products, dim_customers. Versioned tables через changelog-producer=input."
+      >
+        Paimon: dim_products
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="watermark alignment" />
+    <FlowRow>
+      <DataBox
+        label="Watermark Generator"
+        tooltip="forBoundedOutOfOrderness(30s) на каждом source. withWatermarkAlignment между sources — max drift 2 min. Pauses fast source если drift exceeded."
+      >
+        Aligned watermarks
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="temporal join" />
+    <FlowRow>
+      <DataBox
+        label="Enrichment (Temporal Join)"
+        tooltip="FOR SYSTEM_TIME AS OF order_time JOIN products. Historical version product (correct price/category на event time). State: versioned dim entries, cleanup через watermark."
+      >
+        order × product@order_time
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="keyBy(user_id)" />
+    <FlowRow>
+      <DataBox
+        label="UserAggregator (ProcessFunction)"
+        tooltip="Per-user state: ValueState<UserSummary> (total orders, GMV, last_order_time, fraud_score). MapState<window_start, Counts>. TTL 90 days. Emits enriched events + anomaly signals."
+      >
+        UserAggregator
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="window aggregate" />
+    <FlowRow>
+      <DataBox
+        label="Window aggregation"
+        tooltip="TumblingEventTimeWindows 1 min. allowedLateness 10 min, sideOutputLateData. Emits per-window metrics для ClickHouse dashboards."
+      >
+        1-min tumbling windows
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="fan-out" />
+    <FlowRow>
+      <DataBox
+        label="Paimon sink"
+        tooltip="Enriched fact tables. EOS через 2PC."
+      >
+        Paimon enriched
+      </DataBox>
+      <DataBox
+        label="ClickHouse sink"
+        tooltip="Per-minute aggregates. Async insert mode."
+      >
+        ClickHouse
+      </DataBox>
+      <DataBox
+        label="Anomaly sink"
+        tooltip="Anomaly events: order spikes, fraud signals, error rate increases. Kafka topic."
+      >
+        Kafka anomalies
+      </DataBox>
+      <DataBox
+        label="Late side output"
+        tooltip="Late events past allowed lateness. Archive Kafka topic для investigation."
+      >
+        Late events archive
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## UserAggregator — main stateful operator
+
+```java
+public class UserAggregator extends KeyedProcessFunction<String, EnrichedOrder, UserEvent> {
+
+    private transient ValueState<UserSummary> summary;
+    private transient MapState<Long, WindowCounter> windowCounters; // window_start → counters
+    private transient ValueState<Long> lastOrderTime;
+
+    private static final OutputTag<FraudAlert> FRAUD_TAG = new OutputTag<>("fraud-alerts"){};
+    private static final OutputTag<AnomalyEvent> ANOMALY_TAG = new OutputTag<>("anomalies"){};
+
+    @Override
+    public void open(Configuration cfg) {
+        StateTtlConfig ttl90d = StateTtlConfig
+            .newBuilder(Duration.ofDays(90))
+            .setUpdateType(UpdateType.OnCreateAndWrite)
+            .setStateVisibility(StateVisibility.NeverReturnExpired)
+            .cleanupFullSnapshot()
+            .cleanupInRocksdbCompactFilter(10000)
+            .build();
+
+        ValueStateDescriptor<UserSummary> summaryDesc =
+            new ValueStateDescriptor<>("user-summary", UserSummary.class);
+        summaryDesc.enableTimeToLive(ttl90d);
+        summary = getRuntimeContext().getState(summaryDesc);
+
+        StateTtlConfig ttl1d = StateTtlConfig
+            .newBuilder(Duration.ofDays(1))
+            .setUpdateType(UpdateType.OnCreateAndWrite)
+            .cleanupInRocksdbCompactFilter(1000)
+            .build();
+        MapStateDescriptor<Long, WindowCounter> wcDesc =
+            new MapStateDescriptor<>("window-counters", Long.class, WindowCounter.class);
+        wcDesc.enableTimeToLive(ttl1d);
+        windowCounters = getRuntimeContext().getMapState(wcDesc);
+
+        ValueStateDescriptor<Long> lastDesc =
+            new ValueStateDescriptor<>("last-order-time", Long.class);
+        lastDesc.enableTimeToLive(ttl90d);
+        lastOrderTime = getRuntimeContext().getState(lastDesc);
+    }
+
+    @Override
+    public void processElement(EnrichedOrder order, Context ctx, Collector<UserEvent> out)
+            throws Exception {
+
+        UserSummary s = summary.value();
+        if (s == null) {
+            s = UserSummary.newCustomer(ctx.getCurrentKey(), order.eventTime());
+        }
+
+        // Compute fraud score (simple example)
+        Long lastTime = lastOrderTime.value();
+        long timeBetween = lastTime == null ? Long.MAX_VALUE : order.eventTime() - lastTime;
+        double fraudScore = computeFraudScore(s, order, timeBetween);
+
+        // Update summary
+        UserSummary updated = s.toBuilder()
+            .totalOrders(s.totalOrders() + 1)
+            .totalGMV(s.totalGMV().add(order.amount()))
+            .lastOrderTime(order.eventTime())
+            .recentFraudScore(fraudScore)
+            .build();
+
+        summary.update(updated);
+        lastOrderTime.update(order.eventTime());
+
+        // Update windowed counter
+        long windowStart = order.eventTime() / 60_000L * 60_000L;
+        WindowCounter wc = windowCounters.get(windowStart);
+        if (wc == null) wc = new WindowCounter(windowStart);
+        wc.incrementOrders();
+        wc.addAmount(order.amount());
+        windowCounters.put(windowStart, wc);
+
+        // Emit enriched event для downstream
+        out.collect(new UserEvent(
+            ctx.getCurrentKey(),
+            order,
+            updated,
+            fraudScore
+        ));
+
+        // Conditional side outputs
+        if (fraudScore > 0.7) {
+            ctx.output(FRAUD_TAG, new FraudAlert(ctx.getCurrentKey(), order, fraudScore));
+        }
+
+        if (timeBetween < 1000) {  // < 1 second between orders
+            ctx.output(ANOMALY_TAG, AnomalyEvent.suspiciousVelocity(
+                ctx.getCurrentKey(), order, timeBetween));
+        }
+
+        // Timer для cleanup старых window counters
+        ctx.timerService().registerEventTimeTimer(windowStart + 3600_000L);  // 1h
+    }
+
+    @Override
+    public void onTimer(long ts, OnTimerContext ctx, Collector<UserEvent> out) throws Exception {
+        // Cleanup window counters старше timer time
+        Iterator<Map.Entry<Long, WindowCounter>> iter = windowCounters.entries().iterator();
+        while (iter.hasNext()) {
+            Map.Entry<Long, WindowCounter> e = iter.next();
+            if (e.getKey() < ts - 3600_000L) {
+                iter.remove();
+            }
+        }
+    }
+
+    private double computeFraudScore(UserSummary s, EnrichedOrder o, long timeBetween) {
+        double score = 0.0;
+        if (timeBetween < 5000) score += 0.3;                              // rapid orders
+        if (o.amount().compareTo(s.avgOrderAmount().multiply(BigDecimal.valueOf(10))) > 0) score += 0.4;
+        if (o.shippingCountry() != null && !o.shippingCountry().equals(s.homeCountry())) score += 0.2;
+        return Math.min(score, 1.0);
+    }
+}
+```
+
+Key state design:
+- `ValueState<UserSummary>` — cumulative per-user metrics. TTL 90 days от last write.
+- `MapState<Long, WindowCounter>` — per-window counters. TTL 1 day (windows >1 day old не нужны).
+- `ValueState<Long> lastOrderTime` — для velocity-based fraud detection.
+
+---
+
+## Watermark alignment между sources
+
+```java
+WatermarkStrategy<Order> orderWatermark = WatermarkStrategy
+    .<Order>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((o, ts) -> o.eventTime())
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment("main-pipeline", Duration.ofMinutes(2), Duration.ofSeconds(5));
+
+WatermarkStrategy<Product> productWatermark = WatermarkStrategy
+    .<Product>forBoundedOutOfOrderness(Duration.ofSeconds(60))
+    .withTimestampAssigner((p, ts) -> p.updateTime())
+    .withWatermarkAlignment("main-pipeline", Duration.ofMinutes(2), Duration.ofSeconds(5));
+
+DataStream<Order> orders = env.fromSource(orderSource, orderWatermark, "orders");
+DataStream<Product> products = env.fromSource(productSource, productWatermark, "products");
+```
+
+`withWatermarkAlignment` с тем же group name = координация. Max drift 2 минуты — если orders watermark убежал на 2+ min быстрее products, orders source pauses. Это prevents temporal joins из incorporating events когда dim table behind.
+
+---
+
+## Temporal join
+
+```java
+// Регистрируем sources как Table API tables:
+Table ordersTable = tableEnv.fromDataStream(orders,
+    Schema.newBuilder()
+        .columnByExpression("event_time", "TO_TIMESTAMP_LTZ(event_time_ms, 3)")
+        .watermark("event_time", "event_time - INTERVAL '30' SECOND")
+        .build());
+
+Table productsTable = tableEnv.fromDataStream(products,
+    Schema.newBuilder()
+        .columnByExpression("update_time", "TO_TIMESTAMP_LTZ(update_time_ms, 3)")
+        .watermark("update_time", "update_time - INTERVAL '60' SECOND")
+        .primaryKey("product_id")
+        .build());
+
+tableEnv.createTemporaryView("orders", ordersTable);
+tableEnv.createTemporaryView("products", productsTable);
+
+// Temporal join:
+Table enriched = tableEnv.sqlQuery("""
+    SELECT
+        o.order_id,
+        o.user_id,
+        o.product_id,
+        o.quantity,
+        p.name AS product_name,
+        p.price AS product_price_at_order,
+        p.category,
+        o.quantity * p.price AS total,
+        o.event_time
+    FROM orders AS o
+    JOIN products FOR SYSTEM_TIME AS OF o.event_time AS p
+        ON o.product_id = p.product_id
+""");
+
+DataStream<EnrichedOrder> enrichedStream =
+    tableEnv.toDataStream(enriched, EnrichedOrder.class);
+```
+
+`FOR SYSTEM_TIME AS OF o.event_time` — historical price product на event_time order. Replay over October будет use Oct prices, not December.
+
+---
+
+## Allowed lateness + side outputs
+
+После UserAggregator, window-level aggregation для dashboard metrics:
+
+```java
+OutputTag<EnrichedOrder> lateOrdersTag = new OutputTag<EnrichedOrder>("late-orders"){};
+
+SingleOutputStreamOperator<WindowMetrics> windowed = enrichedStream
+    .keyBy(EnrichedOrder::category)
+    .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+    .allowedLateness(Time.minutes(10))
+    .sideOutputLateData(lateOrdersTag)
+    .aggregate(new OrderAggregator(), new EmitContextFunction())
+    .uid("category-window-1min");
+
+// Primary sink — Paimon
+windowed.sinkTo(buildPaimonAggregatesSink()).uid("paimon-window-sink");
+
+// ClickHouse sink с UPSERT
+windowed.sinkTo(buildClickHouseSink()).uid("clickhouse-sink");
+
+// Late events archive
+DataStream<EnrichedOrder> lateOrders = windowed.getSideOutput(lateOrdersTag);
+lateOrders.sinkTo(buildKafkaLateArchiveSink()).uid("late-archive");
+
+// Side outputs from UserAggregator
+DataStream<FraudAlert> fraudAlerts = userEvents.getSideOutput(FRAUD_TAG);
+fraudAlerts.sinkTo(buildKafkaAnomalySink()).uid("fraud-sink");
+
+DataStream<AnomalyEvent> anomalies = userEvents.getSideOutput(ANOMALY_TAG);
+anomalies.sinkTo(buildKafkaAnomalySink()).uid("anomaly-sink");
+```
+
+Каждый sink имеет explicit UID — critical для savepoint compatibility.
+
+---
+
+## State sizing проверка
+
+Compute total state size:
+
+```java
+// UserAggregator:
+//   ValueState<UserSummary> per user_id:
+//     200M users × 500 bytes (incl overhead) = 100 GB
+//   MapState<Long, WindowCounter> per user_id:
+//     200M users × avg 5 active windows × 100 bytes = 100 GB
+//   ValueState<Long> lastOrderTime:
+//     200M × 50 bytes = 10 GB
+//
+// TemporalJoin products:
+//   Versioned state product_id → list of versions:
+//     1M products × 20 versions × 200 bytes = 4 GB
+//
+// Window aggregation:
+//   Per category (100 cats) × 1440 windows/day with 10min lateness:
+//     100 × 60 × 100 bytes = 600 KB
+//
+// Total ~215 GB. Plus operator state, RocksDB amplification — design budget 500 GB.
+```
+
+ForSt backend критичен — local disk 500GB на TM = nightmare. Disaggregated на S3 — manageable.
+
+---
+
+## Watermark dashboard
+
+Production necessity — monitor watermarks per operator:
+
+```yaml
+# Prometheus metrics
+flink_taskmanager_job_task_operator_currentInputWatermark{operator="UserAggregator"}
+flink_taskmanager_job_task_operator_currentOutputWatermark{operator="UserAggregator"}
+flink_taskmanager_job_task_operator_numLateRecordsDropped
+```
+
+Grafana panel: watermark lag vs wall clock. Should be ≤ 30 секунд в healthy state. Spikes indicate backpressure or slow source.
+
+---
+
+## Production gotchas
+
+- **State explosion при отсутствии TTL** — без TTL state growth unbounded. 200M users без TTL за год = ?? — depends на churn. Always TTL.
+- **Watermark stuck при idle partition** — Kafka partition без events → watermark не advance → window не emit. Solution: `withIdleness(Duration.ofMinutes(1))` — marks idle partition, не блокирует overall watermark.
+- **Temporal join без watermark** — versioned state накапливает versions forever. Watermark on versioned table — обязателен для cleanup.
+- **Window aggregation с keyBy huge cardinality** — windows × N users = explosion. Aggregate сначала per-user, потом per-category. Reduce key cardinality before window.
+- **Operator chaining + UID** — если chain нескольких операторов, UID применяется к chained operator. Verify через web UI что UID applied correctly.
+- **Side output для fraud alerts**: separate Kafka topic, не main output. Иначе main consumers получают fraud events как normal.
+- **OnTimer firing storms** — если регистрируете timer per record, при recovery все timers fire одновременно. Solution: round timer time (например, ceiling до nearest minute) для batching.
+- **State backend choice** — ForSt для production scale; RocksDB для smaller state (< 100 GB); никогда heap для production stateful jobs.
+
+<Callout type="warning">
+**FraudScore calculation в primary processElement — risky**. Если fraud detection становится complex и slow (ML inference), оно блокирует main pipeline. Production pattern: keep main path simple (basic rules), emit raw events на отдельный fraud pipeline (Flink job на ML_PREDICT), который returns decisions через separate Kafka topic.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Stateful layer review: проектируем UserAggregator с ValueState<UserSummary> per user_id, MapState<Long, WindowCounter> для windowed counters, и ValueState<Long> lastOrderTime для velocity tracking. Стейкхолдер замечает: 'у нас 5B unique user_ids накопилось за 3 года, parallelism=64. State не растёт ли неуправляемо?'. Анализируйте sizing, identify проблемы и предложите solutions."
+  answer="Critical state sizing analysis. 5B users × parallelism=64 = distribution: каждый subtask владеет 5B/64 = 78M keys. Per-key state size: UserSummary ~300 bytes (after RocksDB overhead 200-400 bytes per entry), MapState wrap +50 bytes overhead, lastOrderTime 50 bytes → total ~400 bytes per key. Per subtask: 78M × 400 = 31 GB. ForSt makes this primary state на S3 (disaggregated), local cache much smaller. Recovery metadata-only ~30s. **BUT** проблемы: (1) 5B keys = много keyed state entries — RocksDB compactions linearly с size, even on ForSt; (2) per-key state actually 'tiny' (300 bytes), overhead dominant — это classic 'tiny state, huge cardinality' anti-pattern! Solutions в порядке impact: **(1) TTL обязателен** — UserSummary с TTL 90d от last write (uses StateTtlConfig OnCreateAndWrite + cleanupInRocksdbCompactFilter). Drastically reduces active key count к activeUsers (~10-20% от total) = 1B keys instead of 5B. **(2) Hot/cold split** — analyze user activity distribution. Если P80 of orders приходится от P20 of users (Pareto), only 1B 'hot' users matter. Cold users (4B) → archive в Paimon, не keyed state. Re-hydrate on rare request via external lookup. **(3) Granularity rethink** — нужен ли per-user fraud score real-time? Если YES для recent activity (TTL 30 days), separate cold storage для historical. Granularity changes drastically reduce state. **(4) maxParallelism tuning** — set explicit maxParallelism=512+ для future scaling beyond parallelism=64. Default 128 limits parallelism options. **(5) ForSt confirmation** — for state size like this RocksDB на local disk impractical (78M × 400 bytes ≈ 31 GB per TM × 64 TMs = 2TB local disk). ForSt с S3 primary makes this manageable + recovery fast. **(6) Monitoring** — `numKeyedStateEntries`, `state.size` per operator, alerting если linear growth without plateau. **(7) Re-evaluate** — может быть, this scale really требует different architecture (external store, Materialize/RisingWave, etc.). 5B users на single Flink job — fundamentally challenging. Lesson: state sizing — design-phase concern, not runtime issue. Catch this BEFORE production."
+/>

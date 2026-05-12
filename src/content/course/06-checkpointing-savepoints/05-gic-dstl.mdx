@@ -1,0 +1,473 @@
+---
+title: "GIC / DSTL: Generic Log-Based Incremental Checkpoints (FLIP-158)"
+description: "Changelog state backend (FLIP-158, 1.15+ MVP, 1.16+ production). DSTL (Durable Short-term Log) на DFS, materialization периодически, секунды checkpoint duration на TB state."
+order: 5
+difficulty: "advanced"
+estimatedTime: 35
+topics: ["GIC", "DSTL", "Changelog State Backend", "FLIP-158", "Materialization", "Stable Checkpoint Latency"]
+---
+
+# Generic Log-Based Incremental Checkpoints: ultimate killer feature
+
+GIC (FLIP-158) — **самая значимая** оптимизация checkpoint behaviour за последние 5 лет Flink. Решает фундаментальную проблему: даже с async + incremental checkpoint duration **нестабильное** — зависит от RocksDB flush cycle, compaction storms, network spikes. GIC даёт **seconds checkpoint duration на TB-scale state**, независимо от backend behaviour.
+
+Это критично для production EOS pipelines с transactional sinks (Kafka, Iceberg) — короткие checkpoints → короткие Kafka transactions → меньше transaction.timeout.ms требуется → меньше data loss risk.
+
+Этот урок — детальный разбор Changelog State Backend, DSTL (Durable Short-term Log) algorithm, materialization cycle, и production tuning.
+
+---
+
+## Проблема, которую решает GIC
+
+### Без GIC: nondeterministic checkpoint duration
+
+Даже с incremental checkpoints duration зависит от:
+- **RocksDB flush** — когда MemTable full, flushes к L0, creating new SSTs (50-200ms async)
+- **Compaction** — L0→L1+ compactions создают много new SSTs (seconds-minutes)
+- **Network spikes** — S3 throttling, partial outages (variable)
+- **Backpressure** — alignment phase под high load
+
+Результат: checkpoint duration распределяется как `mean=30s, p99=10min`. Это catastrophic для EOS:
+
+```
+Kafka transaction.timeout.ms = 15 min
+Checkpoint p99 duration = 10 min
+Network jitter + restart = 5 min
+Total: 15 min reached → transaction expires → data loss risk
+```
+
+### С GIC: stable checkpoint duration
+
+GIC achieves: `mean=2s, p99=10s` — **independent** of state size (50GB or 50TB).
+
+Mechanism: separation между state mutation **persistence** и state **compaction**. Mutations дубль-пишутся в DSTL (append-only log) на DFS. Checkpoint = flush DSTL. Materialization (создание snapshot из current state) — separate cycle, periodic.
+
+---
+
+## Архитектура: Changelog State Backend
+
+<DiagramContainer title="GIC: Changelog backend на top of RocksDB/ForSt" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="State mutation: state.update(value)"
+        tooltip="User code calls state.update() / state.add() / state.put(). Это обычный API — не виден, что происходит underneath с GIC."
+      >
+        ValueState.update(...)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Changelog backend wrapper" />
+    <FlowRow>
+      <DataBox
+        label="ChangelogStateBackend (wrapper)"
+        tooltip="Wrapper backend, который sits between API и underlying backend (RocksDB / ForSt). Intercept-ит каждую mutation, дубль-пишет в DSTL и в underlying. Read paths go к underlying."
+      >
+        Wrapper над RocksDB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="dual write" />
+    <FlowRow>
+      <DataBox
+        label="DSTL (Durable Short-term Log)"
+        tooltip="Append-only log на DFS (S3, HDFS). Each mutation pushed как entry. Flush на checkpoint. Restart → replay DSTL. Materialization periodically truncate DSTL."
+      >
+        Append к log на S3
+      </DataBox>
+      <DataBox
+        label="RocksDB / ForSt underlying"
+        tooltip="Underlying backend получает mutation как обычно. Используется для read path (state queries). MemTable, SST files, compactions — unchanged."
+      >
+        Normal LSM operations
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="checkpoint triggered" />
+    <FlowRow>
+      <DataBox
+        label="Checkpoint = flush DSTL"
+        tooltip="На barrier: flush DSTL — append pending entries, fsync. Это маленькое write на DFS (recent mutations), миллисекунды. DFS state operator-а = latest materialization + DSTL log."
+      >
+        Flush log → ack
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="periodic (10 min default)" />
+    <FlowRow>
+      <DataBox
+        label="Materialization (background)"
+        tooltip="Periodic: RocksDB snapshot создаётся, uploaded к DFS, replaces 'base state' для DSTL. Old DSTL truncated. Это и есть 'compaction' DSTL log."
+      >
+        Snapshot → DFS → truncate DSTL
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Two-stream model
+
+GIC разделяет state в DFS на два потока:
+
+1. **Materialized state** — full RocksDB snapshot at some point. Updated periodically (default 10 min).
+2. **Changelog (DSTL)** — append-only log mutations since last materialization. Continuously flushed.
+
+**Восстановление state** = load materialized state + replay DSTL log.
+
+### Mathematics
+
+```
+state_at_time_T = materialization_at_T0 + apply(DSTL_from_T0_to_T)
+
+where T0 = last materialization timestamp
+```
+
+DSTL bounded по времени: max = materialization interval (10 min default). Replay limit bounded — predictable recovery.
+
+---
+
+## DSTL: Durable Short-term Log
+
+DSTL — sequential append-only log на DFS. Каждый mutation записан как **changelog entry**:
+
+```
+DSTL entry format:
+[Header: operatorId, keyGroup, sequenceNumber]
+[StateName: "lastTime"]
+[Key: serialized key bytes]
+[Operation: PUT | DELETE | ADD]
+[Value: serialized value bytes]
+```
+
+### Append cycle
+
+```java
+public void update(K key, V value) {
+    // 1. Apply к underlying RocksDB
+    underlying.update(key, value);
+
+    // 2. Append к DSTL writer buffer
+    dstlWriter.append(new ChangelogEntry(
+        stateName, key, OpType.PUT, value
+    ));
+    // Не fsync — fsync на checkpoint
+}
+```
+
+**Batching**: DSTL accumulates entries в memory buffer (default ~64KB), flushes к DFS на:
+- Buffer full
+- Checkpoint trigger
+- Periodic time-based flush (~1s default)
+
+### Storage layout
+
+```
+s3://my-bucket/dstl/
+├── job-abc/
+│   ├── operator-001/
+│   │   ├── 0000000-000005.log    ← DSTL segment files
+│   │   ├── 0000005-000010.log
+│   │   └── 0000010-checkpoint-50.log
+│   ├── operator-002/
+│   │   └── ...
+└── materialization/
+    ├── m-0000000/                ← materialization 0 (RocksDB snapshot)
+    ├── m-0000100/
+    └── ...
+```
+
+DSTL segments rotated periodically. После materialization старые segments deleted.
+
+---
+
+## Materialization cycle
+
+Periodic background process, который creates RocksDB native snapshot и uploads к DFS:
+
+```java
+public void materialize() {
+    // 1. RocksDB native snapshot (hardlinks)
+    RocksDBSnapshot snapshot = rocksDB.createNativeSnapshot();
+
+    // 2. Async upload к DFS (materialization location)
+    StateHandle materializedHandle = asyncUpload(snapshot);
+
+    // 3. Record materialization checkpoint ID + DSTL sequence boundary
+    materializationManager.recordMaterialization(
+        materializedHandle, lastDSTLSequenceNumber
+    );
+
+    // 4. Truncate DSTL — DSTL entries до lastDSTLSequenceNumber больше не нужны
+    dstlWriter.truncateUpTo(lastDSTLSequenceNumber);
+}
+```
+
+### Why periodic, not on every checkpoint
+
+Если materialize on every checkpoint — overhead high (RocksDB native snapshot upload), вернёмся к non-GIC behaviour.
+
+Если materialize never — DSTL log unbounded → recovery time slow (replay TBs of log).
+
+**Sweet spot**: 5-15 min (default 10 min). Bounds DSTL size, materialization cost amortized.
+
+### Materialization не blocking checkpoints
+
+Materialization — **background process**, не triggered checkpoint coordinator. Если materialization takes 10 min, checkpoints continue happening каждые 60s — they include DSTL flush + reference к currently-materialized state.
+
+---
+
+## Recovery process
+
+```java
+public void restore(CheckpointMetadata metadata) {
+    // 1. Get materialization handle + DSTL sequence range
+    StateHandle materializedState = metadata.getMaterializedState();
+    Range<Long> dstlRange = metadata.getDSTLRange();
+
+    // 2. Download materialized snapshot
+    File localSnapshot = dfs.download(materializedState);
+
+    // 3. Open RocksDB from snapshot
+    rocksDB = openRocksDB(localSnapshot);
+
+    // 4. Replay DSTL from sequence start to end
+    for (DSTLEntry entry : dstlReader.readRange(dstlRange)) {
+        applyEntry(rocksDB, entry);
+    }
+
+    // 5. Ready to process
+}
+```
+
+### Recovery time
+
+```
+Recovery = download(materializedState) + replay(DSTL)
+         ≈ state_size / DFS_bandwidth + materialization_interval × write_rate / DFS_bandwidth
+```
+
+DSTL replay overhead bounded by `materialization_interval × write_rate`. На 10 min interval × 10K writes/sec = 6M entries × 200 bytes = 1.2GB additional. Negligible vs state size.
+
+---
+
+## Configuration
+
+```yaml
+# Enable Changelog
+state.backend.changelog.enabled: true
+
+# DSTL storage — filesystem ИЛИ memory (для testing)
+state.backend.changelog.storage: filesystem
+
+# DSTL base path
+dstl.dfs.base-path: s3://my-bucket/dstl
+
+# Materialization interval (default 10 min)
+state.backend.changelog.periodic-materialize.interval: 10min
+
+# Maximum allowed failures для materialize before abort
+state.backend.changelog.periodic-materialize.max-failures-allowed: 3
+
+# Underlying backend (must be RocksDB или ForSt)
+state.backend.type: rocksdb
+```
+
+### Programmatic
+
+```java
+CheckpointConfig cpConfig = env.getCheckpointConfig();
+cpConfig.enableChangelogStateBackend(true);
+
+Configuration changelogConfig = new Configuration();
+changelogConfig.set(StateChangelogOptions.PERIODIC_MATERIALIZATION_INTERVAL,
+                    Duration.ofMinutes(10));
+env.configure(changelogConfig);
+```
+
+---
+
+## Performance characteristics
+
+### Latency
+
+| Operation | Without GIC | With GIC |
+|---|---|---|
+| Checkpoint p50 (1TB state) | 30s | 2s |
+| Checkpoint p99 (1TB state) | 10min | 10s |
+| Recovery time | state_size / bandwidth | Same + DSTL replay (~seconds) |
+| Mutation latency | RocksDB write | RocksDB + DSTL append (+10-30%) |
+
+### Bandwidth
+
+| Cost | Without GIC | With GIC |
+|---|---|---|
+| DFS PUT per checkpoint | Incremental diff | DSTL flush (small) |
+| DFS PUT continuous | — | DSTL writes (always) |
+| DFS GET on recovery | Read state files | Read materialized + DSTL |
+
+GIC trades **steady-state DFS bandwidth** (always writing DSTL) for **stable checkpoint latency** (no spikes).
+
+### Production numbers
+
+```
+1TB RocksDB state, 60s checkpoint interval:
+  Without GIC: avg 50s, p99 5min, occasional failures
+  With GIC:    avg 2s, p99 10s, no failures
+```
+
+```
+EOS Kafka pipeline with strict transaction.timeout.ms:
+  Without GIC: tx.timeout = 1 hour (для safety при rare 30min checkpoints)
+  With GIC:    tx.timeout = 5 min sufficient (stable 10s checkpoints)
+```
+
+Shorter Kafka transactions → меньше memory in brokers, faster recovery, fewer stale transactions.
+
+---
+
+## Real production scenario
+
+### Setup
+
+E-commerce platform, fraud detection job:
+- 500 subtasks
+- 2TB RocksDB state на NVMe
+- Kafka source + Kafka EOS sink
+- Checkpoint interval = 60s
+
+### Without GIC
+
+```
+Checkpoint duration distribution:
+  p50:   25s
+  p90:   1min 30s
+  p99:   8min (compaction spike)
+  p99.9: 15min (failure)
+
+Kafka producer transaction.timeout.ms must be 20-30 min для safety
+Memory pressure on Kafka brokers: holding many in-flight transactions
+Periodic transaction expirations → at-least-once degradation
+```
+
+### With GIC
+
+```yaml
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+dstl.dfs.base-path: s3://flink-state/dstl
+state.backend.changelog.periodic-materialize.interval: 10min
+```
+
+```
+Checkpoint duration distribution:
+  p50:   1.5s
+  p90:   3s
+  p99:   8s
+  p99.9: 15s
+
+Kafka transaction.timeout.ms can be 2 min — sufficient
+Lower memory pressure on Kafka brokers
+Stable EOS guarantees
+```
+
+---
+
+## Production gotchas
+
+### 1. DSTL DFS bandwidth — always writing
+
+DSTL дубль-пишет каждую mutation к DFS. На 100K mutations/sec × 200 bytes = 20MB/s sustained DFS write. На multi-TB jobs может быть 100+ MB/s.
+
+**Cost**: S3 PUT requests (charged per request). На 100K writes/sec batched в 64KB chunks = ~10K PUT/sec. Adds up.
+
+**Mitigation**: large batch size, parallel writers per operator, compress DSTL entries.
+
+### 2. DSTL storage — separate из checkpoint storage
+
+```yaml
+state.checkpoints.dir: s3://state/checkpoints
+dstl.dfs.base-path: s3://state/dstl    # ← разные prefix recommended
+```
+
+S3 limits per-prefix throughput. Putting DSTL и checkpoints на same prefix может throttle. Use разные prefixes (или buckets).
+
+### 3. Materialization storms — concurrent с checkpoint
+
+Каждый operator materializes по своему schedule (jitter). Не coordinated globally. Если materializations align с checkpoint trigger — DFS bandwidth doubles.
+
+**Mitigation**: jitter materialization interval (`state.backend.changelog.periodic-materialize.interval` per-operator randomization).
+
+### 4. Recovery readiness — DSTL must быть available
+
+Если DSTL DFS partly unavailable (S3 region outage), recovery fails. State за last materialization (up to 10 min) lost.
+
+**Mitigation**: shorter materialization interval (5 min reduces window), multi-region DSTL replication.
+
+### 5. Stop-with-savepoint после GIC enabled
+
+Savepoints — full snapshot, не incremental. Stop-with-savepoint triggers full materialization + Кmptpoint. На TB state — minutes. Это нормально, just expect.
+
+### 6. RocksDB compaction throughput
+
+Underlying RocksDB всё ещё compaction-uses. Если compaction throughput < write throughput → write stall (как обсуждали в модуле 04). GIC не fixes — DSTL persists mutations, но RocksDB tracking тоже needs to keep up для reads.
+
+### 7. Не работает на non-LSM backends
+
+GIC требует RocksDB или ForSt underlying. На heap state backend (deprecated в 2.x) — не доступен. На custom backends — нужно implement `ChangelogKeyedStateBackend` interface.
+
+### 8. Mutation latency overhead
+
+Каждая mutation now: RocksDB write + DSTL append. DSTL append amortized через batching, но per-mutation latency может add 10-30% (microseconds level). На latency-critical jobs measure.
+
+### 9. Cleanup DSTL после materialization
+
+Truncating DSTL после materialization — async DFS deletes. На high churn — S3 DELETE requests могут throttle. Monitor.
+
+### 10. Не для savepoints
+
+Savepoints always full materialization. Stop-with-savepoint занимает full upload time. Backup strategy: regular checkpoints + occasional savepoints.
+
+---
+
+## When to use GIC
+
+### Use GIC if:
+- State > 100GB
+- Checkpoint duration variability matters (EOS sinks!)
+- Backpressure частый
+- Kafka/transactional sinks с tight timeouts
+- DFS bandwidth available (S3 cost OK)
+
+### Maybe skip GIC if:
+- State < 10GB (overhead per-mutation matters more)
+- Latency-critical processing (per-mutation cost)
+- DFS bandwidth costly (managed-S3 pricing)
+- Mostly read-only workload (DSTL doesn't help)
+
+### Combine GIC + others
+
+- GIC + ForSt: ultimate cloud-native — disaggregated state + stable checkpoints
+- GIC + unaligned: redundant — GIC stable already, unaligned для alignment не нужно
+- GIC + incremental (RocksDB): default — GIC sits on top of incremental
+
+---
+
+## Cheat sheet
+
+```yaml
+# Production GIC setup
+state.backend.type: rocksdb
+state.backend.incremental: true
+state.checkpoints.dir: s3://my-bucket/checkpoints
+
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+dstl.dfs.base-path: s3://my-bucket/dstl
+state.backend.changelog.periodic-materialize.interval: 10min
+
+execution.checkpointing.interval: 30s    # Можно reduce от 60s — duration stable
+execution.checkpointing.timeout: 5min    # Намного меньше чем без GIC
+```
+
+---
+
+<KnowledgeCheck
+  question="GIC vs incremental checkpoints (RocksDB native) — в чём fundamental difference и когда они complement друг друга?"
+  answer="Fundamental difference в подходе: Incremental checkpoints (RocksDB native, через SharedStateRegistry) — на каждый checkpoint diff SST files между previous и current state. Upload только new SSTs, reference existing. Это великое улучшение vs full checkpoint, но duration зависит от SST churn: heavy compaction → много new SSTs → большой diff → длительный upload. Variable, depending на RocksDB internal state. GIC (Generic Log-Based Incremental) — fundamentally different model. Каждая state mutation дубль-пишется в DSTL (append-only log) на DFS. Checkpoint = flush DSTL (small recent mutations), миллисекунды. Materialization (RocksDB native snapshot + upload) — separate periodic cycle (10 min default), NOT синхронно с checkpoint. State в DFS = latest materialization + DSTL log. Recovery = load materialization + replay DSTL. Сравнение: (1) Checkpoint latency: Incremental variable (depend on diff), GIC stable (always small DSTL flush); (2) Steady-state DFS bandwidth: Incremental peaks on heavy compactions, GIC continuous moderate (DSTL writes); (3) Recovery time: Incremental requires download all SSTs in manifest, GIC requires materialization + DSTL replay (bounded by interval); (4) Per-mutation latency: Incremental no extra cost on path, GIC adds DSTL append (small overhead 10-30%); (5) DFS storage: Incremental keeps shared SSTs (refs counted), GIC keeps materializations + active DSTL segments. Они NOT mutually exclusive — GIC sits ON TOP of incremental. Default Flink 2.x stack: ChangelogStateBackend (GIC) wraps RocksDB (incremental) — DSTL для checkpoints, RocksDB native snapshots для materializations (which are incremental themselves!). Complement: (a) Incremental optimizes materialization step within GIC — only diff SSTs uploaded periodically (every 10 min) instead of full each time; (b) GIC optimizes checkpoint cadence — frequent checkpoints (30-60s) are fast regardless of underlying state size. When to use: incremental без GIC = SST sharing, fast initial checkpoint, but variable duration. GIC + incremental = stable checkpoint duration AND efficient materialization. Production recommendation: на любых jobs с state > 100GB или EOS Kafka sinks — ENABLE BOTH. На small state (< 10GB) — incremental sufficient, GIC overhead не payback. На очень frequent rescale operations — GIC strictly better (materialization не disrupted by rescale так sharply, DSTL log unchanged)."
+/>

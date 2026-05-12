@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/04-timers",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-04",
+    "description": "Use IDs: flink-m02-04-q1, flink-m02-04-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-04-q1",
+      "type": "multiple-choice",
+      "question": "В чём разница между event-time и processing-time timers, и когда какой использовать?",
+      "options": [
+        { "id": "a", "text": "Они идентичны" },
+        { "id": "b", "text": "Event-time timer fires когда watermark > registered_ts (event-time progress, не wall clock). Processing-time timer fires когда wall_clock > registered_ts. Event-time для: window expiry, event-based timeouts, reproducible logic. Processing-time для: periodic operations (flushes), real-time alerts независимые от data timestamps, debouncing" },
+        { "id": "c", "text": "Event-time только для batch jobs" },
+        { "id": "d", "text": "Processing-time deprecated в 2.0" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Event-time timer driven by watermark progress: registers fires когда watermark advance-ит past registered_ts. Это deterministic, reproducible (при reprocessing same data за same period — same timer behavior). Processing-time timer driven by wall clock TaskManager-а — non-deterministic при replay (wall clock сейчас, не original). Event-time для: business semantics (timeout по event-time, window expiry, late event detection). Processing-time для: real-time SLA (60-sec response alert независимо от data lag), periodic emissions, debouncing.",
+      "studyHint": "Повторите урок 04 — раздел 'Два типа таймеров'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-04-q2",
+      "type": "multiple-choice",
+      "question": "Inactivity detector через event-time timer на 30 минут. В production Kafka source имеет idle partition (нет новых событий). Что происходит?",
+      "options": [
+        { "id": "a", "text": "Timer fires нормально через 30 минут" },
+        { "id": "b", "text": "Watermark stuck: stream watermark = MIN(watermarks всех parallel sources). Один idle partition → весь watermark stuck → event-time timers НЕ FIRES даже если другие partitions активные. Inactivity alerts задерживаются на часы. Fix: WatermarkStrategy.withIdleness(Duration.ofMinutes(1)) — после idleness threshold partition игнорируется в watermark computation" },
+        { "id": "c", "text": "Timer переключается на processing-time" },
+        { "id": "d", "text": "Job FAILS автоматически" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic 'watermark stuck' проблема. Watermark stream = MIN watermarks parallel sources. Idle partition (no records) → его watermark остаётся at startup value (либо Long.MIN_VALUE) → всего stream watermark stuck. Event-time timers fires только когда watermark > registered_ts — stuck watermark означает stuck timers. Consequences: alerts/windows не fire, state накапливается. Fix: withIdleness(Duration) в WatermarkStrategy — если partition не emit records X minutes, помечать idle и игнорировать в watermark computation. Это позволяет watermark advance по active partitions.",
+      "studyHint": "Повторите урок 04 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-04-q3",
+      "type": "multiple-choice",
+      "question": "Регистрация timer для same (key, timestamp) дважды — это два timer-а или один?",
+      "options": [
+        { "id": "a", "text": "Два timer-а — onTimer вызовется дважды" },
+        { "id": "b", "text": "Один timer. Регистрация idempotent для (key, timestamp) пары — Flink dедуплицирует. Это efficient для частых register calls (не нужен manual deduplication). При delete — удаляется тот единственный timer" },
+        { "id": "c", "text": "Зависит от backend (RocksDB vs Heap)" },
+        { "id": "d", "text": "Только если оба register-а в одном processElement" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Timer registration idempotent для (key, ts). Внутри Flink хранит timers в priority queue keyed по (subtask key range, ts). Несколько register для same (key, ts) — это один timer. Это очень удобно: можно не делать manual deduplication, просто register для нужного ts. delete удаляет это единственное entry. Это разрешает паттерны типа 'register timer + update state' без беспокойства об idempotency.",
+      "studyHint": "Повторите урок 04 — раздел 'Deduplication'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-04-q4",
+      "type": "true-false",
+      "question": "Timer flood (10k+ timers fires за один watermark advance) — частая production проблема. Все timers fires sequentially в mailbox thread, что может занять секунды и блокировать processElement / checkpoints.",
+      "correctAnswer": true,
+      "explanation": "Timers fires sequentially в mailbox thread — это design (single thread = no race conditions). При watermark advance Flink pulls все timers с ts ≤ new_watermark, sorts по ts, и calls onTimer для каждого sequentially. Если в queue 10k+ timers — их firing может занять seconds → processElement waiting, checkpoint barriers waiting → backpressure через timer flood. Solutions: spread timer registrations (jitter on register ts), batch state cleanup в один timer per N records, использовать lazy timer registration (один timer per period).",
+      "bloomLevel": "applied"
+    }
+  ]
+}

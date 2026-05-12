@@ -1,0 +1,344 @@
+---
+title: "Native Kubernetes integration (без Helm и без Operator)"
+order: 3
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Kubernetes", "Native Integration", "flink kubernetes-application", "kubernetes config"]
+---
+
+# Native Kubernetes integration
+
+Flink имеет **native Kubernetes integration** с 1.10. Это означает: Flink сам общается с K8s API server-ом, создаёт/удаляет pods, ConfigMaps, Services — никакого Helm, никакого Operator. JobManager берёт роль ResourceManager-а в K8s mode и динамически provision-ит TaskManager pods.
+
+Native K8s integration — это **слой ниже Flink Kubernetes Operator** (урок 04). Operator использует native integration под капотом, добавляя сверху CRDs, reconciliation loop, savepoint management. В этом уроке смотрим на raw native API: что Flink делает напрямую с K8s, какие resources создаются, как конфигурировать через `kubernetes.*` properties.
+
+Понимание native integration критично даже если используете Operator — потому что debugging упирается в эти primitives, и Operator не магия, а реконсилирующая обёртка.
+
+---
+
+## Что такое «native» vs «standalone» K8s
+
+| Подход | Кто управляет TM-ами | Конфигурация |
+|---|---|---|
+| **Native (active)** | Flink JobManager сам создаёт TM pods через K8s API | `-t kubernetes-application` или `kubernetes-session` |
+| **Standalone (passive)** | Вы заранее deploy-ите N TM pods, Flink JM их использует | Standalone deployment YAML с фиксированным replicas |
+
+Native = **active resource management**. JM ↔ K8s API server напрямую. Слоты подтягиваются по требованию JobMaster-а. При FLIP-271 autoscaler меняет parallelism — RM создаёт/удаляет pods динамически.
+
+Standalone = static. Полезен только для специфичных кейсов (внешний resource manager типа Yarn-ish wrapper), в 2.x — почти не используется. Все production setup-ы — native.
+
+---
+
+## Архитектура native integration
+
+<DiagramContainer title="Flink native K8s — JM как ResourceManager" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="flink CLI / Operator"
+        tooltip="Submission через `flink run-application -t kubernetes-application ...` или через Flink Kubernetes Operator (под капотом — те же K8s API calls)."
+      >
+        submission
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="POST → K8s API server" />
+    <FlowRow>
+      <DataBox
+        label="K8s API server"
+        tooltip="Создаёт Deployment для JM (или Pod если non-HA), Service на 8081 для UI/REST, ConfigMap для flink-conf.yaml, RBAC если включён."
+      >
+        creates JM Deployment + Service + ConfigMap
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="JM pod scheduled" />
+    <FlowRow>
+      <DataBox
+        label="JobManager pod"
+        tooltip="Стартует JVM, поднимает Dispatcher, ResourceManager (KubernetesResourceManagerDriver), JobMaster. RM получает токен от mounted ServiceAccount для общения с K8s API."
+      >
+        JM = Dispatcher + RM + JobMaster
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="RM ↔ K8s API server" />
+    <FlowRow>
+      <DataBox
+        label="KubernetesResourceManagerDriver"
+        tooltip="Внутренний компонент в JM. При запросе слотов от JobMaster, RM создаёт TaskManager Pod-ы напрямую через kubernetes-client (fabric8). Pod manifests генерируются на лету с правильным image, resource limits, env vars."
+      >
+        creates TM Pods on-demand
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="TM pods register" />
+    <FlowRow>
+      <DataBox
+        label="TaskManager pods"
+        tooltip="При старте TM регистрируется в RM по hostname/IP (через K8s headless service или прямой connection). Получает slot allocations. RM может kill TM pod при rescale down."
+      >
+        register slots
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Ключевое: **никакой внешней YAML для TM нет**. TM pods генерируются JobManager-ом dynamically. Это позволяет:
+- Autoscaler через FLIP-271 — RM просто меняет число TM pods
+- Heterogeneous deployments — JM может request разные resource specs для разных task groups (slot sharing)
+- Clean teardown — при job FINISHED все TM pods удаляются автоматически
+
+---
+
+## Submission через `flink run-application`
+
+Полный пример запуска без Operator:
+
+```bash
+./bin/flink run-application \
+    --target kubernetes-application \
+    -Dkubernetes.namespace=streaming-prod \
+    -Dkubernetes.cluster-id=fraud-detector \
+    -Dkubernetes.container.image=registry.example.com/fraud-detector:1.42 \
+    -Dkubernetes.service-account=flink \
+    -Dkubernetes.jobmanager.cpu.amount=2 \
+    -Dkubernetes.jobmanager.cpu.limit-factor=1.0 \
+    -Djobmanager.memory.process.size=4096m \
+    -Dkubernetes.taskmanager.cpu.amount=4 \
+    -Dtaskmanager.memory.process.size=8192m \
+    -Dtaskmanager.numberOfTaskSlots=4 \
+    -Dkubernetes.taskmanager.replicas=2 \
+    -Dstate.backend.type=forst \
+    -Dstate.checkpoints.dir=s3://flink-prod/checkpoints/fraud-detector \
+    -Dhigh-availability.type=kubernetes \
+    -Dhigh-availability.storageDir=s3://flink-prod/ha/fraud-detector \
+    -Djobmanager.scheduler=adaptive \
+    -Dexecution.checkpointing.interval=60s \
+    local:///opt/flink/usrlib/fraud-detector.jar
+```
+
+`local:///` означает JAR внутри Docker image. Flink не upload-ит ничего — image уже содержит artifact.
+
+После submit команда выходит. Cluster живёт сам по себе, управляется через K8s API.
+
+---
+
+## Какие ресурсы K8s создаются
+
+Native integration создаёт точный набор ресурсов:
+
+| Resource | Назначение |
+|---|---|
+| **Deployment** `<cluster-id>` | JobManager (если HA — replicas=2) |
+| **Pod** `<cluster-id>-taskmanager-<idx>-<n>` | TaskManager pods (создаются динамически RM) |
+| **Service** `<cluster-id>-rest` (LoadBalancer/ClusterIP) | REST API + Web UI на 8081 |
+| **Service** `<cluster-id>` (headless, ClusterIP=None) | Internal JM ↔ TM communication |
+| **ConfigMap** `<cluster-id>-config` | flink-conf.yaml, log4j config |
+| **ConfigMap** `<cluster-id>-cluster-config-map` | HA metadata (если HA включён) |
+| **ConfigMap** `<cluster-id>-<job-id>-config-map` | HA job-specific data |
+| **ServiceAccount** | RBAC для RM (если не дефолтный) |
+
+Каждый ConfigMap для HA содержит references на actual data: latest completed checkpoint, JobGraph, leader info. **Сами state data в S3/HDFS** — ConfigMap-ы только pointers.
+
+```bash
+kubectl get all -n streaming-prod -l app=fraud-detector
+# pod/fraud-detector-<jm-hash>-xyz                  Running
+# pod/fraud-detector-taskmanager-1-1                Running
+# pod/fraud-detector-taskmanager-1-2                Running
+# service/fraud-detector-rest                       LoadBalancer
+# service/fraud-detector                            ClusterIP    None
+# deployment.apps/fraud-detector                    1/1
+
+kubectl get configmaps -n streaming-prod -l app=fraud-detector
+# fraud-detector-config-map
+# fraud-detector-cluster-config-map
+# fraud-detector-<jobid>-config-map
+```
+
+---
+
+## Конфигурация через `kubernetes.*` properties
+
+Все K8s-специфичные настройки — отдельные ключи с prefix `kubernetes.*`. Это полный реестр самых важных:
+
+```yaml
+# Identity
+kubernetes.namespace: streaming-prod
+kubernetes.cluster-id: fraud-detector
+kubernetes.service-account: flink
+kubernetes.context: my-cluster-context    # для multi-cluster setups
+
+# Image
+kubernetes.container.image: registry.example.com/fraud-detector:1.42
+kubernetes.container.image.pull-policy: IfNotPresent
+kubernetes.container.image.pull-secrets: regcred
+
+# JobManager
+kubernetes.jobmanager.cpu.amount: 2
+kubernetes.jobmanager.cpu.limit-factor: 1.0          # ratio request → limit
+kubernetes.jobmanager.replicas: 2                    # HA standby
+kubernetes.jobmanager.labels: "team:streaming,tier:critical"
+kubernetes.jobmanager.annotations: "prometheus.io/scrape:true"
+kubernetes.jobmanager.tolerations: "key:streaming,operator:Exists,effect:NoSchedule"
+kubernetes.jobmanager.node-selector: "node-type:streaming"
+
+# TaskManager (аналогично)
+kubernetes.taskmanager.cpu.amount: 4
+kubernetes.taskmanager.cpu.limit-factor: 1.5
+kubernetes.taskmanager.replicas: 4                   # only for session mode
+kubernetes.taskmanager.labels: "team:streaming"
+
+# REST exposure
+kubernetes.rest-service.exposed.type: LoadBalancer   # или ClusterIP, NodePort
+kubernetes.rest-service.exposed.node-port-address-type: InternalIP
+
+# Pod templates — для advanced customization
+kubernetes.pod-template-file.jobmanager: /opt/flink/conf/jm-pod-template.yaml
+kubernetes.pod-template-file.taskmanager: /opt/flink/conf/tm-pod-template.yaml
+
+# Networking
+kubernetes.internal.jobmanager.entrypoint.args:       # сложнее
+kubernetes.hadoop.conf.config-map.name: hadoop-config
+```
+
+---
+
+## Pod template — главный escape hatch
+
+Для нетривиальных deployments (volume mounts, sidecars, security contexts, init containers) используется **pod template**:
+
+```yaml
+# tm-pod-template.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: fraud-detector
+spec:
+  serviceAccountName: flink
+  securityContext:
+    fsGroup: 9999
+  initContainers:
+    - name: warmup-rocksdb-cache
+      image: busybox:1.36
+      command: ["sh", "-c", "echo prewarming..."]
+      volumeMounts:
+        - name: rocksdb-cache
+          mountPath: /rocksdb-cache
+  containers:
+    - name: flink-main-container        # ВАЖНО: точно такое имя для main container
+      resources:
+        requests:
+          ephemeral-storage: 50Gi
+      volumeMounts:
+        - name: rocksdb-cache
+          mountPath: /rocksdb-cache
+        - name: secrets
+          mountPath: /secrets
+          readOnly: true
+      env:
+        - name: AWS_REGION
+          value: us-east-1
+    - name: log-shipper                  # sidecar
+      image: vector:latest
+      volumeMounts:
+        - name: log-volume
+          mountPath: /var/log/flink
+  volumes:
+    - name: rocksdb-cache
+      emptyDir:
+        sizeLimit: 50Gi
+    - name: secrets
+      secret:
+        secretName: flink-secrets
+    - name: log-volume
+      emptyDir: {}
+```
+
+Flink merge-ит этот template с тем, что генерирует automatically (image, resources, ports), используя strategic merge. Main container **обязательно** должен называться `flink-main-container` — иначе Flink не сможет inject правильный command.
+
+<Callout type="warning">
+Pod template merge может сюрпризить: некоторые поля overwrite, некоторые merge. Например volumeMounts мержатся list-wise, но containers — по name. Всегда test pod template на staging перед prod: `kubectl get pod <name> -o yaml` для верификации финальной структуры.
+</Callout>
+
+---
+
+## RBAC: что нужно
+
+JM нужны permissions для управления pods:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flink
+  namespace: streaming-prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flink
+  namespace: streaming-prod
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "configmaps", "services"]
+    verbs: ["create", "get", "list", "watch", "update", "delete", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flink
+  namespace: streaming-prod
+roleBinding:
+subjects:
+  - kind: ServiceAccount
+    name: flink
+    namespace: streaming-prod
+roleRef:
+  kind: Role
+  name: flink
+  apiGroup: rbac.authorization.k8s.io
+```
+
+С Flink Kubernetes Operator (урок 04) operator's ServiceAccount имеет cluster-scoped permissions, а jobs run с минимальным namespace-scoped account.
+
+---
+
+## Native vs Operator: когда без Operator
+
+Native integration без Operator имеет место, но в production 2026 это редкость:
+
+| Use case | Native sufficient | Лучше с Operator |
+|---|---|---|
+| One-off CLI job submission | ✓ | избыточно |
+| Local dev cluster on minikube | ✓ | избыточно |
+| Spark-like batch fleet через CI | ✓ | возможно |
+| Production stateful streaming | — | **Operator** |
+| Many jobs с автоматическим upgrade/savepoint | — | **Operator** |
+| Autoscaling по metrics | — | **Operator + Autoscaler** |
+| HA с automatic failover detection | works но manual | **Operator handles** |
+
+Без Operator вы вручную делаете: trigger savepoints, manage upgrade, watch HA state, fix crashed pods. Operator всё это автоматизирует. Native — это **foundation**, на котором стоит Operator.
+
+---
+
+## Production gotchas
+
+- **`kubernetes.cluster-id` уникален per namespace** — два jobs с одинаковым cluster-id в одном namespace = конфликт ConfigMaps. Включайте имя job в cluster-id.
+- **ServiceAccount default-default** — если не указали `kubernetes.service-account`, JM использует `default` ServiceAccount namespace-а, у которого обычно нет permissions создавать pods. → ImagePull errors или «Forbidden» в логах.
+- **Image pull secrets** — если image в private registry, обязательно `kubernetes.container.image.pull-secrets: regcred` + создать Secret типа `kubernetes.io/dockerconfigjson`.
+- **Pod template merge surprises** — main container ДОЛЖЕН называться `flink-main-container`. Другое имя → Flink не сможет inject runtime configuration.
+- **Resource limits vs requests** — `cpu.limit-factor: 1.0` (default) делает request=limit. Если cluster overcommit-нутый, можно `1.5` (1.5× ratio) — request 4 CPU, limit 6 CPU. Но для streaming jobs это опасно — burst-нувшись в throttling, можно поломать checkpointing.
+- **Без `high-availability.type: kubernetes`** — JM crash = data loss. State backend сохранит state в S3, но job state (JobGraph, completed checkpoint pointer) теряется. Всегда включайте HA в production.
+- **Headless service** — TM ↔ JM communication использует headless service (ClusterIP=None). Если NetworkPolicy блокирует pod-to-pod — TM-ы не зарегистрируются. Симптом: «No TaskManagers registered» в логах JM.
+
+<Callout type="tip">
+Best practice 2026: используйте **Flink Kubernetes Operator** (урок 04) для production, native integration — для понимания внутренностей и для local dev. Operator поверх native API даёт CRDs, reconciliation, automatic savepoints, autoscaler integration — всё, что нужно для serious production. Native — это intermediate-level знание для debugging.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="JM при старте начинает выбрасывать errors типа `Forbidden: User 'system:serviceaccount:streaming-prod:default' cannot create pods in API group ''`. Что произошло и как фиксить?"
+  answer="JobManager пытается создать TM pods через K8s API, но использует ServiceAccount `default` namespace-а — у которого нет RBAC permissions. Решение: (1) Создать дедикатный ServiceAccount `flink` в namespace; (2) Создать Role с verbs create/get/list/watch/update/delete/patch на resources pods, configmaps, services и Deployments из apiGroup apps; (3) RoleBinding связать ServiceAccount и Role; (4) В submission указать `kubernetes.service-account: flink`. Без этого native integration не работает в principle — RM не может provision TaskManagers. С Flink Kubernetes Operator это handled автоматически: operator создаёт ServiceAccount с правильным RBAC при создании FlinkDeployment. Это одна из причин, почему production использует Operator, а не raw native integration."
+/>

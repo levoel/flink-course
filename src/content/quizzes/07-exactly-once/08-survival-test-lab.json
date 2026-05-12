@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/08-survival-test-lab",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-08",
+    "description": "Quiz for EOS Survival Test Lab lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-08-q1",
+      "type": "multiple-choice",
+      "question": "В EOS Survival Test verifier видит 'duplicates' в downstream Kafka topic после chaos kill. Most likely root cause?",
+      "options": [
+        { "id": "a", "text": "Real EOS violation в Flink" },
+        { "id": "b", "text": "Verifier consumer без isolation.level=read_committed (default 'read_uncommitted'). Consumer видит И committed records, И aborted transaction markers — aborted transactions от crashed prior attempts выглядят как 'duplicates' хотя real EOS consumers их не увидят. Fix: set ISOLATION_LEVEL_CONFIG=read_committed. После этого — re-run, обычно zero duplicates" },
+        { "id": "c", "text": "Kafka broker не успел replicate" },
+        { "id": "d", "text": "Network partition" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**90% probability** false positive из verifier config. Kafka transactional API maintains transaction markers в log: BEGIN/COMMIT/ABORT entries plus actual records. **read_uncommitted** (default): consumer видит all records включая aborted transactions. **read_committed**: consumer skips aborted transactions, видит только committed. Для EOS verification обязательно read_committed — иначе все records от failed commits (нормальные в chaos scenarios) выглядят как 'EOS duplicates'. Это очень частый bug при первом EOS testing. Action plan для investigation: (1) Verify consumer props — `props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, \"read_committed\")`. (2) Re-run test 100 iterations. (3) Если все ещё duplicates — escalate: check Flink JM logs для checkpoint sequence, check Kafka broker logs для transaction state, verify transactional.id consistency across recovery. (4) Запустить kafka-console-consumer с `--isolation-level read_committed` для manual cross-check. Edge case: if `transaction.timeout.ms` too small relative to recovery time, real data loss occurs (но это missing, не duplicates).",
+      "studyHint": "Повторите урок — секция 'Production gotchas'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m07-08-q2",
+      "type": "multiple-choice",
+      "question": "Какие шесть chaos scenarios должен покрыть полный EOS Survival Test?",
+      "options": [
+        { "id": "a", "text": "Только kill TaskManager во время writes" },
+        { "id": "b", "text": "(A) Normal write phase — easy case; (B) Mid-barrier alignment; (C) Between preCommit and notifyCheckpointComplete; (D) After notify but before commit() — recoverAndCommit path; (E) Mid-commit — Kafka idempotency test; (F) Slow transaction.timeout — induced data loss demonstration (negative test). A-E expect 0 duplicates 0 missing; F demonstrates failure for education" },
+        { "id": "c", "text": "Source crash, Sink crash, Network crash" },
+        { "id": "d", "text": "Только kill JobManager" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Comprehensive coverage всех 2PC lifecycle phases. **Scenario A**: kill между barriers — стандартный case, replay from previous checkpoint, transient downtime. **B**: kill во время barrier alignment — partial barrier propagation, checkpoint aborts, restart с N-1. **C**: kill после preCommit но до notify — pending transactions exist в Kafka (prepared state). Recovery from N-1, prepared txns abort by broker timeout, новая транзакция re-do records. **D**: kill после notify, до commit() — checkpoint(N) marked completed в JM store. Recovery from N, Committer.commit() для pending committables — recoverAndCommit path. Critical for verifying Flink correctly stores committables. **E**: kill mid-commit() — Kafka может уже принял commit но Flink не получил ack. Recovery вызывает commit again — idempotent на already-committed. **F**: intentional bad config (timeout=30s, recovery 60s) — demonstrates что pitfall #1 в production. Это educational — verify что team понимает root cause. Каждый scenario 100+ iterations для confidence. Production EOS deployment должен pass A-E flawlessly perед go-live.",
+      "studyHint": "Повторите урок — секция 'Chaos scenarios'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-08-q3",
+      "type": "multiple-choice",
+      "question": "Какие метрики monitoring critical для production EOS deployment?",
+      "options": [
+        { "id": "a", "text": "Только throughput" },
+        { "id": "b", "text": "(1) lastCheckpointDuration — < 5s norm; (2) numRestarts — alert > 5/hour; (3) kafka.producer.transaction-coordinator.PendingTransactions — alert > 100; (4) kafka.broker.LastStableOffsetLag — alert > 100K (consumers blocked); (5) lastCheckpointFailureTimestamp — recent value alert; (6) lastCheckpointSize — alert на unbounded growth; (7) backpressure metrics после recovery — should return to normal" },
+        { "id": "c", "text": "Memory usage TaskManager" },
+        { "id": "d", "text": "Network bandwidth" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Comprehensive production monitoring covers checkpoint health + transaction state. **Flink-side**: (1) `lastCheckpointDuration` — increasing duration signals backpressure или slow state backend; (2) `numRestarts` — frequent restarts erode EOS guarantees (more chaos = more chance for edge case); (3) `lastCheckpointFailureTimestamp` — recent failures need investigation; (4) `lastCheckpointSize` — unbounded growth = state leak (TTL misconfig). **Kafka-side**: (5) `kafka.producer.transaction-coordinator-metrics.transaction-init-rate` — should match checkpoint rate; (6) `kafka.broker.transaction-coordinator.PendingTransactions` — long pending = stuck commit; (7) `kafka.broker.LastStableOffsetLag` per partition — measures consumer-visible lag from pending transactions. High LSO lag blocks downstream consumers. **Operational**: (8) recovery time tracking — measure crash-to-running duration, alert если > transaction.timeout.ms/2. **Alerting tiers**: page on EOS-violating conditions (pending txn old + about to timeout), warn on degraded health (slow checkpoints), info on transient blips. Tools: Prometheus + Grafana standard, alert через PagerDuty/Opsgenie. Production runbook должен documents response для каждого alert.",
+      "studyHint": "Повторите урок — секция 'Observability'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-08-q4",
+      "type": "true-false",
+      "question": "Single-broker Kafka в docker-compose lab — representative для testing production EOS deployment.",
+      "correctAnswer": false,
+      "explanation": "False. Single broker — useful для quick functional testing, но НЕ representative для production. Production-realistic test требует: (1) **3+ brokers** с `replication.factor=3`, `min.insync.replicas=2`. Это tests EOS под broker failure (kill 1 broker mid-flight, EOS should survive). (2) **transaction.state.log.replication.factor=3** — без этого transactions logged на single broker, broker crash = transaction state lost. (3) **3 controllers в KRaft mode** для metadata HA. (4) **3+ Zookeeper если using ZK mode** (deprecated). (5) **Cross-AZ replication** на cloud для realistic disaster scenarios. Single broker limitations в lab: (a) cannot test EOS под Kafka cluster failures; (b) `replication.factor=1` means single point of failure; (c) `acks=all` waits только для 1 replica — performance unrealistic; (d) network partitioning не testable. Lab progression: start single broker для functional correctness, then expand до 3 brokers для production-grade chaos. Tools для realistic testing: KIP-500 docker images, Strimzi K8s operator, или managed Kafka на dev cluster. Add chaos: kill brokers (rolling), network delays (tc qdisc), disk I/O throttling. EOS должна survive ALL combinations.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

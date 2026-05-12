@@ -1,0 +1,107 @@
+{
+  "moduleId": "08-table-sql",
+  "title": "Module 08 Exam — Table API and SQL",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m08-exam",
+    "description": "7-question integrated exam for Module 08 Table API and SQL"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-exam-q1",
+      "type": "multiple-choice",
+      "question": "Какие три changelog modes output stream Flink производит, и что определяет выбор?",
+      "options": [
+        { "id": "a", "text": "Append, Update, Delete — выбирается query optimizer" },
+        { "id": "b", "text": "(1) Append stream (+I only) — для projection/filter on append source, или windowed aggregation; (2) Retract stream (-U previous + +U new pairs) — для GROUP BY без window; (3) Upsert stream (+I, +U, -D с PK) — для PK-keyed transformations. Optimizer выбирает based on query structure + sink capabilities. Mismatch sink-source mode (retract → insert-only sink) — planning error" },
+        { "id": "c", "text": "Только Append" },
+        { "id": "d", "text": "Depends on connector" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Three output stream modes — fundamental Flink Table API concept. **Append**: only +I events. Generated for: (a) projection/filter on append-only source (b) windowed aggregations — each window completes once at watermark crossing window_end. Compatible с all sinks. **Retract**: -U (retract previous) + +U (insert new) pairs. Generated for: GROUP BY без window — counter updates emit retract+insert. Sink must support retract (print connector, debug only really). Most production sinks REJECT retract при planning. **Upsert**: +I, +U, -D events с PRIMARY KEY. Generated for: PK-keyed queries — last value per PK wins. Compatible: upsert-kafka, JDBC с PK, Iceberg с equality deletes, Paimon. **Decision algorithm**: Flink optimizer determines mode based on (a) source semantics (append, upsert, all), (b) query operations (projection vs aggregation vs PK-aware), (c) sink capabilities. If mismatch — `TableException: Table sink doesn't support consuming update changes`. Resolution patterns: (a) wrap query в window для append; (b) switch sink к upsert-capable + PRIMARY KEY; (c) accept retract если downstream Flink consumer.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-exam-q2",
+      "type": "multiple-choice",
+      "question": "Какие 4 типа joins в Flink SQL и когда какой использовать?",
+      "options": [
+        { "id": "a", "text": "Только INNER и LEFT JOIN" },
+        { "id": "b", "text": "(1) **Regular join** — stream × stream без time bound, unbounded state (need 'table.exec.state.ttl' = '24h'); (2) **Interval join** — `BETWEEN` time predicate, state bounded by max interval; (3) **Temporal join** — `FOR SYSTEM_TIME AS OF event_time` с versioned dim table (PK + WATERMARK на dim), deterministic historical lookup; (4) **Lookup join** — external system через Async I/O, current state only, cache configurable (PARTIAL/FULL)" },
+        { "id": "c", "text": "INNER, LEFT, RIGHT, FULL" },
+        { "id": "d", "text": "Только regular" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Four join types each для specific stream processing semantics. **Regular join**: most flexible, unbounded state. `SELECT * FROM a JOIN b ON a.id = b.id`. State stores all rows by join key indefinitely. Production must set `SET 'table.exec.state.ttl' = '24h'` для bounded state. Use когда matching events 'whenever they correlate', no time bound. **Interval join**: bounded by time predicate. `JOIN b ON a.id = b.id AND b.t BETWEEN a.t AND a.t + INTERVAL '1' HOUR`. State automatically released after watermark + max interval. Use когда temporal correlation natural (order → payment within hour). **Temporal join**: `JOIN versioned_dim FOR SYSTEM_TIME AS OF stream.event_time`. Requires versioned table с PRIMARY KEY + WATERMARK on update_time. Deterministic historical lookup — order at T finds dim version active at T. Use для SCD (slowly changing dimensions): currency_rates, user_profile (via CDC), product_catalog. State bounded by event lag. **Lookup join**: `LEFT JOIN external FOR SYSTEM_TIME AS OF proc_time ON ...`. Async I/O для external DB/REST. Cache strategies: PARTIAL (LRU), FULL (preload). Processing time only — non-deterministic. Use когда dim table doesn't fit в Flink state, or external system already manages updates. Trade-off: latency vs determinism vs state. **Decision tree**: stream × stream? → regular (need TTL) or interval (bounded). dim in Flink? → temporal (PK + WATERMARK). dim external? → lookup (с cache).",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-exam-q3",
+      "type": "multiple-choice",
+      "question": "Опишите Materialized Tables (FLIP-435) — что они делают и почему disruptive?",
+      "options": [
+        { "id": "a", "text": "Просто VIEW в SQL" },
+        { "id": "b", "text": "Declarative streaming pipelines: `CREATE MATERIALIZED TABLE m FRESHNESS = INTERVAL '30' SEC AS SELECT ...`. Single statement → catalog entry + Paimon physical table + auto-generated refresh job в JobManager. Lifecycle: ALTER (change freshness preserves state), SUSPEND/RESUME, REFRESH (для FULL mode), DROP. Disruptive потому что replace traditional pipeline (source DDL + sink DDL + INSERT INTO + manual job submit) одним declarative statement. Like dbt models в batch — but real-time"
+        },
+        { "id": "c", "text": "Только batch tables" },
+        { "id": "d", "text": "Legacy feature" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Materialized Tables — flagship Flink 2.0 GA feature**. Comparable shift в SQL workflow к dbt's impact на batch ETL. **What it does**: Single CREATE MATERIALIZED TABLE statement: (a) registers catalog entry (TYPE='MATERIALIZED_TABLE') with SELECT query + refresh strategy; (b) creates Paimon physical table в warehouse; (c) generates streaming refresh job; (d) submits job to JobManager — runs continuously; (e) keeps table updated with freshness ≤ specified interval. **No manual**: separate sink DDL, INSERT INTO, job submit, savepoint management. **Why Paimon backend**: streaming-first design — LSM-tree handles continuous updates natively, changelog producer for downstream Flink consumers, partial-update merge engine, native PK upsert. Iceberg less suitable (equality deletes accumulate, need external rewrite). **Lifecycle**: (1) ALTER SET FRESHNESS — savepoint old job, start new, state preserved. (2) SUSPEND/RESUME — pause refresh, table stays in catalog with last state. (3) REFRESH — one-time для FULL mode batch refresh. (4) DROP — full cleanup. **Use cases**: (a) real-time dashboards (10-30s freshness); (b) sessionization (1-5min); (c) multi-stage enrichment (chain MTs); (d) daily reports (FRESHNESS=1 day + REFRESH_MODE=FULL). **Disruptive aspects**: (1) **Declarative** — describe what, not how, like SQL VIEW but materialized + continuous. (2) **Auto lifecycle** — no manual savepoint dance, Flink manages. (3) **CI/CD friendly** — DDL as code, deploy = apply DDL. (4) **Hierarchical composition** — MT reads MT, like dbt models. (5) **Multi-engine** — Paimon read by Spark/Trino/Flink. (6) **Analyst-friendly** — SQL only, no Java/Scala. **Caveats**: (a) abstraction limits для advanced patterns (custom triggers, side outputs); (b) Paimon backend lock-in currently; (c) less control over backpressure handling.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m08-exam-q4",
+      "type": "multiple-choice",
+      "question": "ML_PREDICT (FLIP-526, Flink 2.2) и VECTOR_SEARCH (FLIP-540) — что они enable и какой композиционный pattern?",
+      "options": [
+        { "id": "a", "text": "Только batch ML inference" },
+        { "id": "b", "text": "ML_PREDICT — inline ML inference в SQL: CREATE MODEL с providers (OpenAI, Anthropic, HTTP, ONNX), ML_PREDICT(model, features) returns predictions. VECTOR_SEARCH — vector similarity search через HNSW/IVF indices в Paimon/Pinecone/Weaviate. **Composition pattern (RAG)**: SELECT ... FROM queries, LATERAL TABLE(VECTOR_SEARCH(TABLE products, 'embedding', ML_PREDICT('embedder', query_text).embedding, 5, 'cosine')) — embed query inline, find top-K similar items. Real-time RAG в streaming SQL"
+        },
+        { "id": "c", "text": "Только OpenAI API calls" },
+        { "id": "d", "text": "Deprecated functions" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**ML_PREDICT + VECTOR_SEARCH — disruptive Flink 2.2 features**. Brings AI inference в streaming SQL без custom DataStream code. **ML_PREDICT (FLIP-526)**: `CREATE MODEL` registers inference endpoint, ML_PREDICT() invokes inline in SELECT. Providers: (1) **OpenAI** — chat completions, embeddings, moderation. (2) **Anthropic Claude**. (3) **Custom HTTP** — JSON templating + JSONPath response extraction. (4) **Embedded ONNX/TensorFlow** — models в TM memory, no network. (5) **TensorFlow Serving** — gRPC. Performance: LLM 20-50/sec, custom HTTP 100-1000/sec, embedded batched 10K/sec. **Built-in**: Async I/O, batching, rate limiting matching API quotas, LRU caching, retries with exponential backoff. **VECTOR_SEARCH (FLIP-540)**: similarity search в SQL. `CREATE TABLE products (... embedding ARRAY<FLOAT>, PRIMARY KEY (...)) WITH ('vector.column'='embedding', 'vector.index.type'='hnsw', 'vector.index.metric'='cosine')`. Paimon stores vectors с HNSW index. Query: `LATERAL TABLE(VECTOR_SEARCH(TABLE products, 'embedding', query_vector, 5, 'cosine'))` returns top-K similar items. Backends: Paimon (10M-100M vectors), Pinecone/Weaviate/Milvus (1B+) via connectors. **Composition pattern (RAG)**: ```sql SELECT q.session_id, similar.* FROM user_queries q, LATERAL TABLE(VECTOR_SEARCH( TABLE products, 'embedding', ML_PREDICT('embedder', q.user_query).embedding, 5, 'cosine' )) AS similar ``` Per query: embed (ML_PREDICT) → search (VECTOR_SEARCH) → join. Real-time RAG в 10 строк SQL. **Production patterns**: (a) Aggressive caching reduces cost 30-90%. (b) Multi-stage cascade: cheap model first, LLM only для uncertain. (c) Pre-filter с rules before LLM. (d) Temperature=0 + cache для near-deterministic. (e) Self-hosted models для PII / cost / latency. **Use cases enabled**: real-time fraud scoring, semantic search streaming, content moderation, ML feature engineering в pipelines, customer support routing.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-exam-q5",
+      "type": "multiple-choice",
+      "question": "MATCH_RECOGNIZE — для каких use cases и какое critical production требование?",
+      "options": [
+        { "id": "a", "text": "Только regular expressions" },
+        { "id": "b", "text": "Pattern detection в streaming: stock price V-shape (PATTERN A B+ C+), failed login + success (F{3,} S), customer journey browse→cart→abandon (B+ C I+), fraud structuring (S{3,} L). **Critical production**: ВСЕГДА WITHIN INTERVAL 'n' UNIT — без этого pending matches grow unbounded если pattern never terminates. State per partition explodes, RocksDB OOM. Choose interval based on realistic completion time"
+        },
+        { "id": "c", "text": "Только batch SQL" },
+        { "id": "d", "text": "Deprecated SQL feature" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MATCH_RECOGNIZE — declarative CEP в SQL (SQL:2016 standard). **Production use cases**: **(1) Financial — fraud detection**. Structuring: 4+ transactions just under $10K reporting threshold within 24h: `PATTERN (T{4,} V?) WITHIN INTERVAL '24' HOUR DEFINE T AS T.amount BETWEEN 9000 AND 9999, V AS V.amount BETWEEN 50 AND 200`. Card testing: small txs followed by large: `PATTERN (S{3,} L) WITHIN INTERVAL '10' MINUTE`. **(2) Stock trading — pattern recognition**. V-shape reversal: `PATTERN (A B+ C+) WITHIN INTERVAL '10' MIN DEFINE B AS price < LAST(B.price, 1), C AS C.price > LAST(C.price, 1)`. Head-and-shoulders, double bottom. **(3) Security — anomaly detection**. Failed logins followed by success: `PATTERN (F{3,} S) WITHIN INTERVAL '5' MINUTE` — suspicious sequence. Credential stuffing detection. **(4) Customer analytics — journey patterns**. Browse → cart → abandonment: `PATTERN (BROWSE+ CART IDLE+) WITHIN INTERVAL '1' HOUR DEFINE IDLE AS idle_seconds > 60`. Trigger retention campaigns. **(5) Healthcare — patient monitoring**. Vital signs sequence indicating deterioration. **(6) IoT — equipment failure prediction**. Temperature rising trend + vibration anomaly. **CRITICAL production requirement — WITHIN INTERVAL**: Without WITHIN, state grows unbounded if pattern never completes. Example: `PATTERN (A B+ C)` — if C never arrives, every A starts pending match, B+ accumulates indefinitely. State per partition linearly грows with time. RocksDB OOM. **Interval selection**: matches realistic completion time. Fraud — minutes to hours. Customer journey — hours to days. Stock patterns — minutes. **Other production gotchas**: (a) PARTITION BY high-cardinality column may explode state — pre-filter active partitions. (b) ORDER BY must be time attribute (event_time или proc_time). (c) AFTER MATCH SKIP TO NEXT ROW — overlapping matches O(N²) risk. Default к SKIP PAST LAST ROW. (d) Greedy quantifiers with rare termination — combine с WITHIN. (e) ALL ROWS PER MATCH для CLASSIFIER()/MATCH_NUMBER() debug.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-exam-q6",
+      "type": "multiple-choice",
+      "question": "Greenfield Flink deployment — какой catalog choice и почему?",
+      "options": [
+        { "id": "a", "text": "HiveCatalog — стандарт" },
+        { "id": "b", "text": "Modern alternatives: (1) **Iceberg + REST catalog** (Apache Polaris, Iceberg REST) — multi-engine reads (Spark/Trino/Snowflake/Flink), time travel, branches; (2) **Paimon catalog** для streaming-first workloads — LSM storage, changelog producer; (3) **AWS Glue** на AWS deployments; (4) **Unity Catalog** на Databricks. Avoid Hive overhead (HMS deployment + maintenance, version compatibility, RPC overhead) когда нет legacy investment. Hive justified ТОЛЬКО для migration scenarios с existing tables/UDFs"
+        },
+        { "id": "c", "text": "JDBC catalog только" },
+        { "id": "d", "text": "Default in-memory" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Catalog choice — strategic decision** влияющая на decade ahead. Hive — legacy choice, not greenfield default. **Hive overhead для greenfield**: (1) HMS deployment + maintenance — Postgres backend, Thrift service, scaling, version upgrades. (2) Version compatibility — HMS 2.x vs 3.x incompatible с Flink connector. (3) Performance — HMS RPC for each metadata operation, throughput bottleneck. (4) Not cloud-native — assumes on-prem или DIY cloud. (5) Schema evolution limited. **Modern catalog alternatives**: **(1) Iceberg + REST catalog** (Apache Polaris, Iceberg REST API standard): Pure HTTP — no Thrift. Multi-engine compatibility — Spark, Trino, Snowflake, Flink read same Iceberg tables. Branches/tags для data version control (Nessie-style). Native cloud (S3/GCS/Azure). Time travel и snapshot management. Use для most analytical workloads. **(2) Paimon catalog**: Streaming-first — LSM-tree, native upsert. Changelog producer for Flink consumers. Best для Materialized Tables and streaming aggregations. Filesystem catalog mode — no separate service. **(3) AWS Glue Data Catalog**: Managed service. Iceberg-compatible. Integration с EMR, Athena, Redshift. Pay-per-call. Use на AWS-native. **(4) Unity Catalog (Databricks)**: Lakehouse catalog. Iceberg/Delta support. Fine-grained ACL, lineage. Databricks ecosystem. **(5) Apache Polaris** (open-source equivalent of Snowflake's catalog): Iceberg REST protocol. Multi-tenant, permissions. **Decision matrix**: Legacy Hive ecosystem (10+ tables, UDFs)? → HiveCatalog для bridge. New cloud deployment? → Iceberg + Glue/Polaris. Streaming-heavy с MTs? → Paimon. Databricks shop? → Unity Catalog. **Migration scenarios**: HiveCatalog appropriate during phased migration — read Hive legacy, write Iceberg new. After migration complete, decommission HMS.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-exam-q7",
+      "type": "true-false",
+      "question": "Flink 2.2 SQL делает possible написать real-time fraud detection pipeline (1M events/day) с ML inference в 20 строк SQL — без custom Java code, без отдельной ML service deployment.",
+      "correctAnswer": true,
+      "explanation": "True. **Flink 2.2 SQL — disruptive capability**: full real-time AI pipeline declarative. **Demonstration pipeline**: ```sql -- 1. Source DDL CREATE TABLE transactions ( tx_id BIGINT, user_id STRING, amount DECIMAL, location_risk DOUBLE, ts BIGINT, event_time AS TO_TIMESTAMP_LTZ(ts, 3), WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND ) WITH ('connector' = 'kafka', 'topic' = 'transactions', ...); -- 2. ML Model registration CREATE MODEL fraud_scorer INPUT (features ROW<amount DOUBLE, hour INT, location_risk DOUBLE>) OUTPUT (score DOUBLE, reasoning STRING) WITH ( 'provider' = 'openai', 'model' = 'gpt-4o-mini', 'system_prompt' = 'Score transaction fraud risk 0-1 JSON {score, reasoning}', 'api_key' = '${OPENAI_API_KEY}', 'rate.limit.rpm' = '500', 'cache.enabled' = 'true' ); -- 3. Materialized fraud alerts table CREATE MATERIALIZED TABLE fraud_alerts ( tx_id BIGINT, user_id STRING, amount DECIMAL, fraud_score DOUBLE, reasoning STRING, PRIMARY KEY (tx_id) NOT ENFORCED ) FRESHNESS = INTERVAL '5' SECOND AS SELECT t.tx_id, t.user_id, t.amount, pred.score, pred.reasoning FROM transactions t, LATERAL TABLE(ML_PREDICT(MODEL fraud_scorer, t.amount, EXTRACT(HOUR FROM t.event_time), t.location_risk)) AS pred WHERE pred.score > 0.7; ``` **20 строк SQL** делают: (a) Kafka source с event-time semantics; (b) OpenAI integration с auth, rate limiting, caching; (c) Real-time scoring каждой transaction; (d) Filter high-risk only (score > 0.7); (e) Materialized output в Paimon table с 5s freshness. **No custom Java/Scala code**. **No separate ML service deployment** — OpenAI handles inference. **No manual job lifecycle** — Materialized Table auto-manages. **Downstream consumers** read `fraud_alerts` Paimon table from Trino/Grafana/alerting systems. **Cost optimization**: cache hit rate 30-70% (similar transactions repeat), GPT-4o-mini cheap ($0.15/1M input tokens), pre-filter heuristics могут reduce LLM calls к 5% of volume → cost <$100/day для 1M events. **Compare к pre-2.2**: same pipeline в Flink 1.x or pre-FLIP-526 required: custom DataStream job с AsyncFunction + HTTP client + manual rate limiting + retries + custom serialization + own deployment + monitoring. Hundreds of lines of Java. Flink 2.2 democratizes это. **Caveats**: (a) LLM determinism limited — temperature=0 + cache help; (b) PII concerns — Azure OpenAI с private endpoint or self-hosted models для regulated industries; (c) cost monitoring critical — naive deployment can exceed $1000/day с GPT-4. Best practices outlined в lesson 07.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

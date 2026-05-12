@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/08-tvf-windows-sql",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-08",
+    "description": "Quiz for TVF Windows in Table API/SQL lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-08-q1",
+      "type": "multiple-choice",
+      "question": "В чём преимущество TVF Window syntax vs deprecated GROUP BY TUMBLE?",
+      "options": [
+        { "id": "a", "text": "TVF быстрее на 50%" },
+        { "id": "b", "text": "TVF — first-class table operations (можно использовать в FROM), composable с JOIN/TopN/OVER, consistent с SQL standard, supported optimizer improvements. GROUP BY TUMBLE — legacy syntax, less expressive, limited composition" },
+        { "id": "c", "text": "TVF поддерживает Python UDFs, GROUP BY TUMBLE — нет" },
+        { "id": "d", "text": "Никакой разницы" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "TVF Window syntax (с 1.13) — current recommended. Преимущества: (1) First-class table function — table в FROM, добавляет window_start, window_end, window_time columns; (2) Composable — после TVF можно делать JOIN по window_start/window_end (window join), ROW_NUMBER() OVER PARTITION BY window_start (window TopN), aggregations; (3) Consistent SQL standard — Apache Calcite полностью поддерживает; (4) Optimizer improvements — лучшая physical plan для TVF; (5) Поддерживает offset параметр для timezone alignment. GROUP BY TUMBLE — legacy, работает но limited expressiveness, less optimizable. Migration straightforward.",
+      "studyHint": "Повторите урок — раздел 'TVF synthax'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-08-q2",
+      "type": "multiple-choice",
+      "question": "Use case: 'sum of orders today' с обновлением каждую минуту. Сравните CUMULATE vs HOP по state и semantics.",
+      "options": [
+        { "id": "a", "text": "Оба эквивалентны" },
+        { "id": "b", "text": "HOP(size=24h, slide=1min): 1440 windows в state per key, каждое событие в 1440 окон. Sliding semantic. CUMULATE(step=1min, maxSize=1day): 1 window per key (window_start fixed, window_end растёт каждую минуту), reset в midnight. State 1440x меньше для same semantic. CUMULATE built-in для running/cumulative pattern" },
+        { "id": "c", "text": "CUMULATE работает только в SQL, не в Table API" },
+        { "id": "d", "text": "HOP более точный — CUMULATE использует sampling" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это classic CUMULATE vs HOP comparison. HOP(size=24h, slide=1min): создаёт overlap factor = 24*60/1 = 1440. Каждое событие state-add в 1440 windows. На 1M users × 1440 windows = 1.44B state entries. CUMULATE(step=1min, maxSize=1day): semantics — window_start fixed at midnight, window_end grows каждые step minutes. После maxSize reset (new window_start). Internal state: 1 window per key — emit incremental result каждые step minutes, не fresh aggregate. 1M users × 1 window = 1M state entries. 1440x state reduction. Также CUMULATE — explicit semantic 'rolling/cumulative with reset', easier reason about than equivalent HOP.",
+      "studyHint": "Повторите урок — раздел 'CUMULATE'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-08-q3",
+      "type": "multiple-choice",
+      "question": "Requirement TVF Windows — что обязательно должно быть в CREATE TABLE?",
+      "options": [
+        { "id": "a", "text": "Ничего особенного" },
+        { "id": "b", "text": "WATERMARK FOR <timecol> AS <expression> — TVF windows требуют watermark на input table. Эквивалент DataStream WatermarkStrategy. Например: WATERMARK FOR event_time AS event_time - INTERVAL '20' SECONDS (= forBoundedOutOfOrderness(20s))" },
+        { "id": "c", "text": "PRIMARY KEY constraint" },
+        { "id": "d", "text": "PARTITIONED BY clause" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "TVF Windows требуют WATERMARK clause в CREATE TABLE. Без него — TVF не работает (compilation error 'Window aggregate can only be defined over a time attribute column, but ... is not'). Синтаксис: WATERMARK FOR <time_column> AS <expression>. Эквиваленты DataStream: 'event_time - INTERVAL X SECONDS' = forBoundedOutOfOrderness(X seconds), 'event_time' = forMonotonousTimestamps. Time column должен быть TIMESTAMP(3) тип (millisecond precision). Idle source конфигурируется через TABLE hint /*+ OPTIONS('scan.watermark.idle-timeout' = '1 min') */ или global table.exec.source.idle-timeout. Allowed lateness через table.exec.emit.allow-lateness.",
+      "studyHint": "Повторите урок — раздел 'Watermark requirement'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m05-08-q4",
+      "type": "true-false",
+      "question": "SESSION TVF доступен в Flink с 1.13 как и остальные TVF Windows.",
+      "correctAnswer": false,
+      "explanation": "False. SESSION TVF добавлен позже остальных — GA только с Flink 1.19. До этого приходилось использовать legacy `SESSION(event_time, INTERVAL '30' MINUTES)` синтаксис в GROUP BY clause. TUMBLE, HOP — с 1.13. CUMULATE — с 1.15. SESSION TVF — с 1.19. Это потому что session windows complex — требуют merging windows logic, который в Calcite TVF framework был не trivial implement. С 1.19 SESSION TVF GA: SESSION(TABLE t PARTITION BY user_id, DESCRIPTOR(event_time), INTERVAL '30' MINUTES). Обязательно PARTITION BY (session per partition column). Window merging работает как в DataStream API.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

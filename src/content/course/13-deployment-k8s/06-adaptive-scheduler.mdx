@@ -1,0 +1,336 @@
+---
+title: "Adaptive Scheduler vs Default Scheduler"
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Adaptive Scheduler", "Default Scheduler", "Slot Allocation", "Elastic Parallelism", "FLIP-160"]
+---
+
+# Adaptive Scheduler
+
+В Flink есть **два scheduler-а**: классический **Default Scheduler** (он же `DefaultScheduler`, иногда называется `EagerScheduler`) и **Adaptive Scheduler** (FLIP-160, GA в 1.15). Этот выбор фундаментально определяет, как job реагирует на изменения ресурсов: может ли он на ходу адаптироваться к доступному числу slot-ов или требует фиксированных N slots для запуска. Adaptive Scheduler — это **обязательное условие** для autoscaling (FLIP-271) и in-place rescaling (FLIP-291), которые мы разберём в уроке 07.
+
+В этом уроке: как работают оба scheduler-а, в чём их фундаментальные различия, когда выбирать какой, как переключить, ограничения каждого.
+
+---
+
+## Default Scheduler: "all-or-nothing"
+
+Default Scheduler — классический подход с самого начала Flink. Логика: job деплоится с **точно указанным parallelism**. Если slot-ов недостаточно, job не стартует (или CRASH при recovery).
+
+<DiagramContainer title="Default Scheduler: фиксированный resource budget" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Submission: job N с parallelism=8"
+        tooltip="Job graph содержит 8 subtasks per operator. JobMaster требует от ResourceManager 8 slots (с учётом slot sharing). Если 8 slots не получено в timeout — job FAILED."
+      >
+        request 8 slots
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="request resources" />
+    <FlowRow>
+      <DataBox
+        label="ResourceManager"
+        tooltip="Запрашивает slots у TaskManager-ов. Если slot-ов нет — в Native K8s mode создаёт TM pods. В Session mode — ждёт когда другие jobs освободят slots или таймаут."
+      >
+        allocate or fail
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="all slots ready (or fail)" />
+    <FlowRow>
+      <DataBox
+        label="Job RUNNING with exactly 8 subtasks"
+        tooltip="Параллелизм фиксирован на 8. Если потом slot lost (TM crash), recovery попытается получить тот же parallelism. Если ресурсов нет — job CRASH."
+      >
+        execution at parallelism=8
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Свойства Default Scheduler
+
+- **Eager scheduling** — все slot-ы должны быть доступны до начала выполнения.
+- **Fixed parallelism** — установлено при submission, immutable.
+- **Rescale = full restart** — изменение parallelism → stop with savepoint → restart job → restore.
+- **Pipelined regions** — task scheduling group-ируется в pipelined regions, всё в region запускается атомарно.
+
+### Конфигурация
+
+```yaml
+flinkConfiguration:
+  jobmanager.scheduler: default       # explicit, тот же что отсутствие
+```
+
+`default` — historical name. По функциональности это «classic» / «eager».
+
+### Когда Default Scheduler уместен
+
+- **Batch jobs** — точное parallelism нужно для предсказуемой работы pipelined regions.
+- **Strict SLA** — гарантированное число slot-ов известно заранее, isolation требует exactness.
+- **Legacy jobs**, которые не тестированы на elastic resize.
+
+### Проблемы Default Scheduler
+
+- **No elasticity** — не может handle slot-ы appearing/disappearing после start.
+- **Rescale painful** — stop + savepoint + restart минуты downtime для каждого scale event.
+- **Autoscaler incompatible** — FLIP-271 autoscaler требует Adaptive.
+
+---
+
+## Adaptive Scheduler: "use what you have"
+
+Adaptive Scheduler — переосмысление. Job получает **диапазон parallelism** (min — max, или конкретное desired со slack-ом), и scheduler адаптируется к доступным slot-ам:
+
+- Не хватает slot-ов? Стартуем с меньшим parallelism.
+- Появились новые slot-ы? Rescale up без savepoint.
+- Slot потерян? Rescale down вместо CRASH.
+
+<DiagramContainer title="Adaptive Scheduler: elastic parallelism" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Submission: parallelism=8 (default), min=2, max=32"
+        tooltip="Job submitted с desired parallelism=8. Конфиг scheduler-min-parallelism=2, scheduler-max-parallelism=32. Scheduler попытается дать 8, но согласится на любое в диапазоне."
+      >
+        parallelism range
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="initial allocation" />
+    <FlowRow>
+      <DataBox
+        label="Получено 6 slots (вместо 8)"
+        tooltip="ResourceManager выделил только 6 slot-ов в timeout. Default Scheduler бы fail-ил. Adaptive — стартует job с parallelism=6, в пределах [2..32] это валидно."
+      >
+        start at parallelism=6
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="job RUNNING" />
+    <FlowRow>
+      <DataBox
+        label="2 новых slot-а появились"
+        tooltip="ResourceManager сигнализирует scheduler-у — есть новые slots. Adaptive решает: рескейлить up? Сравнивает с desired (8), потенциалом (любое из диапазона)."
+      >
+        slots available now
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trigger rescale" />
+    <FlowRow>
+      <DataBox
+        label="Rescale to parallelism=8 (in-place с FLIP-291)"
+        tooltip="С FLIP-291 (1.18+) rescale делается БЕЗ savepoint: scheduler stops tasks, redistributes key groups, restarts на новом parallelism, без снимка состояния через DFS. Минимум downtime."
+      >
+        in-place rescale
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Свойства Adaptive Scheduler
+
+- **Lazy scheduling** — job стартует когда есть хотя бы `min-parallelism` slot-ов.
+- **Range-based** — parallelism в диапазоне [min, max], desired — таргет.
+- **In-place rescale** — с FLIP-291 без savepoint, через internal state redistribution.
+- **Autoscaler compatible** — FLIP-271 autoscaler меняет parallelism через REST API, Adaptive Scheduler реагирует.
+- **Reactive Mode replaced** — Reactive Mode из 1.13 (которое было proto-autoscaler) deprecated → заменено Adaptive Scheduler + FLIP-271.
+
+### Конфигурация
+
+```yaml
+flinkConfiguration:
+  jobmanager.scheduler: adaptive
+
+  # Per-job parallelism range
+  jobmanager.adaptive-scheduler.min-parallelism: "2"
+  jobmanager.adaptive-scheduler.max-parallelism: "32"
+
+  # Resource stabilization — wait для resource changes settle
+  jobmanager.adaptive-scheduler.resource-wait-timeout: 5min
+  jobmanager.adaptive-scheduler.resource-stabilization-timeout: 30s
+
+  # Scaling intervals
+  jobmanager.adaptive-scheduler.scaling-interval.min: 30s
+  jobmanager.adaptive-scheduler.scaling-interval.max: 1h
+
+  # Force rescale on slot drop?
+  jobmanager.adaptive-scheduler.executing.resource-stabilization-timeout: 1min
+```
+
+### Когда Adaptive Scheduler уместен
+
+- **Production streaming jobs** — нужна elasticity для traffic patterns.
+- **Autoscaling required** — FLIP-271 autoscaler по metrics требует Adaptive.
+- **K8s native deployment** — где TM pods создаются динамически по request.
+- **Cost optimization** — scale down ночью, up днём без manual savepoints.
+
+### Ограничения Adaptive Scheduler
+
+- **Streaming-only** — batch jobs пока используют Default. Adaptive support для batch обсуждается, но не GA.
+- **maxParallelism immutable** — диапазон min-max parallelism ограничен изначально установленным maxParallelism (см. урок 14.5). Если хочется 1000+, надо set maxParallelism upfront.
+- **Topology immutable** — изменить shape графа (добавить operator) нельзя через rescale, нужен savepoint + redeploy.
+- **Some operators не support unaligned rescale** — pre-1.18 legacy operators могут force savepoint-based rescale. Modern API OK.
+
+---
+
+## Comparison
+
+| Аспект | Default Scheduler | Adaptive Scheduler |
+|---|---|---|
+| Scheduling | Eager (all-or-nothing) | Lazy (start when min slots available) |
+| Parallelism | Fixed exact value | Range [min, max] с desired |
+| Rescale cost | Full restart с savepoint | In-place (FLIP-291) или partial |
+| Slot loss handling | CRASH (нет ресурсов) | Rescale down |
+| Autoscaler support | Нет | Да (FLIP-271) |
+| Batch support | Yes (default for batch) | Streaming-only (пока) |
+| Recovery semantics | Recreate exact topology | Adapt to current resources |
+| Production streaming default | Legacy | **2.x default for K8s** |
+
+---
+
+## Slot allocation: что значит "min-parallelism"
+
+В Adaptive Scheduler scheduler-min-parallelism — это **lowest acceptable parallelism**. Если ResourceManager в `resource-wait-timeout` (default 5min) не может выделить minimum, job FAILED.
+
+Пример: job с min=4, max=16, desired=8, в cluster 5 свободных slots:
+
+```text
+- ResourceManager выделяет 5 slots
+- Adaptive Scheduler: 5 >= min(4) → OK, start job at parallelism=5
+- Notify: будет looking for 3 more slots (до desired=8)
+- Если в jobmanager.adaptive-scheduler.scaling-interval появятся ещё 3 → rescale up
+- Если нет — продолжаем работать на 5
+```
+
+Если бы было 3 свободных slot-а:
+
+```text
+- Adaptive Scheduler: 3 < min(4) → wait
+- resource-wait-timeout = 5min
+- Если 5min прошло без появления новых slots → JOB FAILED
+```
+
+Это критично для production planning: `min-parallelism` должен быть **минимально приемлемый** для SLA. Слишком высокий → fragile (job не стартует при resource crunch). Слишком низкий → может стартовать с insufficient resources для load.
+
+---
+
+## Pipelined regions в Default Scheduler
+
+Default Scheduler scheduling unit = **pipelined region**. Pipelined region — набор tasks связанных pipelined edges (не blocking shuffles). Все tasks в одном region запускаются атомарно — либо все получают slots, либо никто.
+
+Для streaming jobs (все pipelined edges) → один pipelined region на весь граф → all-or-nothing.
+
+Для batch jobs (с blocking shuffles между stages) → несколько pipelined regions → можно запускать stage by stage. Поэтому Default Scheduler logical fit для batch.
+
+Adaptive Scheduler не использует pipelined regions — он работает с целым job graph как единым unit, но с elastic parallelism.
+
+---
+
+## Адаптация на runtime: пример
+
+Сценарий: streaming job parallelism=8 на 2 TM × 4 slots. Один TM падает.
+
+**С Default Scheduler:**
+
+```text
+1. TM crash → JM теряет 4 slots
+2. JobMaster пытается перепланировать tasks на оставшийся TM
+3. Только 4 slots available, нужно 8 → CRASH
+4. JM пытается ResourceManager request 4 new slots
+5. K8s создаёт новый TM (если active mode)
+6. После 30-90s slots available → recovery с last checkpoint
+7. Job RUNNING again, но был downtime 30-90s
+```
+
+**С Adaptive Scheduler:**
+
+```text
+1. TM crash → JM теряет 4 slots
+2. Adaptive Scheduler: current=8, lost 4, available=4
+3. Если 4 >= min-parallelism → rescale down to 4
+4. Recovery из last checkpoint с parallelism=4 (state редистрибуируется по key groups)
+5. Job RUNNING на parallelism=4, no full crash
+6. Когда K8s создал new TM с 4 slots → rescale up to 8
+7. Total downtime: менее 30s (state redistribution time)
+```
+
+Adaptive Scheduler **более resilient** — преобразует resource fluctuations в graceful rescaling, а не CRASH.
+
+---
+
+## Включение Adaptive Scheduler
+
+```yaml
+# Минимальная конфигурация в FlinkDeployment
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector
+spec:
+  flinkConfiguration:
+    jobmanager.scheduler: adaptive
+    jobmanager.adaptive-scheduler.min-parallelism: "2"
+    jobmanager.adaptive-scheduler.max-parallelism: "32"
+```
+
+С Flink Kubernetes Operator + Adaptive Scheduler автоматически включается autoscaler integration (если `job.autoscaler.enabled: true`, см. урок 07).
+
+---
+
+## Производственные подсказки от experience
+
+### Slot resource hints
+
+С Adaptive Scheduler уместно указать **slot resource profile**:
+
+```java
+DataStream<Event> stream = env.fromSource(source, watermark, "kafka")
+    .slotSharingGroup(SlotSharingGroup.newBuilder("source-group")
+        .setCpuCores(0.5)
+        .setTaskHeapMemoryMB(512)
+        .setManagedMemoryMB(256)
+        .build())
+    .map(...)
+    .keyBy(...)
+    .process(new HeavyStateProcessor())
+    .slotSharingGroup(SlotSharingGroup.newBuilder("state-group")
+        .setCpuCores(2.0)
+        .setTaskHeapMemoryMB(1024)
+        .setManagedMemoryMB(4096)
+        .build());
+```
+
+Adaptive Scheduler может request разные TM-pod sizes для разных slot groups, что даёт лучшую утилизацию.
+
+### Stabilization timeouts важны
+
+`resource-stabilization-timeout` — сколько ждать перед re-evaluation parallelism после resource change. Слишком короткий (5s) → flapping (rescale up/down постоянно при flaky resources). Слишком длинный (5min) → реакция медленная.
+
+Sweet spot: **30s-2min** для production. С автоскейлером (FLIP-271) у него свой `stabilization.interval` (~5min) — это разные таймеры на разных уровнях.
+
+---
+
+## Production gotchas
+
+- **`jobmanager.scheduler: adaptive` — easy to forget** — без этого autoscaler (FLIP-271) silently не работает. Operator может не warn-ить. Always check Web UI: должен показывать «Adaptive» как scheduler type.
+- **`min-parallelism` too high** — job не стартует если cluster под нагрузкой. Установите минимально необходимый для baseline traffic, не peak.
+- **`max-parallelism` config != maxParallelism state** — это две РАЗНЫХ настройки. `jobmanager.adaptive-scheduler.max-parallelism` = upper bound для scheduler. `pipeline.max-parallelism` или explicit `setMaxParallelism()` = max ключевых групп. Второе нельзя изменить после старта (см. урок 14.5).
+- **Batch + Adaptive не работает** — если job submitted в batch mode (env.setRuntimeMode(BATCH)) → Adaptive silently ignored, Default используется.
+- **Slot leaks** — если operator имеет state и rescale failed mid-way (TM crash during rescale), могут быть orphaned slots. Monitor `jobmanager.numSlotsAvailable`.
+- **Recovery from savepoint + Adaptive** — savepoint может содержать metadata о parallelism, но Adaptive Scheduler решает на основе current cluster state. Это OK, но иногда сюрприз если ожидаете точного восстановления.
+- **Reactive Mode legacy config** — если в legacy 1.x configs было `scheduler-mode: reactive` — удалите, это deprecated. Замена — `adaptive` scheduler + autoscaler.
+
+<Callout type="warning">
+**Reactive Mode** (введённый в Flink 1.13) был proto-autoscaler — job получал все доступные ресурсы. Он deprecated и заменён Adaptive Scheduler + FLIP-271 autoscaler. Не используйте `scheduler-mode: reactive` в новых deployments — это legacy path.
+</Callout>
+
+<Callout type="tip">
+Production 2026 на K8s: **Adaptive Scheduler + FLIP-271 Autoscaler + FLIP-291 In-place rescaling + Flink Kubernetes Operator**. Это полный elastic stack. Job стартует с reasonable defaults, autoscaler реагирует на metrics, rescaling in-place без downtime. Default Scheduler оставьте для batch jobs.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Job настроен с `jobmanager.scheduler: adaptive`, `min-parallelism: 4`, `max-parallelism: 16`, desired parallelism в job submission = 8. В момент submission в cluster 6 свободных slot-ов. Через 10 минут traffic вырастает 3x и autoscaler хочет parallelism=24. Что произойдёт на каждом этапе?"
+  answer="Этап 1 (submission, 6 slots available): Adaptive Scheduler видит 6 >= min(4) → OK, стартует job с parallelism=6. Background — job request ещё 2 slot-а до desired=8. RM может попросить K8s создать new TM или wait для existing TMs free up slots. Этап 2 (после некоторого времени, 8 slots): scheduler rescale up до 8 — in-place rescale (FLIP-291) если включен (default), либо savepoint-based если не настроено. Этап 3 (traffic spike, autoscaler wants 24): autoscaler делает REST call для rescale до 24. НО max-parallelism в config = 16 → scheduler clamps до 16, не до 24. Job rescales до 16. Autoscaler видит metrics всё ещё показывают bottleneck → log warning «cannot scale beyond max-parallelism». Решение: bump `jobmanager.adaptive-scheduler.max-parallelism: 32` в FlinkDeployment, apply, operator делает reconciliation (no savepoint нужен — это config update). Также важно: maxParallelism state (key groups) — отдельная штука. Если эта установлена 128 (default), всё OK. Если установлена ниже (например 16), то даже scheduler.max-parallelism=32 не поможет — потолок key groups. Этот second case — typical production trap (см. урок 14.5)."
+/>

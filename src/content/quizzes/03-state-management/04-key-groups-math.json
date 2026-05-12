@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/04-key-groups-math",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-04",
+    "description": "Quiz for key groups math lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-04-q1",
+      "type": "multiple-choice",
+      "question": "Job: maxParallelism=128, parallelism=4. Какой subtask владеет key, hash(key) % 128 = 75?",
+      "options": [
+        { "id": "a", "text": "Subtask 0 (key groups 0-31)" },
+        { "id": "b", "text": "Subtask 2 (key groups 64-95). Формула: 75 / (128/4) = 75 / 32 = 2" },
+        { "id": "c", "text": "Subtask 3 (key groups 96-127)" },
+        { "id": "d", "text": "Зависит от runtime — random" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Subtask владеющий key group = keyGroupId / (maxParallelism / parallelism) = 75 / (128/4) = 75 / 32 = 2 (integer division). Каждый subtask владеет 32 ключевых группы: subtask 0 — [0..31], 1 — [32..63], 2 — [64..95], 3 — [96..127]. Key group 75 попадает в диапазон [64..95] subtask 2.",
+      "studyHint": "Повторите урок — Math cheat sheet",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-04-q2",
+      "type": "multiple-choice",
+      "question": "Production job: запущен с default maxParallelism (=128 при parallelism=4). Через год нужен scale до parallelism=200. Что произойдёт?",
+      "options": [
+        { "id": "a", "text": "Просто setParallelism(200) и restart — Flink автоматически расширит maxParallelism" },
+        { "id": "b", "text": "Restart fails — maxParallelism=128 < 200. Решение: State Processor API для offline rebootstrap с новым maxParallelism. Это может занять часы для большого state" },
+        { "id": "c", "text": "maxParallelism игнорируется на restart" },
+        { "id": "d", "text": "Flink работает, но performance низкий" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "maxParallelism IMMUTABLE после старта. Savepoint содержит maxParallelism=128. setParallelism(200) > 128 → conflict, restart fails. Единственный путь — State Processor API offline batch: read savepoint → re-bootstrap с новым maxParallelism → write new savepoint. Для multi-TB savepoint это часы работы. Production lesson: ВСЕГДА env.setMaxParallelism(1024) явно при первом deploy.",
+      "studyHint": "Повторите урок — секция Production gotchas",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-04-q3",
+      "type": "multiple-choice",
+      "question": "Почему при rescaling 4→8 state редистрибуется корректно (запись с userId=42 попадает в правильный новый subtask)?",
+      "options": [
+        { "id": "a", "text": "Flink делает full state rebootstrap на каждом scaling" },
+        { "id": "b", "text": "hash(userId) deterministic, maxParallelism immutable → keyGroup всегда тот же. Меняется только формула keyGroup→subtask, state в RocksDB организован per key group sub-range, новые subtasks подгружают свои ranges" },
+        { "id": "c", "text": "Flink использует random sampling для распределения" },
+        { "id": "d", "text": "Random routing — потом aggregation на JobManager" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "hash(42) % maxParallelism всегда даёт один и тот же keyGroupId (deterministic + immutable mp). Меняется только формула keyGroup→subtask с parallelism. Checkpoint содержит SST файлы, organized per key group sub-range. При rescaling 4→8: каждый новый subtask получает половину предыдущих key groups, подгружает только свои SST. Это работает потому что Flink физически шардит state по key groups в checkpoint, и SharedStateRegistry трекает sharing SST файлов между новыми subtask-ами.",
+      "studyHint": "Повторите урок — Rescaling 4→8 механика",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-04-q4",
+      "type": "true-false",
+      "question": "setMaxParallelism(1024) на job с parallelism=4 создаст significant overhead и замедлит работу.",
+      "correctAnswer": false,
+      "explanation": "False. Overhead установки больших maxParallelism — micro (несколько KB metadata в JobManager и SnapshotMetaData). Cost несравним с риском неспособности scale в будущем. Recommendation: setMaxParallelism(1024) или 4096 для production — практически free insurance против rebootstrap. Только не используйте абсурдно большие значения (типа 32768) на small jobs — это уже излишество.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

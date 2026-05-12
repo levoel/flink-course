@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/03-datastream-python",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-03",
+    "description": "DataStream API в Python, ProcessFunction, state"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-03-q1",
+      "type": "multiple-choice",
+      "question": "Какие features доступны в PyFlink DataStream API в Flink 2.2, а какие нет?",
+      "options": [
+        { "id": "a", "text": "PyFlink DataStream имеет 100% parity с Java" },
+        { "id": "b", "text": "**Available**: source/sink builders, transformations (map, filter, flat_map, key_by, process), ProcessFunction/KeyedProcessFunction (since 1.14), side outputs (OutputTag), watermark strategies, state primitives (ValueState, ListState, MapState), timers (event + processing time), connected streams. **NOT available**: CEP API (Java only), DataStream V2 (FLIP-409, Java only), complex window assigners (limited subset, use Table API), full SinkV2 builder ecosystem, some advanced AsyncFunction patterns. Async UDF в 2.2+ closes большинство gaps" },
+        { "id": "c", "text": "Только map/filter в Python" },
+        { "id": "d", "text": "PyFlink DataStream deprecated в favor of Table API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "PyFlink DataStream API evolved через releases. By Flink 2.2 covered все main production patterns но still имеет gaps vs Java. **First-class в Python**: Source/sink (KafkaSource, JdbcSink, etc.), basic transformations, KeyedProcessFunction (since 1.14 — biggest add), side outputs through OutputTag, watermark strategies (WatermarkStrategy, TimestampAssigner), state primitives (ValueState/ListState/MapState — registered through RuntimeContext в open()), timers (register_event_time_timer/register_processing_time_timer), connected streams (connect + CoProcessFunction). **Missing/limited**: (1) FlinkCEP — Java only, no Python wrapper. (2) DataStream V2 (FLIP-409) — experimental new API, Java only currently. (3) Custom partitioners — limited. (4) Some Sink V2 builder customizations. (5) Advanced window assigners (Tumbling/Sliding work, custom assigners challenging). Async UDFs в Flink 2.2 (см. урок 08) closes async I/O gap. **Production guidance**: Table API имеет first-class parity с Java (см. урок 04), so for ETL-style use Table API. DataStream Python для cases requiring custom keyed state с complex logic, custom timers, or low-level Process functions.",
+      "studyHint": "Повторите урок 03 — секцию 'DataStream API: что доступно в 2.2'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-03-q2",
+      "type": "multiple-choice",
+      "question": "Differences PyFlink DataStream vs Java DataStream API — что характеризует?",
+      "options": [
+        { "id": "a", "text": "Identical APIs" },
+        { "id": "b", "text": "(1) type_info OBLIGATORY — Java's TypeExtractor выводит types из generics, Python нет — нужно explicit `output_type=Types.*()`. (2) `yield` generator pattern вместо `out.collect()` — pythonic, multi-yield supported. (3) Lambdas работают без issues (explicit type info eliminates erasure problems). (4) Python native tuple вместо Flink Tuple2/3 — automatic conversion. (5) Performance gap: process mode ~30-50% baseline, thread mode (PEMJA) ~70-90%, Pandas UDF ~90-95%. (6) Cloudpickle для arbitrary Python objects — fallback Types.PICKLED_BYTE_ARRAY when no explicit type" },
+        { "id": "c", "text": "Python только slower версия Java API" },
+        { "id": "d", "text": "Java API использует POJO, Python нет" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Diff 1 — type_info obligatory**: Java TypeExtractor uses generic signatures (`MapFunction<A, B>`). Python: typing hints не подходят (PEP 484 hints не enforced runtime). Flink requires explicit `output_type=Types.STRING()` etc. Без — cloudpickle fallback (~10x slower) или error. **Diff 2 — yield generator**: Java `out.collect(value)` imperative. Python `yield value` — generator pattern, more Pythonic. Multi-yield в одном `process_element` supported. Both work, but no batch emit. **Diff 3 — Lambdas work**: Java has erasure issues (см. M11 урок 04). Python lambdas + explicit type info — clean, no problems. Common pattern: `.map(lambda r: r[0], output_type=Types.INT())`. **Diff 4 — Native tuples**: Java uses flink.Tuple2/3 with f0/f1 fields. Python: native `(a, b, c)` tuples. PyFlink automatically converts. TypeInformation: `Types.TUPLE([Types.STRING(), Types.INT()])`. **Diff 5 — Performance**: Multiple modes — process (30-50% baseline, urок 05), thread/PEMJA (70-90%, урок 06), Pandas (90-95%, урок 07), async (depends external, урок 08). Choice depends workload characteristics. **Diff 6 — Cloudpickle fallback**: для arbitrary Python objects (custom classes без explicit type), Flink uses cloudpickle. Includes class bytecode in serialization → ~10x slower, larger wire size. Avoid via explicit Types.* declarations.",
+      "studyHint": "Повторите урок 03 — секцию 'Differences от Java API — пятёрка важных'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-03-q3",
+      "type": "multiple-choice",
+      "question": "Pattern для KeyedProcessFunction в PyFlink с ValueState и timers — какой?",
+      "options": [
+        { "id": "a", "text": "PyFlink не поддерживает state и timers" },
+        { "id": "b", "text": "Class extends KeyedProcessFunction. open(runtime_context) — register state via ValueStateDescriptor(name, type), self.state = runtime_context.get_state(descriptor). process_element(value, ctx) — access state via self.state.value()/update()/clear(), register timers via ctx.timer_service().register_event_time_timer(ts). on_timer(timestamp, ctx) — callback when timer fires, yield results. Same pattern как Java, но Python yield instead of Collector" },
+        { "id": "c", "text": "Только через SQL Table API" },
+        { "id": "d", "text": "Используется DataStream API напрямую без classes" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production pattern для stateful KeyedProcessFunction в Python: ```python\\nclass FraudDetector(KeyedProcessFunction):\\n    def open(self, runtime_context):\\n        descriptor = ValueStateDescriptor('last_tx', Types.DOUBLE())\\n        self.last_amount = runtime_context.get_state(descriptor)\\n        # Также get_list_state, get_map_state\\n        # Metrics через runtime_context.get_metric_group()\\n\\n    def process_element(self, value, ctx):\\n        user_id, amount = value\\n        last = self.last_amount.value()  # None if empty\\n        if last and amount > last * 10:\\n            yield {'alert': 'fraud', 'user': user_id}\\n        self.last_amount.update(amount)\\n        # Register timer\\n        ctx.timer_service().register_event_time_timer(ctx.timestamp() + 60_000)\\n\\n    def on_timer(self, timestamp, ctx):\\n        # Called when timer fires\\n        yield f'timer at {timestamp}'```. Use: `stream.key_by(lambda e: e[0], key_type=Types.INT()).process(FraudDetector(), output_type=Types.MAP(STRING(), STRING()))`. **Three state types**: ValueState (single value), ListState (append/get/update list), MapState (key→value pairs). All serialized through TypeInformation declared в descriptor. State persists across checkpoints — full restoration. **Timer types**: event_time (fires when watermark passes), processing_time (wall clock). Timer state automatically checkpointed.",
+      "studyHint": "Повторите урок 03 — секцию 'ProcessFunction / KeyedProcessFunction в Python'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-03-q4",
+      "type": "true-false",
+      "question": "Python ProcessFunction может block watermark progression если process_element медленный — в Java mailbox processor explicitly schedules watermark forwarding, в Python — sequential execution. Watermark stalls приводят к delayed window emissions downstream. Mitigation: Pandas UDFs (vectorized), thread mode (PEMJA), monitor watermark gap metrics.",
+      "correctAnswer": true,
+      "explanation": "Mailbox processor model: Flink JVM has single-threaded mailbox per subtask processing records, watermarks, checkpoint barriers, timers in FIFO order. In Java, Flink can interleave fast operations (forward watermark) с slow ones. В Python — process mode имеет additional IPC layer (см. урок 05), thread mode (PEMJA) has GIL contention. Slow Python UDF (say 100ms per record) blocks entire mailbox процесса — watermark events queue behind. Downstream effects: windowed operators receive watermark late, window emission delayed, processing time лагает за event time. **Symptoms**: `flink_taskmanager_job_task_operator_currentWatermark` metric stuck or progresses much slower than event time. Window emissions сдвигаются. End-to-end latency дoes up. **Mitigation strategies**: (1) **Pandas UDFs (урок 07)**: vectorize Python operations — 100 records processed в batch ~5ms (vs 100×10ms row-wise). Watermark progresses между batches. (2) **Thread mode PEMJA (урок 06)**: eliminates IPC overhead, per-record processing ~5x faster vs process mode. (3) **Async UDFs (урок 08)**: для external I/O specifically — concurrent in-flight requests, no blocking single record. (4) **Reduce parallelism per slot** if GIL contention в thread mode. (5) **Monitor**: `currentWatermark` per operator, `processBundleMs` для Python operators. Alert if watermark gap > expected based on bounded out-of-orderness setting.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

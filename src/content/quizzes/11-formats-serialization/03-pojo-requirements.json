@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/03-pojo-requirements",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-03",
+    "description": "POJO rules, anti-patterns, validation"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-03-q1",
+      "type": "multiple-choice",
+      "question": "Какие правила должен удовлетворять класс T чтобы быть распознанным как POJO в Flink?",
+      "options": [
+        { "id": "a", "text": "Класс должен implement Serializable interface" },
+        { "id": "b", "text": "(1) public класс (или static nested public); (2) public no-arg constructor; (3) каждое non-static non-transient field — либо public, либо имеет public getter/setter; (4) все field types — recognized Flink types (BasicTypeInfo, POJO рекурсивно, supported collections); (5) не generic с unresolved параметрами" },
+        { "id": "c", "text": "Только наличие public no-arg constructor — достаточно" },
+        { "id": "d", "text": "Класс должен иметь @Pojo annotation" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Exhaustive POJO requirements в Flink TypeExtractor.analyzePojo(): (1) Class public + (либо top-level либо static nested). (2) Public no-arg constructor (для deserialization через newInstance). (3) Для каждого field: либо public (и не final, потому что Flink использует Field.set()), либо имеется public getX/setX (для boolean — isX/getX). (4) Все field types recognized: BasicTypeInfo, POJO рекурсивно, Arrays, List, Map, Set из flink-aware элементов, или registered TypeInfo через @TypeInfo. (5) Generic параметры resolved (concrete subclass или @TypeInfo factory). Любое нарушение → fallback на GenericTypeInfo → Kryo silently (если pipeline.generic-types: true). Самый частый случай: Lombok @Data @Builder без @NoArgsConstructor — нет no-arg ctor.",
+      "studyHint": "Повторите урок 03 — секцию 'Правила POJO в Flink — exhaustive list'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-03-q2",
+      "type": "multiple-choice",
+      "question": "Lombok-класс с `@Data @Builder` без `@NoArgsConstructor` показывает 40% throughput regression. Root cause?",
+      "options": [
+        { "id": "a", "text": "Lombok generates медленный bytecode" },
+        { "id": "b", "text": "@Data генерирует getters/setters, но @Builder создаёт только parameterized constructor через builder pattern. NO_ARG constructor отсутствует → Flink TypeExtractor не может валидировать POJO → fallback на GenericTypeInfo → Kryo serializer для всего класса → 50% perf hit. Fix: @Data @Builder @NoArgsConstructor @AllArgsConstructor (последний нужен потому, что @NoArgsConstructor удаляет @Builder-generated ctor, надо явно вернуть)" },
+        { "id": "c", "text": "@Builder создаёт неэффективные copy operations" },
+        { "id": "d", "text": "Это bug в Lombok, не Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Lombok @Data = @Getter + @Setter + @ToString + @EqualsAndHashCode + @RequiredArgsConstructor (last requires final fields, обычно none). @Builder генерирует static Builder class + private all-args constructor для builder use. Result: класс имеет get/set methods, но единственный ctor — `<init>(Long, String, ...)`. NO_ARG `<init>()` отсутствует. PojoTypeExtractor.hasPublicNoArgConstructor() returns false → GenericTypeInfo. Diagnosis: `javap -p MyClass.class` показывает constructors. Production fix: ВСЕГДА `@Data @NoArgsConstructor @AllArgsConstructor` (с `@Builder` если нужен). После добавления — full POJO recognition, ~95% baseline perf.",
+      "studyHint": "Повторите урок 03 — Anti-pattern 1 (отсутствие no-arg constructor)",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-03-q3",
+      "type": "multiple-choice",
+      "question": "Почему inner non-static class в Java НЕ может быть Flink POJO?",
+      "options": [
+        { "id": "a", "text": "Java compiler bug" },
+        { "id": "b", "text": "Inner non-static class имеет implicit synthetic field `this$0` — reference на enclosing Outer instance. PojoSerializer пытался бы сериализовать enclosing instance → infinite recursion или non-Serializable Outer error. Решение: сделать класс `public static class` (statically nested без enclosing reference) или вынести наружу как top-level class" },
+        { "id": "c", "text": "Inner classes имеют ограничение на field visibility" },
+        { "id": "d", "text": "Это специфика Flink, в других engines работает" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Java compiler для non-static inner class генерирует synthetic field `Outer this$0` — reference на enclosing instance + constructor `Inner(Outer)`. Это implicit, не видно в source. PojoTypeExtractor видит non-static `this$0` field → пытается traverse → encounters Outer (которое может не быть POJO, может быть anything) → recursion. Same applies для anonymous classes (внутри method они также имеют this$0 + captures locals). Production rule: nested classes для Flink data всегда `public static class`. Anonymous classes в map/filter — OK если они не сами event types, а functions. Если нужны nested data types — выносите наружу или используйте static nested.",
+      "studyHint": "Повторите урок 03 — Anti-pattern 4 (inner non-static class)",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-03-q4",
+      "type": "true-false",
+      "question": "Java records (Java 14+) распознаются Flink как POJO-equivalent с Flink 1.18+, и работают без Lombok аnnotations или ручного no-arg constructor — Flink использует canonical record constructor для deserialization.",
+      "correctAnswer": true,
+      "explanation": "Records были введены в Java 14 (preview), stable в 16. Flink добавил native record support в 1.18 через RecordSerializer (отдельный от PojoSerializer). Каждый record имеет: implicit canonical constructor (все fields в declaration order), accessor methods (`id()`, `name()` instead of `getId()`, `getName()`), implicit equals/hashCode/toString. Flink использует canonical constructor вместо no-arg + setters — нет необходимости в setable fields. Trade-offs: (1) Records immutable — нельзя modify в-place, каждое update создаёт new instance (overhead vs mutable POJO для very hot paths). (2) Pre-1.18 Flink не поддерживает — Kryo fallback. (3) Records могут содержать те же problematic field types (Instant, Optional) — recursive POJO check applies same. (4) Schema evolution — records add component требует new canonical constructor → может ломать compatibility, used carefully.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

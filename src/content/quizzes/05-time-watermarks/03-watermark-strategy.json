@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/03-watermark-strategy",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-03",
+    "description": "Quiz for WatermarkStrategy deep dive lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-03-q1",
+      "type": "multiple-choice",
+      "question": "Как работает forBoundedOutOfOrderness(Duration.ofSeconds(20))?",
+      "options": [
+        { "id": "a", "text": "Все события задерживаются на 20 секунд перед обработкой" },
+        { "id": "b", "text": "Periodic generator: maxObservedTimestamp обновляется per record, watermark emit каждые autoWatermarkInterval (default 200ms) как maxTimestamp - 20s - 1. Семантика: 'события могут опаздывать максимум на 20 секунд от события с самым свежим timestamp'" },
+        { "id": "c", "text": "Watermark двигается ровно на 20 секунд каждую минуту" },
+        { "id": "d", "text": "Каждый event emit-ит watermark = event.timestamp - 20s" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "BoundedOutOfOrdernessWatermarks — periodic generator. onEvent() обновляет maxTimestamp = MAX(maxTimestamp, eventTimestamp). onPeriodicEmit() (вызывается каждые pipeline.auto-watermark-interval = 200ms) emit watermark = maxTimestamp - outOfOrdernessMillis - 1. Это не задерживает события, не emit per-event watermark — только periodic emission. Tuning: маленький out-of-orderness → быстрый watermark → быстрые окна, больше late events. Большой → медленнее, меньше late.",
+      "studyHint": "Повторите урок — раздел 'forBoundedOutOfOrderness'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-03-q2",
+      "type": "multiple-choice",
+      "question": "Production: Kafka topic с 24 partitions, parallelism source=6, 6 partitions idle. WatermarkStrategy без withIdleness. Что происходит?",
+      "options": [
+        { "id": "a", "text": "Idle partitions автоматически handled — Flink сам detect" },
+        { "id": "b", "text": "Per-partition WatermarkGenerator state: idle partitions emit watermark Long.MIN_VALUE. MIN propagation на subtask и downstream tanks весь pipeline. Окна никогда не закрываются. Fix: .withIdleness(Duration.ofMinutes(1)) — после 60s без events partition помечается idle через markIdle(), MIN исключает её" },
+        { "id": "c", "text": "Parallelism source автоматически уменьшается до active partitions" },
+        { "id": "d", "text": "Kafka сам отправляет heartbeat events для idle partitions" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Per-partition watermarks: каждая Kafka partition имеет свой WatermarkGenerator state. Idle partition без events → onEvent() не вызывается → maxTimestamp = Long.MIN_VALUE + outOfOrderness + 1 → emit watermark = Long.MIN_VALUE. На subtask level MIN(per-partition WM) = Long.MIN_VALUE. На downstream MIN(per-subtask WM) = Long.MIN_VALUE. Окна freeze. Fix: .withIdleness(Duration.ofMinutes(1)) → output.markIdle() через 60s → MIN propagation skips idle channels. Production rule: всегда withIdleness на multi-partition sources.",
+      "studyHint": "Повторите урок — раздел 'withIdleness'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-03-q3",
+      "type": "multiple-choice",
+      "question": "В чём разница между periodic и punctuated WatermarkGenerator?",
+      "options": [
+        { "id": "a", "text": "Periodic быстрее, punctuated точнее" },
+        { "id": "b", "text": "Periodic emit-ит watermark каждые autoWatermarkInterval (200ms) через onPeriodicEmit, независимо от events. Punctuated emit-ит только в onEvent на specific marker events (например, 'end of window' markers от producer)" },
+        { "id": "c", "text": "Никакой разницы — это синонимы" },
+        { "id": "d", "text": "Punctuated работает только в Table API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Periodic generator (default): onEvent() обновляет state, onPeriodicEmit() (every 200ms) emit-ит watermark. Так работают forBoundedOutOfOrderness, forMonotonousTimestamps. Punctuated: emit watermark ТОЛЬКО в onEvent() на конкретные events (например, isWatermarkEvent() marker от source), onPeriodicEmit() обычно пустой. Use cases punctuated: source с explicit 'end of period' markers (custom CDC, IoT heartbeats). 99% случаев — periodic. Если используете punctuated, лучше combine с periodic как fallback — иначе если markers редкие, watermark надолго замораживается.",
+      "studyHint": "Повторите урок — раздел 'Periodic vs Punctuated'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m05-03-q4",
+      "type": "true-false",
+      "question": "WatermarkStrategy должна передаваться в fromSource(), а не через .assignTimestampsAndWatermarks() после source — иначе теряются per-partition watermarks для Kafka.",
+      "correctAnswer": true,
+      "explanation": "True. Когда WatermarkStrategy передаётся в env.fromSource(source, strategy, name) — каждая Kafka partition имеет свой WatermarkGenerator state, watermark emit per-partition, MIN propagation корректно учитывает per-partition WM. Это правильный подход. Если использовать .assignTimestampsAndWatermarks() после fromSource(noWatermarks()) — TimestampsAndWatermarksOperator работает после source partition merge, видит все events как один поток. Per-partition state теряется. На multi-partition Kafka одна fast partition будет двигать WM, другие отстающие — late events. .assignTimestampsAndWatermarks() OK для не-multi-partition sources или после трансформации (filter, map), где timestamp нужно извлекать после.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

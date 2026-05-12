@@ -1,0 +1,467 @@
+---
+title: "Flink CDC 3.6: pipeline YAML, schema evolution, AI integration"
+description: "Глубокий разбор Flink CDC 3.6 (Mar 2026, Apache sub-project с 3.1): pipeline YAML syntax (postgres → paimon, transform). Schema evolution propagation. AI Model Integration (3.3+, OpenAI embedding/chat в transform). Comparison с Debezium standalone"
+order: 8
+difficulty: "advanced"
+estimatedTime: 40
+topics: ["Flink CDC", "Pipeline YAML", "Schema Evolution", "AI Model Integration", "Postgres CDC", "MySQL CDC", "Paimon Sink", "Debezium"]
+---
+
+# Flink CDC 3.6 — declarative DB replication
+
+**Flink CDC** — это **Apache sub-project** (с 3.1, donated к ASF в 2024 от Ververica/Alibaba). 3.6 (March 2026) — current stable. Это replacement для Debezium + Kafka Connect + Spark streaming в lakehouse ingestion: **один YAML файл** заменяет ту pipeline.
+
+Этот урок — **ultimate в модуле**. Покрывает: pipeline YAML syntax, schema evolution propagation, AI Model Integration (3.3+), production deployment patterns, comparison с Debezium standalone.
+
+---
+
+## Что такое Flink CDC
+
+**Two layers:**
+
+### 1. CDC Connectors (Source connectors)
+
+Flink Source implementations для DBs:
+- `flink-connector-postgres-cdc` — Postgres logical replication
+- `flink-connector-mysql-cdc` — MySQL binlog
+- `flink-connector-mongodb-cdc` — MongoDB change streams
+- `flink-connector-oracle-cdc` — Oracle LogMiner
+- `flink-connector-sqlserver-cdc` — MSSQL CDC tables
+
+Embed Debezium engine internally (но pure Flink — no Kafka Connect overhead).
+
+### 2. Flink CDC Pipeline (3.0+)
+
+Declarative YAML pipeline syntax. Source → transform → sink в один файл. **No Java/Scala code needed.**
+
+```yaml
+# pipeline.yaml
+source:
+  type: postgres
+  hostname: db.example.com
+  port: 5432
+  username: cdc_user
+  password: ${PG_PASSWORD}
+  database: production
+  schema-name: public
+  table-list: orders,customers,products
+  slot-name: flink_cdc_slot
+
+transform:
+  - source-table: production.public.orders
+    projection: \\*, _id AS id, UPPER(status) AS status_upper
+    filter: amount > 0
+  
+  - source-table: production.public.customers
+    projection: \\*, MASK_AS_NULL(email) AS email_masked
+    filter: deleted_at IS NULL
+
+route:
+  - source-table: production.public.orders
+    sink-table: lakehouse.staging.orders
+  - source-table: production.public.customers
+    sink-table: lakehouse.staging.customers
+
+sink:
+  type: paimon
+  catalog.warehouse: s3://lakehouse/paimon/
+  catalog.metastore: filesystem
+  
+pipeline:
+  name: prod-pg-to-paimon
+  parallelism: 8
+```
+
+Deploy:
+
+```bash
+$FLINK_HOME/bin/flink run \
+    -t kubernetes-application \
+    /opt/flink/lib/flink-cdc-pipeline-3.6.jar \
+    --remote-flink-cluster k8s://prod-flink \
+    pipeline.yaml
+```
+
+**Single YAML deploys full DB → lakehouse pipeline with schema evolution.**
+
+---
+
+## Architecture: pipeline → DataStream
+
+CDC Pipeline parses YAML, internally generates DataStream pipeline:
+
+<DiagramContainer title="Flink CDC Pipeline 3.x: YAML → DataStream → execution" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="pipeline.yaml"
+        tooltip="Declarative spec — source connector + transforms + routes + sink connector. Может включать env variables, secrets, parallelism overrides."
+      >
+        source / transform / route / sink
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Pipeline Compiler" />
+    <FlowRow>
+      <DataBox
+        label="DataStream pipeline (generated)"
+        tooltip="Compiler reads YAML, instantiates Flink DataStream: CDC source → SchemaInferringDeserializer → transform operator → route operator (table mapping) → sink. Schema info propagates через DataChangeEvent stream alongside data."
+      >
+        Source → Transform → Route → Sink
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="parallel execution" />
+    <FlowRow>
+      <DataBox
+        label="Postgres logical replication"
+        tooltip="Postgres slot reads WAL changes, decoded via pgoutput. Initial snapshot читает existing data, потом continuous WAL streaming. Exactly-once через checkpointing."
+      >
+        WAL → Debezium engine (in-process)
+      </DataBox>
+      <DataBox
+        label="Schema evolution events"
+        tooltip="Когда Postgres DDL (CREATE/ALTER/DROP TABLE) — это special SchemaChangeEvent в stream. Propagates через pipeline к Sink, который applies к lakehouse table — Paimon ALTER TABLE."
+      >
+        DataChangeEvent + SchemaChangeEvent
+      </DataBox>
+      <DataBox
+        label="Paimon sink (atomic snapshot)"
+        tooltip="Each checkpoint = new Paimon snapshot с both data changes и schema changes applied atomically. Downstream readers see consistent view."
+      >
+        Paimon snapshot per checkpoint
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Pipeline YAML detailed sections
+
+### Source
+
+```yaml
+source:
+  type: postgres                                    # postgres / mysql / mongodb / oracle / sqlserver
+  hostname: db.example.com
+  port: 5432
+  username: cdc_user
+  password: ${PG_PASSWORD}
+  database: production
+  schema-name: public
+  table-list: orders,customers,products             # comma-separated, supports wildcards
+  slot-name: flink_cdc_slot                         # Postgres logical replication slot
+  decoding.plugin.name: pgoutput                    # pgoutput / wal2json
+  scan.startup.mode: initial                        # initial / latest-offset / specific-offset
+  scan.snapshot.fetch.size: 10240
+```
+
+**Critical для Postgres:**
+- `slot-name` уникален per pipeline — multiple pipelines с same slot → conflicts
+- `wal_level = logical` в postgresql.conf required
+- `max_replication_slots` достаточно high — каждый slot held permanently
+- Permissions: `REPLICATION` role + table SELECT
+
+### Transform
+
+```yaml
+transform:
+  - source-table: production.public.orders
+    projection: |
+      \\*,                                            -- all columns
+      _id AS id,                                      -- rename
+      UPPER(status) AS status_upper,
+      DATE_FORMAT(created_at, 'yyyy-MM-dd') AS partition_date
+    filter: |
+      amount > 0 AND status != 'CANCELLED'
+    primary-keys: id
+  
+  - source-table: production.public.events
+    projection: \\*, transform_text(content) AS content_norm
+```
+
+Transform applied per-table. SQL expressions через Flink Table API SQL dialect. Special functions: `MASK_AS_NULL` (PII), `__data_event_type__` (INSERT/UPDATE/DELETE), `__schema_version__`.
+
+### Route — table mapping
+
+```yaml
+route:
+  - source-table: production.public.orders
+    sink-table: lakehouse.staging.orders
+    description: "Production orders → staging zone"
+  
+  - source-table: production.public.customers_*       # wildcard
+    sink-table: lakehouse.staging.customers           # collapse в одну table
+    description: "Customer shards consolidated"
+  
+  - source-table: production.public.legacy_table
+    sink-table: archive.archived.legacy_table         # different sink catalog
+```
+
+Wildcards в source-table — consolidate shards в одну sink table.
+
+### Sink
+
+```yaml
+sink:
+  type: paimon
+  catalog.warehouse: s3://lakehouse/paimon/
+  catalog.metastore: filesystem
+  
+  # Or Hive metastore:
+  # catalog.metastore: hive
+  # catalog.uri: thrift://hive-metastore:9083
+  
+  # Per-table options:
+  table.options:
+    bucket: 8
+    changelog-producer: lookup                       # для real-time changelog support
+```
+
+Supported sinks: Paimon, Iceberg, StarRocks, Doris, Kafka, Elasticsearch.
+
+---
+
+## Schema evolution propagation
+
+**Killer feature** Flink CDC 3.x. Когда Postgres получает DDL — CDC pipeline propagates change через все стадии.
+
+Scenario:
+
+```
+T1: Postgres: ALTER TABLE orders ADD COLUMN shipping_addr TEXT
+T2: Flink CDC source detects DDL change в WAL
+T3: Emits SchemaChangeEvent в stream
+T4: Transform layer adapts schema (если applicable)
+T5: Sink (Paimon) calls ALTER TABLE adding column
+T6: Future events with shipping_addr written к updated table
+```
+
+**No restart, no manual schema sync, no data drift.** Это enormous improvement over Debezium + Kafka Connect, где schema changes require manual coordination.
+
+### Supported DDL operations
+
+| DDL | Auto-propagated |
+|---|---|
+| `ADD COLUMN` | Yes — sink adds column with default null |
+| `DROP COLUMN` | Yes (configurable — может skip для safety) |
+| `RENAME COLUMN` | Yes (если sink supports — Paimon yes) |
+| `CHANGE COLUMN TYPE` | Yes (для compatible widening — INT → BIGINT) |
+| `RENAME TABLE` | Limited |
+| `TRUNCATE TABLE` | Configurable |
+| Index changes | Не propagated (Flink CDC focuses on data shape) |
+
+---
+
+## AI Model Integration (3.3+)
+
+Flink CDC 3.3+ added **AI model integration** в transform expressions:
+
+```yaml
+transform:
+  - source-table: production.public.products
+    projection: |
+      \\*,
+      OPENAI_EMBEDDING(description) AS description_embedding,
+      OPENAI_CHAT('Categorize this product: ' || description, 
+                  model='gpt-4', max_tokens=20) AS auto_category
+    options:
+      openai.api-key: ${OPENAI_API_KEY}
+      openai.model: text-embedding-3-small
+      openai.timeout-ms: 5000
+```
+
+Это means: each product row's description vectorised via OpenAI embedding model в real-time, vector written в sink. Same для auto-classification via chat completion.
+
+### Use cases
+
+- **Real-time vector ingestion** в vector DB (Pinecone, Milvus) для semantic search
+- **Automated classification** (sentiment, category, language) при ingestion
+- **PII detection** via LLM
+- **Data enrichment** (translate, summarize)
+
+### Production caveats
+
+- **Cost** — API calls per row × CDC volume. 1M rows × $0.0001 per call = $100. Streaming continuous = recurring cost.
+- **Latency** — API call 100-500ms. Без Async I/O wrapping — bottleneck. Flink CDC AI integration handles async automatically.
+- **Reliability** — API rate limits, transient failures. Retry policy configurable.
+- **Caching** — embeddings deterministic, cache per content hash to reduce calls.
+
+---
+
+## Flink CDC vs Debezium standalone
+
+| Aspect | Flink CDC | Debezium + Kafka Connect |
+|---|---|---|
+| Architecture | Single Flink job | Kafka Connect cluster + Kafka + downstream Flink/Spark |
+| Components | 1 (Flink) | 3+ (KC, Kafka, downstream) |
+| Schema evolution | Auto-propagate к sink | Manual coordinate с downstream |
+| Pipeline definition | YAML declarative | JSON config per connector |
+| Transforms | SQL в YAML transform | SMTs (Kafka Connect) limited |
+| AI integration | Built-in (3.3+) | External |
+| Exactly-once к lakehouse | Native (Paimon, Iceberg) | Multi-hop EOS difficult |
+| Sink options | 6+ (lakehouse-focused) | Many через Kafka Connect ecosystem |
+| Operational overhead | Low (один job) | Higher (multiple systems) |
+| Latency | Lower (direct, no Kafka hop) | Higher (DB → KC → Kafka → sink) |
+| Use case | Greenfield, lakehouse target | Heterogeneous downstream, Kafka-centric |
+
+**Choose Flink CDC** для lakehouse ingestion (Paimon, Iceberg, etc.) — direct, declarative, schema-aware.
+
+**Choose Debezium** для Kafka-centric architectures где Kafka — central nervous system и many downstream consumers.
+
+---
+
+## Production gotchas
+
+### 1. Postgres replication slot — never released
+
+Each Flink CDC Postgres source holds replication slot. WAL accumulates до slot consumed. **Если pipeline crashes и not restarted**, slot persists, WAL grows unbounded → disk full.
+
+**Mitigation:**
+- Monitor `pg_replication_slots` query — `confirmed_flush_lsn` should advance
+- Alerts на slot inactive duration > threshold
+- Drop slots после permanent pipeline removal: `SELECT pg_drop_replication_slot('flink_cdc_slot')`
+
+### 2. Initial snapshot — large table = long blocking
+
+```yaml
+scan.startup.mode: initial    # читает full table сначала
+```
+
+С 100M-row table initial snapshot = hours. During this:
+- Flink CDC source not yet streaming changes
+- Operates под snapshot lock (или MVCC) — может slow source DB
+
+**Mitigation:**
+- `scan.incremental.snapshot.enabled: true` (default in 3.x) — parallel chunked snapshot, no global lock
+- `scan.incremental.snapshot.chunk.size: 8096`
+- Snapshot during low-traffic window
+
+### 3. Schema evolution incompatibility
+
+Не все DDL safely propagatable. Examples:
+
+- `DROP COLUMN` — downstream queries expecting column break. Pipeline option `schema-change.behavior: lenient` skips DROP.
+- `RENAME COLUMN` — некоторые sinks не support, pipeline fails.
+- Type changes — Postgres `VARCHAR → INT` — invalid data in stream, parse failure.
+
+**Practice:**
+- Configure `schema-change.behavior` per safety requirements
+- Schema changes go through CI/CD process — staging deploy + test перед production
+
+### 4. MySQL binlog format requirement
+
+MySQL CDC requires `binlog_format = ROW` (не STATEMENT, не MIXED). Без этого CDC получает statement-based events — incomplete (нет row values), unusable.
+
+```ini
+# my.cnf
+[mysqld]
+log_bin = ON
+binlog_format = ROW
+binlog_row_image = FULL                  # whole row, not just changed columns
+```
+
+Plus `gtid_mode = ON` for reliable failover positioning.
+
+### 5. AI integration cost explosion
+
+```yaml
+transform:
+  - projection: \\*, OPENAI_EMBEDDING(description) AS emb
+```
+
+Если table updates 1000/sec и каждая update триггерит embedding call — $0.0001 × 1000 × 86400 = $8640/day. Может surprise FinOps.
+
+**Mitigation:**
+- Compute embedding only on INSERT, not UPDATE (filter `__data_event_type__ != 'UPDATE'`)
+- Skip embedding if description unchanged (compute hash, cache)
+- Use cheaper / local models — `text-embedding-3-small` (~6x cheaper than ada-002)
+- Batch API endpoints (50% cheaper)
+
+### 6. Paimon bucket count — fixed at table creation
+
+```yaml
+sink:
+  type: paimon
+  table.options:
+    bucket: 8                                     # fixed
+```
+
+Bucket count не easily changed — requires table rewrite. Plan capacity carefully: rule of thumb 1 bucket per ~1GB data.
+
+---
+
+## Real production example: Postgres → Paimon с AI
+
+```yaml
+source:
+  type: postgres
+  hostname: prod-pg.example.com
+  port: 5432
+  username: cdc_user
+  password: ${PG_PASSWORD}
+  database: ecommerce
+  schema-name: public
+  table-list: products,orders,customer_reviews
+  slot-name: flink_cdc_ecommerce
+  scan.startup.mode: initial
+  scan.incremental.snapshot.enabled: true
+  scan.incremental.snapshot.chunk.size: 8096
+
+transform:
+  - source-table: ecommerce.public.products
+    projection: |
+      product_id, name, description, price, category,
+      OPENAI_EMBEDDING(name || ' ' || description) AS embedding,
+      created_at, updated_at
+    filter: deleted_at IS NULL
+    primary-keys: product_id
+  
+  - source-table: ecommerce.public.customer_reviews
+    projection: |
+      review_id, product_id, user_id, rating, content,
+      OPENAI_SENTIMENT(content) AS sentiment_score,
+      created_at
+    primary-keys: review_id
+
+route:
+  - source-table: ecommerce.public.products
+    sink-table: lakehouse.ecommerce.products
+  - source-table: ecommerce.public.customer_reviews
+    sink-table: lakehouse.ecommerce.reviews
+
+sink:
+  type: paimon
+  catalog.warehouse: s3://my-lakehouse/paimon/
+  catalog.metastore: hive
+  catalog.uri: thrift://hive-metastore:9083
+  table.options:
+    bucket: 16
+    changelog-producer: lookup
+    file.format: parquet
+    compression: zstd
+
+pipeline:
+  name: ecommerce-cdc-to-lakehouse
+  parallelism: 16
+  schema-change.behavior: try-evolve              # auto-propagate schema, fail safely
+```
+
+Один YAML — full pipeline. Schema evolution auto-propagated. Embeddings + sentiment computed inline. Lakehouse output ready для downstream analytics.
+
+---
+
+## Key takeaways
+
+- **Flink CDC** — Apache sub-project с 3.1, current 3.6 (Mar 2026). Replacement для Debezium + Kafka Connect + Spark в lakehouse ingestion.
+- **Pipeline YAML** declarative: source + transform + route + sink. No Java code.
+- **Schema evolution auto-propagated** через все стадии pipeline — sink alters table automatically.
+- **AI Model Integration (3.3+)** — OPENAI_EMBEDDING, OPENAI_CHAT, OPENAI_SENTIMENT в transform expressions.
+- **Postgres slot management** — held permanently per pipeline, monitor LSN advance.
+- **Choose Flink CDC** для lakehouse-target pipelines, Debezium для Kafka-centric heterogeneous downstream.
+
+---
+
+<KnowledgeCheck
+  question="Объясните преимущества Flink CDC Pipeline 3.x над traditional Debezium + Kafka Connect для Postgres → Paimon ingestion."
+  answer="Преимущества: (1) Single deployment — Flink CDC pipeline = 1 Flink job vs Debezium + Kafka Connect + Kafka + downstream Flink/Spark = 4 systems; (2) Declarative YAML — нет Java/Scala code, full pipeline в одном файле; (3) Schema evolution auto-propagated — DDL в Postgres (ALTER TABLE ADD COLUMN) flows через pipeline к Paimon, который applies ALTER TABLE автоматически; в Debezium downstream requires manual coordination; (4) Native exactly-once к lakehouse — direct DB → Paimon без Kafka hop, single checkpoint coordinates; в Debezium multi-hop EOS difficult; (5) Built-in AI integration (3.3+) — OPENAI_EMBEDDING/CHAT/SENTIMENT в transform expressions, не external service; (6) Lower latency — нет Kafka intermediate step; (7) Operational simplicity — один YAML, one deploy, один job to monitor; меньше moving parts. When Debezium better: Kafka-centric architecture где Kafka — central nervous system с many downstream consumers (separate analytics, ML, microservices), heterogeneous sink ecosystem через Kafka Connect, или existing Debezium investment. Flink CDC — choice для greenfield lakehouse-target."
+/>

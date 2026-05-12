@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/05-avro-specific-generic",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-05",
+    "description": "Avro Specific vs Generic vs Reflect, Schema Registry"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-05-q1",
+      "type": "multiple-choice",
+      "question": "Три режима Avro в Flink — Specific, Generic, Reflect — какие use cases и trade-offs?",
+      "options": [
+        { "id": "a", "text": "Все три identical, разные только naming" },
+        { "id": "b", "text": "Specific: .avsc → codegen Java classes, compile-time type safety, ~85% baseline perf — production typed pipelines. Generic: GenericRecord wrapper + runtime Schema, field-by-name access record.get('field'), ~75% perf — dynamic/multi-tenant scenarios. Reflect: AvroSerializer создаёт schema из POJO reflection, ~80% perf — legacy POJO с Avro evolution без переписывания" },
+        { "id": "c", "text": "Specific только для compile time, Generic только для tests" },
+        { "id": "d", "text": "Reflect deprecated в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Detailed comparison: **Specific** — Avro Maven/Gradle plugin generates Java class extends SpecificRecordBase, типизированные getters/setters, schema pre-baked в generated class, ~85% baseline. Best для known stable schemas, production. **Generic** — GenericRecord = Schema + Object[], field access record.get('userId').toString() (returns CharSequence/Utf8, нужен .toString()). Schema комбинируется runtime, dynamic. ~75% perf. Best для multi-tenant routing, schema discovery, generic transformations (PII masking by field name pattern). **Reflect** — Avro ReflectData generates schema из Java reflection over POJO, AvroSerializer use this schema. Hybrid: ваш код POJO, но evolution и serialization идут через Avro path. ~80% perf. Best для legacy POJO codebase migration.",
+      "studyHint": "Повторите урок 05 — секцию 'Три режима Avro в Flink' с performance table",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-05-q2",
+      "type": "multiple-choice",
+      "question": "Stream `DataStream<GenericRecord>` без `.returns(new GenericRecordAvroTypeInfo(schema))` — что происходит?",
+      "options": [
+        { "id": "a", "text": "Flink выводит Avro schema автоматически" },
+        { "id": "b", "text": "Silent fallback на GenericTypeInfo<GenericRecord> → Kryo serializer. GenericRecord не имеет inherent Schema (schema приходит externally), TypeExtractor не может вывести которая schema используется. Без явного .returns(new GenericRecordAvroTypeInfo(schema)) — Kryo путь, ~75% → ~50% perf, плюс state evolution невозможен" },
+        { "id": "c", "text": "Job не стартует с ошибкой" },
+        { "id": "d", "text": "GenericRecord всегда automatically resolved" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "GenericRecord — это runtime wrapper класс {Schema schema, Object[] values}. Schema может быть любой Avro schema — Flink не знает которую вы хотите без explicit hint. TypeExtractor.getForClass(GenericRecord.class) returns GenericTypeInfo (так как нет no-arg ctor — GenericData.Record имеет parameterized ctor). Без `.returns(new GenericRecordAvroTypeInfo(schema))` — записи сериализуются Kryo. Это **самая частая ошибка** с Avro Generic mode. Fix: ОБЯЗАТЕЛЬНО после deserialization передавать schema: `KafkaSource.<GenericRecord>... .build(); env.fromSource(source, ..., name).returns(new GenericRecordAvroTypeInfo(schema));`. Production: integration test проверяет TypeInformation типа AvroTypeInfo, не GenericTypeInfo.",
+      "studyHint": "Повторите урок 05 — секцию 'Mode 2: Avro Generic'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-05-q3",
+      "type": "multiple-choice",
+      "question": "Schema evolution в Avro: какие изменения backward compatible (новые consumers читают old data), а какие нет?",
+      "options": [
+        { "id": "a", "text": "Любые изменения compatible" },
+        { "id": "b", "text": "Backward compatible: add field WITH default, remove field, type widen (int → long для positive values), rename via aliases. NOT compatible: add required field без default, change type incompatibly (string → bytes), reuse same field name с разным type. Schema Registry с BACKWARD mode reject-ит non-compatible commits на CI" },
+        { "id": "c", "text": "Только add field compatible, всё остальное breaks" },
+        { "id": "d", "text": "Avro не поддерживает schema evolution" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Avro evolution rules detailed: **Backward** (new schema readable by old code): add field with default, remove field, type widen в некоторых cases (int → long OK, long → int NO — narrowing risks overflow), rename через aliases (`{name: 'newName', aliases: ['oldName']}` — reader проверяет alias). **Forward** (old schema readable by new code): remove field, change required → optional. **Full** = backward + forward. Critical: добавить field БЕЗ default — new consumer пытается deserialize old record без этого field → AvroTypeException. Schema Registry compatibility mode определяет какие checks применяются на commit: NONE (никаких — recipe for disaster), BACKWARD (default, recommended minimum), BACKWARD_TRANSITIVE (против всех previous versions, не только latest), FULL, FULL_TRANSITIVE. Production rule: минимум BACKWARD_TRANSITIVE для shared topics.",
+      "studyHint": "Повторите урок 05 — секцию 'Schema evolution в Avro'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-05-q4",
+      "type": "true-false",
+      "question": "Confluent Schema Registry с compatibility mode NONE является anti-pattern в production — позволяет любые schema changes без validation, что может привести к catastrophic deserialization errors на running consumers.",
+      "correctAnswer": true,
+      "explanation": "Schema Registry compatibility mode controls schema validation на commit. NONE отключает все checks — любая schema accepted (including breaking changes). Это recipe for production disaster: один careless `PUT /subjects/.../versions` commit с required field (no default) ломает ВСЕХ running consumers на ВСЕХ topics использующих subject. Real-world example: дата команды добавила `paymentMethod: string` (required) → все Flink consumers падают с AvroTypeException → pipeline backpressure → downstream sinks idle → revenue impact. Production rule: ВСЕГДА минимум BACKWARD compatibility, для shared infrastructure — BACKWARD_TRANSITIVE или FULL_TRANSITIVE. Configure через registry API: `PUT /config/<subject> {compatibility: 'BACKWARD'}`. Также: CI/CD pipeline должен include schema compatibility check как required gate перед merge. Tools: confluent-cli, buf (для Protobuf), avro-tools.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

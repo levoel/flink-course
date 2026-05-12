@@ -1,0 +1,452 @@
+---
+title: "CDC end-to-end pipeline — Debezium → Flink CDC 3.6 → Paimon/Iceberg"
+description: "Полный CDC pipeline: Postgres binlog → Debezium → Kafka → Flink CDC YAML pipeline → Paimon/Iceberg sink. Schema evolution propagation, transform expressions, exactly-once, route и transform правила Flink CDC 3.6."
+order: 4
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["CDC", "Flink CDC 3.6", "Debezium", "Paimon", "Iceberg", "Schema Evolution"]
+---
+
+# CDC end-to-end pipeline — Debezium → Flink CDC 3.6 → Paimon/Iceberg
+
+CDC (Change Data Capture) — это нерв modern data architecture. Внутри Postgres bank-а лежат миллионы строк customer/account/transaction. Snowflake/ClickHouse/Iceberg/Pinot — хотят real-time copy для analytics. ETL раз в час — мёртв (latency, нагрузка на OLTP). Решение — stream changes из БД logs, transform в streaming, sink в lakehouse.
+
+Flink CDC 3.6 — это **YAML-defined pipeline** поверх Flink, который скрывает 90% boilerplate. Вы описываете source + transform + route + sink в декларативном format-е, под капотом Flink builds full DataStream graph с exactly-once гарантиями, schema evolution propagation, snapshot+streaming hybrid execution.
+
+Этот урок — `★ KILLER`. Мы разберём полный pipeline Postgres → Paimon с automatic schema evolution, реальный production setup, troubleshooting.
+
+---
+
+## Архитектура полного pipeline
+
+<DiagramContainer title="Postgres → Debezium → Kafka → Flink CDC 3.6 → Paimon" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Postgres OLTP"
+        tooltip="Production transactional DB. wal_level=logical обязателен. REPLICA IDENTITY FULL для tables что хотим CDC (или DEFAULT — нужен PRIMARY KEY). Replication slot создан для consumer."
+      >
+        Postgres (wal_level=logical)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="logical replication slot" />
+    <FlowRow>
+      <DataBox
+        label="Debezium connector"
+        tooltip="Kafka Connect connector. Читает Postgres WAL через pgoutput plugin. Снимает initial snapshot (COPY-based), потом стримит changes. Один topic per table в Kafka (.<schema>.<table>)."
+      >
+        Debezium for Postgres
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Debezium envelope: before/after/op" />
+    <FlowRow>
+      <DataBox
+        label="Kafka topics"
+        tooltip="postgres.public.customers, postgres.public.orders, postgres.public.products. Каждый change — JSON или Avro с Debezium envelope. Partition by primary key."
+      >
+        per-table change topics
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Flink CDC YAML pipeline" />
+    <FlowRow>
+      <DataBox
+        label="Flink CDC source"
+        tooltip="MySqlSource / PostgresSource / KafkaSource (для Debezium-produced). FLIP-27 Source API. Snapshot phase (parallel splits по primary key range) + streaming phase. Schema events интегрированы в data stream."
+      >
+        Flink CDC YAML source
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="transform + route" />
+    <FlowRow>
+      <DataBox
+        label="Transform layer"
+        tooltip="SQL-like expressions: derived columns, type cast, projection. Schema evolution applied к transform output. Multi-table routing — несколько tables в один sink table или split по conditions."
+      >
+        transform / route
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="schema evolution events" />
+    <FlowRow>
+      <DataBox
+        label="Paimon sink (или Iceberg)"
+        tooltip="Lakehouse table с native upsert. EOS через Flink 2PC + Paimon snapshot. Schema evolution applied automatically — новые columns appear в next snapshot. Compaction sub-tasks для small files."
+      >
+        Paimon table
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Часть 1: Postgres готовится для CDC
+
+```sql
+-- В postgresql.conf
+ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM SET max_wal_senders = 10;
+ALTER SYSTEM SET max_replication_slots = 10;
+-- restart Postgres
+
+-- Создать replication slot:
+SELECT pg_create_logical_replication_slot('debezium', 'pgoutput');
+
+-- Подготовить tables (PRIMARY KEY обязателен для CDC):
+ALTER TABLE customers REPLICA IDENTITY DEFAULT;  -- использует PK
+-- Для FULL row (включая old values для UPDATE/DELETE):
+ALTER TABLE orders REPLICA IDENTITY FULL;
+
+-- Publication для tables что хотим CDC:
+CREATE PUBLICATION debezium_pub FOR TABLE customers, orders, products;
+```
+
+`REPLICA IDENTITY DEFAULT` (using PRIMARY KEY) — стандарт. `FULL` шлёт all columns старого row перед UPDATE/DELETE — нужно для downstream если требуется before-value (например, для materialized views с aggregations).
+
+---
+
+## Часть 2: Debezium connector
+
+```json
+{
+  "name": "postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "...",
+    "database.dbname": "ecommerce",
+    "topic.prefix": "postgres",
+    "schema.include.list": "public",
+    "table.include.list": "public.customers,public.orders,public.products",
+    "plugin.name": "pgoutput",
+    "publication.name": "debezium_pub",
+    "slot.name": "debezium",
+    "key.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "key.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "double"
+  }
+}
+```
+
+Ключевые параметры:
+- `snapshot.mode=initial` — full snapshot при первом запуске, потом streaming. Альтернативы: `never` (только stream), `when_needed` (smart), `initial_only` (только snapshot, потом stop).
+- `key.converter=AvroConverter` — Avro для schema evolution support. JSON работает, но дороже и без schema enforcement.
+- `decimal.handling.mode=double` — Postgres NUMERIC → Java double. Альтернатива `precise` (string-encoded для no precision loss).
+
+Debezium produces в Kafka envelope:
+
+```json
+{
+  "before": null,
+  "after": { "id": 1234, "name": "Alice", "email": "alice@x.com" },
+  "source": { "ts_ms": 1726000000000, "lsn": "0/1A2B3C4D" },
+  "op": "c",
+  "ts_ms": 1726000000050
+}
+```
+
+`op`: `c`=create, `u`=update, `d`=delete, `r`=read (snapshot).
+
+---
+
+## Часть 3: Flink CDC 3.6 YAML pipeline
+
+Вот magic — полный pipeline в declarative YAML:
+
+```yaml
+source:
+  type: postgres
+  hostname: postgres
+  port: 5432
+  username: debezium
+  password: ...
+  database-name: ecommerce
+  schema-name: public
+  table-name: public.\\.*    # все tables в public
+  slot.name: flink-cdc
+  decoding.plugin.name: pgoutput
+  scan.startup.mode: initial
+  scan.snapshot.fetch.size: 10240
+  chunk.meta.group.size: 1000
+
+sink:
+  type: paimon
+  catalog.properties.metastore: filesystem
+  catalog.properties.warehouse: s3://lakehouse/paimon
+  table.properties.bucket: 8
+  table.properties.changelog-producer: input
+
+transform:
+  - source-table: public.customers
+    projection: \\*, UPPER(email) AS email_upper, NOW() AS ingested_at
+    filter: deleted_at IS NULL
+  - source-table: public.orders
+    projection: \\*, amount * 0.01 AS amount_dollars
+
+route:
+  - source-table: public.customers
+    sink-table: lakehouse.dim_customers
+    description: Customer dim
+  - source-table: public.orders
+    sink-table: lakehouse.fact_orders
+  - source-table: public.products
+    sink-table: lakehouse.dim_products
+
+pipeline:
+  name: postgres-to-paimon
+  parallelism: 8
+  schema.change.behavior: evolve
+  execution.runtime-mode: streaming
+```
+
+Запуск:
+
+```bash
+./bin/flink-cdc.sh deploy \
+    -t kubernetes-application \
+    --flink-config-dir ./conf \
+    pipeline-postgres-to-paimon.yaml
+```
+
+Что генерирует Flink CDC под капотом:
+1. Source operator с FLIP-27 architecture, snapshot reader + streaming reader.
+2. Transform operators — projection/filter применяются к каждому DataChangeEvent.
+3. Route operator определяет sink-table per record.
+4. SchemaOperator agentcator-ит schema change events и пропагирует.
+5. Paimon sink с EOS через Flink 2PC + Paimon snapshot mechanism.
+
+---
+
+## Schema evolution propagation
+
+Самая мощная фича Flink CDC 3.x — **automatic schema evolution**.
+
+Сценарий: добавляем column в Postgres:
+
+```sql
+ALTER TABLE customers ADD COLUMN phone VARCHAR(20);
+```
+
+Что происходит:
+
+<DiagramContainer title="Schema evolution propagation в Flink CDC pipeline" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Postgres ALTER"
+        tooltip="DDL: ADD COLUMN phone. Postgres пишет это в WAL как SchemaChangeEvent."
+      >
+        ALTER TABLE ADD COLUMN
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="logical replication" />
+    <FlowRow>
+      <DataBox
+        label="Source detect"
+        tooltip="Flink CDC source detect-ит schema change event в WAL stream. Не data event — это metadata event. Создаёт SchemaChangeEvent в DataStream."
+      >
+        SchemaChangeEvent in stream
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="через graph" />
+    <FlowRow>
+      <DataBox
+        label="SchemaOperator coordination"
+        tooltip="Special operator coordinator на JobManager. Receives schema change event, flush-ит pending data, then sends ApplyEvolutionEvent downstream. Это barrier-like coordination — все subtasks sync на этот event."
+      >
+        SchemaOperator broadcast
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="apply schema" />
+    <FlowRow>
+      <DataBox
+        label="Sink schema apply"
+        tooltip="Paimon sink получает evolution event. Делает Paimon ALTER TABLE через catalog API. Создаёт new snapshot с new schema. Next data writes используют new schema."
+      >
+        Paimon ALTER + new snapshot
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Конфигурация поведения:
+
+```yaml
+pipeline:
+  schema.change.behavior: evolve   # auto-apply
+```
+
+Опции:
+- `evolve` — auto-apply schema changes к sink (default-ный choice).
+- `try-evolve` — попытка, но если sink не support — log warning, continue.
+- `lenient` — игнорировать schema changes (старая seman tics).
+- `exception` — throw error при любом schema change (strict mode).
+- `ignore` — completely skip schema change events.
+
+**Поддерживаемые changes** в `evolve`:
+- ADD COLUMN ✓
+- DROP COLUMN ✓ (зависит от sink)
+- RENAME COLUMN ✓ (зависит от sink — Iceberg yes, Paimon yes)
+- ALTER COLUMN TYPE (compatible) ✓
+- TRUNCATE TABLE ⚠ (skipped по умолчанию)
+- DROP TABLE ⚠ (требует config)
+
+<Callout type="warning">
+Schema evolution `evolve` mode применяет changes на live production sink. Это powerful, но dangerous — миграция типа DROP COLUMN автоматически удаляет column в lakehouse. В production prod-prod environments используйте `try-evolve` + audit log + manual review для DROP/RENAME operations.
+</Callout>
+
+---
+
+## Transform expressions
+
+Flink CDC 3.x поддерживает rich transform — derived columns, conversions, filters.
+
+```yaml
+transform:
+  - source-table: public.orders
+    projection: |
+      *,
+      amount * 0.01 AS amount_dollars,
+      CASE WHEN amount > 100000 THEN 'large' ELSE 'normal' END AS category,
+      DATE_FORMAT(order_time, 'yyyy-MM-dd') AS order_date,
+      JSON_VALUE(metadata, '$.source') AS source_channel
+    filter: status != 'CANCELLED' AND amount > 0
+    converter-after-transform: SOFT_DELETE  # transform DELETE в soft delete с deleted_at flag
+    description: Orders с derived columns
+```
+
+Под капотом Flink CDC компилирует expressions в Flink SQL execution plan, выполняет на каждом DataChangeEvent. Performance близкий к hand-written ProcessFunction.
+
+---
+
+## Multi-table routing patterns
+
+### Pattern 1: 1-to-1 mapping
+
+```yaml
+route:
+  - source-table: public.customers
+    sink-table: lakehouse.dim_customers
+```
+
+### Pattern 2: Merge multiple tables в одну
+
+```yaml
+route:
+  - source-table: public.orders_2024
+    sink-table: lakehouse.fact_orders
+  - source-table: public.orders_2025
+    sink-table: lakehouse.fact_orders
+  - source-table: public.orders_2026
+    sink-table: lakehouse.fact_orders
+```
+
+Sharded tables merged в один unified lakehouse table. Полезно для time-partitioned OLTP shards.
+
+### Pattern 3: Database-level routing
+
+```yaml
+route:
+  - source-table: public.\\.*           # все public.*
+    sink-table: lakehouse.\\.${tableName}
+```
+
+Regex замена. Wildcard `${tableName}` — captured group из source name.
+
+---
+
+## Snapshot + Streaming hybrid execution
+
+`scan.startup.mode: initial`:
+1. **Snapshot phase** — parallel splits по PRIMARY KEY range. На table с 100M rows и parallelism=8, source создаёт 8 chunks по 12.5M rows each. Splits координируются SplitEnumerator на JobManager.
+2. **Streaming phase** — после snapshot complete, switch на WAL streaming. Один thread читает logical replication slot.
+
+```yaml
+source:
+  scan.startup.mode: initial
+  scan.snapshot.fetch.size: 10240   # rows per fetch
+  chunk.meta.group.size: 1000       # rows per chunk meta
+  chunk.key.column: id              # explicit PK column для split
+```
+
+Чтобы избежать read-pressure на production Postgres:
+
+```yaml
+source:
+  scan.incremental.snapshot.enabled: true
+  scan.incremental.snapshot.chunk.size: 100000   # 100k rows per chunk
+  connect.max-retries: 3
+  jdbc.properties.tcpKeepAlive: true
+```
+
+`scan.incremental.snapshot.enabled` — lock-free snapshot algorithm (FLIP-27 + Flink CDC incremental). Не делает lock-table операций, parallelizable. Это must для huge tables.
+
+---
+
+## Часть 4: Paimon sink details
+
+```yaml
+sink:
+  type: paimon
+  catalog.properties.metastore: hive
+  catalog.properties.uri: thrift://hive-metastore:9083
+  catalog.properties.warehouse: s3://lakehouse/paimon
+  table.properties.bucket: 8
+  table.properties.changelog-producer: input
+  table.properties.merge-engine: deduplicate
+  table.properties.snapshot.expire.execution-mode: async
+  table.properties.snapshot.num-retained.min: 10
+  table.properties.snapshot.num-retained.max: 100
+```
+
+Ключевые Paimon options:
+- `bucket: 8` — partitioning bucket count. Bucket = subtask который handle-ит. Trade-off: больше bucket = больше parallelism but small files.
+- `changelog-producer: input` — produce changelog stream для downstream consumers (Materialized Tables, CDC chaining).
+- `merge-engine: deduplicate` — UPSERT semantics, latest wins per PK. Альтернатива `partial-update` (merge non-null fields), `aggregation` (predefined aggregations).
+- `snapshot.expire.execution-mode: async` — old snapshots cleaned background, не блокирует writes.
+
+---
+
+## Comparison: Paimon vs Iceberg для CDC sink
+
+| Aspect | Paimon | Iceberg |
+|---|---|---|
+| Native upsert | Yes (primary key in spec) | Yes (V2 spec, merge-on-read) |
+| Changelog producer | Yes (full/lookup/input) | Yes (через delta scans) |
+| Streaming read | First-class | Yes |
+| Small files compaction | Background, in Flink | External (Trino/Spark) или Iceberg compaction service |
+| Adoption | Apache Top-Level project (since 2024) | Industry standard, broader ecosystem |
+| Sweet spot | Streaming-first lakehouse | Batch + streaming, broader compute compat |
+
+Для pure CDC streaming pipelines с lakehouse — Paimon часто лучший fit. Для broader analytics ecosystem (Spark, Trino, Snowflake reading) — Iceberg.
+
+---
+
+## Production gotchas
+
+- **Replication slot fill-up** — если consumer (Flink) down, WAL накапливается, не truncate-ится. Postgres диск переполняется. Solution: monitor `pg_replication_slots.confirmed_flush_lsn`, alert при growth > X GB, max_slot_wal_keep_size для bound.
+- **Snapshot phase backpressure на OLTP** — parallel SELECT * FROM table загружает Postgres. На production это бьёт по latency приложения. Solutions: (1) запустить initial snapshot ночью; (2) использовать read replica для snapshot; (3) `scan.snapshot.fetch.size` снизить; (4) parallelism source меньше во время snapshot.
+- **Schema evolution: DROP COLUMN в production catastrophic** — automatic apply удалит column в lakehouse, downstream queries сломаются. Production prod должен иметь `try-evolve` + alerting + manual review для destructive changes.
+- **Decimal precision loss** — Postgres NUMERIC(20,10) → Java double → Paimon DECIMAL: precision может теряться. Use `decimal.handling.mode=precise` (string) если critical для finance.
+- **TOAST values в Postgres** — large text/JSON > 8KB хранятся отдельно в TOAST. По умолчанию Debezium шлёт TOAST как unchanged placeholder в UPDATE event. Solution: `unavailable.value.placeholder` config + downstream обработка.
+- **Watermark + temporal join** — при temporal join к CDC source, watermark должен учитывать replication lag. Если lag 30 секунд, bounded out-of-orderness ≥ 30s, иначе temporal joins вернут stale results.
+- **Exactly-once gotcha при restart** — Flink CDC snapshot phase не идемпотентен поверх Kafka offsets (snapshot reader использует JDBC, не offsets). При restart до snapshot complete — pipeline начинается заново с снапшотом. Используйте `scan.startup.mode: latest-offset` если хотите skip snapshot после initial deploy.
+- **Iceberg sink + EOS** — нужно `table.write.format.default: parquet` + `flink-iceberg` runtime с 2PC committer. Default config может быть at-least-once. Проверьте `commit.execution-mode`.
+- **Kafka topic per table — high topic count** — 1000 tables = 1000 Kafka topics. Connect cluster и Kafka должны scale. Альтернатива — без Kafka layer, Flink CDC source напрямую к Postgres (skip Debezium).
+- **JobManager OOM на много source tables** — каждый table — SourceSplit state в JobManager. 10000 tables = JM heap nightmare. Sharding pipelines по logical group is recommended.
+
+<Callout type="note">
+В Flink CDC 3.6 появилась поддержка **OceanBase, Doris и StarRocks** как sinks, plus enhanced metrics emission для observability (numRecordsIn per source table, schema evolution counter, snapshot/streaming phase indicators). Полный list new features — release notes Apr 2026 release.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: large-scale CDC pipeline. Postgres 50 tables (some 1B+ rows), 100k changes/sec sustained. Need to land в Paimon lakehouse с automatic schema evolution. На second day обнаруживается, что team случайно сделал ALTER TABLE customers DROP COLUMN email в production Postgres. Что произойдёт в Flink CDC pipeline и как восстановиться?"
+  answer="С `schema.change.behavior: evolve` (default): Flink CDC source detect-нет DROP COLUMN event в WAL → SchemaOperator propagate-нет downstream → Paimon sink выполнит ALTER TABLE DROP COLUMN на lakehouse customers table → новый snapshot Paimon без email column. Downstream analytics queries (SELECT email FROM customers) сломаются. Recovery: (1) immediate — STOP Flink CDC pipeline с savepoint. (2) Через Paimon time-travel: SELECT * FROM customers /\\* SNAPSHOT 'X' \\*/ — read previous snapshot с email column. (3) Restore Paimon: ALTER TABLE customers ROLLBACK TO SNAPSHOT 'X' (если в retention window). (4) В Postgres — restore email column из backup, потом ALTER TABLE ADD COLUMN email с тем же type. (5) Re-deploy pipeline с `schema.change.behavior: try-evolve` или `exception` для production prod. Production prevention: (a) NEVER `evolve` на critical tables в production — используйте `try-evolve` с alerting на DROP/RENAME/incompatible changes; (b) Postgres review process — DROP COLUMN требует ADR / approval; (c) lakehouse retention min 30 days; (d) downstream queries должны handle missing columns gracefully (COALESCE), не падать. Lesson: schema evolution `evolve` — мощный tool, но требует guardrails. CDC pipeline без schema governance — source of incidents."
+/>

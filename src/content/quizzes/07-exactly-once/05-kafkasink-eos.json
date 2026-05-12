@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/05-kafkasink-eos",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-05",
+    "description": "Quiz for KafkaSink EOS lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-05-q1",
+      "type": "multiple-choice",
+      "question": "Production incident: Flink job с KafkaSink EOS, recovery после crash занимает 30 минут, transaction.timeout.ms = 900000 (15 min). После restart обнаруживают gap данных. Что произошло?",
+      "options": [
+        { "id": "a", "text": "Kafka cluster down, данные потеряны в broker" },
+        { "id": "b", "text": "Pending transactions (флушенные на prepareCommit) превысили transaction.timeout.ms — Kafka broker автоматически abort-ил их через 15min. После recovery Flink вызывает commitTransaction(txnId) для уже aborted transactions → Kafka возвращает InvalidTxnStateException, данные потеряны. Fix: установить transaction.timeout.ms ≥ max expected recovery time (1 hour typical), broker transaction.max.timeout.ms тоже 1 hour" },
+        { "id": "c", "text": "Network partition, broker не получил сообщения" },
+        { "id": "d", "text": "Consumer slow, lag накопился" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это **THE killer pitfall** KafkaSink EOS. Sequence: (1) prepareCommit at t0 — records flushed в Kafka prepared state, txnId saved в Flink state. (2) Crash at t0+1min. (3) Broker автоматически abort-ит prepared transaction через transaction.timeout.ms (15min default). (4) Recovery completes at t0+30min — Flink restores state, вызывает commitTransaction(txnId). (5) Kafka returns InvalidTxnStateException / TransactionNotFoundException — transaction long gone. Записи помечены aborted markers, consumers их не увидят. **Data loss**. Fix эскалация: (1) **Primary** — `setProperty(\"transaction.timeout.ms\", \"3600000\")` (1 hour). (2) Broker config update: `transaction.max.timeout.ms=3600000` в server.properties всех brokers. Без этого producer setting clamped до broker max. (3) Verify через JMX `kafka.producer.transaction-coordinator-metrics.transaction-timeout-ms` effective value. (4) Add integration test для config. (5) Monitor broker logs для timeout events. Это самый распространённый production bug в Flink EOS deployments.",
+      "studyHint": "Повторите урок — секция 'Transaction timeout — THE killer pitfall'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m07-05-q2",
+      "type": "multiple-choice",
+      "question": "Blue/green deployment KafkaSink: Blue running с transactionalIdPrefix='fraud-v1', Green deploys с тем же prefix. Что произойдёт?",
+      "options": [
+        { "id": "a", "text": "Оба job работают параллельно без проблем" },
+        { "id": "b", "text": "Transaction zombification: Green's initTransactions() для transactional.id 'fraud-v1-{subtask}-{seq}' increment broker-side epoch, что invalidate Blue's producer для same transactional.id. Blue's commitTransaction() fails → data loss. Fix: разные prefixes per version (fraud-blue, fraud-green) или stop-with-savepoint Blue перед start Green" },
+        { "id": "c", "text": "Green ждёт пока Blue остановится" },
+        { "id": "d", "text": "Records дублируются в downstream" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Kafka transactional API использует epoch для zombie fencing. Когда producer вызывает initTransactions() с transactional.id, broker assign new producer.id + epoch. Старые producers с same transactional.id получают InvalidProducerEpochException и могут только abort. Это design для recovery — после crash restart с same ID 'забирает' transaction ownership. Но в blue/green collision это breaks Blue: Green ownership = Blue is fenced. Blue's pending preCommitted transactions can't be committed → data loss. Best practices: (1) **разные prefixes**: Blue 'fraud-blue', Green 'fraud-green'. После cutover Blue остановится, pending Blue transactions abort по timeout. (2) Альтернатива — proper stop-with-savepoint Blue → wait for committed (no pending) → start Green с same ID (same job continuation). Это требует tight coordination. (3) Flink Kubernetes Operator с FlinkSessionJob supports proper blue/green через job names. Production tip: prefix include version + deployment timestamp 'fraud-v1-20260512-001' для unique identification.",
+      "studyHint": "Повторите урок — секция 'Blue/Green deployment scenario'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-05-q3",
+      "type": "multiple-choice",
+      "question": "Downstream Kafka consumer не видит records из Flink KafkaSink EOS pipeline, хотя в Flink UI checkpoint succeeded. Что забыли configure?",
+      "options": [
+        { "id": "a", "text": "auto.offset.reset=earliest" },
+        { "id": "b", "text": "isolation.level=read_committed в consumer config. Без этого consumer в default 'read_uncommitted' mode видит И committed records, И aborted transaction markers — но для EOS pipelines обязательно read_committed чтобы видеть только committed. Это side: транзакции в pending state (между prepareCommit и commit) не видны read_committed — это нормально, normal commit happens через секунды" },
+        { "id": "c", "text": "max.poll.records=1" },
+        { "id": "d", "text": "Group ID должен match Flink job" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "isolation.level — **must-have** для EOS consumers. Default 'read_uncommitted' — historical Kafka behavior, consumer видит все messages включая aborted transactions (помеченные aborted markers). Для EOS это ломает гарантию: consumer видит records из failed transactions. **read_committed** — consumer skip aborted markers, видит только committed transactions. Side effect: pending transactions block consumer offset advance (LSO — Last Stable Offset). Если pending hang за минуты, consumer lag = pending duration. Это OK для normal operation — pending duration short (1-5s). Plus pitfall: tools для verification (`kafka-console-consumer.sh`) default read_uncommitted, без `--isolation-level read_committed` показывают aborted records что выглядит как EOS violation. Production checklist: (1) ALL downstream consumers в EOS pipelines используют read_committed; (2) document это в team runbooks; (3) ksqlDB tables auto-set read_committed для streams used in queries; (4) Flink itself when consuming EOS-produced topic — KafkaSource имеет setProperty(\"isolation.level\", \"read_committed\").",
+      "studyHint": "Повторите урок — секция 'Comparison: AT_LEAST_ONCE vs EXACTLY_ONCE'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m07-05-q4",
+      "type": "true-false",
+      "question": "DeliveryGuarantee.AT_LEAST_ONCE в KafkaSink быстрее (примерно 10-15%) чем EXACTLY_ONCE, потому что не использует transactional protocol.",
+      "correctAnswer": true,
+      "explanation": "True. AT_LEAST_ONCE использует idempotent producer (enable.idempotence=true, acks=all, retries), но без транзакций. Преимущества: (1) **No commit wait** — records visible сразу после write (no preCommit → commit lag); (2) **No transaction.id management** — fewer broker-side resources; (3) **No __transaction_state writes** — Kafka transactional metadata operations skipped. Throughput typically 10-15% higher than EOS. Trade-off: дубликаты возможны на checkpoint replay — после restart KafkaSink повторно send-ит records since last successful checkpoint, без transactional rollback. Когда использовать AT_LEAST_ONCE: (a) downstream идемпотентен — UPSERT в БД, deduplication по message ID; (b) latency-critical use cases где 1-5s commit lag неприемлемо; (c) developement/staging environments где perfectionism unnecessary. Когда EXACTLY_ONCE обязателен: financial transactions, billing, audit logs — anywhere дубликаты создают correctness issues. Default рекомендация — EOS для production, AT_LEAST_ONCE как deliberate trade-off с downstream idempotency.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

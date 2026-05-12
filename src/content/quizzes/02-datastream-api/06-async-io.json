@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/06-async-io",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-06",
+    "description": "Use IDs: flink-m02-06-q1, flink-m02-06-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-06-q1",
+      "type": "multiple-choice",
+      "question": "В чём фундаментальное отличие unorderedWait и orderedWait в Async I/O?",
+      "options": [
+        { "id": "a", "text": "Идентичны, только название разное" },
+        { "id": "b", "text": "unorderedWait: emit как только result ready (order watermark-preserving — within watermark records могут reorder). Лучше performance — no head-of-line blocking. orderedWait: emit в strict input order, slow record блокирует следующие даже если их responses ready. Используйте orderedWait только если downstream require strict ordering" },
+        { "id": "c", "text": "unorderedWait для batch, orderedWait для streaming" },
+        { "id": "d", "text": "Только один доступен в 2.x" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical архитектурное различие. unorderedWait: emit responses в любом order по мере ready (constraint — order watermark-preserving, records внутри одного watermark интервала могут reorder, но не пересекут watermark boundary). No head-of-line blocking → лучше throughput. orderedWait: maintains strict input order — если record N slow, records N+1..N+K wait в queue даже если их responses ready. Head-of-line blocking. Default choice = unorderedWait, orderedWait только когда downstream строго требует ordering (sequence reconstruction).",
+      "studyHint": "Повторите урок 06 — раздел 'unorderedWait vs orderedWait'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-06-q2",
+      "type": "multiple-choice",
+      "question": "Sizing capacity для AsyncFunction. Throughput 100k events/sec, parallelism 16, p99 PG latency 20ms. Какая capacity подходит?",
+      "options": [
+        { "id": "a", "text": "1 — minimum для async" },
+        { "id": "b", "text": "10000 — максимум для safety" },
+        { "id": "c", "text": "~200. Formula: capacity = throughput_per_subtask × p99_latency. 100k/16=6250 events/sec/subtask. 6250 × 0.020 = 125 → round up до 200 (50% headroom для spikes). Slишком низкое → backpressure. Слишком высокое → memory/external system OOM" },
+        { "id": "d", "text": "100k = total throughput" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Capacity sizing формула: capacity = target_throughput_per_subtask × p99_latency. Throughput per subtask = 100k / 16 parallelism = 6250 events/sec. Latency p99 = 20ms = 0.020 sec. Capacity = 6250 × 0.020 = 125 → round up до 200 для 50% headroom. Trade-offs: слишком низкое (10) — limited by capacity, rapid backpressure. Слишком высокое (10000) — OK throughput но memory/external system overload (16 subtasks × 10000 capacity = 160k одновременных connections — PG falls over). Sweet spot 100-1000 для typical scenarios.",
+      "studyHint": "Повторите урок 06 — раздел 'Capacity sizing'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m02-06-q3",
+      "type": "multiple-choice",
+      "question": "Почему обычный sync JDBC внутри asyncInvoke не работает, даже если код в AsyncFunction?",
+      "options": [
+        { "id": "a", "text": "JDBC не supported в Flink" },
+        { "id": "b", "text": "AsyncFunction contract: asyncInvoke must return IMMEDIATELY. Sync JDBC: connection.executeQuery() блокирует caller thread (mailbox!) на latency duration. Capacity не помогает потому что все calls sequential через blocked thread. Эффективная concurrency = 1. Решение: R2DBC (reactive PG driver) — connection.execute() возвращает Publisher<Result>, non-blocking" },
+        { "id": "c", "text": "JDBC не thread-safe" },
+        { "id": "d", "text": "Async I/O не поддерживает PostgreSQL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "AsyncFunction works только с **truly non-blocking** async clients. Contract: asyncInvoke возвращается immediately, real work happens в background. Sync JDBC внутри asyncInvoke: connection.executeQuery() блокирует caller thread (mailbox thread!) на latency duration — fully defeats async benefit. Capacity не помогает: все calls sequential через blocked thread. Effective concurrency = 1. Решение: используйте reactive/async clients — R2DBC для PG/MySQL, Lettuce для Redis, AsyncHttpClient для REST, Netty-based clients. Они возвращают CompletableFuture (или reactive Publisher) — non-blocking. resultFuture.complete вызывается из callback отдельного executor thread.",
+      "studyHint": "Повторите урок 06 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-06-q4",
+      "type": "true-false",
+      "question": "Async I/O retry strategies (FLIP-260, Flink 1.16+) поддерживают FixedDelay и ExponentialBackoff с predicate functions ifResult/ifException — можно retry только specific exceptions (timeout, IO errors), не retry на data errors (indicate bug).",
+      "correctAnswer": true,
+      "explanation": "FLIP-260 (Flink 1.16+) добавил встроенный retry в Async I/O — это game changer, до этого нужно было ручной retry logic. Strategies: FixedDelayRetryStrategy (повторяет с фиксированным delay), ExponentialBackoffDelayRetryStrategy (doubling delay 100ms→200ms→400ms). Predicate functions: ifResult(predicate) — retry если result matches (e.g., empty list), ifException(predicate) — retry если specific exception (e.g., SocketTimeoutException, IOException). Правильный pattern: retry только на network errors, не на data errors которые indicate bug. AsyncDataStream.unorderedWaitWithRetry(stream, func, timeout, unit, capacity, retryStrategy).",
+      "bloomLevel": "applied"
+    }
+  ]
+}

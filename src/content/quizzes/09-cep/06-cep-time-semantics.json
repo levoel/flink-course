@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/06-cep-time-semantics",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-06",
+    "description": "Quiz для time semantics в CEP"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-06-q1",
+      "type": "multiple-choice",
+      "question": "В event time mode когда CEP эмитит match?",
+      "options": [
+        { "id": "a", "text": "Сразу после того как все matching events arrived" },
+        { "id": "b", "text": "Когда watermark пересекает 'first_event_timestamp + within(Duration)' — это inherent latency event time semantics. NFA ждёт watermark чтобы гарантировать что late events не нарушат matching" },
+        { "id": "c", "text": "По fixed interval — каждые 60s" },
+        { "id": "d", "text": "Когда вызывается ctx.emit() в IterativeCondition" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Inherent property event time CEP. Match эмитится только когда watermark >= first_event_timestamp + within. Это потому что late events (events с timestamp < watermark) теоретически могут нарушить existing partial matches — NFA ждёт пока watermark не гарантирует 'no more events with these timestamps will arrive'. Implications: match с within(5 min) + watermark bound 20s = ~5 min 20s latency между first event и emission. Если нужна sub-second latency — processing time mode или tight forBoundedOutOfOrderness bound.",
+      "studyHint": "Повторите урок — секция Watermark progression",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m09-06-q2",
+      "type": "multiple-choice",
+      "question": "У вас CEP на Kafka source с 8 partitions, одна partition idle (no events). Pattern не эмитит matches несмотря на complete sequences. Что не так?",
+      "options": [
+        { "id": "a", "text": "Kafka source не поддерживает CEP" },
+        { "id": "b", "text": "Watermark = min(per-partition watermarks). Idle partition имеет stuck watermark → overall min stuck → CEP не может эмитить. Fix: WatermarkStrategy.withIdleness(Duration.ofMinutes(1)) — partitions без events marked idle и не tank overall watermark" },
+        { "id": "c", "text": "Нужно увеличить parallelism" },
+        { "id": "d", "text": "Это normal — нужно подождать дольше" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic production issue. Watermark across multiple partitions/sources — это min watermark всех partitions/sources. Idle partition не emits watermarks → stuck в last seen timestamp → overall min stuck → CEP не может проehать пресечь границу within() → matches stuck в state. Fix: WatermarkStrategy.<Event>forBoundedOutOfOrderness(...).withIdleness(Duration.ofMinutes(1)). Это marks idle partitions как 'not contributing to watermark' — overall может proceed.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-06-q3",
+      "type": "multiple-choice",
+      "question": "Для use case 'cart abandonment: ADD_TO_CART без CHECKOUT within 30 min' какой select function?",
+      "options": [
+        { "id": "a", "text": ".select(SelectFunction) — стандартный" },
+        { "id": "b", "text": ".flatSelect(FlatSelectFunction) — для multiple outputs" },
+        { "id": "c", "text": ".process(PatternProcessFunction) с processTimedOutMatch — потому что target event это PATTERN_TIMEOUT (abandonment), не complete match. Без processTimedOutMatch timeouts silently dropped" },
+        { "id": "d", "text": "Невозможно — Flink не поддерживает timeout patterns" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Для timeout-based detection (cart abandonment, SLA breach, missed heartbeat) нужен PatternProcessFunction с processTimedOutMatch. Standard .select() discards timed-out partial matches — important events miss. process() даёт две callback methods: processMatch для completed (когда CHECKOUT произошёл — обычно not target alert) и processTimedOutMatch (когда within expired без CHECKOUT — собственно abandonment alert). processTimedOutMatch fires когда watermark crosses first_event_timestamp + within без completion.",
+      "studyHint": "Повторите урок — секция Partial matches expiry",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-06-q4",
+      "type": "true-false",
+      "question": "Late events (event с timestamp < watermark) в CEP по умолчанию dropped — они не могут completed partial match.",
+      "correctAnswer": true,
+      "explanation": "Правда. Late events dropped по умолчанию — они proходят watermark assigner с already-fired watermark, и CEP treats partial matches как already expired для этих timestamps. Late event 'would have completed match' = false negative. Mitigation: (1) relaxed watermark bound — forBoundedOutOfOrderness(2-5 min) вместо 20s; (2) side output для late events через ProcessFunction upstream от CEP, потом separate re-CEP logic; (3) для multi-source — watermark alignment важен. Trade-off explicit: больше latency vs fewer dropped events.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

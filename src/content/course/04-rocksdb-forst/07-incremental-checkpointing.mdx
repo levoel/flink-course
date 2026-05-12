@@ -1,0 +1,400 @@
+---
+title: "Incremental Checkpointing и SharedStateRegistry"
+description: "SST files immutable (LSM property) → SharedStateRegistry maps SST → checkpoints. Incremental = upload только NEW SSTs. Reference counting, comparison vs full checkpoints"
+order: 7
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Incremental Checkpointing", "SharedStateRegistry", "SST", "Reference Counting", "FLIP-23"]
+---
+
+# Incremental Checkpointing — почему это game changer
+
+Full checkpoints для multi-TB state — это смерть: каждые 60 секунд upload 1TB на S3 = непрерывный 17GB/s throughput requirement. Невозможно. Incremental checkpointing решает это, эксплуатируя fundamental property LSM-tree: **SST files immutable**.
+
+В этом уроке препарируем механику: SharedStateRegistry, reference counting, как Flink декорирует RocksDB SST уровень для shared SST между checkpoints.
+
+---
+
+## Базовая идея: LSM SST immutable
+
+В RocksDB SST file once written **никогда** не modified. Compaction может delete SST, но не modify content. Это значит:
+- SST `00010.sst` в checkpoint N — тот же файл что в checkpoint N+1 (если ещё не compacted)
+- Можно reuse через checkpoints — upload один раз, reference многократно
+
+Incremental checkpoint:
+- Upload только **новые** SST (созданные since last checkpoint)
+- Reference old SST из previous checkpoints
+- При cleanup учитывать ссылки
+
+---
+
+## Architecture: SharedStateRegistry
+
+<DiagramContainer title="Incremental checkpoint architecture" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager: SharedStateRegistry"
+        tooltip="Centralized registry: tracks все SST files в активных checkpoints. Maps fileName → reference count. Когда reference count = 0 → file удаляется from S3."
+      >
+        Per-job registry
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="manages references for" />
+    <FlowRow>
+      <DataBox
+        label="Checkpoint N"
+        tooltip="Содержит metadata + список SST файлов с references. Например: {00001.sst: shared, 00002.sst: shared, 00003.sst: private}. Shared SST reference в registry, private — owned exclusively."
+      >
+        SST refs: [001, 002, 003]
+      </DataBox>
+      <DataBox
+        label="Checkpoint N+1"
+        tooltip="Reuse 001, 002 из N (still in registry, refcount++). Plus new 004 (после flush MemTable since N). 003 уже compacted away, не included."
+      >
+        SST refs: [001, 002, 004]
+      </DataBox>
+      <DataBox
+        label="Checkpoint N+2"
+        tooltip="001 уже compacted (после N+1). 005 new. 002 still there. Refcount 001 decrements, eventually deleted from S3 когда refcount=0."
+      >
+        SST refs: [002, 004, 005]
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="физическое S3 storage" />
+    <FlowRow>
+      <DataBox
+        label="S3 / DFS"
+        tooltip="Files: 001.sst (refcount 1 после N+2 уже expired), 002.sst (refcount 3 от N, N+1, N+2), 004.sst (refcount 2), 005.sst (refcount 1). Deletion lazy — когда refcount=0 после checkpoint subsume."
+      >
+        Shared SST storage
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### How incremental checkpoint работает
+
+При checkpoint N:
+
+1. **MemTable flush** — Flink триггерит RocksDB flush MemTable → creates new L0 SST.
+2. **List current SST** — RocksDB API enumerate all live SST files (L0, L1, ..., L6).
+3. **Compare к previous checkpoint** — find new SST (not в previous), find removed (compacted away).
+4. **Upload new SST к S3/DFS** — async, parallel uploads.
+5. **Send metadata к JobManager** — list of SST handles (new + shared from previous).
+6. **JobManager updates SharedStateRegistry** — refcounts.
+
+При checkpoint subsumption (N becomes superseded by N+1):
+- Decrement refcounts for SST in N
+- If refcount → 0 → delete from S3
+
+---
+
+## SST file references
+
+В checkpoint metadata каждый SST имеет state handle. Формат:
+
+```java
+class IncrementalKeyedStateHandle {
+    Map<StateHandleID, StreamStateHandle> sharedState;   // SST shared с другими checkpoints
+    Map<StateHandleID, StreamStateHandle> privateState;  // exclusive к этому checkpoint
+    StreamStateHandle metaStateHandle;                    // metadata, всегда private
+}
+```
+
+- **Shared state**: SST files reusable между checkpoints (registered в SharedStateRegistry)
+- **Private state**: SST exclusively owned by this checkpoint (typically L0 SST flushed-only-for-this-checkpoint)
+
+When checkpoint disposed:
+- Shared state: ref count decremented; deleted if 0
+- Private state: immediately deleted
+
+---
+
+## Configuration
+
+```yaml
+state.backend.incremental: true                      # enable incremental
+state.checkpoints.dir: s3://bucket/checkpoints
+state.backend.rocksdb.local-recovery: true           # local cache of SST для fast recovery
+state.checkpoints.num-retained: 5                    # сколько checkpoints держать
+```
+
+`num-retained: 5` — last 5 checkpoints retained. После 6-го старый деsubsumed. SharedStateRegistry handles refcounts.
+
+---
+
+## Storage savings example
+
+Workload: 1TB state, checkpoint каждые 60 сек.
+
+### Full checkpoints
+
+Каждый checkpoint = 1TB upload.
+60 minutes worth retained:
+- 60 checkpoints × 1TB = 60TB S3 storage
+
+Каждые 60 секунд upload 1TB → требует 17GB/s sustained bandwidth → infeasible.
+
+### Incremental checkpoints
+
+Steady-state: ~1-5% state changes between checkpoints (depends на compaction rate, MemTable size).
+- Per-checkpoint upload: ~10-50GB
+- Steady-state storage growth: ~30GB/min
+- After 60 min steady-state: ~1.05TB (mostly shared SST + new deltas)
+
+Reduction: ~99% bandwidth, ~98% storage.
+
+---
+
+## Async snapshot
+
+Incremental checkpoint is **async** — RocksDB не blocked during checkpoint:
+
+1. Snapshot phase (sync): RocksDB creates **iterator** point-in-time view. Take hard link of current SST files in `/tmp/flink-rocksdb-state/checkpoints/<id>/`.
+2. Upload phase (async): background thread uploads SST files к S3.
+3. Once upload complete: send handles к JobManager, acknowledge checkpoint.
+
+Async phase doesn't block writes — RocksDB продолжает processing. Hard links ensure SST not deleted by compaction during upload.
+
+```yaml
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.interval: 60s
+execution.checkpointing.timeout: 5min          # async upload limit
+execution.checkpointing.max-concurrent-checkpoints: 1
+```
+
+---
+
+## Local recovery
+
+```yaml
+state.backend.rocksdb.local-recovery: true
+```
+
+Каждый TaskManager сохраняет SST locally `/tmp/flink-rocksdb-localcache/` в addition к S3 upload. При **restart на same TaskManager** — local files available → instant recovery without S3 download.
+
+С K8s pod restart на other node — local cache gone, recovery from S3. Так что local-recovery help для in-process failure (operator restart), не для pod migration.
+
+Useful для:
+- Quick stop+start (same node)
+- TaskManager process restart (Adaptive Scheduler in-place rescaling)
+- Avoid round-trip к S3 для unchanged SST
+
+---
+
+## Recovery time analysis
+
+| Recovery scenario | Full checkpoint | Incremental |
+|---|---|---|
+| Same TaskManager (local cache) | Same as full | Instant (no S3) |
+| Different TaskManager | Download 1TB | Download 1TB (shared) |
+| Scale-up (more parallelism) | Re-bootstrap state | Re-bootstrap state from SST |
+| ForSt (disaggregated) | Independent of size | Independent of size |
+
+Recovery time для incremental на different TM = same как full, because need full SST set. Incremental saves UPLOAD bandwidth/storage, не download time.
+
+For **fast recovery** independent of state size → ForSt (next lesson).
+
+---
+
+## SharedStateRegistry deeper dive
+
+```java
+class SharedStateRegistry {
+    Map<SharedStateRegistryKey, SharedStateEntry> registeredStates;
+
+    void register(SharedStateRegistryKey key, StreamStateHandle handle) {
+        SharedStateEntry entry = registeredStates.get(key);
+        if (entry == null) {
+            entry = new SharedStateEntry(handle);
+            registeredStates.put(key, entry);
+        } else {
+            entry.incrementReferenceCount();
+        }
+    }
+
+    void unregister(SharedStateRegistryKey key) {
+        SharedStateEntry entry = registeredStates.get(key);
+        entry.decrementReferenceCount();
+        if (entry.referenceCount == 0) {
+            entry.handle.discardState();  // delete from S3
+            registeredStates.remove(key);
+        }
+    }
+}
+```
+
+Keys typically derived from SST file name + key group range. Two checkpoints reference тот же SST = same registry key = increment refcount.
+
+---
+
+## Production gotchas
+
+### 1. Orphaned SST files на S3
+
+Bug/crash во время checkpoint disposal → some SST refcounts not decremented → files lingering на S3.
+
+Fix: periodic S3 lifecycle policy для cleanup old files (with caution — don't delete actively used files).
+
+```yaml
+# Use S3 lifecycle rules для prefix /checkpoints/<job-uid>/shared/
+# Delete objects > 7 days старше last successful checkpoint
+```
+
+### 2. Incremental + Universal compaction = small benefit
+
+Universal compaction merges SST into large files — каждая compaction rewrites lots of data, creating new SST files. Less reuse between checkpoints.
+
+Incremental works best с **Leveled compaction** — small SST, predictable growth.
+
+### 3. num-retained too high
+
+```yaml
+state.checkpoints.num-retained: 100
+```
+
+Retains 100 checkpoints в S3 → SharedStateRegistry grows, S3 storage grows. Default 1-3 typically sufficient.
+
+### 4. Checkpoint size grows linearly с state
+
+Even with incremental, SOMETIMES full state needs upload (compaction caused all SST rewriting). Watch checkpoint size variance.
+
+```
+flink_taskmanager_<job>_checkpointSize  # per-checkpoint size
+```
+
+Spikes correlate с compaction events.
+
+### 5. Local recovery + ephemeral disk
+
+```yaml
+state.backend.rocksdb.local-recovery: true
+```
+
+Если TaskManager pod restart с empty disk (ephemeral volume), local-recovery doesn't help. Need persistent volumes for value.
+
+Configure `persistent volume mount` для `/tmp/flink-rocksdb-localcache/`.
+
+### 6. Checkpoint asymmetry с state size
+
+Job: 4 subtask, each имеет different state size due skewed key distribution. Subtask 0: 100GB. Subtask 1: 1GB. Subtask 2,3: 5GB each.
+
+Checkpoint duration = max(subtask checkpoint durations). Subtask 0 dominates. Skew kills checkpoint performance.
+
+Address through better key distribution.
+
+### 7. Savepoint vs checkpoint format
+
+```bash
+flink stop --savepointPath ... --savepoint-format canonical
+```
+
+**Canonical savepoint** — full state в portable format (across backends). Incremental не applies.
+**Native savepoint** (default) — backend-specific format, can be incremental.
+
+Canonical нужен when changing state backend (RocksDB ↔ ForSt). Native faster.
+
+---
+
+## Checkpoint best practices
+
+```yaml
+# Recommended baseline:
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.interval: 60s
+execution.checkpointing.timeout: 10min
+execution.checkpointing.min-pause-between-checkpoints: 30s
+execution.checkpointing.max-concurrent-checkpoints: 1
+
+# State:
+state.backend.type: rocksdb
+state.backend.incremental: true                      # ← critical для big state
+state.checkpoints.num-retained: 3
+state.backend.rocksdb.local-recovery: true
+state.checkpoints.dir: s3://bucket/checkpoints
+
+# Unaligned checkpoints для high-backpressure:
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+```
+
+---
+
+## Monitoring
+
+Critical metrics:
+
+```
+checkpoint.size                       # total bytes per checkpoint
+checkpoint.duration                   # total duration
+checkpoint.alignment-time             # time spent aligning barriers
+checkpoint.async-time                 # time spent uploading
+checkpoint.sync-time                  # time spent in snapshot phase
+checkpoint.bytes-persisted-per-checkpoint  # actually uploaded bytes
+```
+
+Healthy:
+- `bytes-persisted` ~ 5-10% `size` (incremental working well)
+- `duration` < interval (checkpoints не piling up)
+- `alignment-time` < 1s (no severe backpressure)
+
+Alert thresholds:
+- `duration` > 80% interval → tune checkpoint interval bigger
+- `bytes-persisted` > 50% `size` → compaction churning, investigate
+- `alignment-time` > 10s → enable unaligned checkpoints
+
+---
+
+## Comparison: Full vs Incremental
+
+| Aspect | Full | Incremental |
+|---|---|---|
+| Upload size | 100% state per checkpoint | 1-5% per checkpoint |
+| Storage size | N × state (N retained) | 1.05-1.2× state |
+| Recovery time | Same | Same (need full SST set) |
+| Async-friendly | Yes | Yes |
+| With ForSt | N/A (no upload) | N/A (no upload) |
+| Format | Backend-specific | Backend-specific |
+| Canonical savepoint | Yes | No (need canonical) |
+
+**Default recommendation**: incremental enabled. Только turn off для tiny state (<1GB) где overhead не payback.
+
+---
+
+## Reference counting visualization
+
+```
+Checkpoint timeline:
+
+t=0:   CP1 created. SSTs: [a, b, c]
+       Registry: a=1, b=1, c=1
+
+t=60:  CP2 created. SSTs: [a, b, d]  (c compacted, d new)
+       Registry: a=2, b=2, c=1, d=1
+       Upload: only d (a, b reused)
+
+t=120: CP3 created. SSTs: [b, d, e]  (a compacted, e new)
+       Registry: a=1 (only CP1), b=3, c=1, d=2, e=1
+       Upload: only e
+
+t=180: CP1 subsumed (after CP4 confirmed).
+       Registry: a=0 → delete a from S3
+                 b=2 (CP2, CP3 still own), c=0 → delete c
+       Net: a, c removed from S3
+```
+
+It's a continuous garbage collection of SSTs based на actual usage. Elegant and efficient.
+
+---
+
+<Callout type="tip">
+Incremental checkpointing — main reason почему RocksDB backend usable для TB-scale state. Без него каждый checkpoint upload 1TB = infeasible. Always enable (`state.backend.incremental: true`) для production. Только тривиальные jobs (<1GB state) могут без.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Job с RocksDB, 500GB state. Checkpoint каждые 60 секунд. Incremental disabled. Что произойдёт с S3 costs и performance? Как fix?"
+  answer="Catastrophic costs и performance. С full checkpoints каждые 60 секунд: 500GB × 60 checkpoints/hour = 30TB upload per hour, 720TB per day. S3 bandwidth costs alone: $X/GB × 30TB = огромные суммы. Upload time: even с 10Gbps network — 500GB / 1.25GB/s = 400 секунд. Это превышает checkpoint interval — checkpoints overlap, system заходит в death spiral. Plus storage: 500GB × num-retained (default 1) = 500GB just for current. Recommended fix: enable state.backend.incremental: true. Incremental upload только delta — typically 1-5% per checkpoint. 500GB state → 5-25GB upload per checkpoint. Bandwidth requirement drops от 8.3 GB/s до 0.4 GB/s. Storage: 500GB × 1.05 = 525GB (через shared SST reuse). Recovery time не improves with incremental — нужен full SST set для restore — но это OK trade-off vs ongoing bandwidth/cost. Plus enable local-recovery для in-place restart speed. Дополнительная optimization: combine с ForSt для recovery independent of size. Validation после fix: monitor checkpoint.bytes-persisted-per-checkpoint < 5% of checkpoint.size — это incremental working правильно. duration < 60s — checkpoints not piling. S3 costs: drop 95%+."
+/>

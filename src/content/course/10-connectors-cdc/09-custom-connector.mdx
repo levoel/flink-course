@@ -1,0 +1,651 @@
+---
+title: "Custom connectors: implementing FLIP-27 Source и SinkV2"
+description: "Custom Source implementing FLIP-27 (SplitEnumerator, SourceReader), Custom Sink implementing SinkV2 (SinkWriter, Committer). When нужен custom (proprietary systems)"
+order: 9
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Custom Connector", "FLIP-27 Implementation", "SinkV2 Implementation", "SourceReaderBase", "Committer", "Production Patterns"]
+---
+
+# Custom connectors — когда стандартные не хватает
+
+Иногда нужно integrate с proprietary system, legacy DB, internal API, или specialized hardware. Standard connectors (Kafka, Postgres, S3, Iceberg) не покрывают. Custom connector — proper solution: implementing FLIP-27 Source и/или SinkV2 Sink interfaces.
+
+Этот урок — finale модуля. Walk-through implementation custom Source с FLIP-27 и custom Sink с SinkV2 — не toy example, а production-grade с recovery, parallelism, exactly-once.
+
+---
+
+## Когда custom connector
+
+Случаи где нужен:
+
+1. **Proprietary message bus** — internal corporate queue не покрытый Kafka/RabbitMQ connector.
+2. **Specialized hardware** — sensor с custom protocol (Modbus, OPC-UA вариант не в standard).
+3. **Internal API / microservice** — read/write через REST/gRPC к internal service.
+4. **Legacy mainframe** — IBM MQ, IMS, AS/400.
+5. **Custom database** — embedded DB or specialized analytical engine без JDBC.
+
+Случаи **не** нужен:
+- Standard DB → use JDBC (даже если SQL slightly non-standard)
+- Kafka-compatible MQ → use Kafka connector с config tweaks
+- File-based — почти всегда покрыто FileSource
+
+Когда есть выбор — стандартный connector предпочтительнее. Custom = long-term maintenance.
+
+---
+
+## Custom Source implementation (FLIP-27)
+
+Build custom source для **MyInternalQueue** — proprietary message bus.
+
+### 1. Define SourceSplit
+
+```java
+public class MyQueueSplit implements SourceSplit {
+    private final String queueName;
+    private final String partitionId;
+    private final long startingOffset;
+    private long currentOffset;
+    
+    public MyQueueSplit(String queueName, String partitionId, long startingOffset) {
+        this.queueName = queueName;
+        this.partitionId = partitionId;
+        this.startingOffset = startingOffset;
+        this.currentOffset = startingOffset;
+    }
+    
+    @Override
+    public String splitId() {
+        return queueName + ":" + partitionId;
+    }
+    
+    public long getCurrentOffset() { return currentOffset; }
+    public void setCurrentOffset(long offset) { this.currentOffset = offset; }
+    // ... other getters
+}
+```
+
+Split — unit of work. Для message queue: one partition. Для file system: one file. Для DB: one partition range.
+
+### 2. Split serializer
+
+```java
+public class MyQueueSplitSerializer implements SimpleVersionedSerializer<MyQueueSplit> {
+    private static final int CURRENT_VERSION = 1;
+    
+    @Override
+    public int getVersion() { return CURRENT_VERSION; }
+    
+    @Override
+    public byte[] serialize(MyQueueSplit split) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
+        out.writeUTF(split.getQueueName());
+        out.writeUTF(split.getPartitionId());
+        out.writeLong(split.getStartingOffset());
+        out.writeLong(split.getCurrentOffset());
+        return baos.toByteArray();
+    }
+    
+    @Override
+    public MyQueueSplit deserialize(int version, byte[] serialized) throws IOException {
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(serialized));
+        String queueName = in.readUTF();
+        String partitionId = in.readUTF();
+        long startingOffset = in.readLong();
+        long currentOffset = in.readLong();
+        MyQueueSplit split = new MyQueueSplit(queueName, partitionId, startingOffset);
+        split.setCurrentOffset(currentOffset);
+        return split;
+    }
+}
+```
+
+Version field critical для forward compatibility — будущие versions могут add fields safely.
+
+### 3. SplitEnumerator (runs on JobManager)
+
+```java
+public class MyQueueSplitEnumerator 
+        implements SplitEnumerator<MyQueueSplit, MyQueueEnumeratorState> {
+    
+    private final SplitEnumeratorContext<MyQueueSplit> context;
+    private final MyQueueClient adminClient;
+    private final Set<MyQueueSplit> pendingSplits = new HashSet<>();
+    private final Map<Integer, Set<MyQueueSplit>> assignedSplits = new HashMap<>();
+    private long lastDiscoveryTime = 0;
+    
+    public MyQueueSplitEnumerator(SplitEnumeratorContext<MyQueueSplit> ctx, 
+                                   MyQueueClient client) {
+        this.context = ctx;
+        this.adminClient = client;
+    }
+    
+    @Override
+    public void start() {
+        // Initial discovery
+        context.callAsync(this::discoverPartitions, this::handleDiscoveredPartitions);
+        // Periodic re-discovery
+        context.callAsync(
+            this::discoverPartitions, 
+            this::handleDiscoveredPartitions,
+            30_000L,      // initial delay
+            30_000L);     // periodic
+    }
+    
+    private List<MyQueueSplit> discoverPartitions() throws Exception {
+        return adminClient.listPartitions().stream()
+            .map(p -> new MyQueueSplit("orders", p.getId(), p.getStartingOffset()))
+            .collect(Collectors.toList());
+    }
+    
+    private void handleDiscoveredPartitions(List<MyQueueSplit> discovered, Throwable t) {
+        if (t != null) {
+            // log + retry handled by callAsync periodicity
+            return;
+        }
+        Set<String> alreadyAssigned = assignedSplits.values().stream()
+            .flatMap(Set::stream).map(MyQueueSplit::splitId).collect(Collectors.toSet());
+        
+        for (MyQueueSplit split : discovered) {
+            if (!alreadyAssigned.contains(split.splitId())) {
+                pendingSplits.add(split);
+            }
+        }
+        assignPendingToReaders();
+    }
+    
+    private void assignPendingToReaders() {
+        int numReaders = context.currentParallelism();
+        if (numReaders == 0 || pendingSplits.isEmpty()) return;
+        
+        Map<Integer, List<MyQueueSplit>> assignment = new HashMap<>();
+        int reader = 0;
+        for (MyQueueSplit split : pendingSplits) {
+            assignment.computeIfAbsent(reader % numReaders, k -> new ArrayList<>()).add(split);
+            assignedSplits.computeIfAbsent(reader % numReaders, k -> new HashSet<>()).add(split);
+            reader++;
+        }
+        pendingSplits.clear();
+        
+        for (Map.Entry<Integer, List<MyQueueSplit>> entry : assignment.entrySet()) {
+            context.assignSplits(new SplitsAssignment<>(Map.of(entry.getKey(), entry.getValue())));
+        }
+    }
+    
+    @Override
+    public void addReader(int subtaskId) {
+        // Reader joined — try assign pending splits
+        assignPendingToReaders();
+    }
+    
+    @Override
+    public void handleSplitRequest(int subtaskId, @Nullable String requesterHostname) {
+        // Reader requesting more work — handled by assignment logic
+        assignPendingToReaders();
+    }
+    
+    @Override
+    public void addSplitsBack(List<MyQueueSplit> splits, int subtaskId) {
+        // Subtask failed, splits return to pending pool
+        pendingSplits.addAll(splits);
+        assignedSplits.remove(subtaskId);
+        assignPendingToReaders();
+    }
+    
+    @Override
+    public MyQueueEnumeratorState snapshotState(long checkpointId) {
+        return new MyQueueEnumeratorState(pendingSplits, assignedSplits);
+    }
+    
+    @Override
+    public void close() { adminClient.close(); }
+    
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) {}
+}
+```
+
+Heart of FLIP-27. Periodic discovery → splits assigned к readers → failover handling via `addSplitsBack`.
+
+### 4. SourceReader (runs on TaskManager)
+
+Easier path — extend `SourceReaderBase`:
+
+```java
+public class MyQueueSourceReader 
+        extends SingleThreadMultiplexSourceReaderBase<RawMessage, ParsedMessage, MyQueueSplit, MyQueueSplitState> {
+    
+    public MyQueueSourceReader(
+            SourceReaderContext readerContext,
+            MyQueueClient client,
+            Configuration config) {
+        super(
+            () -> new MyQueueSplitReader(client),
+            new MyQueueRecordEmitter(),
+            config,
+            readerContext);
+    }
+    
+    @Override
+    public void start() {
+        if (getNumberOfCurrentlyAssignedSplits() == 0) {
+            context.sendSplitRequest();   // request work
+        }
+    }
+    
+    @Override
+    protected MyQueueSplit toSplitType(String splitId, MyQueueSplitState state) {
+        return state.toSplit();
+    }
+    
+    @Override
+    protected MyQueueSplitState initializedState(MyQueueSplit split) {
+        return new MyQueueSplitState(split);
+    }
+    
+    @Override
+    protected void onSplitFinished(Map<String, MyQueueSplitState> finishedSplitIds) {
+        context.sendSplitRequest();
+    }
+}
+```
+
+`SplitReader` — actual fetching logic:
+
+```java
+public class MyQueueSplitReader implements SplitReader<RawMessage, MyQueueSplit> {
+    private final MyQueueClient client;
+    private final Map<String, MyQueueConsumer> consumers = new HashMap<>();
+    
+    public MyQueueSplitReader(MyQueueClient client) {
+        this.client = client;
+    }
+    
+    @Override
+    public RecordsWithSplitIds<RawMessage> fetch() throws IOException {
+        Map<String, List<RawMessage>> recordsBySplit = new HashMap<>();
+        for (Map.Entry<String, MyQueueConsumer> entry : consumers.entrySet()) {
+            List<RawMessage> records = entry.getValue().poll(Duration.ofMillis(100));
+            if (!records.isEmpty()) {
+                recordsBySplit.put(entry.getKey(), records);
+            }
+        }
+        return new MyQueueRecords(recordsBySplit);
+    }
+    
+    @Override
+    public void handleSplitsChanges(SplitsChange<MyQueueSplit> change) {
+        if (change instanceof SplitsAddition) {
+            for (MyQueueSplit split : change.splits()) {
+                MyQueueConsumer consumer = client.createConsumer(split.getPartitionId(), 
+                                                                 split.getCurrentOffset());
+                consumers.put(split.splitId(), consumer);
+            }
+        }
+    }
+    
+    @Override
+    public void wakeUp() {}
+    
+    @Override
+    public void close() throws Exception {
+        for (MyQueueConsumer c : consumers.values()) c.close();
+    }
+}
+```
+
+### 5. Source factory
+
+```java
+public class MyQueueSource 
+        implements Source<ParsedMessage, MyQueueSplit, MyQueueEnumeratorState> {
+    
+    private final String hostName;
+    private final int port;
+    private final List<String> queues;
+    
+    @Override
+    public Boundedness getBoundedness() {
+        return Boundedness.CONTINUOUS_UNBOUNDED;
+    }
+    
+    @Override
+    public SplitEnumerator<MyQueueSplit, MyQueueEnumeratorState> createEnumerator(
+            SplitEnumeratorContext<MyQueueSplit> ctx) {
+        MyQueueClient adminClient = new MyQueueClient(hostName, port);
+        return new MyQueueSplitEnumerator(ctx, adminClient);
+    }
+    
+    @Override
+    public SplitEnumerator<MyQueueSplit, MyQueueEnumeratorState> restoreEnumerator(
+            SplitEnumeratorContext<MyQueueSplit> ctx, 
+            MyQueueEnumeratorState checkpoint) {
+        MyQueueClient adminClient = new MyQueueClient(hostName, port);
+        return new MyQueueSplitEnumerator(ctx, adminClient, checkpoint);
+    }
+    
+    @Override
+    public SimpleVersionedSerializer<MyQueueSplit> getSplitSerializer() {
+        return new MyQueueSplitSerializer();
+    }
+    
+    @Override
+    public SimpleVersionedSerializer<MyQueueEnumeratorState> getEnumeratorCheckpointSerializer() {
+        return new MyQueueEnumeratorStateSerializer();
+    }
+    
+    @Override
+    public SourceReader<ParsedMessage, MyQueueSplit> createReader(
+            SourceReaderContext readerContext) {
+        return new MyQueueSourceReader(readerContext, 
+                                       new MyQueueClient(hostName, port), 
+                                       new Configuration());
+    }
+}
+```
+
+User-facing usage:
+
+```java
+MyQueueSource source = new MyQueueSource("queue-server", 9000, List.of("orders"));
+DataStream<ParsedMessage> stream = env.fromSource(
+    source,
+    WatermarkStrategy.<ParsedMessage>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+        .withTimestampAssigner((m, ts) -> m.getEventTime()),
+    "my-queue-source"
+);
+```
+
+---
+
+## Custom Sink implementation (SinkV2)
+
+Build sink для **MyInternalAPI** — REST API write.
+
+<DiagramContainer title="Custom Sink с SinkV2 + TwoPhaseCommittingSink" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="MyApiSinkWriter"
+        tooltip="Receives records, buffers, на checkpoint barrier sends к API в staging mode — returns transactionId. Produces Committable (transactionId)."
+      >
+        Buffer + POST к /staging API
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Committable (transactionId)" />
+    <FlowRow>
+      <DataBox
+        label="MyApiCommitter"
+        tooltip="Parallelism 1. Receives transactionIds, calls POST /commit с each. Atomic — API commits all-or-nothing. Idempotent — recovery re-commits."
+      >
+        POST /commit/{transactionId}
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### 1. Sink factory
+
+```java
+public class MyApiSink 
+        implements TwoPhaseCommittingSink<Order, MyApiCommittable> {
+    
+    private final String apiUrl;
+    private final String apiKey;
+    
+    @Override
+    public PrecommittingSinkWriter<Order, MyApiCommittable> createWriter(
+            InitContext context) throws IOException {
+        return new MyApiSinkWriter(apiUrl, apiKey, context.getSubtaskId());
+    }
+    
+    @Override
+    public Committer<MyApiCommittable> createCommitter() throws IOException {
+        return new MyApiCommitter(apiUrl, apiKey);
+    }
+    
+    @Override
+    public SimpleVersionedSerializer<MyApiCommittable> getCommittableSerializer() {
+        return new MyApiCommittableSerializer();
+    }
+}
+```
+
+### 2. SinkWriter
+
+```java
+public class MyApiSinkWriter 
+        implements PrecommittingSinkWriter<Order, MyApiCommittable> {
+    
+    private final MyApiClient client;
+    private final List<Order> buffer = new ArrayList<>();
+    private final int subtaskId;
+    
+    public MyApiSinkWriter(String apiUrl, String apiKey, int subtaskId) {
+        this.client = new MyApiClient(apiUrl, apiKey);
+        this.subtaskId = subtaskId;
+    }
+    
+    @Override
+    public void write(Order order, Context context) {
+        buffer.add(order);
+    }
+    
+    @Override
+    public Collection<MyApiCommittable> prepareCommit() throws IOException {
+        if (buffer.isEmpty()) return Collections.emptyList();
+        
+        String transactionId = client.openTransaction();
+        client.stage(transactionId, buffer);
+        buffer.clear();
+        
+        return Collections.singletonList(new MyApiCommittable(transactionId, subtaskId));
+    }
+    
+    @Override
+    public void flush(boolean endOfInput) throws IOException {
+        // Optional flushing logic
+    }
+    
+    @Override
+    public void close() throws Exception {
+        client.close();
+    }
+}
+```
+
+### 3. Committer
+
+```java
+public class MyApiCommitter implements Committer<MyApiCommittable> {
+    
+    private final MyApiClient client;
+    
+    public MyApiCommitter(String apiUrl, String apiKey) {
+        this.client = new MyApiClient(apiUrl, apiKey);
+    }
+    
+    @Override
+    public void commit(Collection<CommitRequest<MyApiCommittable>> requests) 
+            throws IOException, InterruptedException {
+        for (CommitRequest<MyApiCommittable> req : requests) {
+            MyApiCommittable committable = req.getCommittable();
+            try {
+                client.commit(committable.getTransactionId());
+            } catch (TransientApiException e) {
+                req.retryLater();          // Flink retries после backoff
+            } catch (PermanentApiException e) {
+                req.signalFailedWithKnownReason(e);
+            }
+        }
+    }
+    
+    @Override
+    public void close() throws Exception { client.close(); }
+}
+```
+
+User-facing:
+
+```java
+stream.sinkTo(new MyApiSink("https://api.example.com", System.getenv("API_KEY")));
+```
+
+---
+
+## Advanced: WithPreCommitTopology
+
+Если sink нуждается в compaction или batching:
+
+```java
+public class MyApiSink 
+        implements TwoPhaseCommittingSink<Order, MyApiCommittable>,
+                   WithPreCommitTopology<Order, MyApiCommittable> {
+    
+    @Override
+    public DataStream<MyApiCommittable> addPreCommitTopology(
+            DataStream<MyApiCommittable> committables) {
+        return committables
+            .keyBy(MyApiCommittable::getRegion)
+            .process(new BatchingCompactor());
+    }
+}
+```
+
+Pre-commit topology — adds operator graph между writer и committer. Useful для merging committables, deduplication, regional batching.
+
+---
+
+## Testing strategy
+
+Critical для custom connectors:
+
+### Unit tests
+
+```java
+@Test
+public void testSplitEnumeratorAssignsSplits() {
+    SplitEnumeratorContext<MyQueueSplit> ctx = new MockSplitEnumeratorContext<>(2);
+    MyQueueClient mockClient = mock(MyQueueClient.class);
+    when(mockClient.listPartitions()).thenReturn(List.of(
+        new Partition("p0", 0), new Partition("p1", 0)));
+    
+    MyQueueSplitEnumerator enumerator = new MyQueueSplitEnumerator(ctx, mockClient);
+    enumerator.start();
+    
+    ctx.getExecutorService().triggerAll();
+    assertThat(ctx.getAssignedSplits()).hasSize(2);
+}
+```
+
+### Integration tests с MiniCluster
+
+```java
+@Test
+public void testEndToEnd() throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.enableCheckpointing(1000);
+    env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, 1000L));
+    
+    DataStream<ParsedMessage> source = env.fromSource(
+        new MyQueueSource("localhost", embeddedQueue.getPort(), List.of("test")),
+        WatermarkStrategy.noWatermarks(),
+        "test-source"
+    );
+    
+    source.sinkTo(new TestingSink<>());
+    env.execute();
+    
+    assertThat(TestingSink.getReceived()).hasSize(EXPECTED_COUNT);
+}
+```
+
+### Chaos tests
+
+- Random TM kills via Flink kubernetes operator
+- Network partitions через toxiproxy
+- Slow sink responses via mock latency
+
+---
+
+## Production gotchas
+
+### 1. Idempotent committer — critical
+
+Committer может called multiple times для same committable (recovery). Must be **idempotent**:
+
+```java
+// ❌ Non-idempotent — duplicate commits
+client.commit(committable.getTransactionId());  // first call commits, second fails
+
+// ✅ Idempotent — handle already-committed gracefully
+try {
+    client.commit(committable.getTransactionId());
+} catch (AlreadyCommittedException e) {
+    // OK, idempotent
+}
+```
+
+### 2. Serialization version compatibility
+
+Изменение SplitT или EnumChkT structure → old savepoints incompatible.
+
+**Mitigation:**
+- Version field в serializers
+- Handle multiple versions in deserialize
+- Test savepoint compatibility перед deploy
+
+### 3. SplitEnumerator runs in JM thread pool — careful
+
+Длинные blocking operations в enumerator block other operators. Use `context.callAsync()` для async work:
+
+```java
+// ❌ Blocking
+List<Split> splits = adminClient.listPartitions();   // 10 seconds!
+
+// ✅ Async
+context.callAsync(
+    () -> adminClient.listPartitions(),
+    (splits, t) -> handleResult(splits, t)
+);
+```
+
+### 4. SourceReader threading — careful
+
+`SourceReaderBase` uses single thread для mailbox + multiple fetcher threads. Custom threading может deadlock.
+
+**Practice:** extend `SingleThreadMultiplexSourceReaderBase` whenever possible — handles threading correctly.
+
+### 5. Watermark generation — per-split
+
+Each split может have own timestamps. Per-split watermark generation важен для correctness multi-partition sources.
+
+`SourceReaderBase` automatically handles per-split watermarks if `WatermarkStrategy` provided correctly.
+
+### 6. Recovery scenarios test extensively
+
+Test cases:
+- TaskManager kill mid-checkpoint
+- JobManager failover
+- Source DB / sink API unavailable
+- Split reassignment after subtask failure
+- Schema changes mid-job
+
+---
+
+## Key takeaways
+
+- **Custom connector** when standard не покрывает proprietary system — но prefer standard whenever possible.
+- **FLIP-27 Source** = SourceSplit + SplitEnumerator (JM) + SourceReader (TM) + serializers.
+- **Extend `SourceReaderBase`** или `SingleThreadMultiplexSourceReaderBase` для most cases — handles threading.
+- **SinkV2 TwoPhaseCommittingSink** = SinkWriter (pre-commit produces Committable) + Committer (atomic commit).
+- **Committer must be idempotent** — recovery may re-commit same Committable.
+- **Test recovery scenarios extensively** — most bugs surface only под failure.
+
+---
+
+<KnowledgeCheck
+  question="Что обязательно для committer в custom SinkV2 implementation? Какой production failure scenario это решает?"
+  answer="Committer должен быть idempotent. На recovery (TM failure, JM failover) Flink restores Committables из checkpoint и calls Committer.commit() для них снова — possibly уже на already-committed transactions. Non-idempotent committer throws (transaction already committed exception) → CommitRequest fails → Flink retries → infinite loop или data inconsistency. Idempotent implementation: catch AlreadyCommittedException и treat as success, или use unique transaction IDs that можно safely re-submit. Production scenario: Flink job crashes after Committer.commit() succeeded но перед JM acknowledging — JM thinks commit not done, on restart re-submits Committable. Without idempotence: spurious failure, manual recovery required. With idempotence: smooth recovery, exactly-once preserved. Same principle applies к KafkaSink (Kafka transactional API idempotent commit) и FileSink (rename .pending → final idempotent — если уже renamed, OK). Custom committers must explicitly implement this contract — это #1 source of production bugs в custom connectors."
+/>

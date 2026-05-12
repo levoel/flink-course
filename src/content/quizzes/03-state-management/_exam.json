@@ -1,0 +1,89 @@
+{
+  "moduleId": "03-state-management",
+  "title": "Module 03 Exam — State Management",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m03-exam",
+    "description": "Integrated exam for State Management module"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-exam-q1",
+      "type": "multiple-choice",
+      "question": "Какой state primitive выбрать для per-user feature: счётчик по типам событий (event_type → count), 500 типов на user, 10M users, 100k events/sec?",
+      "options": [
+        { "id": "a", "text": "ValueState<HashMap<String, Long>> — простая модель" },
+        { "id": "b", "text": "MapState<String, Long> — каждая entry = separate RocksDB row, per-entry lazy serialization" },
+        { "id": "c", "text": "ListState<Tuple2<String, Long>> с linear scan" },
+        { "id": "d", "text": "ReducingState<Long>" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MapState — единственный правильный выбор. ValueState<HashMap> на RocksDB: каждый state.value() десериализует весь map (500 entries), update сериализует обратно — на 100k events/sec это main bottleneck. MapState хранит каждую entry как отдельную RocksDB row с composite key (kgId, ns, userKey, stateName, mapKey): get(eventType) = один GET ~10μs, put = один PUT. Performance gain ~500x в этом сценарии.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-exam-q2",
+      "type": "multiple-choice",
+      "question": "Job стартовал с parallelism=4 без явного setMaxParallelism. Через год нужен scale до parallelism=300. Что произойдёт и что делать?",
+      "options": [
+        { "id": "a", "text": "Flink автоматически расширит maxParallelism" },
+        { "id": "b", "text": "Default maxParallelism=128, savepoint содержит его. setParallelism(300) > 128 → restart fails. Единственное решение — State Processor API offline rebootstrap с новым maxParallelism. Production lesson: ВСЕГДА setMaxParallelism(1024+) явно при первом deploy" },
+        { "id": "c", "text": "Использовать --allowNonRestoredState" },
+        { "id": "d", "text": "Просто scale down до 128" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic maxParallelism trap. Default считается на запуск (parallelism=4 → 128). После запуска IMMUTABLE — потому что keyGroupId = hash(key) % maxParallelism, изменение mp = всех ключей в разные key groups = state lost. State Processor API offline batch может перепаковать state в новый mp, но для multi-TB savepoint часы работы. Solution до запуска: setMaxParallelism(1024) или 4096 — free insurance.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-exam-q3",
+      "type": "multiple-choice",
+      "question": "ForSt backend + Async State API V2 — какой relationship и почему?",
+      "options": [
+        { "id": "a", "text": "Они независимы, можно использовать ForSt с sync API" },
+        { "id": "b", "text": "Async API V2 ОБЯЗАТЕЛЕН для ForSt. ForSt хранит primary state на S3, cache miss = 50-100ms S3 GET. Sync блокирует mailbox thread → throughput 200 events/sec (катастрофа). Async через AEC параллелит I/O → 30k events/sec (Apache benchmarks)" },
+        { "id": "c", "text": "Async API V2 заменяет ForSt" },
+        { "id": "d", "text": "ForSt — это название для async API V2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-424/425 (Async API) и FLIP-427 (ForSt) развивались как единый stack. ForSt = primary state на S3, локальный диск только cache. S3 latency 50-100ms. Sync state access блокирует single-threaded mailbox subtask-а — throughput становится unusable (~200 events/sec при ForSt+sync). С Async API AEC delegates state I/O в worker pool (8 threads default), mailbox продолжает работать. Numerical (Apache benchmarks): ForSt+sync = 200 events/sec, ForSt+async = 30k events/sec — 150x разница.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-exam-q4",
+      "type": "multiple-choice",
+      "question": "Need TTL=30min с session timeout semantics (state живёт, пока активный). RocksDB backend. Какая конфигурация?",
+      "options": [
+        { "id": "a", "text": "UpdateType.OnCreateAndWrite, cleanupFullSnapshot" },
+        { "id": "b", "text": "UpdateType.OnReadAndWrite (sliding) + cleanupInRocksdbCompactFilter + cleanupFullSnapshot. CAVEAT: OnReadAndWrite превращает каждый read в write на RocksDB → catastrophic write amplification на read-heavy workload. Часто лучше — explicit event-time timer вместо TTL" },
+        { "id": "c", "text": "Никакого TTL не нужно — Flink автоматически" },
+        { "id": "d", "text": "cleanupIncrementally(1000, true)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sliding TTL = OnReadAndWrite. + RocksDB cleanup через compact filter. + full snapshot. CRITICAL CAVEAT: OnReadAndWrite на RocksDB = каждый read становится PUT (refresh ttl_timestamp). На read-heavy workload (10 reads per event @ 100k events/sec = 1M PUT/sec) — катастрофа: MemTable постоянно flushing, write amplification 50-100x, CPU на compaction. Для real session timeout часто лучше explicit event-time timer + state.clear(). cleanupIncrementally не работает на RocksDB!",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-exam-q5",
+      "type": "multiple-choice",
+      "question": "Какой тип operator state опасен для big metadata и почему?",
+      "options": [
+        { "id": "a", "text": "ListState — split redistribution может потерять данные" },
+        { "id": "b", "text": "UnionListState — при scale-up каждый из N subtask получает все items × N items, memory растёт квадратично, main источник OOM" },
+        { "id": "c", "text": "BroadcastState — он автоматически compresses" },
+        { "id": "d", "text": "Все одинаково safe" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "UnionListState имеет union redistribution: при rescale каждый subtask получает все items от всех старых subtask. При scale-up 8→32 каждый из 32 subtask получает все 8×items = 4x items на subtask. Memory растёт линейно в parallelism. На больших списках = OOM. Используйте только для small metadata (<1MB total). ListState (split redistribution) безопасно: items делятся между subtask, memory остаётся constant. BroadcastState — separate API, controlled через broadcast stream, safe для rules/configs.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-exam-q6",
+      "type": "true-false",
+      "question": "Schema evolution через POJO Serializer поддерживает добавление nullable Integer field (compatible after migration), но не поддерживает type change (int→long). Для type changes нужен State Processor API или переход на Avro Serializer.",
+      "correctAnswer": true,
+      "explanation": "True. POJO Serializer schema evolution rules: ✅ Add nullable field (COMPATIBLE_AFTER_MIGRATION, default null), ✅ Remove field (data discarded), ❌ Change type even widening (INCOMPATIBLE), ❌ Rename (INCOMPATIBLE). Для type changes есть два пути: (1) State Processor API offline rebootstrap — read savepoint, transform, write new savepoint; (2) Use Avro instead of POJO — Avro поддерживает type promotion int→long→float→double через built-in evolution rules. Production recommendation: для state, evolving regularly, prefer Avro Serializer от старта.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

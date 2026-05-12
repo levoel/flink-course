@@ -1,0 +1,564 @@
+---
+title: "Keyed State primitives: 5 типов и их семантика"
+description: "ValueState, ListState, MapState, ReducingState, AggregatingState — внутреннее устройство, TypeInformation, RuntimeContext, per-key isolation"
+order: 3
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Keyed State", "ValueState", "MapState", "ListState", "ReducingState", "AggregatingState", "TypeInformation"]
+---
+
+# Keyed State primitives — 5 типов и их семантика
+
+Flink даёт 5 primitives для keyed state. На первый взгляд они выглядят как «обёртки над HashMap», но за каждым стоит особая семантика, оптимизированная под конкретный access pattern и под особенности backend (heap, RocksDB, ForSt).
+
+Этот урок — deep dive в каждый primitive: API, internal layout, TypeInformation resolution, per-key isolation механика, performance implications.
+
+---
+
+## Что вообще такое «keyed state»
+
+Когда после `keyBy(Tx::getUserId)` записи приходят в оператор, Flink под капотом ставит «текущий key context» равный userId. Все обращения к state primitives автоматически scoped to этому key:
+
+<DiagramContainer title="Per-key isolation: как работает state.value()" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Запись приходит"
+        tooltip="Запись Transaction(userId=42, amount=100). Flink через CurrentKeyContext устанавливает current_key = 42 перед вызовом processElement."
+      >
+        Tx(userId=42, amt=100)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="setCurrentKey(42)" />
+    <FlowRow>
+      <DataBox
+        label="processElement called"
+        tooltip="Метод processElement выполняется. Внутри вызов state.value() — резолвится в state[current_key] = state[42]. Никакого явного key parameter не нужно."
+      >
+        state.value()
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="lookup в backend" />
+    <FlowRow>
+      <DataBox
+        label="State backend (RocksDB)"
+        tooltip="RocksDB key = (key_group_id, namespace, key, state_name). hash(42) % maxParallelism → key_group. SST файл lookup через bloom filter + block cache. Десериализация → возврат Java объекта."
+      >
+        SST lookup: (kg, userId=42) → Value
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Ключевые свойства:
+- **Per-key isolation**: `state.value()` для userId=42 не видит state userId=43. Никаких race conditions между keys внутри одного subtask.
+- **Lazy materialization**: state не материализуется до первого `.value()` call. До тех пор Flink держит только descriptor.
+- **Single-threaded access**: каждый key обрабатывается mailbox thread-ом subtask-а — нет concurrent modifications.
+
+---
+
+## 1. ValueState — single value per key
+
+Самый простой primitive — single value per key.
+
+```java
+public class CounterFunction extends KeyedProcessFunction<Long, Event, Long> {
+
+    private transient ValueState<Long> countState;
+
+    @Override
+    public void open(Configuration config) {
+        ValueStateDescriptor<Long> descriptor =
+            new ValueStateDescriptor<>("event-count", Long.class);
+        countState = getRuntimeContext().getState(descriptor);
+    }
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Long> out)
+            throws Exception {
+        Long current = countState.value();  // null если не было update
+        long newValue = (current == null) ? 1L : current + 1;
+        countState.update(newValue);
+        out.collect(newValue);
+    }
+}
+```
+
+### API surface
+
+| Method | Semantics | RocksDB ops |
+|---|---|---|
+| `value()` | Get current value (null if absent) | 1 GET per call |
+| `update(v)` | Set value | 1 PUT |
+| `clear()` | Delete state for current key | 1 DELETE |
+
+### Internal layout (RocksDB)
+
+```
+RocksDB key:   (keyGroupId, namespace, userKey, stateName)
+RocksDB value: serialized Value
+```
+
+При `state.value()` Flink делает один GET в Column Family этого state, десериализует, возвращает Java объект.
+
+### Когда использовать
+
+- Single number/object per key (counter, last-seen timestamp, current state machine state)
+- Read-modify-write workflows
+- Простой alarm с per-key threshold
+
+### Когда НЕ использовать
+
+- Список значений — используйте `ListState`
+- Hash structure — используйте `MapState`
+
+<Callout type="warning">
+ValueState с `LinkedHashMap<K,V>` внутри — антипаттерн. Каждый `state.value()` десериализует весь map, `state.update(newMap)` — сериализует всё. Используйте `MapState` напрямую — он lazy и per-entry.
+</Callout>
+
+---
+
+## 2. ListState — append-only list per key
+
+```java
+private transient ListState<Transaction> historyState;
+
+@Override
+public void open(Configuration c) {
+    historyState = getRuntimeContext().getListState(
+        new ListStateDescriptor<>("history",
+            TypeInformation.of(Transaction.class)));
+}
+
+@Override
+public void processElement(Transaction tx, Context ctx, Collector<Alert> out)
+        throws Exception {
+    historyState.add(tx);  // append O(1) для RocksDB
+    Iterable<Transaction> recent = historyState.get();
+    // ... process history
+}
+```
+
+### Internal layout (RocksDB)
+
+```
+RocksDB key: (kgId, namespace, userKey, stateName, listIndex)  // не совсем
+```
+
+В реальности RocksDB ListState хранит сериализованный список как **один blob** под одним ключом, с прямой serialization формат, оптимизированный для append (`add` = append к существующему массиву байт без полной де-/ре-сериализации).
+
+### API
+
+| Method | Semantics | RocksDB ops |
+|---|---|---|
+| `add(v)` | Append | Append to value buffer (amortized O(1)) |
+| `addAll(coll)` | Append batch | One PUT for batch |
+| `get()` | Iterable over elements | Lazy iterator |
+| `update(coll)` | Replace entire list | One PUT |
+| `clear()` | Delete state | DELETE |
+
+### Key gotcha — `get()` returns Iterable, не List
+
+```java
+Iterable<Transaction> txs = historyState.get();
+// ❌ size() недоступен:
+// int n = txs.size();
+// ✅ материализация:
+List<Transaction> list = new ArrayList<>();
+txs.forEach(list::add);
+```
+
+Iterable намеренно — позволяет lazy iteration без deserialization всех элементов сразу. Подходит для streaming aggregation.
+
+### Use case: per-key event history
+
+```java
+public class SessionDetector extends KeyedProcessFunction<Long, Event, Session> {
+    private transient ListState<Event> eventsState;
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Session> out)
+            throws Exception {
+        eventsState.add(e);
+        ctx.timerService().registerEventTimeTimer(e.getTimestamp() + 30_000);
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx,
+                        Collector<Session> out) throws Exception {
+        List<Event> session = new ArrayList<>();
+        eventsState.get().forEach(session::add);
+        if (session.size() > 1) {
+            out.collect(Session.fromEvents(session));
+        }
+        eventsState.clear();
+    }
+}
+```
+
+---
+
+## 3. MapState — hash map per key
+
+Per-key hash map. **Lazy per-entry serialization** — game changer для RocksDB.
+
+```java
+private transient MapState<String, Long> countByCategoryState;
+
+@Override
+public void open(Configuration c) {
+    countByCategoryState = getRuntimeContext().getMapState(
+        new MapStateDescriptor<>("count-by-category",
+            String.class, Long.class));
+}
+
+@Override
+public void processElement(Tx tx, Context ctx, Collector<?> out)
+        throws Exception {
+    String cat = tx.getCategory();
+    Long count = countByCategoryState.get(cat);  // ← lookup ТОЛЬКО одного entry
+    countByCategoryState.put(cat, count == null ? 1L : count + 1);
+}
+```
+
+### Internal layout (RocksDB)
+
+```
+RocksDB key:   (kgId, namespace, userKey, stateName, mapKey)
+RocksDB value: mapValue (serialized)
+```
+
+Каждая map entry — **отдельная RocksDB row**. Это критично:
+- `get(mapKey)` — один GET (~10μs)
+- `put(mapKey, v)` — один PUT
+- `entries()` — range scan по prefix `(kgId, namespace, userKey, stateName, *)`
+
+Compare с `ValueState<HashMap>`:
+- `state.value()` десериализует **весь** map (могут быть тысячи entries)
+- `state.update(map)` сериализует **весь** map back
+
+Для maps с >10 entries `MapState` всегда быстрее.
+
+### API
+
+| Method | Semantics |
+|---|---|
+| `get(key)` / `put(k,v)` | Per-entry access |
+| `contains(k)` | Без deserialization value |
+| `remove(k)` | Delete entry |
+| `keys()` / `values()` / `entries()` | Range scan |
+| `iterator()` | Same |
+| `isEmpty()` | Cheap check |
+
+### Use case: per-user feature counter
+
+```java
+// Per-user statistics: count по типу события
+MapState<String, Long> eventTypeCount;
+
+// processElement: increment(type)
+Long c = eventTypeCount.get(eventType);
+eventTypeCount.put(eventType, c == null ? 1L : c + 1);
+```
+
+Без MapState пришлось бы держать `ValueState<Map<String, Long>>` и re-serialize всё на каждый event — катастрофа на больших maps.
+
+---
+
+## 4. ReducingState — value + reduce function
+
+`ReducingState<T>` хранит **одно значение** того же типа что input, но при `add(v)` Flink применяет `ReduceFunction<T>` для merge нового value с существующим:
+
+```java
+ReducingStateDescriptor<Long> descriptor =
+    new ReducingStateDescriptor<>(
+        "sum-amounts",
+        (a, b) -> a + b,            // ReduceFunction<Long>
+        Long.class);
+
+ReducingState<Long> sumState = getRuntimeContext().getReducingState(descriptor);
+
+// processElement:
+sumState.add(tx.getAmount());  // ← внутри: sumState = sumState + amount
+Long total = sumState.get();
+```
+
+### Internal layout
+
+```
+RocksDB key:   (kgId, ns, userKey, stateName)
+RocksDB value: serialized T
+```
+
+Идентично ValueState с T. Разница — `add` runs ReduceFunction перед PUT.
+
+### API
+
+| Method | Semantics |
+|---|---|
+| `add(v)` | reduce(currentValue, v) → update |
+| `get()` | Get current reduced value |
+| `clear()` | Delete |
+
+### Use case
+
+Sum/min/max/concatenation accumulators — где input и output одинакового типа.
+
+```java
+ReducingStateDescriptor<Long> maxDesc = new ReducingStateDescriptor<>(
+    "max-tx", Math::max, Long.class);
+```
+
+### Когда НЕ использовать
+
+Если input и output разных типов — нужен `AggregatingState` (см. ниже).
+
+---
+
+## 5. AggregatingState — input ≠ output type
+
+Самый мощный primitive. `AggregateFunction<IN, ACC, OUT>` разделяет:
+- `IN` — input record type
+- `ACC` — accumulator type (что хранится)
+- `OUT` — output type
+
+```java
+public class AvgAccumulator {
+    public long sum;
+    public long count;
+}
+
+AggregateFunction<Long, AvgAccumulator, Double> avgFunc =
+    new AggregateFunction<>() {
+        @Override
+        public AvgAccumulator createAccumulator() {
+            return new AvgAccumulator();
+        }
+        @Override
+        public AvgAccumulator add(Long value, AvgAccumulator acc) {
+            acc.sum += value;
+            acc.count++;
+            return acc;
+        }
+        @Override
+        public Double getResult(AvgAccumulator acc) {
+            return (double) acc.sum / acc.count;
+        }
+        @Override
+        public AvgAccumulator merge(AvgAccumulator a, AvgAccumulator b) {
+            a.sum += b.sum;
+            a.count += b.count;
+            return a;
+        }
+    };
+
+AggregatingStateDescriptor<Long, AvgAccumulator, Double> desc =
+    new AggregatingStateDescriptor<>("avg", avgFunc,
+        TypeInformation.of(AvgAccumulator.class));
+
+AggregatingState<Long, Double> avgState =
+    getRuntimeContext().getAggregatingState(desc);
+
+avgState.add(tx.getAmount());           // обновляет accumulator
+Double currentAvg = avgState.get();     // выводит average через getResult
+```
+
+### Internal layout
+
+```
+RocksDB key:   (kgId, ns, userKey, stateName)
+RocksDB value: serialized ACC (не OUT!)
+```
+
+В backend хранится только accumulator. `getResult` вызывается на `.get()` — может быть expensive operation (например percentile из t-digest).
+
+### Когда использовать
+
+- Streaming aggregations с complex accumulator (average, percentile, sketch-based unique count)
+- Когда output type разный от input (input = events, output = avg/p99/count-distinct)
+
+---
+
+## TypeInformation — как Flink понимает типы
+
+Каждый StateDescriptor требует знать TypeSerializer для T. Flink resolve это в порядке:
+
+1. **Class<T>** — простые типы (Long.class, String.class)
+2. **TypeInformation.of(class)** — explicit
+3. **TypeHint** — для generics (Tuple, List)
+
+```java
+// Простой тип:
+new ValueStateDescriptor<>("counter", Long.class);
+
+// POJO:
+new ValueStateDescriptor<>("event", TypeInformation.of(Event.class));
+
+// Generic — нужен TypeHint:
+new ValueStateDescriptor<>("list",
+    TypeInformation.of(new TypeHint<List<String>>() {}));
+```
+
+Под капотом Flink использует **TypeExtractor** для анализа классов и резолва TypeInformation, которая разворачивается в TypeSerializer (KryoSerializer для unknown / POJO Serializer / TupleSerializer / прямые primitive serializers).
+
+<Callout type="note">
+TypeSerializer влияет на performance state access на порядки. KryoSerializer (fallback) в 5-10x медленнее, чем POJOSerializer. Для POJO: убедитесь, что класс public, имеет nullary constructor и pair getter/setter для каждого поля — тогда Flink пойдёт по POJO path.
+</Callout>
+
+---
+
+## RuntimeContext: единственный путь к state
+
+State доступен **только** через `RuntimeContext` в RichFunction (включая KeyedProcessFunction, RichFlatMapFunction, RichMapFunction etc):
+
+```java
+public class MyFunction extends KeyedProcessFunction<K, IN, OUT> {
+
+    private transient ValueState<Long> state;
+
+    @Override
+    public void open(Configuration config) {
+        // ✅ Только в open() или позже:
+        state = getRuntimeContext().getState(descriptor);
+    }
+
+    @Override
+    public void processElement(IN value, Context ctx, Collector<OUT> out) {
+        state.value();  // ✅ работает
+    }
+}
+```
+
+Нельзя resolve state в constructor — RuntimeContext ещё не инициализирован.
+
+### State в constructor pattern
+
+```java
+public class MyFunction extends KeyedProcessFunction<K, IN, OUT> {
+
+    // ❌ NPE: getRuntimeContext() == null здесь:
+    private final ValueState<Long> state = getRuntimeContext().getState(...);
+
+    // ✅ Lazy через transient:
+    private transient ValueState<Long> state;
+}
+```
+
+---
+
+## Per-key isolation deep dive
+
+Что **физически** гарантирует, что `state.value()` для userId=42 не возвращает state userId=43?
+
+<DiagramContainer title="Key context → RocksDB key composition" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Current key = 42"
+        tooltip="Mailbox processor устанавливает CurrentKeyContext.currentKey = 42 перед вызовом processElement. Это thread-local значение в TaskManager-е."
+      >
+        ctx.currentKey = 42
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="state.value() вызывает RocksDBStateBackend" />
+    <FlowRow>
+      <DataBox
+        label="Key composition"
+        tooltip="RocksDB key = byte[] из: KeyGroupRangeAssignment.assignToKeyGroup(42, maxParallelism), namespace (default VoidNamespace), serialized userKey, stateName. Это garantee uniqueness scope."
+      >
+        kgId(42) || ns || userKey || stateName
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="RocksDB Column Family lookup"
+        tooltip="GET в CF этого state. Bloom filter check → block cache → SSTable. Сериализованный value возвращается, десериализуется TypeSerializer-ом → Java объект."
+      >
+        SST GET → bytes → deserialize
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Эта композиция key — почему `state.value()` для разных userId возвращает разные значения: они физически разные ключи в RocksDB.
+
+---
+
+## Production gotchas
+
+### 1. NULL value semantics
+
+```java
+Long v = state.value();
+// v может быть null — даже для primitive descriptor
+```
+
+Если state не был ни разу `.update(v)` для текущего key — `value()` возвращает `null`. Это часто причина NullPointerException в processElement. Всегда проверяйте.
+
+### 2. `state.value()` создаёт state implicitly?
+
+Нет. `value()` только читает. `update(v)` создаёт. Поэтому `state.value() == null` ≠ «state создан, но пуст». State просто не существует для этого key.
+
+### 3. Heavy POJO в ValueState
+
+```java
+class HeavyPojo {
+    Map<String, List<SubObject>> data; // ← может быть MB
+}
+ValueState<HeavyPojo> state;
+```
+
+Каждый `.value()` десериализует весь POJO. Каждый `.update()` сериализует back. На RocksDB это main bottleneck. Декомпозируйте на `MapState` per field.
+
+### 4. `getRuntimeContext().getState(desc)` вызывайте только в `open()`
+
+```java
+public void processElement(...) {
+    // ❌ Каждый вызов создаёт overhead на validation:
+    ValueState<Long> state =
+        getRuntimeContext().getState(new ValueStateDescriptor<>("c", Long.class));
+}
+```
+
+Cache `state` field в `open()`.
+
+### 5. Несовпадение TypeInformation между versions
+
+Если в v1 вы создавали state с `TypeInformation.of(EventV1.class)`, а в v2 деплоите `EventV2` без schema evolution — restart падает с serialization error. Урок 07 разбирает schema evolution.
+
+### 6. Reading state в onTimer
+
+```java
+@Override
+public void onTimer(long ts, OnTimerContext ctx, Collector<?> out) {
+    Long v = state.value();
+    // ✅ Здесь current key = key, для которого зарегистрирован timer
+}
+```
+
+Flink автоматически устанавливает current key context для onTimer. Это работает корректно — не нужно вручную трекать.
+
+---
+
+## Performance comparison
+
+Tests на in-memory benchmark, 100k operations per key:
+
+| Primitive | RocksDB ops | Hashmap ops | Серьёзность |
+|---|---|---|---|
+| ValueState (small T) | ~10μs | ~100ns | Same magnitude |
+| ValueState (Map<K,V> as T) | ~5ms / op | ~5μs | RocksDB 1000x медленнее — антипаттерн |
+| MapState | ~10μs per entry | ~100ns | Per-entry хорошо scales |
+| ListState | ~10μs per element | ~100ns | Append optimized |
+| ReducingState | ~15μs | ~200ns | Чуть больше из-за reduce call |
+| AggregatingState | ~20μs | ~300ns | Custom getResult может быть expensive |
+
+Heap state — на 2 порядка быстрее RocksDB, но размер ограничен JVM heap.
+
+---
+
+<KnowledgeCheck
+  question="У вас per-user feature: счётчик по типам события (event_type → count). Может быть до 500 типов на user, 10M users. Какой state primitive выбрать и почему НЕ `ValueState<Map<String, Long>>`?"
+  answer="Правильный выбор — MapState<String, Long>. ValueState<Map<String, Long>> — антипаттерн в RocksDB: каждый state.value() десериализует ВЕСЬ map (до 500 entries), каждый update() сериализует обратно. На 10M users × 500 entries × несколько events/sec это main bottleneck. MapState хранит каждую entry как отдельную RocksDB row с composite key (kgId, ns, userKey, stateName, mapKey), поэтому get(eventType) — один GET (~10μs), put — один PUT, без де-/ре-сериализации остального map. Memory footprint: одна entry на RocksDB row, range scan через entries() прозрачно по prefix. Performance gain: при 500 entries — ~500x ускорение per access на RocksDB. На heap state разница меньше (~50x), но MapState всё равно предпочтительнее из-за чистоты API."
+/>

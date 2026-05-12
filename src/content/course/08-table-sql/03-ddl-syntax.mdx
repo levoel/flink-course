@@ -1,0 +1,552 @@
+---
+title: "DDL syntax — CREATE TABLE, time attributes, watermarks"
+description: "CREATE TABLE syntax, WITH connector properties, PROCTIME/WATERMARK, computed columns, primary key constraints"
+order: 3
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["DDL", "CREATE TABLE", "WATERMARK", "PROCTIME", "Computed Columns", "PRIMARY KEY"]
+---
+
+# DDL syntax — CREATE TABLE, time attributes, watermarks
+
+DDL (Data Definition Language) — declarative way определить tables, time attributes, watermarks. В отличие от Java DataStream API где каждое из этого требует code, DDL читается как обычный SQL и более compact. Этот урок разбирает CREATE TABLE syntax полностью: column types, time attributes, computed columns, primary keys, WITH connector properties, и production patterns для declaring streaming tables.
+
+Mastering DDL — это путь к declarative streaming. SQL pipelines становятся читаемыми для аналитиков и data engineers без deep Flink knowledge.
+
+---
+
+## Basic CREATE TABLE
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id STRING,
+    product STRING,
+    amount DECIMAL(10, 2),
+    order_time TIMESTAMP(3)
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'properties.group.id' = 'orders-pipeline',
+    'scan.startup.mode' = 'earliest-offset',
+    'format' = 'json',
+    'json.timestamp-format.standard' = 'ISO-8601'
+);
+```
+
+Structure:
+- **Column list** — name, type, optional constraints.
+- **WITH clause** — connector configuration. Required.
+
+---
+
+## Data types
+
+Flink SQL types (subset most used):
+
+| SQL Type | Java Equivalent | Notes |
+|---|---|---|
+| `INT` / `INTEGER` | `Integer` | 32-bit |
+| `BIGINT` | `Long` | 64-bit |
+| `DECIMAL(p, s)` | `BigDecimal` | precision/scale, для финансов |
+| `DOUBLE` / `FLOAT` | `Double` / `Float` | floating-point |
+| `STRING` / `VARCHAR(n)` | `String` | |
+| `BOOLEAN` | `Boolean` | |
+| `BYTES` / `VARBINARY` | `byte[]` | |
+| `DATE` | `LocalDate` | без time component |
+| `TIME(3)` | `LocalTime` | precision до ms |
+| `TIMESTAMP(3)` | `LocalDateTime` | без timezone |
+| `TIMESTAMP_LTZ(3)` | `Instant` | local time zone |
+| `ARRAY<T>` | `T[]` | |
+| `MAP<K, V>` | `Map<K, V>` | |
+| `ROW<f1 T1, f2 T2>` | nested struct | |
+| `MULTISET<T>` | `Map<T, Integer>` | bag |
+
+`TIMESTAMP(3)` precision = milliseconds (3 digits после dot). TIMESTAMP(6) = microseconds. TIMESTAMP(9) = nanoseconds.
+
+### Nested types
+
+```sql
+CREATE TABLE events (
+    user_id STRING,
+    properties MAP<STRING, STRING>,
+    tags ARRAY<STRING>,
+    address ROW<street STRING, city STRING, zip STRING>
+) WITH (...);
+
+-- Query nested:
+SELECT user_id, properties['region'], tags[1], address.city
+FROM events;
+```
+
+---
+
+## Connector properties (WITH clause)
+
+WITH is connector-specific. Common examples:
+
+### Kafka source
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    -- ...
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'properties.group.id' = 'orders-pipeline',
+    'scan.startup.mode' = 'earliest-offset',
+    -- Or: 'latest-offset', 'group-offsets', 'specific-offsets', 'timestamp'
+    'scan.startup.specific-offsets' = 'partition:0,offset:42;partition:1,offset:300',
+    'scan.startup.timestamp-millis' = '1715500000000',
+    'format' = 'json',
+    'json.fail-on-missing-field' = 'false',
+    'json.ignore-parse-errors' = 'true'
+);
+```
+
+### Filesystem (Parquet)
+
+```sql
+CREATE TABLE orders_lake (
+    order_id BIGINT,
+    user_id STRING,
+    amount DECIMAL(10, 2),
+    `date` STRING
+) PARTITIONED BY (`date`)
+WITH (
+    'connector' = 'filesystem',
+    'path' = 's3://data-lake/orders',
+    'format' = 'parquet',
+    'sink.partition-commit.policy.kind' = 'success-file',
+    'sink.rolling-policy.file-size' = '128MB',
+    'sink.rolling-policy.rollover-interval' = '15min'
+);
+```
+
+### Upsert-Kafka
+
+```sql
+CREATE TABLE user_balance (
+    user_id STRING,
+    balance DECIMAL(15, 2),
+    last_update TIMESTAMP(3),
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'upsert-kafka',
+    'topic' = 'user_balance',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'key.format' = 'json',
+    'value.format' = 'json'
+);
+```
+
+Note `PRIMARY KEY (...) NOT ENFORCED` — required для upsert-kafka.
+
+### JDBC
+
+```sql
+CREATE TABLE postgres_orders (
+    order_id BIGINT,
+    user_id STRING,
+    amount DECIMAL(10, 2),
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://postgres:5432/mydb',
+    'table-name' = 'orders',
+    'username' = 'flink',
+    'password' = 'flinkpass',
+    'sink.buffer-flush.max-rows' = '1000',
+    'sink.buffer-flush.interval' = '5s'
+);
+```
+
+---
+
+## Time attributes
+
+Crucial для windowed aggregations. Two flavors: processing time и event time.
+
+### Processing time
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    amount DECIMAL(10, 2),
+    proc_time AS PROCTIME()
+) WITH (...);
+```
+
+`PROCTIME()` — special function, returns timestamp on processing. Computed column (synthesized at runtime).
+
+Use:
+```sql
+SELECT order_id, TUMBLE_START(proc_time, INTERVAL '5' MINUTE) AS w_start
+FROM orders
+GROUP BY TUMBLE(proc_time, INTERVAL '5' MINUTE);
+```
+
+Non-deterministic при replay (depends on wall clock TM).
+
+### Event time + watermark
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    amount DECIMAL(10, 2),
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (...);
+```
+
+**WATERMARK FOR `event_time` AS `event_time - INTERVAL '5' SECOND`**:
+- `event_time` becomes time attribute (timestamps used для windowing).
+- Watermark = max(event_time) - 5 seconds. Out-of-orderness up to 5s tolerated.
+- Records с event_time < current watermark — late.
+
+Use:
+```sql
+SELECT order_id, TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS w_start
+FROM orders
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE);
+```
+
+### TIMESTAMP_LTZ для UTC events
+
+```sql
+CREATE TABLE events (
+    -- ts_millis from Kafka headers
+    ts_millis BIGINT,
+    event_time AS TO_TIMESTAMP_LTZ(ts_millis, 3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND
+) WITH (...);
+```
+
+`TO_TIMESTAMP_LTZ` конвертирует epoch ms в `TIMESTAMP_LTZ(3)`. LTZ (Local Time Zone) корректен для events across timezones.
+
+---
+
+## Computed columns
+
+Columns derived from expressions:
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    amount DECIMAL(10, 2),
+    tax DECIMAL(10, 2),
+    total AS amount + tax,                              -- arithmetic
+    is_large AS amount > 1000,                          -- boolean
+    user_region AS SUBSTRING(user_id, 1, 2),           -- string function
+    proc_time AS PROCTIME(),                            -- time
+    event_time AS TO_TIMESTAMP_LTZ(ts_millis, 3)       -- conversion
+) WITH (...);
+```
+
+Computed columns:
+- Not stored in source (computed at runtime).
+- Can use built-in functions, UDFs.
+- Can be used in WATERMARK declaration:
+  ```sql
+  WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+  ```
+
+### Metadata columns
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    amount DECIMAL(10, 2),
+    record_kafka_ts TIMESTAMP_LTZ(3) METADATA FROM 'timestamp',
+    record_partition INT METADATA FROM 'partition' VIRTUAL,
+    record_offset BIGINT METADATA FROM 'offset' VIRTUAL,
+    record_headers MAP<STRING, BYTES> METADATA FROM 'headers'
+) WITH (
+    'connector' = 'kafka',
+    ...
+);
+```
+
+**METADATA FROM 'name'** — accesses Kafka record metadata. **VIRTUAL** = read-only (для sink не emit).
+
+Useful: dedup by Kafka offset, partition-aware processing, header-based routing.
+
+---
+
+## Primary key constraint
+
+```sql
+CREATE TABLE user_state (
+    user_id STRING,
+    balance DECIMAL(15, 2),
+    last_update TIMESTAMP(3),
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (...);
+```
+
+**NOT ENFORCED** — Flink не валидирует uniqueness (это не database). Это metadata для:
+- Source connectors с upsert semantics (upsert-kafka, CDC).
+- Sink connectors с upsert support (JDBC, upsert-kafka).
+- Query planner для optimization.
+
+**Composite PK**:
+```sql
+PRIMARY KEY (region, user_id) NOT ENFORCED
+```
+
+PK влияет на partitioning при sink (по PK hash).
+
+---
+
+## PARTITIONED BY — для filesystem/Hive
+
+```sql
+CREATE TABLE orders_lake (
+    order_id BIGINT,
+    user_id STRING,
+    amount DECIMAL(10, 2),
+    region STRING,
+    `date` STRING,
+    `hour` STRING
+) PARTITIONED BY (region, `date`, `hour`)
+WITH (
+    'connector' = 'filesystem',
+    'path' = 's3://data-lake/orders',
+    'format' = 'parquet'
+);
+```
+
+Generates Hive-style partitioning:
+```
+s3://data-lake/orders/region=us-east-1/date=2026-05-12/hour=14/part-0-0.parquet
+```
+
+Query engines partition-prune по WHERE clause on partition columns.
+
+---
+
+## DDL патерны для production
+
+### Pattern: temporal table
+
+For temporal join с versioning:
+
+```sql
+CREATE TABLE currency_rates (
+    currency STRING,
+    rate DECIMAL(10, 4),
+    update_time TIMESTAMP(3),
+    PRIMARY KEY (currency) NOT ENFORCED,
+    WATERMARK FOR update_time AS update_time
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'currency_rates',
+    ...
+);
+
+-- Use:
+SELECT o.order_id, o.amount * r.rate AS amount_usd
+FROM orders AS o
+JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
+  ON o.currency = r.currency;
+```
+
+`update_time` + PK + watermark — задаёт versioned table.
+
+### Pattern: CDC source
+
+Debezium-style CDC:
+
+```sql
+CREATE TABLE postgres_users (
+    user_id BIGINT,
+    name STRING,
+    email STRING,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'postgres-cdc',
+    'hostname' = 'postgres',
+    'port' = '5432',
+    'username' = 'flink',
+    'password' = 'flinkpass',
+    'database-name' = 'mydb',
+    'schema-name' = 'public',
+    'table-name' = 'users'
+);
+```
+
+Source emits +I/-U/+U/-D events automatically. Flink CDC connector reads logical replication slot.
+
+### Pattern: temporary table
+
+Per-session, не persisted в catalog:
+
+```sql
+CREATE TEMPORARY TABLE debug_print (
+    payload STRING
+) WITH (
+    'connector' = 'print'
+);
+
+INSERT INTO debug_print
+SELECT CAST(events AS STRING) FROM events LIMIT 100;
+```
+
+Useful для debugging без catalog clutter.
+
+---
+
+## SHOW и DESCRIBE
+
+```sql
+SHOW DATABASES;
+SHOW CATALOGS;
+SHOW TABLES IN myCatalog.myDatabase;
+
+DESCRIBE orders;
+-- Output:
+-- order_id BIGINT
+-- user_id STRING
+-- amount DECIMAL(10, 2)
+-- event_time TIMESTAMP(3)
+-- WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+-- ...
+
+DESCRIBE EXTENDED orders;
+-- Shows connector properties, full schema, comments
+```
+
+---
+
+## DROP, ALTER, TRUNCATE
+
+```sql
+-- DROP
+DROP TABLE orders;
+DROP TABLE IF EXISTS orders;
+
+-- ALTER — limited support в Flink (depends on catalog)
+ALTER TABLE orders RENAME TO orders_old;
+ALTER TABLE orders SET ('scan.startup.mode' = 'latest-offset');
+
+-- TRUNCATE — для materialized tables / paimon
+TRUNCATE TABLE orders_metrics;
+```
+
+Flink SQL — DDL ortogonal к Hive/Spark — может не support все ANSI features. ALTER COLUMN типично не supported (depends on catalog).
+
+---
+
+## Production gotchas
+
+### 1. WATERMARK on non-time column
+
+```sql
+WATERMARK FOR amount AS amount - 5  -- ❌ amount is DECIMAL, not TIMESTAMP
+```
+
+Watermark должен быть на TIMESTAMP(3) или TIMESTAMP_LTZ(3) column. Other types error при planning.
+
+### 2. WATERMARK too aggressive — lost late events
+
+```sql
+WATERMARK FOR event_time AS event_time - INTERVAL '1' SECOND  -- ❌ too small
+```
+
+Production: measure P99 out-of-orderness. Set watermark = P99 + 50% safety. Typical 5-30 seconds.
+
+### 3. Computed column ordering
+
+```sql
+CREATE TABLE foo (
+    a INT,
+    b AS a + 1,        -- OK: b uses a (earlier)
+    c AS d * 2,        -- ❌ d not declared yet
+    d INT
+) WITH (...);
+```
+
+Computed columns могут только reference previously-declared columns. Reorder if needed.
+
+### 4. PROCTIME() in INSERT INTO
+
+```sql
+CREATE TABLE source (id INT, proc_time AS PROCTIME());
+CREATE TABLE sink (id INT, ts TIMESTAMP_LTZ(3));
+
+INSERT INTO sink SELECT id, proc_time FROM source;  -- ✅ OK
+```
+
+PROCTIME column можно select-ить в downstream. Но не **persist** — это computed.
+
+### 5. Кафka format mismatch
+
+```sql
+WITH (
+    'format' = 'json',
+    'json.timestamp-format.standard' = 'ISO-8601'   -- expects "2026-05-12T14:30:00Z"
+)
+```
+
+Если source actually has Unix epoch ("ts": 1715500000000) → parse fails → records dropped (с `ignore-parse-errors=false` default).
+
+**Fix**: use `'format' = 'json'` + computed column `event_time AS TO_TIMESTAMP_LTZ(ts, 3)` для conversion.
+
+### 6. Default scan.startup.mode = 'group-offsets'
+
+Без explicit setting Kafka source reads from group-offsets (where consumer group last committed). Для new pipeline group never committed → behavior depends on `auto.offset.reset`. Confusing.
+
+**Fix**: всегда set `'scan.startup.mode' = 'earliest-offset'` или `'latest-offset'` explicitly.
+
+### 7. JSON format с nested arrays — performance
+
+```sql
+properties MAP<STRING, STRING>  -- OK
+nested_arr ARRAY<ROW<a INT, b STRING>>  -- может быть slow для deep nesting
+```
+
+JSON deserialization для deeply nested types CPU-bound. Alternatives: Avro (schema-based, faster), Protobuf, format = 'raw' + manual parsing в UDF.
+
+### 8. Catalog confusion
+
+Default catalog = `default_catalog`, default database = `default_database`. Создав table без schema prefix — она в default catalog. После migrations легко потерять table в wrong catalog.
+
+**Fix**: всегда use full qualified names `catalog.database.table` в production scripts.
+
+---
+
+## Cheat sheet
+
+```
+CREATE TABLE [IF NOT EXISTS] [catalog.][database.]table_name (
+    column_name type [constraints],
+    column_name AS expression,                    -- computed
+    column_name type METADATA FROM 'key' [VIRTUAL], -- metadata
+    [PRIMARY KEY (cols) NOT ENFORCED,]
+    [WATERMARK FOR col AS col - INTERVAL 'n' UNIT]
+) [PARTITIONED BY (cols)]
+WITH (connector properties);
+
+Time attributes:
+    PROCTIME() — non-deterministic
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+
+Common connectors:
+    kafka           — append source/sink
+    upsert-kafka    — upsert source/sink с PK
+    filesystem      — Parquet/CSV/JSON files
+    jdbc            — RDBMS (Postgres/MySQL)
+    iceberg         — lakehouse
+    paimon          — lakehouse streaming-first
+    *-cdc           — Debezium-style CDC
+```
+
+---
+
+<KnowledgeCheck
+  question="DDL design for Kafka source: Kafka topic 'transactions' has JSON events with fields `tx_id`, `user_id`, `amount`, `ts` (Unix epoch milliseconds), and Kafka producer adds header `region`. Production stream has P99 out-of-orderness 8 seconds. Write complete CREATE TABLE statement с corretct time attributes, metadata extraction и production-grade settings."
+  answer="```sql\nCREATE TABLE transactions (\n    tx_id BIGINT,\n    user_id STRING,\n    amount DECIMAL(10, 2),\n    ts BIGINT,                                           -- raw epoch ms from JSON\n    event_time AS TO_TIMESTAMP_LTZ(ts, 3),               -- computed time attribute\n    -- Kafka metadata extraction:\n    record_partition INT METADATA FROM 'partition' VIRTUAL,\n    record_offset BIGINT METADATA FROM 'offset' VIRTUAL,\n    record_kafka_ts TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL,\n    record_headers MAP<STRING, BYTES> METADATA FROM 'headers' VIRTUAL,\n    -- Region extracted из header (cast bytes to string)\n    region AS CAST(record_headers['region'] AS STRING),\n    -- Watermark: P99=8s, add 50% safety margin = 12s\n    WATERMARK FOR event_time AS event_time - INTERVAL '12' SECOND\n) WITH (\n    'connector' = 'kafka',\n    'topic' = 'transactions',\n    'properties.bootstrap.servers' = 'kafka-1:9092,kafka-2:9092,kafka-3:9092',\n    'properties.group.id' = 'transactions-pipeline-v1',\n    'properties.isolation.level' = 'read_committed',     -- если upstream EOS\n    'scan.startup.mode' = 'earliest-offset',             -- explicit, не group-offsets\n    'format' = 'json',\n    'json.fail-on-missing-field' = 'false',\n    'json.ignore-parse-errors' = 'true',                 -- skip malformed events\n    'json.timestamp-format.standard' = 'ISO-8601'        -- если другие TIMESTAMP fields\n);\n```\n\n**Design rationale**: (1) **`ts BIGINT` + computed event_time**: raw Unix epoch storage потому что JSON formats преобразует epoch к LTZ через `TO_TIMESTAMP_LTZ(ts, 3)` precision=3 (ms). Direct TIMESTAMP в JSON requires ISO-8601 format которого нет. (2) **Watermark P99 + 50%**: measured P99 = 8s, add safety → 12s. Conservative — better miss few events as 'late' (use side output) чем lose data. (3) **TIMESTAMP_LTZ vs TIMESTAMP**: LTZ correct для UTC events across timezones — represents instant in time, not local civil time. Critical для multi-region pipelines. (4) **Metadata columns VIRTUAL**: read-only — не emit при INSERT INTO downstream. (5) **Header extraction**: Kafka headers MAP<STRING, BYTES> требует CAST к STRING для region. Alternatively use header в filter `WHERE record_headers['region'] = X.getBytes()`. (6) **isolation.level=read_committed**: если upstream producer пишет с EXACTLY_ONCE, consumer должен skip aborted transactions. (7) **scan.startup.mode='earliest-offset' explicit**: avoid implicit group-offsets behavior — for new pipeline group never committed, fallback to auto.offset.reset confusing. Production should explicit. (8) **ignore-parse-errors=true**: malformed JSON events (corruption, schema drift) logged but не crash pipeline. Trade-off: silently drops invalid events; instrument with metrics counter. (9) **3 bootstrap servers**: client-side resilience to broker failures. Подсказка для downstream: добавить `.process(LateRecordSideOutput)` после source для capture late events в separate stream — для analytics / replay."
+/>

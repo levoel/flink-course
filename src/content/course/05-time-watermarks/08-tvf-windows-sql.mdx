@@ -1,0 +1,493 @@
+---
+title: "TVF Windows в Table API/SQL: TUMBLE, HOP, CUMULATE, SESSION"
+description: "Table-Valued Function windows: TUMBLE, HOP, CUMULATE, SESSION (с 1.19). Рекомендуемый подход для Table API/SQL контекста. Differences с DataStream window API."
+order: 8
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["TVF Windows", "Table API", "SQL", "TUMBLE", "HOP", "CUMULATE", "SESSION"]
+---
+
+# TVF Windows: следующее поколение windowing в Table API/SQL
+
+Table-Valued Function (TVF) Windows — это **рекомендованный** способ windowing в Table API/SQL Flink (с 1.13). Они заменяют старый `GROUP BY TUMBLE(...)` синтаксис более выразительным API, который поддерживает window TVFs как обычные SQL operators — JOIN, aggregation, TopN.
+
+В этом уроке: TUMBLE, HOP (sliding), CUMULATE, SESSION (GA с 1.19), их state characteristics, и почему CUMULATE — answer to «sliding window slide=1min, size=24h».
+
+---
+
+## TVF synthax: window as SQL function
+
+### Старый GROUP BY синтаксис (deprecated)
+
+```sql
+SELECT
+    TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS w_start,
+    TUMBLE_END(event_time, INTERVAL '5' MINUTE) AS w_end,
+    SUM(amount)
+FROM orders
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE);
+```
+
+### TVF (recommended)
+
+```sql
+SELECT
+    window_start,
+    window_end,
+    SUM(amount)
+FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end;
+```
+
+**Чем лучше TVF**:
+- Window TVF — first-class table operation, можно использовать в FROM
+- Composable — можно chain с JOIN, OVER, TopN
+- Поддерживает offsets, multi-column partitioning
+- Consistent с SQL standard
+
+---
+
+## TUMBLE — fixed non-overlapping windows
+
+```sql
+SELECT
+    window_start,
+    window_end,
+    window_time,
+    user_id,
+    SUM(amount) AS total
+FROM TABLE(
+    TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES)
+)
+GROUP BY window_start, window_end, user_id;
+```
+
+**Параметры TUMBLE TVF**:
+- `data` — input table (positional or named)
+- `timecol` — `DESCRIPTOR(event_time)` — какая колонка contains event time
+- `size` — `INTERVAL` — длина окна
+- `offset` (optional) — смещение для timezone alignment
+
+### С offset
+
+```sql
+-- Дни выровнены по UTC+3 (Москва)
+TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '1' DAY, INTERVAL '-3' HOURS)
+```
+
+### Output columns
+
+Window TVF добавляет 3 колонки к row:
+
+| Column | Meaning |
+|---|---|
+| `window_start` | TIMESTAMP начало окна (inclusive) |
+| `window_end` | TIMESTAMP конец окна (exclusive) |
+| `window_time` | TIMESTAMP, equivalent windowEnd - 1ms (use для join, group, OVER) |
+
+`window_time` — special: это **row time** в контексте окна, используется в downstream operations (join по window).
+
+---
+
+## HOP — sliding windows
+
+```sql
+SELECT
+    window_start, window_end,
+    SUM(amount) AS rolling_avg
+FROM TABLE(
+    HOP(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES, INTERVAL '15' MINUTES)
+)
+GROUP BY window_start, window_end;
+```
+
+**Параметры**:
+- `slide` (3rd) — шаг сдвига (5 минут)
+- `size` (4th) — длина окна (15 минут)
+- `offset` (5th, optional)
+
+В этом примере: window 15 минут, sliding каждые 5 минут. Overlap ratio = 3.
+
+### State implications same as DataStream sliding
+
+Каждое событие в `size/slide` окон. Avoid `slide << size` patterns — state explodes.
+
+---
+
+## CUMULATE — answer to «running window» pattern
+
+**Это killer feature TVF Windows**. Решает classic anti-pattern «sliding window slide=1min, size=24h» более эффективно.
+
+```sql
+SELECT
+    window_start, window_end,
+    SUM(amount) AS cumulative_sum
+FROM TABLE(
+    CUMULATE(
+        TABLE orders,
+        DESCRIPTOR(event_time),
+        INTERVAL '1' MINUTE,    -- step
+        INTERVAL '24' HOURS     -- max size
+    )
+)
+GROUP BY window_start, window_end;
+```
+
+### Семантика CUMULATE
+
+<DiagramContainer title="CUMULATE window: rolling sum с reset" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Step 1 minute"
+        tooltip="Каждую минуту CUMULATE emit-ит intermediate result. window_start фиксированный (начало maxSize периода), window_end растёт."
+      >
+        Emit каждую минуту
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="window grows" />
+    <FlowRow>
+      <DataBox
+        label="00:00..00:01"
+        tooltip="Первая минута после reset. window_start=00:00, window_end=00:01. Emit sum за [00:00, 00:01)."
+      >
+        size = 1 min
+      </DataBox>
+      <DataBox
+        label="00:00..00:02"
+        tooltip="window_start = тот же 00:00, window_end растёт до 00:02. Sum накапливается."
+      >
+        size = 2 min
+      </DataBox>
+      <DataBox
+        label="00:00..23:59"
+        tooltip="Последняя минута maxSize. Sum за почти все 24 часа."
+      >
+        size = 1439 min
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="После maxSize — reset" />
+    <FlowRow>
+      <DataBox
+        label="24:00 — new window_start"
+        tooltip="После maxSize=24h Flink начинает новое CUMULATE окно. window_start=24:00. Старое окно closed. Это и есть 'rolling' semantic."
+      >
+        Reset к window_start = 24:00
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### State efficiency
+
+Внутри Flink CUMULATE использует **only one window state per (key, window_start)**, не N окон. Каждые stepSize минут — emit incremental result, не fresh aggregate.
+
+```
+HOP (15-min, 1-min slide):    1440 windows in state per key
+CUMULATE (24h max, 1-min step): 1 window in state per key (reset every 24h)
+```
+
+24h × 1k users × 1440 windows = 34.5M state entries для HOP.
+24h × 1k users × 1 window = 1k state entries для CUMULATE.
+
+**1440x state reduction**.
+
+### Use case: cumulative metrics
+
+Real-time dashboard «orders today», «revenue this hour», «active users this month» — все CUMULATE patterns:
+
+```sql
+-- Orders today (reset midnight)
+SELECT window_start, window_end, COUNT(*) AS orders_today
+FROM TABLE(CUMULATE(TABLE orders, DESCRIPTOR(event_time),
+                    INTERVAL '1' MINUTE, INTERVAL '1' DAY))
+GROUP BY window_start, window_end;
+
+-- Revenue this week (reset Monday)
+SELECT window_start, window_end, SUM(amount) AS revenue_this_week
+FROM TABLE(CUMULATE(TABLE orders, DESCRIPTOR(event_time),
+                    INTERVAL '1' HOUR, INTERVAL '7' DAYS))
+GROUP BY window_start, window_end;
+```
+
+---
+
+## SESSION TVF (с Flink 1.19)
+
+Session windows как TVF добавлены позже остальных — GA с 1.19. До этого приходилось использовать deprecated `SESSION(event_time, INTERVAL '30' MINUTES)` синтаксис.
+
+```sql
+SELECT
+    window_start, window_end,
+    user_id,
+    COUNT(*) AS events_in_session,
+    MAX(amount) AS max_amount
+FROM TABLE(
+    SESSION(TABLE orders PARTITION BY user_id, DESCRIPTOR(event_time), INTERVAL '30' MINUTES)
+)
+GROUP BY window_start, window_end, user_id;
+```
+
+**Особенности SESSION TVF**:
+- Требует `PARTITION BY` (session per partition column — typically user/entity)
+- `gap` параметр — INTERVAL duration без events до закрытия session
+- Window merging работает как в DataStream API
+
+---
+
+## Comparison таблица
+
+| TVF | Параметры | State | Use case |
+|---|---|---|---|
+| `TUMBLE` | size, offset | O(window) | Fixed-time aggregations |
+| `HOP` | slide, size, offset | O(window × overlap) | Moving averages |
+| `CUMULATE` | step, maxSize | O(1) per window | Rolling/running metrics |
+| `SESSION` | gap, partition | O(active sessions) | User session analysis |
+
+---
+
+## Window TVF + JOIN
+
+TVF windows можно join — каждый side window-ed independently, join по `window_start, window_end`:
+
+```sql
+SELECT
+    o.window_start, o.window_end,
+    o.user_id,
+    o.total_orders,
+    p.total_payments
+FROM (
+    SELECT window_start, window_end, user_id, SUM(amount) AS total_orders
+    FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES))
+    GROUP BY window_start, window_end, user_id
+) o
+JOIN (
+    SELECT window_start, window_end, user_id, SUM(amount) AS total_payments
+    FROM TABLE(TUMBLE(TABLE payments, DESCRIPTOR(event_time), INTERVAL '5' MINUTES))
+    GROUP BY window_start, window_end, user_id
+) p
+ON o.window_start = p.window_start
+   AND o.window_end = p.window_end
+   AND o.user_id = p.user_id;
+```
+
+### Window TopN
+
+```sql
+-- Top 3 users by orders per window
+SELECT *
+FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY window_start, window_end ORDER BY total DESC) AS rn
+    FROM (
+        SELECT window_start, window_end, user_id, SUM(amount) AS total
+        FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES))
+        GROUP BY window_start, window_end, user_id
+    )
+) WHERE rn <= 3;
+```
+
+Это **window-based TopN** — корректно работает с retract stream, EMIT после window closure.
+
+---
+
+## Watermark requirement
+
+TVF windows require **watermark** на input table. Это конфигурируется в CREATE TABLE:
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    event_time TIMESTAMP(3),
+    WATERMARK FOR event_time AS event_time - INTERVAL '20' SECONDS
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'format' = 'json',
+    'scan.startup.mode' = 'earliest-offset'
+);
+```
+
+`WATERMARK FOR event_time AS event_time - INTERVAL '20' SECONDS` эквивалентно `forBoundedOutOfOrderness(Duration.ofSeconds(20))` в DataStream API.
+
+### Idle source в SQL
+
+```sql
+-- Per-table idleness
+SELECT ... FROM orders /*+ OPTIONS('scan.watermark.idle-timeout' = '1 min') */
+```
+
+или global:
+
+```sql
+SET 'table.exec.source.idle-timeout' = '1 min';
+```
+
+---
+
+## Allowed lateness в SQL
+
+```sql
+-- Допустить late events до 5 минут после window close
+SET 'table.exec.emit.late-fire.enabled' = 'true';
+SET 'table.exec.emit.late-fire.delay' = '0';
+SET 'table.exec.emit.allow-lateness' = '5 min';
+```
+
+И для side output late events — пока не GA в SQL, нужно делать через DataStream API (catch dropped late records).
+
+---
+
+## TVF Windows vs DataStream API
+
+| Feature | DataStream API | TVF Windows (SQL) |
+|---|---|---|
+| Tumbling | `TumblingEventTimeWindows.of(...)` | `TUMBLE(...)` |
+| Sliding | `SlidingEventTimeWindows.of(...)` | `HOP(...)` |
+| Session | `EventTimeSessionWindows.withGap(...)` | `SESSION(...)` (1.19+) |
+| Cumulative | Не нативно, через custom | `CUMULATE(...)` (built-in!) |
+| Custom triggers | `.trigger(...)` | Limited, через config |
+| Evictors | `.evictor(...)` | Нет |
+| Allowed lateness | `.allowedLateness(...)` | `table.exec.emit.allow-lateness` |
+| Side output | `.sideOutputLateData(...)` | Через DataStream API |
+| Window joins | Manual | Built-in (window_start, window_end) |
+| Window TopN | Manual | ROW_NUMBER() OVER |
+
+**Когда что использовать**:
+- **TVF Windows** — declarative analytics, SQL pipelines, простые aggregations + joins + TopN
+- **DataStream API** — custom logic, triggers, evictors, complex state per window
+
+---
+
+## Performance: incremental aggregation
+
+TVF Windows автоматически выбирают **incremental aggregation** где возможно. SUM, COUNT, AVG, MIN, MAX — incremental. Custom UDAF может быть incremental или not (depends on implementation).
+
+```sql
+-- Incremental (быстро, low state)
+SELECT window_start, SUM(amount), COUNT(*) FROM TABLE(TUMBLE(...)) GROUP BY window_start;
+
+-- Non-incremental (медленно, large state)
+SELECT window_start, COLLECT(payload) FROM TABLE(TUMBLE(...)) GROUP BY window_start;
+```
+
+`COLLECT` хранит все raw payloads — anti-pattern для большинства cases.
+
+---
+
+## Migration: GROUP BY TUMBLE → TVF
+
+### Старый код
+
+```sql
+SELECT
+    TUMBLE_START(event_time, INTERVAL '5' MINUTE) AS w_start,
+    TUMBLE_END(event_time, INTERVAL '5' MINUTE) AS w_end,
+    user_id,
+    SUM(amount) AS total
+FROM orders
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE), user_id;
+```
+
+### Новый код
+
+```sql
+SELECT
+    window_start AS w_start,
+    window_end AS w_end,
+    user_id,
+    SUM(amount) AS total
+FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(event_time), INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end, user_id;
+```
+
+Same semantics, новый syntax. Подсветка ошибок лучше, optimization более продвинут.
+
+---
+
+## Production gotchas
+
+### 1. TVF requires watermark
+
+Без `WATERMARK FOR ... AS ...` в CREATE TABLE — TVF не работает (errors at plan time). Convert nullable timestamp в `TIMESTAMP(3)` строго.
+
+### 2. `window_time` для downstream
+
+После TVF используйте `window_time` для row time в дальнейших time-based operations:
+
+```sql
+-- ✅ window_time как row time
+SELECT * FROM (
+    SELECT window_start, window_end, window_time, user_id, SUM(amount) AS total
+    FROM TABLE(TUMBLE(...))
+    GROUP BY window_start, window_end, window_time, user_id
+)
+WINDOW w AS (PARTITION BY user_id ORDER BY window_time ...);
+```
+
+### 3. SESSION TVF — partition required
+
+`SESSION` обязательно требует `PARTITION BY` в TVF call. Иначе compilation error.
+
+### 4. CUMULATE step > maxSize — bug
+
+```sql
+-- ❌ step > maxSize — что значит?
+CUMULATE(..., INTERVAL '1' HOUR, INTERVAL '30' MINUTES)
+```
+
+Это compilation error. step ≤ maxSize required.
+
+### 5. Mixing TVF и legacy syntax
+
+В одной job можно использовать оба, но **не mix в одном query**. Either use legacy `GROUP BY TUMBLE` consistently или TVF — не пол-на-пол.
+
+### 6. State backend для TVF — same как DataStream
+
+TVF windows используют тот же state backend (RocksDB/ForSt). Same tuning rules: state size, checkpoint config, allowed lateness — все matter.
+
+### 7. CUMULATE rolling reset boundaries
+
+CUMULATE «обнуляется» каждые maxSize. Boundary = `window_start + maxSize`. Если ваш «день» определяется иначе (например, Friday 9am — Friday 9am следующей недели), используйте `offset` параметр:
+
+```sql
+-- Day starts at 9am UTC
+CUMULATE(TABLE orders, DESCRIPTOR(event_time),
+         INTERVAL '1' MINUTE, INTERVAL '1' DAY, INTERVAL '9' HOURS)
+```
+
+---
+
+## Cheat sheet
+
+```sql
+-- TUMBLE (fixed)
+SELECT window_start, window_end, SUM(x)
+FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(ts), INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end;
+
+-- HOP (sliding)
+SELECT window_start, window_end, SUM(x)
+FROM TABLE(HOP(TABLE t, DESCRIPTOR(ts), INTERVAL '1' MINUTE, INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end;
+
+-- CUMULATE (running)
+SELECT window_start, window_end, SUM(x)
+FROM TABLE(CUMULATE(TABLE t, DESCRIPTOR(ts), INTERVAL '1' MINUTE, INTERVAL '1' DAY))
+GROUP BY window_start, window_end;
+
+-- SESSION (per partition, 1.19+)
+SELECT window_start, window_end, user_id, SUM(x)
+FROM TABLE(SESSION(TABLE t PARTITION BY user_id, DESCRIPTOR(ts), INTERVAL '30' MINUTES))
+GROUP BY window_start, window_end, user_id;
+```
+
+---
+
+<KnowledgeCheck
+  question="Дизайн SQL pipeline для real-time analytics: 'orders в этот час', 'orders сегодня', 'unique active users в последние 5 минут (rolling)'. На 1M events/sec, 1M unique users. Что выбрать для каждой метрики и почему?"
+  answer="Каждая метрика maps на разный TVF window: (1) 'orders в этот час' — TUMBLE с size = 1 HOUR, offset = 0. State = 1 window per (hour, user_id), reset каждый час. Стандартный pattern, low state. ```sql SELECT window_start, window_end, COUNT(*) FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(ts), INTERVAL '1' HOUR)) GROUP BY window_start, window_end ``` Emit happens once per hour when watermark crosses boundary. Если нужны intermediate updates within hour — добавить early firing через config table.exec.emit.early-fire.enabled. (2) 'orders сегодня' — это CUMULATE. Размер = 1 DAY, step = 1 MINUTE (или 10 SEC, в зависимости от business latency). Reset каждые 24 часа в midnight (или через offset для timezone). State = 1 window per (day, user_id) — efficient. ```sql SELECT window_start, window_end, COUNT(*) FROM TABLE(CUMULATE(TABLE orders, DESCRIPTOR(ts), INTERVAL '1' MINUTE, INTERVAL '1' DAY)) GROUP BY window_start, window_end ``` Альтернатива через HOP (size=24h, slide=1min) — но это 1440 windows в state per key, vs 1 в CUMULATE. CUMULATE 1440x более эффективен. (3) 'unique active users в последние 5 минут (rolling)' — это NOT TUMBLE (это rolling, не fixed bucket). Это HOP (sliding) с size = 5 MINUTES, slide = X. Choice slide зависит от update latency: slide=1min → 5 windows per event, slide=10sec → 30 windows per event. Lower slide = больше state, более smooth updates. Trade-off: '1M users × 5 windows × ~16 bytes (user_id approx)' = 80MB peak state per slide. ```sql SELECT window_start, window_end, COUNT(DISTINCT user_id) FROM TABLE(HOP(TABLE orders, DESCRIPTOR(ts), INTERVAL '1' MINUTE, INTERVAL '5' MINUTES)) GROUP BY window_start, window_end ``` Note: COUNT(DISTINCT) state-heavy — Flink использует MapState<user_id, count> per window. На 1M unique users × 5 windows = 5M MapState entries. RocksDB OK, heap state OOM. Optionally use HyperLogLog approximate count для bounded state. Дополнительные considerations: (a) Watermark setup — все три метрики используют same WATERMARK clause в CREATE TABLE; должна быть consistent (например, event_time - INTERVAL '30' SECONDS); (b) State backend RocksDB или ForSt — на 1M events/sec definitely не heap; (c) Late events handling — table.exec.emit.allow-lateness = '5 min' для toleration; (d) Side output для late через DataStream conversion — sink в DLQ; (e) Output sink — для real-time dashboard ClickHouse / Druid через KafkaSink upsert; (f) Test backfill сценарий — для historical reload использовать SET 'table.exec.source.idle-timeout' = '1 min' иначе stuck на dead partitions; (g) Если для COUNT(DISTINCT) точность не critical — заменить на HLL UDF, state снижается в 100-1000x."
+/>

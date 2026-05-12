@@ -1,0 +1,238 @@
+---
+title: "JobManager: Dispatcher, ResourceManager, JobMaster"
+description: "Внутренние компоненты JobManager — три отдельных сервиса с разной зоной ответственности. HA через ZooKeeper / K8s ConfigMap, leader election."
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["JobManager", "Dispatcher", "ResourceManager", "JobMaster", "HA", "Leader Election"]
+---
+
+# JobManager: Dispatcher, ResourceManager, JobMaster
+
+JobManager — это не один сервис, а **три внутренних компонента** в одном JVM-процессе, каждый со своей зоной ответственности и жизненным циклом. Эта декомпозиция — не academic detail, а ключ к пониманию HA, application mode и того, что произойдёт, когда умрёт лидер кластера.
+
+В этом уроке препарируем JobManager на Dispatcher (REST-фасад кластера), ResourceManager (распределение slots), JobMaster (lifecycle per job), и разберём HA через ZooKeeper и Kubernetes ConfigMap.
+
+---
+
+## Зачем три компонента, а не один
+
+Изначально (Flink 1.0–1.4) JobManager был монолитом. С 1.5 (FLIP-6) его разделили — это позволило поддерживать одновременно multiple jobs, гибко эмбедить ResourceManager под разные cluster managers (Standalone / YARN / K8s), и сделать HA semantics чище: при leader change новый Dispatcher восстанавливает submitted jobs из persistent storage, ResourceManager поднимается отдельно, JobMaster каждой job восстанавливается из последнего checkpoint.
+
+<DiagramContainer title="Анатомия JobManager" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="JobManager JVM"
+        tooltip="Один процесс, три сервиса. Все слушают RPC через одну Akka/Pekko ActorSystem, но имеют независимые сервис-интерфейсы и lifecycle. В HA setup leader election происходит per-сервис, но обычно все три на одном leader-е."
+      >
+        flink-jobmanager pod
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Dispatcher"
+        tooltip="REST-фасад кластера. Принимает submissions через /jobs/upload + /jobs/run, хранит JobGraph в persistent storage (для HA), стартует JobMaster per accepted job. Один Dispatcher на cluster. Слушает порт 8081."
+      >
+        REST API + submissions
+      </DataBox>
+      <DataBox
+        label="ResourceManager"
+        tooltip="Управляет slots. Один на cluster. В Standalone — registers existing TaskManagers. В Kubernetes Native — общается с K8s API для запроса новых TaskManager-pod-ов под нагрузкой. В YARN — запрашивает containers через AM-RM protocol."
+      >
+        slot allocation
+      </DataBox>
+      <DataBox
+        label="JobMaster (×N)"
+        tooltip="Один на каждый running job. Держит ExecutionGraph, координирует checkpoints через CheckpointCoordinator, обрабатывает failures и rescheduling. Запрашивает slots у ResourceManager, deploy-ит tasks на TaskManagers через TaskExecutorGateway."
+      >
+        per-job lifecycle
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="RPC" />
+    <FlowRow>
+      <DataBox
+        label="HA Services"
+        tooltip="ZooKeeperHaServices или KubernetesHaServices. Хранят: leader pointers (кто текущий лидер), JobGraphs (для restart), submitted JobResults, checkpoint metadata pointers. Без HA Services persisted state теряется при рестарте JobManager."
+      >
+        leader election + persistence
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Dispatcher: фасад кластера
+
+Dispatcher — то, с чем общается `flink` CLI и Web UI. Он принимает JobGraph (сериализованный результат компиляции вашего main-метода) и инициирует его исполнение. Важные обязанности:
+
+1. **Приём submissions** — REST `/jars/upload` загружает JAR, `/jars/{jarid}/run` компилирует main → JobGraph → запускает.
+2. **Persistence** — JobGraph пишется в `high-availability.storageDir` (S3/HDFS) с metadata-пойнтером в ZK/K8s ConfigMap. Если Dispatcher умирает, новый лидер читает JobGraph из storage и поднимает JobMaster заново.
+3. **Cluster-wide REST** — `/jobs`, `/jobs/{id}/checkpoints`, `/jobs/{id}/savepoints`, `/jobs/{id}/yarn-cancel` и так далее.
+4. **Job retention** — после завершения job (FINISHED/CANCELED/FAILED) Dispatcher хранит execution graph store до `jobstore.expiration-time` для post-mortem анализа.
+
+Один Dispatcher на cluster (в Application mode — один на cluster и одна job, в Session mode — один на много jobs).
+
+```bash
+# Dispatcher endpoints
+curl http://jobmanager:8081/overview
+curl http://jobmanager:8081/jobs
+curl http://jobmanager:8081/jobs/<jobId>/checkpoints
+```
+
+---
+
+## ResourceManager: учёт slots
+
+Один ResourceManager на cluster. Его роль — abstraction над тем, как Flink получает compute-ресурсы:
+
+| Cluster type | Implementation | Поведение |
+|---|---|---|
+| Standalone | `StandaloneResourceManager` | Регистрирует уже запущенные TaskManager-ы. Не может создавать новые. |
+| Kubernetes Native | `KubernetesResourceManager` | Создаёт новые TM-pod-ы через K8s API при нехватке slots. Удаляет idle pod-ы по `slotmanager.taskmanager-timeout`. |
+| YARN | `YarnResourceManager` | Запрашивает containers через AM-RM protocol, релизит unused. |
+
+JobMaster при старте просит у ResourceManager-а N slots (по parallelism job-а). Если slots не хватает:
+
+- **Standalone**: job ждёт `slot.request.timeout` (default 5 min), потом FAILED.
+- **K8s Native / YARN**: ResourceManager инициирует pending allocation, поднимает дополнительные TaskManager-ы.
+
+```yaml
+# Adaptive Scheduler + reactive K8s
+jobmanager.scheduler: adaptive
+slot.request.timeout: 5min
+slotmanager.taskmanager-timeout: 30s     # idle TM удаляется через 30с
+kubernetes.taskmanager.cpu: 2.0
+kubernetes.taskmanager.memory: 4096m
+```
+
+ResourceManager также управляет **slot pool** per-JobMaster — кэш предложенных slots, чтобы при minor failure не запрашивать заново.
+
+<Callout type="note">
+В Application mode JobManager pod-а имеет один Dispatcher, один ResourceManager и один JobMaster (для единственной job этой application). В Session mode тот же Dispatcher и ResourceManager обслуживают много параллельных JobMaster-ов.
+</Callout>
+
+---
+
+## JobMaster: lifecycle одной job
+
+JobMaster — самое сложное из трёх. Один JobMaster на каждый running job. Что внутри:
+
+<DiagramContainer title="JobMaster внутри" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="ExecutionGraph"
+        tooltip="Распараллеленный JobGraph. Каждый node JobGraph-а раскрывается в N ExecutionVertex (по parallelism). JobMaster держит этот граф как source of truth для текущего состояния job — какие subtasks RUNNING/FINISHED/FAILED."
+      >
+        4-й уровень graph
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Scheduler"
+        tooltip="Default Scheduler — pipelined, allocates slots upfront. Adaptive Scheduler (FLIP-160) — для elastic scaling, может пересоздать ExecutionGraph при изменении доступных slots. Adaptive Batch Scheduler — для bounded jobs с post-completion optimization."
+      >
+        DefaultScheduler / AdaptiveScheduler
+      </DataBox>
+      <DataBox
+        label="SlotPool"
+        tooltip="Кеш slots, выделенных JobMaster-у. При rescaling или recovery slot pool помнит предыдущие выделения для preferred allocation (local recovery). При завершении job pool возвращает slots в ResourceManager."
+      >
+        кэш slot allocations
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="CheckpointCoordinator"
+        tooltip="Триггерит барьеры на source operators каждые execution.checkpointing.interval. Собирает ACK от всех tasks. Хранит метаданные в _metadata файле checkpoint-а. При успехе вызывает notifyCheckpointComplete на committers (для 2PC). При failure инициирует restart."
+      >
+        ABS-алгоритм триггер
+      </DataBox>
+      <DataBox
+        label="FailoverStrategy"
+        tooltip="Region-based failover (default): при сбое subtask-а перезапускается только его failover region, а не весь job. Pipelined region = граница shuffle. Реализация — RestartPipelinedRegionFailoverStrategy."
+      >
+        Pipelined Region restart
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+В обычном lifecycle JobMaster проходит фазы: CREATED → RUNNING → (CANCELLING|FAILING) → (FINISHED|CANCELED|FAILED). RUNNING — состояние, в котором JobMaster ждёт сигналов от tasks и периодически триггерит checkpoints. Деплой tasks на TaskManager-ы JobMaster делает через RPC `TaskExecutorGateway.submitTask(TaskDeploymentDescriptor)` — TDD содержит сериализованный код task-а, его inputs/outputs и slot id.
+
+---
+
+## HA через ZooKeeper и Kubernetes ConfigMap
+
+Без HA Services рестарт JobManager означает потерю всех submitted jobs (Dispatcher не помнит JobGraphs). HA Services решают это через persistent state в ZK или K8s.
+
+### ZooKeeperHaServices
+
+Используется в bare-metal / VM / Hadoop окружениях:
+
+```yaml
+high-availability.type: zookeeper
+high-availability.zookeeper.quorum: zk1:2181,zk2:2181,zk3:2181
+high-availability.zookeeper.path.root: /flink
+high-availability.storageDir: s3://my-bucket/flink-ha
+high-availability.cluster-id: production-cluster
+```
+
+ZK хранит **только pointers**: пути к JobGraph blob-ам в S3, идентификатор текущего leader-а, latest checkpoint pointer. Большие объекты — в `storageDir`. Это позволяет ZK-ноды держать малыми (znode limit 1MB).
+
+### KubernetesHaServices
+
+С Flink 1.12+ HA можно делать без ZK через K8s native ConfigMaps:
+
+```yaml
+high-availability.type: kubernetes
+high-availability.storageDir: s3://my-bucket/flink-ha
+kubernetes.cluster-id: production-cluster
+```
+
+K8s ConfigMap содержит leader info + JobGraph pointers, persistent storage в S3 для blob-ов. Leader election — через K8s lease mechanism. Это снимает зависимость от ZK для cloud-native deployments — типичный setup для Flink Kubernetes Operator.
+
+### Leader election
+
+При старте каждый JobManager pod пытается стать лидером:
+
+1. **ZK**: запись в ephemeral znode `/leader/dispatcher` с lock. Кто первый — тот лидер. При смерти ephemeral znode исчезает, kикdaster кто-то другой триггерит resubscribe и захватывает lock.
+2. **K8s**: каждый pod пытается update ConfigMap с annotation `leader=<pod-id>` через optimistic lock. Lease (renew раз в N секунд) гарантирует, что dead pod не блокирует election.
+
+Leader election происходит отдельно для каждого сервиса: Dispatcher leader, ResourceManager leader, per-JobMaster leader. Обычно они на одном pod-е, но логически независимы.
+
+---
+
+## Что значит «JobManager умер»
+
+| Сценарий | Что происходит |
+|---|---|
+| **Без HA** | Все running jobs FAIL. State lost (если checkpoint dir не на DFS). Cluster нужно поднимать руками. |
+| **С HA, ZK/K8s leader change** | Standby JM становится leader через 5-20 сек. Восстанавливает JobGraphs из storage. JobMaster каждой job стартует, читает latest checkpoint, deploy-ит tasks на оставшиеся TM-ы. TM-ы переключают connection на новый JM. |
+| **TaskManager умер** | JobMaster детектит через heartbeat timeout (default 50s). Все subtasks на этом TM перешли в FAILED. Failover triggered — restart pipelined region. State recovered из last checkpoint. |
+| **Dispatcher умер, JobMaster жив** | Dispatcher не critical для running jobs — JobMaster продолжает работать, общается с ResourceManager напрямую. Новые submissions блокируются до восстановления Dispatcher. |
+
+<Callout type="warning">
+**Важный gotcha**: heartbeat timeout default 50 сек — это значит при transient network glitch (10-30 сек) job выживает, но TM считается мёртвым после 50с. На K8s с graceful termination и rolling updates стоит уменьшить `heartbeat.timeout` до 30 секунд, иначе rolling restart TM-ов вызовет десятки restart-ов pipeline.
+</Callout>
+
+---
+
+## Production gotchas
+
+- **Dispatcher не масштабируется** — один сервис на cluster. Если у вас 1000+ jobs в Session mode, узким местом будет Dispatcher REST endpoint, не TaskManagers. Решение — Application mode или несколько Session clusters.
+- **ResourceManager на K8s медленный** — поднятие нового TM-pod-а занимает 10-60 секунд (image pull, JVM startup). Если parallelism job > available slots, job может ждать минуты. Pre-warm TM-ов через `kubernetes.jobmanager.replicas` + `slotmanager.number-of-slots.min`.
+- **Cluster-id collision** — два разных Flink cluster с одним `high-availability.cluster-id` в одном ZK/K8s namespace будут конфликтовать за leadership и потеряют state. Всегда уникальный `cluster-id` per environment.
+- **HA storage permissions** — JobManager pod должен иметь write access к `storageDir`. На K8s это IRSA / Workload Identity, не credentials в env. После recovery права на чтение existing blob-ов критичны.
+
+---
+
+<KnowledgeCheck
+  question="JobManager в HA mode внезапно становится unreachable из-за network partition. У вас 3 standby JobManager pod-а в Kubernetes. Опишите, что происходит со 100 running jobs и почему ResourceManager + Dispatcher могут переключиться на разных лидеров."
+  answer="При network partition бывший leader через несколько секунд теряет lease в KubernetesHaServices ConfigMap. Один из standby pod-ов выигрывает leader election на этом ConfigMap. ВАЖНО: leader election происходит отдельно для каждого сервиса (Dispatcher, ResourceManager, и per-JobMaster). Это значит, что в теории Dispatcher leader может быть pod-A, ResourceManager leader — pod-B, а отдельные JobMaster leaders — разбросаны по разным pod-ам. На практике K8s lease обновляется почти одновременно, поэтому обычно все три сервиса попадают на один pod, но не гарантировано. Для 100 running jobs: новый Dispatcher читает JobGraph blob-ы из storageDir (S3), стартует JobMaster per job, каждый JobMaster читает latest checkpoint pointer из ConfigMap, запрашивает slots у нового ResourceManager-а, deploy-ит tasks на оставшиеся TaskManager-ы, которые переоткрывают connection на нового JM. TaskManager-ы за время recovery (5-20s) детектируют пропавший JM через heartbeat и инициируют reconnect, restoring state с последнего checkpoint. Если в HA storage были несогласованные данные между сервисами, можно получить split state — рекомендуется fence quorum и читать checkpoint pointers atomically."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/02-stateful-microservice",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-02",
+    "description": "Quiz for stateful microservice pattern"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-02-q1",
+      "type": "multiple-choice",
+      "question": "Stateful microservice на Flink vs traditional REST + DB: какое фундаментальное архитектурное преимущество?",
+      "options": [
+        { "id": "a", "text": "Flink быстрее Postgres на reads" },
+        { "id": "b", "text": "State IS the database — single-writer per aggregate root через keyBy, нет race conditions / distributed locks, full audit log из коробки (event log), replay capability из любой точки прошлого, EOS без 2PC между сервисом и БД" },
+        { "id": "c", "text": "Не нужны микросервисы вообще" },
+        { "id": "d", "text": "Это только в Java, не Python" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Ключевой shift: state живёт внутри Flink operator (ValueState/MapState), single-threaded per key через keyBy(aggregateId). Никаких optimistic locks, никаких distributed transactions между app и DB. Event log (Kafka) — natively append-only, full audit. Replay через savepoint + earliest offset. Это event-sourcing + CQRS, реализованные напрямую на streaming engine. Trade-off: requires team familiar с event-sourcing, schema evolution discipline, и not suitable для простых CRUD.",
+      "studyHint": "Повторите урок 02 — раздел 'Архитектурный сдвиг'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-02-q2",
+      "type": "multiple-choice",
+      "question": "Idempotency в command processing — зачем нужна и как реализована?",
+      "options": [
+        { "id": "a", "text": "Не нужна, Kafka гарантирует exactly-once" },
+        { "id": "b", "text": "Производство гарантирует at-least-once от client → Kafka → Flink, duplicate commands возможны (retry клиента). MapState<requestId, ts> с TTL отсеивает дубли. Без этого retry → 2 заказа" },
+        { "id": "c", "text": "Используется UUID primary key" },
+        { "id": "d", "text": "Через distributed lock" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production realities: between client → API gateway → Kafka producer, retries неизбежны. Один user click → potentially N duplicate PlaceOrder commands. Solution: каждый command имеет request_id (UUID). Flink держит MapState<String, Long> processedCommands с TTL (24h обычно достаточно). On processElement: if (processedCommands.contains(cmd.requestId())) return. Без этого business logic выполняется N раз — 2 orders, 2 charges. Это применимо ко всем event-driven patterns, не только Flink.",
+      "studyHint": "Повторите урок 02 — раздел 'ProcessFunction как aggregate root'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-02-q3",
+      "type": "multiple-choice",
+      "question": "Replay capability event-sourced Flink service — что нужно для корректной работы?",
+      "options": [
+        { "id": "a", "text": "Только savepoint и Kafka offsets reset" },
+        { "id": "b", "text": "Events должны меняться по правилам compatibility (Avro/Protobuf schemas, no semantic-breaking changes). Replay over старых v1 events требует upcasting в коде consumer-а. Это design constraint event-sourced систем. Без discipline — replay даёт incorrect results" },
+        { "id": "c", "text": "Достаточно immutable событий" },
+        { "id": "d", "text": "Replay работает always — это магия Flink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Events живут в Kafka долго (месяцы-годы). Code меняется чаще (deploys daily). Если OrderPlaced v1 имеет поле `total`, в v2 — `subtotal + tax + shipping`, replay over v1 events с new code требует, чтобы consumer correctly upcast v1 → v2 (либо derive missing fields, либо handle absence). Это design discipline: (1) Avro/Protobuf для schema; (2) backward compatibility rules — only add optional fields, never remove/rename; (3) versioning explicit; (4) upcasting logic в deserialization layer.",
+      "studyHint": "Повторите урок 02 — раздел 'Replay capability'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-02-q4",
+      "type": "true-false",
+      "question": "Stateful microservice pattern на Flink уместен для всех use cases, включая простой CRUD над сущностями.",
+      "correctAnswer": false,
+      "explanation": "Anti-pattern. Stateful Flink — large architectural decision, требует команду которая понимает event-sourcing, CQRS, schema evolution. Для простых CRUD (создать запись, прочитать, обновить, удалить) — traditional REST + Postgres. Stateful Flink оправдан для core domain critical state machines (orders, payments, fraud, IoT shadows), не для каждой таблицы. Overengineering — реальная цена ошибки.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

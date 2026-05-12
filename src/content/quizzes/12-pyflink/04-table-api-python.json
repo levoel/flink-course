@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "12-pyflink/04-table-api-python",
+  "moduleId": "12-pyflink",
+  "_meta": {
+    "idPrefix": "flink-m12-04",
+    "description": "Table API в Python, parity с Java, SQL"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-04-q1",
+      "type": "multiple-choice",
+      "question": "Почему PyFlink Table API имеет first-class parity с Java, в отличие от DataStream API?",
+      "options": [
+        { "id": "a", "text": "Table API проще реализовать" },
+        { "id": "b", "text": "Под капотом Table API работает на JVM: Apache Calcite parser → logical plan → optimizer → physical plan → code generation → DataStream graph execution. Python — thin wrapper через Py4J. Python только submits SQL strings и собирает results. Runtime processing — JVM bytecode с native Flink performance (~100% Java baseline). Python в hot path только если используются Python UDFs внутри SQL" },
+        { "id": "c", "text": "Table API использует Python natively" },
+        { "id": "d", "text": "Это маркетинговая стратегия" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Table API architecture: SQL string parsed Apache Calcite (Java) → AST → logical plan → rule-based optimizer applies optimizations (predicate pushdown, projection pruning, join reordering) → physical plan → code generation (generates Java bytecode на runtime для row processing) → DataStream graph submitted к execution. Все steps — JVM. Python TableEnvironment — Py4J wrapper, calls equivalent Java TableEnvironment methods. `t_env.execute_sql('INSERT INTO sink SELECT ...')` — Python passes string к JVM, JVM handles everything. **No Python в data path** (unless Python UDFs invoked, then только для that UDF). Performance equivalent Java Table API. **DataStream API в Python different**: each transformation has Python callback (map function), even simple operations require Python execution. Process mode adds IPC overhead, thread mode adds GIL contention. **Implication for choice**: для majority production use cases — Table API recommended (SQL declarative, easier to maintain, full performance). DataStream Python только когда нужны low-level operations (custom keyed state with complex logic, timers, side outputs).",
+      "studyHint": "Повторите урок 04 — секцию 'Performance: Python vs Java Table API' с diagram",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m12-04-q2",
+      "type": "multiple-choice",
+      "question": "Streaming join без `table.exec.state.ttl` — какая проблема в production?",
+      "options": [
+        { "id": "a", "text": "Никаких проблем" },
+        { "id": "b", "text": "Regular join (`SELECT * FROM orders JOIN refunds ON ...`) требует unbounded state — Flink хранит ВСЕ orders и refunds для potential future matches. Без TTL state grows infinitely, eventually OOM или checkpoint timeout. Production fix: `SET table.exec.state.ttl = '7 day'` — automatically cleans up state older than threshold. Interval joins (`BETWEEN ... INTERVAL`) имеют implicit TTL based на interval, безопаснее" },
+        { "id": "c", "text": "Joins работают только batch mode" },
+        { "id": "d", "text": "Только Iceberg sinks affected" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Streaming join semantics: regular SQL join `FROM A JOIN B ON A.id = B.id` без time constraints — Flink must maintain state для both A и B indefinitely, потому что future record from A might join with current B record (или vice versa). Без cleanup state grows монотонно. **Failure modes**: (1) **OOM**: RocksDB state на disk grows, eventually fills. Or heap state OOM. (2) **Checkpoint timeout**: large state takes long to snapshot, checkpoint timeout (default 10 min) → checkpoint failures → job restarts. (3) **Recovery time**: на recovery, multi-GB state restoration takes hours. **Fix**: `SET table.exec.state.ttl = '7 day'` — Flink automatically expires state older than 7 days. Trade-off: late events (>7d after partner record) won't join. Acceptable для most use cases. **Better alternatives**: (1) **Interval join**: `WHERE A.event_time BETWEEN B.event_time - INTERVAL '1' HOUR AND B.event_time + INTERVAL '1' HOUR` — implicit state retention = interval length. Safe by design. (2) **Lookup join** (temporal): `JOIN reference_table FOR SYSTEM_TIME AS OF A.event_time` — no state accumulation, just lookup at event time. (3) **Aggregate before join** — reduce data through aggregation/window первый. **Production rule**: ALWAYS set `table.exec.state.ttl` для streaming jobs unless explicit reason. Monitor `flink_taskmanager_job_task_operator_KeyedStateBackendMemoryUsed` for state growth detection.",
+      "studyHint": "Повторите урок 04 — Production gotchas, state retention",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m12-04-q3",
+      "type": "multiple-choice",
+      "question": "Когда выбирать PyFlink Table API vs PyFlink DataStream vs Java DataStream?",
+      "options": [
+        { "id": "a", "text": "Всегда Java" },
+        { "id": "b", "text": "**PyFlink Table API**: ETL declarative (CDC → aggregation → sink), schema-driven processing, SQL-expressible logic, Python team. Native Java performance through JVM execution. **PyFlink DataStream**: custom keyed state с complex logic, custom timers, side outputs, when SQL не expressive enough. Performance trade-offs based on mode (process/thread/pandas/async). **Java DataStream**: throughput > 100k events/sec/subtask с stateful, latency-critical (<50ms p99), FlinkCEP needed, DataStream V2 features (FLIP-409), custom connectors не available в PyFlink" },
+        { "id": "c", "text": "Только Python всегда" },
+        { "id": "d", "text": "Они interchangeable" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Decision matrix detailed: **PyFlink Table API** — ideal для (1) ETL streaming SQL-expressible: CDC → window aggregation → Iceberg/Paimon sink. (2) Schema-driven workflows: CREATE TABLE + INSERT INTO SELECT. (3) Joining streams with reference data (lookup joins, temporal joins). (4) When data team is Python-first, не deep Java expertise. Performance: ~100% Java baseline (JVM execution under hood). **PyFlink DataStream** — needed когда (1) Custom keyed state machine с complex per-key logic не expressible в SQL (multi-step fraud detection, state-based business rules). (2) Custom event-time timers с specific scheduling. (3) Side outputs с custom routing. (4) Connect two unrelated streams с custom co-processing logic. Performance: process mode ~30-50%, thread mode ~70-90%, pandas UDF ~90-95% Java. **Java DataStream** — choose when (1) High throughput >100k events/sec/subtask с stateful processing — Python overhead в state ops compounds. (2) Latency-critical <50ms p99 — Python tooling adds even в thread mode small overhead. (3) FlinkCEP for complex event patterns — Java only. (4) DataStream V2 (FLIP-409) features — Java only. (5) Custom connectors implementing FLIP-27 Source API or SinkV2 — must be Java currently. (6) Operating teams have strong Java expertise. **Hybrid pattern**: Java для high-throughput state-heavy processing, output features to Kafka, PyFlink для ML inference на features. Two jobs, two deployments, each optimized.",
+      "studyHint": "Повторите урок 04 — секцию 'Когда выбирать Table API vs DataStream'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-04-q4",
+      "type": "true-false",
+      "question": "Все Java connectors (Kafka, JDBC, Iceberg, Paimon, CDC, Hive, Elasticsearch) доступны в PyFlink Table API через CREATE TABLE DDL без необходимости Python wrappers — connectors реализованы как JAR'ы, PyFlink использует их через JVM.",
+      "correctAnswer": true,
+      "explanation": "Flink connector architecture: каждый connector — Java implementation packaged as JAR (flink-connector-kafka, flink-connector-jdbc, flink-connector-iceberg, etc.). Connector регистрируется через Java SPI (Service Provider Interface) — `META-INF/services/org.apache.flink.table.factories.DynamicTableFactory` файл. На CREATE TABLE с `'connector' = 'name'` Flink looks up factory by name, instantiates source/sink. **PyFlink integration**: Python Table API через Py4J calls equivalent Java APIs. CREATE TABLE DDL is just SQL string passed к Java parser. JAR connectors loaded в same JVM Python uses. No Python wrapper needed — JAR availability sufficient. **Implication**: PyFlink имеет full enterprise connector ecosystem out of the box. Kafka (with all formats: Avro, Protobuf, JSON, CSV), JDBC (Postgres, MySQL, etc.), Iceberg, Paimon, Hive, Elasticsearch, HBase, MongoDB, Cassandra, Pulsar, Kinesis, RabbitMQ, S3 filesystem, и many more. **Deployment**: JAR файлы должны быть в Flink classpath. Methods: (a) include в Docker image (/opt/flink/lib/). (b) `flink run -j /path/to/connector.jar -py job.py`. (c) Maven coordinates через FlinkDeployment CRD `spec.flinkConfiguration: 'pipeline.classpaths: file:///opt/connectors/'`. **Connector availability table** для PyFlink Table API identical для Java — no Python-specific limitations. Это критически important — позволяет PyFlink teams build production pipelines без feeling limited vs Java teams.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

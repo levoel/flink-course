@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/04-network-buffer-tuning",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-04",
+    "description": "Quiz for network buffer tuning lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-04-q1",
+      "type": "multiple-choice",
+      "question": "Что такое credit-based flow control в Flink network stack?",
+      "options": [
+        { "id": "a", "text": "TCP window size tuning" },
+        { "id": "b", "text": "Механизм backpressure: upstream проверяет credit от downstream перед отправкой buffer. Credit > 0 → send + decrement. Credit == 0 → блокироваться. Downstream после обработки buffer шлёт credit announce. Это даёт per-channel backpressure (не блокирует весь TCP), predictable latency, точную диагностику через backPressuredTimeMsPerSecond" },
+        { "id": "c", "text": "Алгоритм load balancing между subtasks" },
+        { "id": "d", "text": "Memory allocation strategy" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-37 (Flink 1.5+). До этого backpressure через TCP window — блокировал весь TCP channel, делал latency хаотичной. Credit-based — Flink-level: один TCP channel мультиплексирует N логических каналов с независимыми credits. Преимущества: (1) per-channel backpressure (не all-or-nothing); (2) predictable latency без TCP stall; (3) точные backpressure metrics. Downstream tracks available buffers как credits — sends announce обратно upstream при освобождении.",
+      "studyHint": "Повторите урок — credit-based flow control",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-04-q2",
+      "type": "multiple-choice",
+      "question": "FLIP-183 Buffer Debloating (1.14+) — что это и когда включать?",
+      "options": [
+        { "id": "a", "text": "Уменьшает segment size globally" },
+        { "id": "b", "text": "Dynamic buffer sizing based на processing throughput. Buffer-ы автоматически shrink под backpressure (меньше in-flight data → быстрее checkpoint alignment), grow при высокой throughput. Включать для aligned checkpoints с variable throughput, EXACTLY_ONCE с slow sinks. Single config line даёт 2-5x ускорение alignment" },
+        { "id": "c", "text": "Удаление неиспользуемых buffers" },
+        { "id": "d", "text": "Compression buffer-ов перед отправкой" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-183 (1.14+). Старая модель: фиксированный buffer 32KB. Проблема — на slow downstream путь записи через сотни 32KB буферов создаёт большой in-flight delay. При backpressure inflight data 100MB+ → убивает latency и blocking-checkpoint alignment. Debloating: каждые 200ms measure throughput → optimal buffer size = target_time × throughput / utilization. taskmanager.network.memory.buffer-debloat.enabled: true, target: 1s. Эффект: при backpressure in-flight data резко падает, alignment ускоряется 2-5x. Default disabled из conservatism, но production de-facto mandatory.",
+      "studyHint": "Повторите урок — Buffer Debloating",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-04-q3",
+      "type": "multiple-choice",
+      "question": "Job parallelism=200, EXACTLY_ONCE с slow Kafka sink. Checkpoint duration 5min (timeout 10min), state size только 200MB. Логи: 80% времени в 'alignment'. Какой план fix?",
+      "options": [
+        { "id": "a", "text": "Увеличить parallelism" },
+        { "id": "b", "text": "Buffer debloating (FLIP-183) обязательно: buffer-debloat.enabled: true, target: 500ms. Уменьшает in-flight data → alignment ускоряется 2-5x. Plus unaligned checkpoints (FLIP-76): execution.checkpointing.unaligned: true, aligned-checkpoint-timeout: 30s. Plus reduce buffers-per-channel с 2 до 1. Kafka transaction.timeout.ms должен быть > checkpoint.timeout × 2" },
+        { "id": "c", "text": "Уменьшить state size" },
+        { "id": "d", "text": "Увеличить network.fraction" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Long alignment time — не state size issue. Aligned checkpoints (default EXACTLY_ONCE): operator ждёт barrier по всем input channels прежде чем snapshot. Slow downstream → in-flight data накапливается → barrier ждёт обработки в очереди. 5min alignment = огромный in-flight backlog. Solutions stacked: (1) buffer-debloat — biggest win, in-flight уменьшается → alignment ускоряется; (2) unaligned checkpoints — fallback после aligned-timeout, in-flight включается в snapshot; (3) buffers-per-channel: 1 — меньше in-flight at baseline; (4) Kafka transaction.timeout.ms: 1200000 (20min, иначе transaction может expire прежде чем checkpoint complete → data loss).",
+      "studyHint": "Повторите урок — Production tuning patterns + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-04-q4",
+      "type": "true-false",
+      "question": "Уменьшение taskmanager.memory.segment-size с default 32KB до 4KB даёт пропорциональное ускорение latency без negative impact на throughput.",
+      "correctAnswer": false,
+      "explanation": "False. Каждый buffer имеет fixed header overhead (~50 bytes). При segment-size=4KB header — 1.25% от полезной нагрузки. При 32KB — 0.15%. Меньшие buffers увеличивают per-record overhead → throughput падает 5-15%. Дополнительно: больше buffer-ов на тот же memory budget → больше context switches → CPU overhead. Default 32KB подобран experimentally для balance. Меняйте только при специфической потребности (low-latency sub-100ms — segment-size=8KB acceptable). Production rule: не трогайте segment-size без серьёзной причины. Лучше используйте buffer-debloating для dynamic sizing.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

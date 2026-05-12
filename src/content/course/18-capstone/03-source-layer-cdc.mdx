@@ -1,0 +1,352 @@
+---
+title: "Capstone — source layer: Flink CDC из Postgres"
+description: "Implementation phase 1: настройка Postgres для logical replication, Flink CDC 3.6 YAML pipeline с transform expressions, schema evolution behavior, parallel snapshot tuning."
+order: 3
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Implementation", "Flink CDC", "Postgres", "Schema Evolution", "Snapshot"]
+---
+
+# Capstone — source layer: Flink CDC из Postgres
+
+Первая phase implementation: получить changes из Postgres в Paimon raw tables. Это foundation — все последующие layers reading from raw tables.
+
+Mы используем **Flink CDC 3.6 directly** (без intermediate Kafka), как обосновано в design phase. Pipeline declarative YAML, под капотом Flink DataStream graph с EOS sink.
+
+---
+
+## Step 1: Postgres preparation
+
+```sql
+-- На primary Postgres (postgresql.conf):
+ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM SET max_wal_senders = 20;
+ALTER SYSTEM SET max_replication_slots = 20;
+ALTER SYSTEM SET max_slot_wal_keep_size = '100GB';  -- safety bound
+
+-- Restart Postgres
+
+-- Создать user для replication:
+CREATE USER flink_cdc WITH REPLICATION LOGIN PASSWORD 'secret';
+GRANT CONNECT ON DATABASE ecommerce TO flink_cdc;
+GRANT USAGE ON SCHEMA public TO flink_cdc;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO flink_cdc;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO flink_cdc;
+
+-- Подготовить tables для CDC:
+ALTER TABLE customers REPLICA IDENTITY DEFAULT;  -- uses PK
+ALTER TABLE orders    REPLICA IDENTITY FULL;     -- full row для UPDATE/DELETE before-values
+ALTER TABLE order_items REPLICA IDENTITY FULL;
+ALTER TABLE products  REPLICA IDENTITY DEFAULT;
+
+-- Publication:
+CREATE PUBLICATION flink_cdc_pub FOR TABLE
+    customers, orders, order_items, products;
+
+-- Replication slot:
+SELECT pg_create_logical_replication_slot('flink_cdc', 'pgoutput');
+```
+
+REPLICA IDENTITY FULL для orders/order_items — потому что нам нужны old values при UPDATE/DELETE для downstream change events (например, для transition tracking status).
+
+---
+
+## Step 2: Flink CDC YAML pipeline
+
+```yaml
+source:
+  type: postgres
+  hostname: postgres-replica.internal  # ← read replica, не primary!
+  port: 5432
+  username: flink_cdc
+  password: secret
+  database-name: ecommerce
+  schema-name: public
+  table-name: public\\..*                # все public tables
+  slot.name: flink_cdc
+  decoding.plugin.name: pgoutput
+  scan.startup.mode: initial
+  scan.incremental.snapshot.enabled: true
+  scan.incremental.snapshot.chunk.size: 100000
+  chunk.meta.group.size: 1000
+  connect.max-retries: 5
+  jdbc.properties.tcpKeepAlive: true
+
+sink:
+  type: paimon
+  catalog.properties.metastore: hive
+  catalog.properties.uri: thrift://hive-metastore:9083
+  catalog.properties.warehouse: s3://capstone/paimon
+  table.properties.bucket: 8
+  table.properties.changelog-producer: input
+  table.properties.merge-engine: deduplicate
+  table.properties.snapshot.expire.execution-mode: async
+  table.properties.snapshot.num-retained.min: 30
+  table.properties.snapshot.num-retained.max: 1000
+
+transform:
+  - source-table: public.orders
+    projection: |
+      *,
+      amount * 0.01 AS amount_dollars,
+      DATE_FORMAT(created_at, 'yyyy-MM-dd') AS order_date,
+      CASE WHEN amount > 100000 THEN 'large'
+           WHEN amount > 10000 THEN 'medium'
+           ELSE 'small' END AS order_size,
+      NOW() AS ingested_at
+    description: Orders с derived columns
+
+  - source-table: public.customers
+    projection: |
+      *,
+      UPPER(email) AS email_normalized,
+      DATE_PART('year', AGE(NOW(), created_at)) AS account_age_years
+    filter: deleted_at IS NULL
+    description: Active customers с derived fields
+
+  - source-table: public.order_items
+    projection: '*'
+    description: Order items raw
+
+  - source-table: public.products
+    projection: |
+      *,
+      CASE WHEN inventory_count = 0 THEN 'out_of_stock'
+           WHEN inventory_count < 10 THEN 'low_stock'
+           ELSE 'available' END AS stock_status
+    description: Products с derived
+
+route:
+  - source-table: public.customers
+    sink-table: capstone.dim_customers
+  - source-table: public.orders
+    sink-table: capstone.fact_orders
+  - source-table: public.order_items
+    sink-table: capstone.fact_order_items
+  - source-table: public.products
+    sink-table: capstone.dim_products
+
+pipeline:
+  name: capstone-postgres-cdc
+  parallelism: 8
+  schema.change.behavior: try-evolve   # production prod safety
+  execution.runtime-mode: streaming
+  execution.checkpointing.interval: 60s
+  execution.checkpointing.mode: EXACTLY_ONCE
+  state.backend.type: forst
+  state.backend.forst.primary-dir: s3://capstone/cdc-state
+```
+
+Critical choices in this config:
+
+1. **Read replica для source** — `postgres-replica.internal`. Production primary остаётся без CDC load.
+2. **Incremental snapshot** — lock-free, parallelizable. Чанки 100k rows.
+3. **schema.change.behavior: try-evolve** — apply when possible, log warning otherwise. Production prod safety против destructive changes.
+4. **transform expressions** — derived columns computed during ingest. Downstream queries simpler.
+5. **filter** для customers — пропускаем deleted_at IS NOT NULL records (soft-deleted users not in lake).
+6. **Paimon bucket=8** — matches Flink parallelism. Bigger bucket = more parallelism in compaction, but more small files.
+
+---
+
+## Step 3: Deployment
+
+```bash
+# Deploy через Flink Kubernetes Operator
+kubectl apply -f flinkdeployment-cdc.yaml
+
+# FlinkDeployment manifest:
+```
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: capstone-cdc
+  namespace: flink
+spec:
+  image: ghcr.io/our-org/flink-cdc:2.2.0-java17
+  flinkVersion: v2_2
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    state.backend.type: forst
+    state.backend.forst.primary-dir: s3://capstone/cdc-state
+    state.backend.forst.local-dir: /opt/flink/forst-cache
+    state.backend.changelog.enabled: "true"
+    state.backend.changelog.storage: filesystem
+    dstl.dfs.base-path: s3://capstone/dstl
+    state.checkpoints.dir: s3://capstone/checkpoints
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://capstone/ha
+    s3.access-key: ${AWS_ACCESS_KEY}
+    s3.secret-key: ${AWS_SECRET_KEY}
+    metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OpenTelemetryReporterFactory
+    metrics.reporter.otel.endpoint: http://otel-collector:4317
+  serviceAccount: flink
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+  jobManager:
+    resource:
+      cpu: 4
+      memory: 8192m
+    replicas: 2  # HA
+  taskManager:
+    resource:
+      cpu: 16
+      memory: 32768m
+    replicas: 2  # будет autoscaled
+  job:
+    jarURI: local:///opt/flink/flink-cdc-pipeline.jar
+    args:
+      - --pipeline-config
+      - /opt/flink/configs/capstone-cdc.yaml
+    parallelism: 8
+    upgradeMode: savepoint
+    state: running
+```
+
+---
+
+## Step 4: Initial snapshot strategy
+
+На production tables с 100M+ rows initial snapshot — самая чувствительная phase. Если ошибиться:
+- Snapshot загружает Postgres → latency приложения spike.
+- Snapshot занимает дни.
+- Disk фnam ouverloaded.
+
+Strategy для capstone:
+
+1. **Запуск snapshot ночью** — minimum traffic window. 0:00-6:00 UTC.
+2. **Read replica с minimum lag** — verify pg_replication_slot lag < 1min перед запуском.
+3. **Parallelism начально 4** — не 8 во время snapshot. После snapshot complete — scale up через autoscaler.
+4. **Chunk size 100k** — balance между request size и memory footprint.
+5. **Monitoring** — `SELECT * FROM pg_stat_activity WHERE query LIKE 'COPY%'` watch postgres-side load.
+
+```sql
+-- Pre-snapshot validation:
+SELECT slot_name, restart_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag
+FROM pg_replication_slots WHERE slot_name = 'flink_cdc';
+```
+
+---
+
+## Step 5: Verification после snapshot
+
+```sql
+-- В Paimon
+SELECT
+    table_name,
+    snapshot_id,
+    schema_id,
+    commit_user,
+    commit_time,
+    record_count
+FROM capstone.`fact_orders$snapshots`
+ORDER BY snapshot_id DESC
+LIMIT 10;
+
+-- Compare row counts с Postgres
+SELECT COUNT(*) FROM capstone.fact_orders;
+-- vs
+SELECT COUNT(*) FROM postgres.public.orders;
+```
+
+Counts должны совпадать с tolerance ~1min lag (events во время snapshot).
+
+---
+
+## Step 6: Schema evolution test
+
+Verify schema evolution works (controlled experiment в staging):
+
+```sql
+-- В Postgres staging:
+ALTER TABLE orders ADD COLUMN discount_code VARCHAR(50);
+
+-- В Postgres:
+INSERT INTO orders (..., discount_code) VALUES (..., 'SUMMER2026');
+
+-- В Paimon через 1-2 минуты:
+SELECT * FROM capstone.fact_orders WHERE discount_code IS NOT NULL LIMIT 10;
+-- Должны видеть new column populated
+```
+
+Если column добавлен auto — schema evolution propagation работает.
+
+Для production prod: добавьте explicit step в release process — manual review schema changes перед apply.
+
+---
+
+## Monitoring layer
+
+```yaml
+# Prometheus rules
+groups:
+- name: flink-cdc
+  rules:
+    - alert: ReplicationSlotLag
+      expr: pg_replication_slot_lag_bytes > 50000000000  # 50 GB
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Postgres replication slot lag > 50GB
+
+    - alert: SnapshotTooSlow
+      expr: |
+        flink_jobmanager_job_uptime > 7200  # 2h
+        and
+        flink_taskmanager_job_task_operator_snapshot_phase_active == 1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: Snapshot phase took > 2 hours, investigate
+
+    - alert: CDCSourceLag
+      expr: flink_taskmanager_job_task_operator_currentInputWatermark < (time() - 60) * 1000
+      for: 5m
+      labels:
+        severity: warning
+```
+
+---
+
+## Migration plan от existing infrastructure
+
+If team has existing Debezium → Kafka → Flink:
+
+1. Deploy Flink CDC parallel pipeline в staging.
+2. Compare row counts + sample data between two pipelines for accuracy.
+3. Switch downstream consumers (Paimon queries) на new pipeline atomically.
+4. Decommission old Debezium connectors.
+
+Не «migrate in place» — too risky. Parallel + cutover.
+
+---
+
+## Production gotchas (Phase 1)
+
+- **Snapshot loads Postgres replica** — verify replica can handle. Sometimes replica behind primary by-design (read-only replica for analytics) — snapshot pressure compounds. Mitigation: increase replica resources during snapshot window.
+- **Network failures during snapshot** — Flink CDC retries, но some implementations требуют restart полного snapshot. Set `connect.max-retries: 5+`, monitor recovery.
+- **Replication slot orphaning** — если Flink CDC job stopped permanently, slot остаётся, WAL накапливается. Cleanup procedure: `SELECT pg_drop_replication_slot('flink_cdc');` после confirming pipeline retired.
+- **Time zones и timestamps** — Postgres TIMESTAMP без TZ vs WITH TZ — proper handling в transform. Default Flink CDC uses UTC; ensure downstream consistent.
+- **Numeric precision loss** — DECIMAL(20,10) в Postgres → handle через `decimal.handling.mode=precise` (string-encoded) для finance. Default `double` имеет precision loss.
+- **TOAST values** — large text/jsonb > 8KB. По умолчанию Debezium шлёт unchanged placeholder в UPDATE. Flink CDC handles это, но downstream might see placeholder values. Solution: explicit unavailable.value.placeholder handling.
+- **Schema registry vs no registry** — Flink CDC может работать без Schema Registry для simplicity, но в production add Confluent SR или Apache Atlas для schema governance.
+
+<Callout type="warning">
+**REPLICA IDENTITY FULL имеет performance impact на Postgres writes** — каждый UPDATE/DELETE on table требует logging full old row в WAL. Это increased WAL volume + network traffic. На critical OLTP tables измеряйте impact в staging. Для some tables может быть acceptable DEFAULT (только PK) если downstream не нуждается в before-values.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Implementation review: ваша Flink CDC pipeline в production. Postgres primary имеет 5 hours WAL retention. Flink CDC job crash, vendor support говорит «restart it tomorrow morning». 12 часов позже Flink CDC restart-аут. Что произойдёт с replication slot, какие риски, и как восстановиться?"
+  answer="Critical scenario. (1) WAL retention 5 hours: Postgres покупает WAL только 5 часов после последний consumer checkpoint. Если Flink CDC down 12h без max_slot_wal_keep_size — WAL накапливался все 12h, disk сильно использован. Если max_slot_wal_keep_size 100GB set: после exceeding 100GB Postgres dropped slot automatically (we lose CDC events после этой точки). (2) Restart options analysis: (a) Slot жив — Flink CDC restart, consumes accumulated 12h WAL (это могут быть часы processing), потом switching на live tail. State в Paimon reaches consistent после catch-up. (b) Slot dropped (because exceeded WAL keep size) — restart fails: 'replication slot does not exist'. Recovery: (i) Create new slot — only future events; events from window 5h-12h LOST; (ii) Re-snapshot full database — но table changed during window, snapshot reflects current state, not historical. Some lost events recoverable from raw Postgres data, some not. (3) Critical preventions для будущего: (a) Alerting на slot lag > 1 hour — escalate immediately, не 'tomorrow'; (b) max_slot_wal_keep_size с monitoring — prevent infinite slot growth disk overflow; (c) Recovery runbook documented — что делать когда slot expired; (d) Backup pipeline: Flink CDC → Paimon raw + parallel Debezium → S3 archive для recovery scenarios; (e) DR plan — ability re-snapshot full DB + replay из archive если slot lost. (4) Lesson: replication slot — single point of failure без proper guardrails. Production setups REQUIRE alerting, bounds, recovery procedures. 'Restart tomorrow' для CDC pipeline = unacceptable on-call response — это immediate priority."
+/>

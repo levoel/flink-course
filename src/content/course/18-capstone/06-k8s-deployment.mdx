@@ -1,0 +1,377 @@
+---
+title: "Capstone — K8s deployment: Flink Kubernetes Operator, autoscaler, HA"
+description: "★ DEEP — Flink Kubernetes Operator deployment, FlinkDeployment CR walkthrough, autoscaler config (FLIP-271), in-place rescaling (FLIP-291), HA setup, blue/green upgrade strategy."
+order: 6
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Kubernetes", "Flink Operator", "Autoscaler", "HA", "FlinkDeployment"]
+---
+
+# Capstone — K8s deployment: Flink Kubernetes Operator, autoscaler, HA
+
+Phase 4: production deployment. Этот урок — `★ DEEP` детали: full FlinkDeployment manifest, autoscaler configuration, HA setup, blue/green deployment strategy для upgrades.
+
+Мы используем **Flink Kubernetes Operator** (official Apache project) — declarative deployment через CRD-ы, namespace isolation, GitOps-friendly. **Adaptive Scheduler** + **in-place rescaling** (FLIP-291) позволяют scale без full job restart.
+
+---
+
+## Operator install
+
+```bash
+# Install Flink Kubernetes Operator via Helm
+helm repo add flink-operator-repo https://downloads.apache.org/flink/flink-kubernetes-operator-1.10.0/
+helm install flink-kubernetes-operator flink-operator-repo/flink-kubernetes-operator \
+    --namespace flink \
+    --create-namespace \
+    --set image.repository=ghcr.io/apache/flink-kubernetes-operator \
+    --set image.tag=1.10.0 \
+    --set webhook.create=true
+
+# Verify
+kubectl get pods -n flink
+kubectl get crd | grep flink
+# flinkdeployments.flink.apache.org
+# flinksessionjobs.flink.apache.org
+```
+
+Operator watches CRDs `FlinkDeployment` и `FlinkSessionJob`, reconciles desired state с actual cluster state.
+
+---
+
+## FlinkDeployment manifest для capstone
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: capstone-pipeline
+  namespace: flink
+  annotations:
+    kubernetes.flink.apache.org/savepoint-trigger-nonce: "1"  # для savepoint trigger
+spec:
+  image: ghcr.io/our-org/capstone-flink:2.2.0-java17-v45
+  imagePullPolicy: Always
+  flinkVersion: v2_2
+
+  flinkConfiguration:
+    # Slots
+    taskmanager.numberOfTaskSlots: "4"
+    parallelism.default: "8"
+
+    # State backend
+    state.backend.type: forst
+    state.backend.forst.primary-dir: s3://capstone/forst-state
+    state.backend.forst.local-dir: /opt/flink/forst-cache
+    state.backend.changelog.enabled: "true"
+    state.backend.changelog.storage: filesystem
+    dstl.dfs.base-path: s3://capstone/dstl
+    state.checkpoints.dir: s3://capstone/checkpoints
+    state.checkpoints.num-retained: "10"
+    state.savepoints.dir: s3://capstone/savepoints
+
+    # Checkpointing
+    execution.checkpointing.interval: 60s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: 10min
+    execution.checkpointing.unaligned: "true"
+    execution.checkpointing.aligned-checkpoint-timeout: 30s
+    execution.checkpointing.max-concurrent-checkpoints: "1"
+    execution.checkpointing.tolerable-failed-checkpoints: "3"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+
+    # HA
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://capstone/ha
+    kubernetes.cluster-id: capstone
+
+    # Network / Memory
+    taskmanager.network.memory.buffer-debloat.enabled: "true"
+    taskmanager.memory.network.fraction: "0.15"
+    taskmanager.memory.managed.fraction: "0.4"
+
+    # Adaptive scheduler (FLIP-160)
+    jobmanager.scheduler: adaptive
+    jobmanager.adaptive-scheduler.resource-wait-timeout: 5min
+    jobmanager.adaptive-scheduler.min-parallelism-increase: "1"
+    jobmanager.adaptive-scheduler.scaling-interval.min: 30s
+
+    # Autoscaler (FLIP-271)
+    job.autoscaler.enabled: "true"
+    job.autoscaler.stabilization.interval: 5min
+    job.autoscaler.metrics.window: 10min
+    job.autoscaler.target.utilization: "0.7"
+    job.autoscaler.target.utilization.boundary: "0.4"
+    job.autoscaler.scale-up.grace-period: 1h
+    job.autoscaler.scale-down.max-factor: "0.6"
+
+    # Observability
+    metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OpenTelemetryReporterFactory
+    metrics.reporter.otel.endpoint: http://otel-collector:4317
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+
+    # Security
+    security.kerberos.login.principal: flink@CORP
+    s3.access-key: ${AWS_ACCESS_KEY}
+    s3.secret-key: ${AWS_SECRET_KEY}
+
+  serviceAccount: flink-sa
+
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+            - secretRef:
+                name: kafka-credentials
+            - secretRef:
+                name: aws-credentials
+          volumeMounts:
+            - name: forst-cache
+              mountPath: /opt/flink/forst-cache
+      volumes:
+        - name: forst-cache
+          emptyDir:
+            sizeLimit: 50Gi
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: streaming
+          effect: NoSchedule
+      nodeSelector:
+        workload: streaming
+
+  jobManager:
+    resource:
+      cpu: 4
+      memory: 8192m
+    replicas: 2          # HA — 2 JM pods с leader election
+    podTemplate:
+      spec:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    component: jobmanager
+                topologyKey: kubernetes.io/hostname
+
+  taskManager:
+    resource:
+      cpu: 16
+      memory: 32768m
+    replicas: 2          # инициальный count, autoscaler управляет
+
+  job:
+    jarURI: local:///opt/flink/capstone-pipeline.jar
+    entryClass: com.acme.capstone.CapstoneJob
+    args:
+      - --config
+      - /opt/flink/configs/capstone-prod.yaml
+    parallelism: 8
+    upgradeMode: savepoint        # savepoint-based upgrades
+    state: running
+    allowNonRestoredState: false  # strict savepoint compatibility
+```
+
+Ключевые secciones:
+
+1. **flinkVersion: v2_2** — operator uses correct image tags.
+2. **flinkConfiguration** — все Flink config через one place.
+3. **jobManager.replicas: 2** — HA with K8s ConfigMap-based leader election.
+4. **podAntiAffinity** — JM pods на разных nodes (resilience).
+5. **autoscaler.enabled: true** — automatic scaling.
+6. **upgradeMode: savepoint** — стандартный upgrade flow.
+
+---
+
+## HA setup details
+
+```yaml
+high-availability.type: kubernetes
+high-availability.storageDir: s3://capstone/ha
+kubernetes.cluster-id: capstone
+```
+
+Под капотом:
+1. **Leader election** через K8s ConfigMap + lease (как Kubernetes native controllers).
+2. **JobGraph + checkpoint pointer** persisted в S3 (storageDir).
+3. **На JM crash**: standby JM acquires lease, reads pointer из S3, restores job from latest checkpoint.
+
+Recovery flow:
+- JM 1 crash (pod evicted, node failure) → ~10-15s lease timeout → JM 2 acquires lease → restore job state, restart job.
+- Total recovery time: ~30-60s for healthy cluster.
+
+`high-availability.type: kubernetes` — preferred over ZooKeeper для cloud-native deployments. No external ZK cluster to operate.
+
+---
+
+## Autoscaler (FLIP-271)
+
+```yaml
+job.autoscaler.enabled: "true"
+job.autoscaler.stabilization.interval: 5min       # ждать stable metrics
+job.autoscaler.metrics.window: 10min               # rolling window
+job.autoscaler.target.utilization: "0.7"           # target 70% utilization
+job.autoscaler.target.utilization.boundary: "0.4"  # acceptable range
+job.autoscaler.scale-up.grace-period: 1h           # min time between scale-ups
+job.autoscaler.scale-down.max-factor: "0.6"        # max 40% reduction
+```
+
+Как работает:
+1. Autoscaler monitors `busyTimeMsPerSecond` per operator (mailbox timings).
+2. Если sustained busy > target boundary (например >0.85 utilization) → scale up.
+3. Если sustained idle/low busy < (target - boundary) → scale down.
+4. Adjusts parallelism per operator, не just sink/source — **operator-level scaling**.
+5. Through Adaptive Scheduler, scaling happens **in-place** (FLIP-291) — no full job restart!
+
+In-place rescaling: только affected slots restarted, остальные continue processing. Drastically reduces scaling cost vs traditional savepoint+restore.
+
+---
+
+## Adaptive Scheduler + in-place rescaling
+
+```yaml
+jobmanager.scheduler: adaptive
+jobmanager.adaptive-scheduler.resource-wait-timeout: 5min
+jobmanager.adaptive-scheduler.min-parallelism-increase: "1"
+jobmanager.adaptive-scheduler.scaling-interval.min: 30s
+```
+
+Pre-2.x Flink scaling was «savepoint, change parallelism, restore» — minutes downtime. Adaptive Scheduler:
+1. Detects available slots.
+2. Adjusts parallelism dynamically.
+3. In-place rescaling: only impacted subtasks restart; rest continue.
+4. State redistribution через key groups — fast.
+
+Result: scaling event = 10-30s minor disruption vs 1-3 min traditional.
+
+---
+
+## Blue/green deployment strategy
+
+Production upgrade pattern для critical jobs:
+
+<DiagramContainer title="Blue/green deployment с FlinkDeployment" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Blue (running)"
+        tooltip="Existing FlinkDeployment 'capstone-pipeline'. Processing events, writing to Paimon."
+      >
+        Blue: v44 running
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="deploy parallel" />
+    <FlowRow>
+      <DataBox
+        label="Green (parallel)"
+        tooltip="New FlinkDeployment 'capstone-pipeline-green' с new image. Starts с savepoint of blue. Writing to PARALLEL sink tables (different paths)."
+      >
+        Green: v45 parallel
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="validate" />
+    <FlowRow>
+      <DataBox
+        label="Validation phase"
+        tooltip="Compare metrics blue vs green. Sample records — content match? Lag behaviors similar? Errors identical?"
+      >
+        Compare outputs
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="cutover" />
+    <FlowRow>
+      <DataBox
+        label="Cutover"
+        tooltip="Stop blue, rename green path к production path (или change query routing к green tables). Atomic switch downstream consumers."
+      >
+        Cutover atomic
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+```bash
+# 1. Trigger savepoint blue
+kubectl annotate flinkdeployment capstone-pipeline \
+    kubernetes.flink.apache.org/savepoint-trigger-nonce=42
+
+# Get savepoint path:
+kubectl get flinkdeployment capstone-pipeline -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}'
+# s3://capstone/savepoints/savepoint-abc123
+
+# 2. Deploy green:
+cat <<EOF | kubectl apply -f -
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: capstone-pipeline-green
+spec:
+  image: ghcr.io/our-org/capstone-flink:2.2.0-java17-v45
+  job:
+    initialSavepointPath: s3://capstone/savepoints/savepoint-abc123
+    allowNonRestoredState: false
+    # write to parallel paths:
+    args: ["--paimon-table-suffix", "_green"]
+EOF
+
+# 3. Validate green for 1-24h:
+# - Compare row counts blue vs green
+# - Sample queries identical results
+# - Latency / throughput identical
+
+# 4. Cutover — update downstream queries to read _green tables
+# Atomic: ALTER VIEW capstone.fact_orders RENAME TO ... ;
+# Or через query routing (feature flag)
+
+# 5. Stop blue:
+kubectl delete flinkdeployment capstone-pipeline
+# Rename green to canonical name (optional cleanup)
+```
+
+---
+
+## Capacity planning
+
+| Scenario | TM count × resources | Cost/month |
+|---|---|---|
+| Baseline (10k events/sec) | 2 × 16 CPU, 32GB | $800 |
+| Peak (50k events/sec) | 8 × 16 CPU, 32GB | $3200 |
+| Stressed (chaos test, 100k spike) | 12 × 16 CPU, 32GB | $4800 |
+
+Autoscaler bounds:
+```yaml
+job.autoscaler.parallelism.min: "8"
+job.autoscaler.parallelism.max: "64"
+```
+
+Spread limits prevent runaway scaling (cost blowup) or under-provisioning (data lag).
+
+---
+
+## Production gotchas
+
+- **Operator не перезапустит JM на config change без savepoint** — нужно annotate с savepoint-trigger-nonce для restart with state.
+- **In-place rescaling требует Adaptive Scheduler** — default DefaultScheduler не support. Verify config.
+- **Autoscaler conservative по default** — может не scale up достаточно быстро при traffic spike. Tune `scale-up.grace-period` for responsiveness.
+- **HA storage cleanup** — старые HA znodes/files в S3 не cleaned automatically. Periodic cleanup script (старше 30 days) необходим.
+- **PodTemplate affinity rules** — нужны для resilience (anti-affinity для JM, проч spread). Without it — single node failure может kill multiple JM/TM pods.
+- **Image pull from private registry** — imagePullSecrets необходим. Configure через SA или explicit pod template.
+- **Adaptive Scheduler memory model** — некоторые operators сложнее rescale (large state). Может быть rescaling slow или fail. Monitor scaling latency.
+- **K8s API throttling** — много FlinkDeployment в одном cluster может hit API quota. Consider operator sharding для many jobs.
+- **Savepoint trigger requires healthy job** — если job уже crashed, нельзя trigger savepoint normally. Recovery: restart from checkpoint, then savepoint, then upgrade.
+- **upgradeMode: savepoint vs stateless** — savepoint безопаснее (state preserved), stateless только для idempotent transformations. Critical state apps — always savepoint.
+
+<Callout type="warning">
+**Не использовать Reactive Mode** в Flink 2.x — removed, заменён Adaptive Scheduler + autoscaler. Если legacy config содержит `scheduler-mode: reactive`, удалите — operator может fail apply manifest. Use `jobmanager.scheduler: adaptive` instead.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production K8s deployment review: capstone pipeline running, autoscaler enabled. Black Friday traffic spike — 5x normal (50k → 250k events/sec). Что должно произойти автоматически, какие risks, и какие preparations нужны до Black Friday?"
+  answer="Expected automatic behavior: (1) Autoscaler detects sustained busyTimeMsPerSecond > 0.85 утилiz через 10min metrics window; (2) Calculates scale factor — operators most busy (probably UserAggregator, sinks) get scaled up; (3) Through Adaptive Scheduler + in-place rescaling (FLIP-291), parallelism increased — additional TM pods spawned by K8s scheduler; (4) State redistribution через key groups — fast; (5) After 5min stabilization observation, additional scale ups if needed. Total scaling time: 5-15 min depending on metrics window. **Risks**: (a) K8s cluster may not have spare nodes — cluster autoscaler (separate from Flink autoscaler) должен также trigger node provisioning. Cold start nodes 2-5 min. Combined Flink + cluster autoscaler scaling: 7-20 min. **For 5x sudden spike это TOO SLOW** — first 10-15 min будут backpressure, latency degradation, possibly checkpoint timeouts. (b) Autoscaler may overshoot — scale up к max, потом не scale down достаточно быстро после Black Friday → cost spike. (c) Downstream systems may not handle 5x — ClickHouse cluster, Postgres replication slot — все get stressed. Bottlenecks shift. **Preparations до Black Friday (must)**: (1) **Pre-scale** — manually set parallelism к expected peak до event. `kubectl patch flinkdeployment ... --type=merge --patch '{"spec":{"job":{"parallelism": 32}}}'`. Don't rely on reactive autoscale для known events. (2) **Pre-provision nodes** — K8s nodepool scale up manually. Don't wait for cluster autoscaler. (3) **Set autoscaler max higher** — `job.autoscaler.parallelism.max: "128"` (4x normal max) для unexpected further growth. (4) **Test in staging** — load test 5x в staging environment предыдущий week. Verify pipeline behavior. (5) **Increase checkpoint timeout** — `execution.checkpointing.timeout: 20min` для headroom during high load. (6) **Pre-create K8s resources** — pod quotas, namespace quotas verified. (7) **Downstream prep** — ClickHouse cluster nodes, Postgres replica capacity, Kafka brokers все pre-scaled. (8) **War room runbook** — clear escalation, kill switches (rate-limit incoming events если pipeline overwhelmed), DR procedures. (9) **Disable scale-down during event** — set `job.autoscaler.scale-down.max-factor: 0` для events; re-enable after stabilization. (10) **Observability dashboards** — dedicated 'event day' dashboard, on-call ready. Lesson: autoscaler — для unknown traffic patterns. For known events — combination pre-scaling + autoscaler safety net. 'Autoscaler handles everything' — мis-conception that causes prod incidents."
+/>

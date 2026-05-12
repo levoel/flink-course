@@ -1,0 +1,480 @@
+---
+title: "Table API в Python: first-class parity с Java"
+description: "Table API в Python с полным паритетом с Java. CREATE TABLE, SQL execute, DataFrame-like operations."
+order: 4
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["PyFlink", "Table API", "SQL", "TableEnvironment", "Connectors"]
+---
+
+# Table API в Python: first-class parity с Java
+
+В отличие от DataStream API (где Python — limited subset с performance gap), **Table API в Python имеет first-class parity с Java**. Same TableEnvironment, same SQL dialect, same connectors, same performance — потому что под капотом всё работает на JVM (Calcite-based query planner, generated code execution), Python — только thin layer над Java API через Py4J. SQL queries и DataFrame-like operations выполняются на JVM с native speed.
+
+Это делает Table API **рекомендуемый путь для PyFlink** в большинстве production use cases. Если ваша задача — schema-driven ETL, stream-table joins, windowed aggregations, CDC processing — pишите Table API. DataStream используйте только когда нужен low-level custom state с complex логикой.
+
+---
+
+## TableEnvironment vs StreamExecutionEnvironment
+
+```python
+from pyflink.table import EnvironmentSettings, TableEnvironment
+
+# Standalone Table environment (без DataStream interop)
+t_env = TableEnvironment.create(
+    EnvironmentSettings.in_streaming_mode())
+# Settings.in_batch_mode() для batch
+
+# Или через интеграцию с DataStream
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.table import StreamTableEnvironment
+
+env = StreamExecutionEnvironment.get_execution_environment()
+t_env = StreamTableEnvironment.create(env)
+# Поддерживает конверсии Table ↔ DataStream
+```
+
+`TableEnvironment` — recommended для pure Table API jobs. `StreamTableEnvironment` — для hybrid, когда нужно конвертировать results в DataStream для custom processing.
+
+---
+
+## CREATE TABLE — declarative source/sink
+
+```python
+t_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+
+# Source table — Kafka
+t_env.execute_sql("""
+    CREATE TABLE transactions (
+        tx_id BIGINT,
+        user_id BIGINT,
+        amount DOUBLE,
+        currency STRING,
+        event_time TIMESTAMP_LTZ(3),
+        WATERMARK FOR event_time AS event_time - INTERVAL '20' SECOND
+    ) WITH (
+        'connector' = 'kafka',
+        'topic' = 'transactions',
+        'properties.bootstrap.servers' = 'kafka:9092',
+        'properties.group.id' = 'py-table-aggregator',
+        'scan.startup.mode' = 'latest-offset',
+        'format' = 'avro-confluent',
+        'avro-confluent.url' = 'http://schema-registry:8081'
+    )
+""")
+
+# Sink table — Iceberg
+t_env.execute_sql("""
+    CREATE TABLE user_daily_summary (
+        user_id BIGINT,
+        day DATE,
+        total_amount DECIMAL(18, 2),
+        tx_count BIGINT,
+        PRIMARY KEY (user_id, day) NOT ENFORCED
+    ) WITH (
+        'connector' = 'iceberg',
+        'catalog-name' = 'hadoop_catalog',
+        'catalog-type' = 'hadoop',
+        'warehouse' = 's3://data-lake/iceberg',
+        'format-version' = '2'
+    )
+""")
+```
+
+Это **identical Java syntax** — SQL DDL, connector properties, schema definition. PyFlink — thin wrapper.
+
+---
+
+## SQL queries
+
+```python
+# INSERT INTO ... SELECT — streaming aggregation
+t_env.execute_sql("""
+    INSERT INTO user_daily_summary
+    SELECT
+        user_id,
+        DATE(event_time) AS day,
+        SUM(amount) AS total_amount,
+        COUNT(*) AS tx_count
+    FROM transactions
+    WHERE currency = 'USD'
+    GROUP BY user_id, DATE(event_time)
+""")
+
+# Это становится streaming job: continuous aggregation, sink на каждый changelog change
+```
+
+`execute_sql` returns `TableResult` — для INSERT это handle к running job. Для SELECT — iteratable rows.
+
+```python
+# Interactive SELECT
+result = t_env.execute_sql("SELECT user_id, COUNT(*) FROM transactions GROUP BY user_id")
+
+with result.collect() as rows:
+    for row in rows:
+        print(row)
+```
+
+---
+
+## DataFrame-like Table API
+
+Кроме SQL, Table API имеет fluent Python API:
+
+```python
+from pyflink.table import expressions as expr
+
+transactions = t_env.from_path("transactions")  # уже CREATE TABLE-ом
+
+result = (transactions
+    .filter(expr.col("currency") == "USD")
+    .group_by(expr.col("user_id"))
+    .select(
+        expr.col("user_id"),
+        expr.col("amount").sum.alias("total"),
+        expr.col("amount").count.alias("count")))
+
+# Output
+result.execute_insert("user_summary")
+```
+
+Native Python DSL поверх Table API. Под капотом — same Calcite logical plan + code generation как для SQL. Performance identical.
+
+---
+
+## Connector ecosystem
+
+Все Java connectors доступны в PyFlink Table API через DDL. Не нужны Python wrappers — connectors реализованы как JAR'ы, PyFlink использует через JVM.
+
+```python
+# Kafka source/sink
+'connector' = 'kafka'
+
+# Filesystem (S3, HDFS, local)
+'connector' = 'filesystem'
+'format' = 'parquet'   # или 'avro', 'csv', 'orc', 'json'
+
+# JDBC (Postgres, MySQL, etc.)
+'connector' = 'jdbc'
+
+# Iceberg
+'connector' = 'iceberg'
+
+# Paimon (formerly Flink Table Store)
+'connector' = 'paimon'
+
+# CDC (Flink CDC 3.x)
+'connector' = 'postgres-cdc'
+'connector' = 'mysql-cdc'
+
+# Hive
+'connector' = 'hive'
+
+# HBase
+'connector' = 'hbase-2.2'
+
+# Elasticsearch
+'connector' = 'elasticsearch-7'
+```
+
+Это **полный enterprise ecosystem** — те же connectors, что Java teams используют.
+
+---
+
+## Performance: Python vs Java Table API
+
+<DiagramContainer title="Table API execution: Python vs Java" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Python TableEnvironment"
+        tooltip="Тонкий Py4J wrapper над Java TableEnvironment. SQL parsing, planning, code generation — всё на JVM. Python только submits SQL и собирает results."
+      >
+        Python client
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Py4J: submit SQL string" />
+    <FlowRow>
+      <DataBox
+        label="Java TableEnvironment"
+        tooltip="Apache Calcite parser → logical plan → optimizer → physical plan → code generation → DataStream graph. Полностью JVM-side."
+      >
+        Calcite + codegen
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="JVM execution"
+        tooltip="Generated bytecode выполняется на TaskManagers, как Java jobs. No Python в hot path. ~100% Java baseline performance. Python interpreter free после submit."
+      >
+        Native Flink execution
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Это критическое insight: **PyFlink Table API performance = Java Table API performance**. Python code присутствует только на submission step. Сам runtime processing — JVM bytecode.
+
+Exception: если используете Python UDFs внутри SQL (см. урок 05-07), Python execution возвращается, с соответствующим performance gap.
+
+---
+
+## Python UDFs в Table API
+
+```python
+from pyflink.table.udf import udf
+from pyflink.table import DataTypes
+
+@udf(input_types=[DataTypes.STRING()], result_type=DataTypes.STRING())
+def to_upper(s):
+    return s.upper() if s else None
+
+t_env.create_temporary_function("to_upper", to_upper)
+
+# Использование в SQL
+t_env.execute_sql("""
+    INSERT INTO output
+    SELECT to_upper(country) FROM users
+""")
+```
+
+UDFs выполняются в Python process mode (по умолчанию). См. урок 05 для details. Для optimized — Pandas UDFs (vectorized, urок 07) или thread mode (PEMJA, урок 06).
+
+---
+
+## Stream-table joins
+
+Один из killer features Table API — declarative joins streams с reference data:
+
+### Lookup join (temporal table function)
+
+```python
+# Source: events stream
+t_env.execute_sql("""
+    CREATE TABLE clicks (
+        user_id BIGINT,
+        page STRING,
+        ts TIMESTAMP_LTZ(3),
+        WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+    ) WITH ('connector' = 'kafka', ...)
+""")
+
+# Reference: lookup в JDBC при каждом event
+t_env.execute_sql("""
+    CREATE TABLE users (
+        user_id BIGINT PRIMARY KEY NOT ENFORCED,
+        name STRING,
+        country STRING
+    ) WITH (
+        'connector' = 'jdbc',
+        'url' = 'jdbc:postgresql://pg:5432/users_db',
+        'table-name' = 'users',
+        'lookup.cache.max-rows' = '10000',
+        'lookup.cache.ttl' = '10 min'
+    )
+""")
+
+# Join — на каждый event lookup в users (cached)
+t_env.execute_sql("""
+    INSERT INTO enriched_clicks
+    SELECT
+        c.user_id,
+        u.name,
+        u.country,
+        c.page,
+        c.ts
+    FROM clicks AS c
+    JOIN users FOR SYSTEM_TIME AS OF c.ts AS u
+    ON c.user_id = u.user_id
+""")
+```
+
+`FOR SYSTEM_TIME AS OF` — temporal join syntax. `lookup.cache.*` — automatic caching для performance. Под капотом — same Java implementation как обычно.
+
+### Interval join
+
+```sql
+-- Two streams, joined within time interval
+SELECT *
+FROM orders AS o, shipments AS s
+WHERE o.order_id = s.order_id
+  AND o.event_time BETWEEN s.event_time - INTERVAL '5' MINUTE
+                       AND s.event_time + INTERVAL '5' MINUTE
+```
+
+State retention управляется automatically based на interval.
+
+### Stream-stream join (regular)
+
+```sql
+SELECT *
+FROM orders o
+JOIN refunds r
+ON o.order_id = r.order_id
+```
+
+⚠️ **Caveat**: regular join требует unbounded state. Use `table.exec.state.ttl` для cleanup.
+
+---
+
+## Window operations
+
+Tumbling, hopping, session windows через SQL:
+
+```sql
+-- Tumbling 1-hour window
+SELECT
+    user_id,
+    window_start,
+    window_end,
+    SUM(amount) AS total
+FROM TABLE(
+    TUMBLE(TABLE transactions, DESCRIPTOR(event_time), INTERVAL '1' HOUR))
+GROUP BY user_id, window_start, window_end;
+
+-- Hopping (sliding) — 1 hour window, 10 min slide
+SELECT
+    user_id,
+    window_start,
+    COUNT(*) AS click_count
+FROM TABLE(
+    HOP(TABLE clicks, DESCRIPTOR(ts), INTERVAL '10' MINUTE, INTERVAL '1' HOUR))
+GROUP BY user_id, window_start, window_end;
+
+-- Session window (gap-based)
+SELECT
+    user_id,
+    SESSION_START(ts, INTERVAL '5' MINUTE) AS session_start,
+    SESSION_END(ts, INTERVAL '5' MINUTE) AS session_end,
+    COUNT(*) AS events
+FROM clicks
+GROUP BY user_id, SESSION(ts, INTERVAL '5' MINUTE);
+```
+
+PyFlink Table API exposes same WINDOW functions как Java SQL. No Python-specific limitations.
+
+---
+
+## CDC processing
+
+Flink CDC 3.x работает с PyFlink Table API:
+
+```python
+# Postgres CDC source
+t_env.execute_sql("""
+    CREATE TABLE orders_cdc (
+        order_id BIGINT,
+        user_id BIGINT,
+        amount DECIMAL(10, 2),
+        status STRING,
+        updated_at TIMESTAMP_LTZ(3),
+        PRIMARY KEY (order_id) NOT ENFORCED
+    ) WITH (
+        'connector' = 'postgres-cdc',
+        'hostname' = 'pg',
+        'port' = '5432',
+        'database-name' = 'orders_db',
+        'schema-name' = 'public',
+        'table-name' = 'orders',
+        'slot.name' = 'flink_cdc_slot'
+    )
+""")
+
+# Aggregation на CDC stream
+t_env.execute_sql("""
+    INSERT INTO user_active_orders
+    SELECT
+        user_id,
+        COUNT(*) AS active_count,
+        SUM(amount) AS total_active
+    FROM orders_cdc
+    WHERE status IN ('PENDING', 'PROCESSING')
+    GROUP BY user_id
+""")
+```
+
+PyFlink + CDC — fully production-ready. Real-time materialized views с Python deployments.
+
+---
+
+## Pandas integration
+
+Bridge между PyFlink Tables и pandas DataFrames:
+
+```python
+import pandas as pd
+
+# pandas DataFrame → Flink Table
+pdf = pd.DataFrame({"user_id": [1, 2, 3], "amount": [10.0, 20.0, 30.0]})
+table = t_env.from_pandas(pdf)
+
+# Flink Table → pandas DataFrame (collect — для small results)
+result_table = t_env.sql_query("SELECT user_id, amount * 2 AS doubled FROM input_table")
+result_pdf = result_table.to_pandas()
+```
+
+`to_pandas()` collect-ит результат на client side — только для bounded (batch) queries или sample data.
+
+---
+
+## Production gotchas
+
+- **`execute_sql` для DDL не starts job** — это metadata operation. Только `INSERT INTO` или `executeStatementSet().execute()` starts streaming job.
+- **Multiple INSERT INTO в одном job** — wrap в StatementSet для shared sources:
+
+  ```python
+  stmt_set = t_env.create_statement_set()
+  stmt_set.add_insert_sql("INSERT INTO sink1 SELECT ... FROM source")
+  stmt_set.add_insert_sql("INSERT INTO sink2 SELECT ... FROM source")  # same source, no double-read
+  stmt_set.execute()
+  ```
+
+- **State retention для streaming joins** — default unbounded. Set `table.exec.state.ttl` (например, `'1 day'`) для cleanup.
+- **Watermark stalls** — если один partition source idle, watermark не progress. Use `WATERMARK FOR event_time AS event_time - INTERVAL '20' SECOND` + `'scan.idle-timeout' = '1 min'` в Kafka source.
+- **`TIMESTAMP_LTZ` vs `TIMESTAMP`** — LTZ timezone-aware, `TIMESTAMP` naive. Production: use LTZ для consistency.
+- **Backpressure source** — Table API source backpressure через `table.exec.source.idle-timeout` и `pipeline.auto-watermark-interval`.
+- **Schema evolution** — Iceberg sink имеет automatic schema evolution support, но не all connectors. Check connector-specific docs.
+- **JDBC sink batching** — default batch size 100. For high throughput tune `sink.buffer-flush.max-rows = 1000`, `sink.buffer-flush.interval = 1s`.
+- **Python UDFs внутри Table API** — performance hit (см. уроки 05-07). Use Pandas UDFs для vectorization.
+- **Catalog management** — Default in-memory catalog не persists между sessions. Use HiveCatalog или PostgresCatalog для persistence.
+- **EXPLAIN PLAN** — `t_env.explain_sql("...")` returns query plan. Critical для optimization debugging.
+
+<Callout type="warning">
+Streaming joins без state TTL — common production bug. Job state grows unbounded, eventually OOM или checkpoint timeout. Always set `table.exec.state.ttl` для regular joins (interval joins имеют implicit TTL based на interval). Recommend: 24h-7d depending на use case.
+</Callout>
+
+<Callout type="tip">
+PyFlink Table API — practical default для большинства streaming ETL. Java required только для: (a) custom state machines не expressible в SQL, (b) low-level ProcessFunction с complex timer logic, (c) custom connectors. SQL/Table API covers 80% production use cases с full Java performance.
+</Callout>
+
+---
+
+## Catalog integration
+
+Production teams часто используют persistent catalog для shared table definitions:
+
+```python
+# Hive Metastore
+from pyflink.table.catalog import HiveCatalog
+
+hive_catalog = HiveCatalog(
+    catalog_name="prod_hive",
+    default_database="streaming",
+    hive_conf_dir="/etc/hive/conf"
+)
+t_env.register_catalog("prod_hive", hive_catalog)
+t_env.use_catalog("prod_hive")
+
+# Теперь все CREATE TABLE persist в Hive Metastore
+# Других jobs могут SELECT из этих tables без re-defining
+```
+
+Это enables **shared streaming table definitions** в команде — analytics team пишет dashboards без re-defining tables.
+
+---
+
+<KnowledgeCheck
+  question="Сравните когда выбирать PyFlink Table API vs PyFlink DataStream API vs Java DataStream. Use case: CDC от Postgres → real-time aggregation → enriched events в Iceberg. Throughput target 50k events/sec."
+  answer="**Use case анализ**: CDC → aggregation → Iceberg sink. Это classic Table API territory — declarative ETL с schema-driven processing. Throughput 50k events/sec — нормальный для Flink. **Recommendation: PyFlink Table API**. **Почему PyFlink Table API**: (1) **CDC connectors first-class** — `postgres-cdc` declared через CREATE TABLE с PRIMARY KEY constraint, automatic changelog handling. (2) **Aggregation в SQL** — простой `GROUP BY user_id, TUMBLE(...)`. Optimizer (Calcite) генерирует efficient state management. (3) **Iceberg sink declarative** — same CREATE TABLE pattern, no custom sink coding. (4) **Performance identical Java** — Table API под капотом всё JVM (Calcite parser, optimizer, code generation, DataStream graph). Python только на submit. Throughput 50k easy достижим. (5) **Lookup joins available** если нужно enrich CDC с reference data (users table в Postgres). **Когда выбрать PyFlink DataStream вместо Table API**: (1) Custom state machine с complex per-key logic не expressible в SQL — fraud detection с multi-step heuristics, anti-money laundering rules. (2) Custom timers с business-specific scheduling. (3) Side outputs с custom routing logic. (4) Когда нужны specific UDFs внутри keyed state operations. **Когда Java DataStream предпочтителен**: (1) Throughput > 100k events/sec/subtask с stateful processing — Python overhead в state ops добавляется. (2) Latency-critical <50ms p99 — JVM overhead Java < Python tooling. (3) Custom connectors не доступные в PyFlink Table API. (4) CEP-based patterns (Flink CEP — Java only). (5) DataStream V2 features (FLIP-409) — Java only. **Для конкретного use case (CDC → agg → Iceberg, 50k/sec)**: PyFlink Table API + SQL — 100% правильный choice. **Implementation**: (a) `CREATE TABLE orders_cdc (...) WITH ('connector'='postgres-cdc', ...)`. (b) `CREATE TABLE user_summary (user_id, day, total, count, PRIMARY KEY (user_id, day)) WITH ('connector'='iceberg', ...)`. (c) `INSERT INTO user_summary SELECT user_id, DATE(event_time), SUM(amount), COUNT(*) FROM orders_cdc GROUP BY user_id, DATE(event_time)`. (d) Configure: `table.exec.state.ttl = '7 day'`, `pipeline.auto-watermark-interval = '1 sec'`, checkpoint interval 60s. (e) Iceberg `format-version = '2'`, `write.upsert.enabled = true` для proper UPSERT semantics на CDC PK. **Production preparation**: (a) Test locally via MiniCluster с sample CDC events. (b) EXPLAIN PLAN для verify optimal plan (verify keyed aggregation, not cartesian). (c) Staging cluster с production data volume. (d) Monitor watermark progress, checkpoint duration, Iceberg commit lag. (e) Schema evolution: Iceberg automatic для add column; rename — requires `INSERT INTO new_table SELECT *, NULL AS old_name FROM old_table` migration. **Performance expectations**: 50k events/sec achievable на 4 TaskManagers × 4 slots = 16 parallel. CDC source single-threaded by default (one slot for replication slot). Aggregation parallel based on user_id key cardinality. Iceberg sink parallel writers. Total resource: 16 vCPU, 32GB total. Well within budget."
+/>

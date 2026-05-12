@@ -1,0 +1,426 @@
+---
+title: "Two-Phase Commit protocol — анатомия 2PC в Flink"
+description: "beginTransaction → preCommit → notifyCheckpointComplete → commit. Recovery с pending transactions. Crash scenarios"
+order: 3
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Two-Phase Commit", "2PC", "preCommit", "recoverAndCommit", "Crash Recovery", "Distributed Transactions"]
+---
+
+# Two-Phase Commit protocol — анатомия 2PC в Flink
+
+Two-Phase Commit (2PC) — фундаментальный distributed transactions protocol. Адаптированный для streaming контекста, он позволяет Flink гарантировать exactly-once для transactional sinks. Этот урок препарирует протокол на event level — что происходит с барьерами, state и внешней транзакцией в каждом моменте времени, и что Flink делает после crash.
+
+В Flink 2.x 2PC реализуется через **SinkV2 API** (FLIP-191) с интерфейсом `Committer`. Старый `TwoPhaseCommitSinkFunction` deprecated в 1.x и removed в 2.0. Архитектура та же — мы разбираем именно её.
+
+---
+
+## Постановка задачи
+
+Sink принимает поток записей и пишет их во внешнюю систему (Kafka, JDBC, file). Цель — атомарность относительно Flink checkpoint:
+
+- Если checkpoint(N) succeeds — все записи между checkpoint(N-1) и checkpoint(N) должны быть **видимы downstream**.
+- Если checkpoint(N) fails — те же записи **не должны быть видимы**.
+- При replay после restart — те же записи не должны повториться во внешней системе.
+
+Главная сложность: checkpoint considered «successful» только после того, как **JobManager** получает acks от всех операторов. Sink не может сам знать «глобально успешный ли checkpoint». Нужен внешний trigger.
+
+---
+
+## Фазы протокола
+
+<DiagramContainer title="Two-Phase Commit timeline" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="t0 — barrier(N) injection"
+        tooltip="JobManager triggers checkpoint(N). Coordinator (CheckpointCoordinator) injects barrier(N) в источники. Barrier propagates через граф вместе с обычными records."
+      >
+        JobManager → source: barrier(N)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier propagates downstream" />
+    <FlowRow>
+      <DataBox
+        label="t1 — sink processes records"
+        tooltip="Между barrier(N-1) и barrier(N) sink получает обычные records. SinkWriter.write(record) добавляет их в open transaction. Транзакция уже создана (beginTransaction вызвана на предыдущем barrier)."
+      >
+        SinkWriter.write(record) → open txn
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier(N) arrives at sink" />
+    <FlowRow>
+      <DataBox
+        label="t2 — Phase 1: preCommit (prepare)"
+        tooltip="Barrier(N) дошёл до sink. SinkWriter.prepareCommit() → flush данных во внешнюю систему. Транзакция НЕ commit-ится. txnId сохраняется в Flink state (Committable). Acknowledge barrier к JobManager."
+      >
+        prepareCommit() → flush + txnId в state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ack barrier → JM ждёт от всех operators" />
+    <FlowRow>
+      <DataBox
+        label="t3 — JobManager собирает acks"
+        tooltip="CheckpointCoordinator ждёт ack от всех операторов pipeline. Только когда ВСЕ ack-ed checkpoint(N) считается completed. Это глобальная точка успеха."
+      >
+        All operators ack(N) → checkpoint complete
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="notifyCheckpointComplete(N) broadcast" />
+    <FlowRow>
+      <DataBox
+        label="t4 — Phase 2: commit"
+        tooltip="JobManager broadcast notifyCheckpointComplete(N) всем операторам. У sink в этом callback → Committer.commit(txnId). Внешняя транзакция атомарно finalize. Данные visible downstream."
+      >
+        Committer.commit(txnId) → visible
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="new transaction для следующего checkpoint" />
+    <FlowRow>
+      <DataBox
+        label="t5 — beginTransaction(N+1)"
+        tooltip="SinkWriter создаёт новую транзакцию для следующего checkpoint. Records, приходящие после barrier(N), пишутся в новую txn. Cycle повторяется."
+      >
+        beginTransaction(N+1) для next records
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Critical observation: между `prepareCommit` (t2) и `commit` (t4) транзакция **в pending state** — данные записаны во внешнюю систему, но не видны (для Kafka это `READ_COMMITTED` consumer не видит uncommitted records).
+
+---
+
+## Псевдокод реализации
+
+```java
+public class TransactionalSinkWriter<T, TxnID> implements StatefulSinkWriter<T, TxnID> {
+
+    private ExternalTransaction currentTxn;
+    private TxnID currentTxnId;
+
+    @Override
+    public void write(T record, Context ctx) {
+        currentTxn.write(record); // append в открытую транзакцию
+    }
+
+    // ФАЗА 1: prepare — вызывается на barrier
+    @Override
+    public Collection<TxnID> prepareCommit() throws IOException {
+        currentTxn.flush();                    // flush в external system
+        TxnID committable = currentTxnId;      // txnId сохраним в state
+        currentTxn = beginTransaction();       // открываем новую для next checkpoint
+        currentTxnId = currentTxn.getId();
+        return Collections.singleton(committable);
+    }
+
+    // State snapshot: pending txnIds сохраняются Flink-ом автоматически
+    @Override
+    public List<TxnID> snapshotState(long checkpointId) {
+        return List.of(currentTxnId); // активная txn (для recovery после crash перед prepareCommit)
+    }
+}
+
+public class TransactionalCommitter<TxnID> implements Committer<TxnID> {
+
+    // ФАЗА 2: commit — вызывается ПОСЛЕ notifyCheckpointComplete
+    @Override
+    public void commit(Collection<CommitRequest<TxnID>> commits) {
+        for (CommitRequest<TxnID> req : commits) {
+            try {
+                externalSystem.commitTransaction(req.getCommittable());
+            } catch (RetryableException e) {
+                req.retryLater(); // Flink retry on next notifyCheckpointComplete
+            } catch (FatalException e) {
+                req.signalFailedWithKnownReason(e);
+            }
+        }
+    }
+}
+```
+
+В SinkV2 эти два класса оформлены как `Sink` (factory), `SinkWriter` (writes + preCommit), `Committer` (commits). Деталь разбирается в следующем уроке.
+
+---
+
+## Что хранится в state
+
+Между `prepareCommit` и `commit` Flink хранит **Committable** в operator state. Это маркер транзакции, который позволит после восстановления узнать «какие транзакции нужно commit».
+
+```
+operator state (per subtask):
+  - activeTxnId      (для текущей не-prepared txn — нужно abort после restart)
+  - pendingCommitables: List<TxnID>   (preCommit-ed но не commit-ed)
+```
+
+`pendingCommitables` — это transaction handles (для Kafka — это `transactional.id` + `producer.id` + epoch; для JDBC XA — Xid; для file sinks — список pending file paths).
+
+---
+
+## Crash сценарии
+
+### Crash A: до prepareCommit (между barriers)
+
+Transaction state: открытая, неfflushed данные в памяти.
+
+```
+t0: barrier(N-1) committed
+t0.5: записи приходят, пишутся в open txn
+t1: CRASH (TaskManager dies)
+```
+
+**Recovery**:
+1. JobManager детектит failure, restart job from checkpoint(N-1).
+2. SinkWriter инициализируется. `initializeState()` восстанавливает `activeTxnId` из state — это **abandoned transaction**.
+3. SinkWriter вызывает `abortTransaction(activeTxnId)` или просто открывает новую — старая будет abort-ed внешней системой по timeout.
+4. Source replays с offset из checkpoint(N-1). Записи переписываются в новую txn.
+5. Результат: no duplicates, no data loss. ✅
+
+### Crash B: между prepareCommit и notifyCheckpointComplete
+
+Transaction state: prepared (flushed но не committed). `pendingCommittable` сохранён в state. Checkpoint(N) НЕ глобально завершён (т.к. crash до final ack или до broadcast).
+
+```
+t0: barrier(N) arrived at sink
+t1: prepareCommit(N) → flush, txnId saved
+t2: ack(N) → JobManager
+t3: JobManager ждёт остальных acks...
+t4: CRASH до того, как все acks собраны
+```
+
+**Recovery**:
+1. JobManager детектит failure, checkpoint(N) marked abort. Restart from checkpoint(N-1).
+2. SinkWriter восстанавливает state из checkpoint(N-1). В state — `pendingCommittables` от checkpoint(N-1) (уже committed раньше, дубликат commit будет idempotent).
+3. `activeTxnId` от t1 — это prepared транзакция. Sink должен её **abort**, не commit.
+4. Source replays с checkpoint(N-1) offset. Записи дублируются — пишутся снова в новую txn.
+5. Результат: prepared txn от prior attempt aborted (по timeout либо явно), данные повторно записаны. No duplicates ✅.
+
+<Callout type="warning">
+В этом сценарии есть subtle issue: prepared транзакция остаётся pending до timeout. Если Kafka `transaction.timeout.ms` маленький и Flink быстро recovers — prepared txn ещё не aborted, но новая записывает те же records. После timeout старая prepared aborts → данные финально в новой txn (consistent). Но если timeout слишком маленький относительно recovery duration — prepared abort происходит до того, как Flink даже инициализирует sink → **OK**. Проблема только если timeout МАЛЕНЬКИЙ и Flink не успевает abort до автоматического abort, ситуация всё равно consistent. Реальная проблема — обратная, обсуждается в уроке 05.
+</Callout>
+
+### Crash C: после notifyCheckpointComplete, до commit
+
+Transaction state: prepared. JobManager уже broadcast notify, но sink не успел commit.
+
+```
+t0-t4: same as above
+t5: JobManager broadcast notifyCheckpointComplete(N)
+t6: sink receives notify
+t7: CRASH до commit(txnId)
+```
+
+**Recovery**:
+1. JobManager детектит failure. Но **checkpoint(N) marked completed** (notifyCheckpointComplete уже broadcasted).
+2. Restart from checkpoint(N). В state восстанавливаются `pendingCommittables(N)` — те же txnId-ы что были на t1.
+3. Flink вызывает `Committer.commit(pendingCommittables)` в **первом цикле** после recovery. Это `recoverAndCommit` behavior — known pending transactions финализируются.
+4. Внешняя система видит `commit(txnId)` — если raw `txnId` ещё в pending → finalize. Если уже была committed предыдущей попыткой — idempotent (для Kafka `commitTransaction` идемпотентен на уже committed txn).
+5. Source replay с checkpoint(N) — записи **после** barrier(N) перечитываются и пишутся в новую txn.
+6. Результат: данные checkpoint(N) committed (1 раз), последующие данные replayed без дубликатов. ✅
+
+### Crash D: после commit
+
+Trivial — checkpoint(N) committed, sink advanced дальше. Recovery from checkpoint(N) или (N+1) когда дойдёт.
+
+---
+
+## Recovery flow в коде
+
+```java
+public class TransactionalSinkWriter<T, TxnID> implements StatefulSinkWriter<T, TxnID> {
+
+    private ExternalTransaction currentTxn;
+
+    // Restore: вызывается при инициализации после recovery
+    @Override
+    public void initializeState(WriterInitContext ctx, Collection<TxnID> recoveredState) {
+        // recoveredState = pending txnIds от последнего successful checkpoint
+        for (TxnID id : recoveredState) {
+            // Тут НЕ commit — это будет Committer.commit() через notifyCheckpointComplete
+            // Можем только abort активные (не prepared) txns, если знаем их
+        }
+        // Open new transaction для текущего checkpoint
+        currentTxn = beginTransaction();
+    }
+}
+
+public class TransactionalCommitter<TxnID> implements Committer<TxnID> {
+
+    @Override
+    public void commit(Collection<CommitRequest<TxnID>> commits) {
+        for (CommitRequest<TxnID> req : commits) {
+            try {
+                externalSystem.commitTransaction(req.getCommittable());
+            } catch (TransactionNotFoundException e) {
+                // Уже committed previous attempt — idempotent OK
+            } catch (TransactionTimedOutException e) {
+                // Slow recovery — данные потеряны
+                req.signalFailedWithKnownReason(new EOSViolationException(...));
+            }
+        }
+    }
+}
+```
+
+`Committer.commit()` после recovery — это **same code path** что и normal commit. Идемпотентность реализуется внешней системой (Kafka `commitTransaction` повторно — no-op).
+
+---
+
+## Coordination protocol view
+
+<DiagramContainer title="Sequence diagram — координация между JobManager и Sink" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. CheckpointCoordinator.triggerCheckpoint(N)"
+        tooltip="JobManager scheduler инициирует checkpoint. Coordinator wakes up через configured interval (execution.checkpointing.interval)."
+      >
+        JM → trigger barrier(N)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="2. Source: barrier(N) injected"
+        tooltip="Все source subtasks одновременно получают сигнал triggerCheckpoint. Они flush текущие records, emit barrier(N), snapshot state (Kafka offsets)."
+      >
+        Source emits barrier(N)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="3. Operators: barrier alignment"
+        tooltip="Каждый operator с multiple inputs (after keyBy / join) ждёт barriers с всех inputs. Aligned: block input после первого barrier. Unaligned (1.11+): пишет inflight buffers в snapshot."
+      >
+        Align + snapshot state
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="4. Sink: prepareCommit(N)"
+        tooltip="Barrier(N) дошёл до sink. prepareCommit flushes external txn, txnId записан в state. Sink ack-ит barrier к JobManager."
+      >
+        prepareCommit + ack
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="5. JM: collect all acks"
+        tooltip="JobManager ждёт acks от всех subtasks всех операторов. Когда последний ack пришёл → checkpoint(N) marked complete в CompletedCheckpointStore."
+      >
+        All acks → checkpoint complete
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="6. JM: broadcast notifyCheckpointComplete(N)"
+        tooltip="JobManager rpc к всем операторам: 'checkpoint N committed everywhere, можно делать post-checkpoint work'. Это callback используется для commit."
+      >
+        notifyCheckpointComplete(N) → all
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="7. Sink: commit(txnId)"
+        tooltip="Committer.commit() финализирует pending транзакции. Для Kafka — KafkaProducer.commitTransaction(). Атомарно делает данные visible для READ_COMMITTED consumers."
+      >
+        Committer.commit() → external
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Ключевое наблюдение: `notifyCheckpointComplete(N)` — это **single point of truth** для всех transactional sinks. Они commit **только** после этого callback.
+
+---
+
+## Сравнение с классическим distributed 2PC
+
+Классический 2PC (XA, базы данных):
+
+| Aspect | Classic 2PC | Flink 2PC |
+|---|---|---|
+| Coordinator | Transaction Manager (TM) | JobManager CheckpointCoordinator |
+| Participants | Resource Managers (RM) | Sink operators (TaskManagers) |
+| Phase 1 | Prepare → vote YES/NO | preCommit (no vote, just flush) |
+| Phase 2 | Commit if all YES | commit on notifyCheckpointComplete |
+| Blocking | Coordinator crash → blocked | JobManager HA через ZK/K8s |
+| Failure resolution | Manual в большинстве случаев | Automatic через checkpoint replay |
+| Latency | Wait for all participants per txn | Wait for checkpoint cycle (~10s-1min) |
+
+Flink 2PC **отличается** от классики в том, что нет «vote» phase — preCommit не может проголосовать NO. Если flush fails, exception throws и checkpoint(N) aborts. Это упрощение: streaming sink либо может flush, либо нет.
+
+---
+
+## Production gotchas
+
+### 1. Slow notifyCheckpointComplete = data invisibility lag
+
+Между `prepareCommit` и `commit` транзакция в pending state — данные **записаны но не видны** downstream. Если checkpoint interval = 60s, downstream видит данные с латентностью до 60s.
+
+**Trade-off**: меньший checkpoint interval = меньше latency, но больше overhead (state snapshots, network).
+
+**Compromise**: 10-30s interval для latency-sensitive EOS, 60s для throughput-oriented.
+
+### 2. Committer не идемпотентен
+
+Если внешняя система не идемпотентна на repeated `commit(txnId)`, recovery scenario C ломается: `recoverAndCommit` повторно вызывает commit, который уже был выполнен → exception → job fails.
+
+**Fix**: либо use idempotent external API (Kafka — да, JDBC XA — да), либо в committer ловить «already committed» exception и treat as success.
+
+### 3. Pending transactions блокируют downstream consumers
+
+Kafka consumer в `READ_COMMITTED` mode **не видит** uncommitted transactions. Если Flink slow или crashed, и pending txn timeout долго — downstream blocked.
+
+**Mitigation**: monitor `kafka_producer_metrics_txn_lag`, alert на pending txns старше N seconds. Set sensible `transaction.timeout.ms`.
+
+### 4. Параметр transaction.timeout.ms vs recovery time
+
+Если recovery занимает > `transaction.timeout.ms`, Kafka abort-ит pending txn после timeout. После restart Flink вызывает `commitTransaction(txnId)` для уже aborted txn → exception, **data loss**. Это критичный pitfall, разбирается отдельно в уроке 05.
+
+### 5. preCommit может быть expensive
+
+Flush больших buffers — это I/O. Если `prepareCommit` занимает minutes (миллион записей × сжатие), checkpoint timeout может expire. JobManager abort checkpoint, replay from previous.
+
+**Fix**: batch size tuning в sink (`KafkaSink.setProperty("batch.size", "16384")`), либо async flush via background thread с awaiting в `prepareCommit`.
+
+### 6. Sink parallelism vs transaction count
+
+Каждый sink subtask держит свою транзакцию (с уникальным `transactional.id` суффиксом). Parallelism 100 = 100 active txns одновременно. Kafka broker limit `transaction.max.timeout.ms` × 100 txns × N checkpoints может насытить broker memory.
+
+**Fix**: monitor broker `transaction-coordinator-metrics`, scale parallelism сознательно.
+
+---
+
+## Cheat sheet
+
+```
+2PC Phase 1 (Prepare):
+    barrier(N) → sink
+    prepareCommit() → flush external + txnId в state
+    ack → JobManager
+
+2PC Phase 2 (Commit):
+    JM collects all acks → checkpoint(N) complete
+    JM broadcasts notifyCheckpointComplete(N)
+    Committer.commit(txnId) → external finalize
+
+Recovery:
+    Restore state с pendingCommittables
+    Committer.commit() для pending (idempotent)
+    abort активные prepared если known
+    Open new transaction
+    Source replay с saved offsets
+```
+
+---
+
+<KnowledgeCheck
+  question="В Flink 2PC sequence: Flink committed `prepareCommit(N)` в 12:00:00, JobManager broadcast `notifyCheckpointComplete(N)` в 12:00:05, sink crashed в 12:00:06 ДО успешного `commit(txnId)`. Recovery занял 30 минут. Kafka `transaction.timeout.ms = 15min`. Что происходит с данными checkpoint(N)?"
+  answer="**Data loss**. Это canonical crash scenario C, осложнённый недостаточным transaction.timeout.ms. Timeline: (1) 12:00:00 — prepareCommit flushes в Kafka, txnId saved в state. (2) 12:00:05 — JobManager marks checkpoint(N) complete (acks received), broadcasts notifyCheckpointComplete. (3) 12:00:06 — sink crashes до commit(). (4) 12:15:00 — Kafka broker автоматически abort-ит pending txn (timeout reached) — flushed records от prepareCommit отбрасываются. (5) 12:30:00 — Flink restored, читает pendingCommittables(N) из state, вызывает Committer.commit(txnId) для уже aborted txn → Kafka возвращает `TransactionNotFoundException` или `InvalidTxnStateException`. Records от checkpoint(N) **потеряны**. Source replays с checkpoint(N) offset, но Flink не повторит обработку между checkpoint(N-1) и (N) — state уже reflects checkpoint(N). Result: gap в output. Fix: set `transaction.timeout.ms` ≥ max expected recovery time + safety margin (1 hour typical). Также broker config `transaction.max.timeout.ms` должен быть ≥ producer setting. Best practice — задать оба на 1 hour: `KafkaSink.setProperty(\"transaction.timeout.ms\", \"3600000\")` и broker `transaction.max.timeout.ms=3600000`. Дополнительно: настроить monitoring на `transaction.timeout` events в Kafka logs."
+/>

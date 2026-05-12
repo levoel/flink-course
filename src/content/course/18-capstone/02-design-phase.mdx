@@ -1,0 +1,292 @@
+---
+title: "Capstone — design phase: real-time observability platform"
+description: "Requirements gathering, technology stack choices (Kafka, Flink, Paimon, ClickHouse, Grafana), architecture diagram. Что включит в pipeline: CDC, stateful aggregations, EOS, autoscaler, chaos testing."
+order: 2
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Capstone", "Design", "Architecture", "Requirements", "Technology Stack"]
+---
+
+# Capstone — design phase: real-time observability platform
+
+Это первый урок capstone проекта. Мы строим **real-time observability platform** — production-grade pipeline что собирает события из OLTP database, agregirует в real-time, отдаёт в OLAP store + lakehouse для analytics + alerting. Это integral проект, использующий все killer-темы курса: CDC, stateful processing, ForSt, EOS, K8s autoscaler, chaos testing, observability.
+
+В этом уроке — requirements, technology choices, architecture diagram. Следующие уроки — implementation each layer.
+
+---
+
+## Business requirements
+
+**Сценарий**: e-commerce платформа. Стейкхолдеры просят real-time observability:
+
+1. **Real-time dashboard** — current order volume, GMV, error rate, top products. Freshness ≤ 5 секунд. SLO: 99.9% uptime.
+2. **Anomaly alerting** — detect order spikes/drops, error rate increases, latency degradation. Time-to-alert ≤ 30 секунд.
+3. **Historical analytics** — daily/weekly business reports, cohort analysis, A/B test analytics. Reads same data lake.
+4. **CDC pipeline для downstream** — order changes должны быть available в Iceberg lakehouse для analytics, ML training, search indexer.
+5. **Exactly-once для money-critical metrics** — GMV calculation должен быть accurate. No duplicates, no drops.
+
+**Non-functional requirements:**
+
+- **Volume**: 50k orders/sec peak, 10k average. 1B events/day.
+- **State size**: ~500GB (per-user aggregates, per-product aggregates, dimension cache).
+- **Recovery RTO**: 5 минут (after node failure).
+- **Recovery RPO**: 30 секунд (max data loss in catastrophic failure).
+- **Multi-DC**: одно primary region + DR replica.
+- **Budget**: ~$15k/month for whole platform.
+
+---
+
+## Technology choices
+
+### Source layer — Postgres + Flink CDC 3.6
+
+Existing OLTP — Postgres. Tables: orders, customers, products, order_items. Choice: **Flink CDC 3.6 directly** (skip Debezium + Kafka — reduces hops).
+
+Альтернативы рассмотренные:
+- Debezium + Kafka — extra hop, extra ops, extra retention cost. Reject.
+- Outbox pattern — requires app changes. Reject (cannot modify OLTP app).
+- Periodic Spark batch — not real-time. Reject.
+
+### Streaming engine — Apache Flink 2.2
+
+Уже знакомый. Choice: **Flink 2.2.x** (current stable). Java 17 LTS.
+
+Альтернативы:
+- Kafka Streams — limited state size, no SQL parity с Flink, no Iceberg sink. Reject.
+- Spark Structured Streaming — micro-batch latency too high для alerting requirement. Reject.
+- RisingWave — interesting, но immature ecosystem для нашего scale + custom logic. Reject for now.
+
+### Storage — Apache Paimon
+
+Streaming lakehouse — нативный fit для CDC pipeline.
+
+Альтернативы:
+- Iceberg — more mature, broader ecosystem. **Choice trade-off**: Paimon native streaming reads + writes, Iceberg requires compaction service. Choose Paimon for primary, mirror critical tables в Iceberg для broader compute compat (Trino/Snowflake).
+- Delta Lake — Databricks ecosystem, less natural для Flink streaming.
+- Hudi — viable, less momentum than Iceberg/Paimon.
+
+### Real-time OLAP — ClickHouse
+
+Для dashboard queries (sub-second response).
+
+Альтернативы:
+- Druid — viable, more operational complexity.
+- Pinot — viable, less mature SQL.
+- Materialized Tables в Paimon — поллинг latency для dashboard slower чем ClickHouse.
+
+### Visualization & alerting — Grafana
+
+Standard choice. Plus AlertManager для critical alerts.
+
+### Deployment — Kubernetes + Flink Kubernetes Operator
+
+Standard for Flink 2.x production. Plus Adaptive Scheduler для in-place rescaling.
+
+### Observability — OpenTelemetry + Prometheus + Grafana
+
+OTel для traces + metrics из Flink (Flink 2.x has native OTel exporter). Prometheus для metrics scrape. Grafana для visualization.
+
+---
+
+## Architecture diagram
+
+<DiagramContainer title="Capstone: end-to-end real-time observability platform" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Postgres OLTP"
+        tooltip="Production e-commerce database. wal_level=logical, replication slot для Flink CDC. Read replica для snapshot phase чтобы не bить production."
+      >
+        Postgres primary + replica
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Flink CDC 3.6 YAML pipeline" />
+    <FlowRow>
+      <DataBox
+        label="Flink CDC source"
+        tooltip="Parallel snapshot splits через PK ranges из read replica. Streaming phase из logical replication slot. Schema evolution applied automatic к downstream."
+      >
+        CDC source (initial+stream)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="transform + enrichment" />
+    <FlowRow>
+      <DataBox
+        label="Stateful enrichment"
+        tooltip="ProcessFunction с ValueState<UserAggregate>, MapState<ProductCounter>. Temporal joins с product/customer dimensions. Watermark alignment между sources."
+      >
+        Stateful processing
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="fan out" />
+    <FlowRow>
+      <DataBox
+        label="Paimon sink (EOS)"
+        tooltip="Raw orders + enriched fact tables. 2PC commit alignment с Flink checkpoint. Pre-commit compaction sub-topology. Snapshot retention 30 days."
+      >
+        Paimon (raw + enriched)
+      </DataBox>
+      <DataBox
+        label="ClickHouse sink"
+        tooltip="Materialized aggregates per minute/hour. Async insert mode для high throughput. At-least-once с idempotent UPSERT по (window_start, key)."
+      >
+        ClickHouse
+      </DataBox>
+      <DataBox
+        label="Anomaly stream"
+        tooltip="Real-time detection: order rate drops > 50% за 60 секунд, error rate > 1%. CEP pattern matching. Output → Kafka alerts topic → AlertManager."
+      >
+        Anomaly Kafka topic
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="serving" />
+    <FlowRow>
+      <DataBox
+        label="Grafana dashboards"
+        tooltip="ClickHouse data source. 12 main dashboards: order volume, GMV, error rate, top products, latency p99, etc. Auto-refresh 5s."
+      >
+        Grafana
+      </DataBox>
+      <DataBox
+        label="AlertManager"
+        tooltip="Routes alerts на oncall (PagerDuty), email, Slack. Severity routing — critical to oncall, warning to channel."
+      >
+        AlertManager
+      </DataBox>
+      <DataBox
+        label="Trino / Spark"
+        tooltip="Ad-hoc queries и batch ML training over Paimon. Read-only access. Запускают analytics teams."
+      >
+        Analytics
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## State design
+
+State distribution по operators:
+
+| Operator | State type | Size estimate | Backend |
+|---|---|---|---|
+| Source SplitEnumerator | Operator state (offsets) | Few MB | Heap |
+| UserAggregator | ValueState\<UserSummary\> per user_id | 200M users × 500 bytes = 100GB | ForSt (disaggregated, on S3) |
+| ProductCounter | MapState\<window_start, Long\> per product | 1M products × 24 windows × 200 bytes = 5GB | ForSt |
+| TemporalJoinProducts | Versioned state per product_id | 1M × 200KB avg = 200GB | ForSt |
+| WindowAggregate | Window state | 5GB | ForSt |
+| Kafka EOS Sink | Pending transaction state | Small | Heap |
+
+Total state: ~300-500GB. ForSt backend critical — local disk would be massive cost, recovery time linear от state size.
+
+---
+
+## Watermark strategy
+
+Multi-source pipeline — Postgres CDC + Kafka external. Watermark alignment между ними.
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((e, ts) -> e.eventTime())
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment(
+        "main-pipeline",
+        Duration.ofMinutes(2),    // max drift
+        Duration.ofSeconds(5)
+    );
+```
+
+30 секунд bounded out-of-orderness — учитывает replication lag, Kafka producer delays, и P99 retry scenarios.
+
+---
+
+## Checkpoint config
+
+```yaml
+execution.checkpointing.interval: 60s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 10min
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+execution.checkpointing.max-concurrent-checkpoints: 1
+execution.checkpointing.tolerable-failed-checkpoints: 3
+
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://capstone/forst-state
+state.backend.forst.local-dir: /tmp/forst-cache
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+dstl.dfs.base-path: s3://capstone/dstl
+
+state.checkpoints.dir: s3://capstone/checkpoints
+state.checkpoints.num-retained: 10
+```
+
+Combined config: ForSt (disaggregated state на S3), GIC (Generic Log Incremental Checkpoints) для metadata-only checkpoints, unaligned для backpressure resilience. Recovery time: metadata-only — ~30s даже на 500GB state.
+
+---
+
+## Sizing estimate
+
+| Component | Resources | Cost/month |
+|---|---|---|
+| Flink TMs (8x) | 8 × 16 CPU, 32GB RAM | $3200 |
+| Flink JM (HA, 2x) | 2 × 4 CPU, 8GB RAM | $400 |
+| Postgres primary | 16 CPU, 128GB | $1500 |
+| Postgres replica | 8 CPU, 64GB | $800 |
+| ClickHouse cluster (3 nodes) | 3 × 8 CPU, 64GB | $2400 |
+| Kafka cluster (3 brokers) | 3 × 4 CPU, 32GB | $1200 |
+| S3 storage (state + lake) | 50TB | $1000 |
+| Grafana + Prometheus | 2 × 4 CPU, 16GB | $400 |
+| Networking, egress | — | $500 |
+| Total | | ~$11400 |
+
+Budget compliant ($15k cap). Headroom для peak periods.
+
+---
+
+## Trade-offs taken
+
+| Decision | Trade-off |
+|---|---|
+| Paimon vs Iceberg primary | Paimon: native streaming reads/writes, better для CDC, but smaller ecosystem |
+| ClickHouse separate from lake | ClickHouse: sub-second dashboard, but extra system to operate |
+| Flink CDC direct (no Debezium) | One less hop, but Flink CDC younger than Debezium |
+| ForSt state backend | Disaggregated state on S3 — recovery fast, но first-time read S3 latency |
+| Single Flink job vs multiple | One job: easier ops, harder isolation. Choose single для simplicity |
+
+---
+
+## Deployment phases
+
+1. **Phase 1 (Week 1)**: Source layer — Flink CDC из Postgres → Paimon raw tables.
+2. **Phase 2 (Week 2)**: Stateful enrichment — per-user/product aggregates, temporal joins.
+3. **Phase 3 (Week 3)**: Sinks — Paimon enriched + ClickHouse aggregates.
+4. **Phase 4 (Week 4)**: K8s deployment + autoscaler + HA.
+5. **Phase 5 (Week 5)**: Observability — OTel + Grafana dashboards + alerting.
+6. **Phase 6 (Week 6)**: Chaos testing + production readiness review.
+
+---
+
+<Callout type="note">
+Реальные projects often go in iterations не linear. Start с minimum viable pipeline (Phase 1+2 simplified) → deploy to staging → validate с stakeholders → expand. Этот design — target state; arriving there требует weeks-months iterative work.
+</Callout>
+
+---
+
+## Production gotchas (design-time)
+
+- **Postgres replica lag** — snapshot from replica может быть behind primary by seconds-minutes. Document это для downstream — initial state may be slightly stale, eventually catches up via streaming.
+- **Kafka не в pipeline** — это conscious choice (Flink CDC direct). Risk: no buffer между Postgres и Flink. Если Flink down hours, replication slot накапливается. Mitigation: monitoring slot lag, alerting, max_slot_wal_keep_size.
+- **ClickHouse separate из main pipeline** — eventual consistency между lake и ClickHouse OK для dashboards, но не для billing. Critical metrics computed in Paimon (EOS), mirrored в ClickHouse (at-least-once UPSERT).
+- **Single Flink job risk** — bug в one operator может kill entire job. Mitigation: extensive testing, savepoint backup перед deploys, blue/green deployment strategy (см. урок 06).
+- **Dimension tables freshness** — temporal join state size grows с updates. TTL обязателен; tune retention под business need.
+- **Recovery time SLO 5 min** — с ForSt recovery metadata-only ~30s + JM/TM pod startup ~2 min. Plus local recovery для same-TM restarts.
+
+---
+
+<KnowledgeCheck
+  question="Design review: stakeholder задаёт вопрос — 'почему не использовать Kafka между Postgres и Flink (как is the textbook pattern Debezium → Kafka → Flink), вместо direct Flink CDC?'. Какие trade-offs вы adresat-ете в response?"
+  answer="Excellent question — это intentional choice с trade-offs. **Кафка ИЗ pipeline plusses (что мы теряем)**: (1) Buffer между Postgres и Flink — если Flink down 24h, Kafka holds events, replication slot не filled, Postgres safe; (2) Multiple consumers — другие services могут subscribe to same change events without affecting Flink; (3) Mature tech — Debezium + Kafka проверены production years; (4) Replay simple — reset Kafka consumer group offsets. **Direct Flink CDC plusses (что мы получаем)**: (1) One less hop — less latency, less operational complexity; (2) No Kafka retention cost — для 1B events/day × 1KB × 30 days retention = 30TB Kafka storage saving ~$3-5k/month; (3) Flink CDC schema evolution propagation built-in — automatic ALTER applied к Paimon. С Debezium + Kafka, schema events нужно отдельно handle; (4) Simpler debugging — less surfaces. **Risk mitigation для direct approach**: (1) Monitoring replication slot lag — alert if > 10GB или > 30 min; (2) max_slot_wal_keep_size = 100GB — automatic slot drop if exceeded (prevents Postgres disk fill); (3) If we need multi-consumer scenario в будущем — we can ADD Kafka layer (Flink CDC → Kafka sink) without architectural rewrite. **Decision**: для current use case (1 consumer, simplicity priority, cost budget) direct лучше. Если scenarios evolve (multiple consumers, longer DR window required), reconsider. Это explicit trade-off с monitoring guardrails, не неосознанное choice."
+/>

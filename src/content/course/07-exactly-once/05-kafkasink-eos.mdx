@@ -1,0 +1,418 @@
+---
+title: "KafkaSink с EOS — transactional.id и timeout pitfall"
+description: "DeliveryGuarantee.EXACTLY_ONCE, transactional.id prefix, transaction.timeout.ms pitfall (data loss), blue/green deployments"
+order: 5
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["KafkaSink", "Exactly-Once", "transactional.id", "transaction.timeout", "Blue/Green"]
+---
+
+# KafkaSink с EOS — transactional.id и timeout pitfall
+
+KafkaSink — самый используемый transactional sink в Flink. Его настройка кажется простой (`setDeliveryGuarantee(EXACTLY_ONCE)`), но содержит несколько production gotchas, которые приводили к catastrophic data loss в реальных pipelines. Этот урок разбирает internal mechanics, `transactional.id` semantics, `transaction.timeout.ms` pitfall (центральная тема) и blue/green deployment strategy.
+
+KafkaSink использует **Kafka transactional API** (introduced в Kafka 0.11) для атомарных produces. Понимание Kafka producer transactions — обязательный prerequisite для разбора Flink integration.
+
+---
+
+## Kafka transactional API — короткий refresh
+
+Kafka producer имеет три режима:
+
+| Mode | Settings | Guarantees |
+|---|---|---|
+| `at-most-once` | default | acks=0/1, no retries → возможны потери |
+| `at-least-once` | `acks=all`, `retries>0` | дубликаты возможны на retry |
+| `idempotent` | `enable.idempotence=true` | acks=all, retries, dedupe внутри partition |
+| `transactional` | `transactional.id=X` | exactly-once across partitions + atomic commit |
+
+Transactional API API:
+```java
+producer.initTransactions();
+producer.beginTransaction();
+producer.send(record1);
+producer.send(record2);
+producer.commitTransaction();  // или abortTransaction()
+```
+
+Между `beginTransaction` и `commit` — записи помечены `isTransactional=true`. Consumer в `isolation.level=read_committed` **не видит** их до commit. После commit — atomically visible.
+
+Транзакция привязана к `transactional.id` — string identifier. Per partition broker помнит latest `producer.id + epoch + sequence number` для этого `transactional.id`.
+
+---
+
+## KafkaSink builder
+
+```java
+KafkaSink<Alert> sink = KafkaSink.<Alert>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+        .setTopic("fraud-alerts")
+        .setValueSerializationSchema(new AlertSerializer())
+        .build())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("fraud-pipeline-v1")
+    .setProperty("transaction.timeout.ms", "3600000") // 1 hour
+    .build();
+```
+
+Минимальный EOS setup. Все detail в `setTransactionalIdPrefix` и `transaction.timeout.ms`.
+
+---
+
+## Transactional.id — what и why
+
+Каждый sink subtask должен иметь **уникальный** `transactional.id`. KafkaSink генерирует их по схеме:
+
+```
+transactionalId = {prefix}-{subtaskId}-{txnSequenceNumber}
+
+Examples:
+  fraud-pipeline-v1-0-0
+  fraud-pipeline-v1-0-1
+  fraud-pipeline-v1-1-0
+  ...
+```
+
+`prefix` — задаваемый пользователем (`setTransactionalIdPrefix`). `subtaskId` — index parallel subtask. `txnSequenceNumber` — incremental per checkpoint cycle.
+
+### Почему prefix критичен
+
+Когда Flink job restart-ит с savepoint, новые subtasks могут иметь **другой** assignment. Если префикс совпадает с другой running job (или predecessor), может произойти **transaction zombification**: один producer убивает транзакции другого по принципу epoch.
+
+### Blue/Green deployment scenario
+
+```
+Blue (running):   transactionalIdPrefix = "fraud-v1"
+                  subtask 0 → fraud-v1-0-N
+
+Green (deploying): transactionalIdPrefix = "fraud-v1"  ← collision!
+                  subtask 0 → fraud-v1-0-0
+```
+
+Green's `initTransactions()` для `fraud-v1-0-0` increment epoch. Broker invalidate-ит Blue's producer для same `transactional.id`. Blue's `commitTransaction()` fails → data loss.
+
+**Fix**: разные prefixes для каждой версии:
+
+```java
+// Blue
+.setTransactionalIdPrefix("fraud-blue")
+
+// Green
+.setTransactionalIdPrefix("fraud-green")
+```
+
+После cutover Blue остановить, Green продолжает. Pending Blue transactions abort по timeout.
+
+---
+
+## Mechanics — что происходит во время checkpoint
+
+<DiagramContainer title="KafkaSink с EOS — checkpoint cycle" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="t0 — beginTransaction(N)"
+        tooltip="После предыдущего checkpoint(N-1), SinkWriter создаёт нового producer с transactionalId = {prefix}-{subtask}-{seq}. Calls producer.initTransactions() — broker assign epoch. Затем producer.beginTransaction()."
+      >
+        new producer + beginTransaction
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="records arrive" />
+    <FlowRow>
+      <DataBox
+        label="t1 — write records"
+        tooltip="SinkWriter.write() → producer.send(record). Records записываются в log partition с isTransactional=true. Consumer в read_committed их НЕ видит до commit."
+      >
+        producer.send(record) → invisible
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier(N) arrives" />
+    <FlowRow>
+      <DataBox
+        label="t2 — prepareCommit(N)"
+        tooltip="On barrier(N): SinkWriter flush()-ит pending records (producer.flush()). НЕ commitTransaction(). Сохраняет transactionalId в state. Создаёт нового producer для transaction(N+1)."
+      >
+        flush() + txnId в state → Committable
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ack → JobManager" />
+    <FlowRow>
+      <DataBox
+        label="t3 — JM collects all acks"
+        tooltip="JobManager ждёт acks от всех subtasks всех операторов. Когда checkpoint(N) marked completed → broadcast notifyCheckpointComplete(N)."
+      >
+        global checkpoint complete
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="notifyCheckpointComplete" />
+    <FlowRow>
+      <DataBox
+        label="t4 — Committer.commit(txnId)"
+        tooltip="Committer создаёт recovery producer с saved transactionalId (используется тот же ID что в prepareCommit). Вызывает producer.commitTransaction(). Атомарно makes records visible для read_committed consumers."
+      >
+        commitTransaction(txnId) → visible
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Между t2 и t4 (preCommit и commit) — это **transaction lag window**. Downstream consumers видят данные только после t4. Размер lag = checkpoint complete latency (typically 100ms-5s для healthy job).
+
+---
+
+## Transaction timeout — THE killer pitfall
+
+Kafka transactional API имеет конфигурацию `transaction.timeout.ms`. После этого времени broker **автоматически abort-ит** prepared transaction независимо от Flink.
+
+**Default value: 60000 ms (60 seconds)** в Kafka client. Production Flink job требует значительно больше.
+
+### Failure scenario — data loss
+
+```
+Timeline:
+  t0:        Flink prepareCommit, txnId в state, broker prepared
+  t1=t0+5s:  notifyCheckpointComplete broadcast
+  t2=t0+6s:  CRASH TaskManager до commit
+  t3=t0+30min: Flink JobManager детектит failure, инициирует restart
+  t4=t0+45min: Recovery completes, Committer вызывает commitTransaction(txnId)
+              ↓
+              Broker: "transaction.timeout.ms=15min — aborted в t0+15min, не существует"
+              ↓
+              Kafka returns: InvalidTxnStateException / TransactionNotFoundException
+              ↓
+              Flink: data loss для checkpoint(N)
+```
+
+Записи в Kafka логе помечены `isTransactional=true` с aborted marker — consumers их **никогда** не увидят.
+
+### Configuration
+
+```java
+KafkaSink.<T>builder()
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("my-app")
+    .setProperty("transaction.timeout.ms", "3600000")  // 1 hour
+    .build();
+```
+
+**Recommendation**: 1 hour (3600000ms) для production. Это покрывает 99% recovery scenarios.
+
+### Broker-side limit
+
+`transaction.timeout.ms` ограничен broker config:
+
+```
+# Kafka broker config (server.properties)
+transaction.max.timeout.ms=3600000   # ← max producer can request
+```
+
+Default broker setting — **15 minutes** (900000ms). Если producer requests `transaction.timeout.ms` > broker `transaction.max.timeout.ms` → broker rejects с `InvalidConfigurationException`.
+
+**Action**: на broker side увеличить:
+```
+transaction.max.timeout.ms=3600000
+```
+
+Без broker change producer settings ограничены 15min.
+
+### Trade-off — почему не задать 24 hours?
+
+Pending transactions блокируют **consumer offset advance**. Downstream consumer в `read_committed` не может прогрессировать past pending transaction LSO (Last Stable Offset). Если pending hang за 24h → 24h consumer lag.
+
+**Балланс**: timeout ≥ realistic max recovery time (1h covers всё кроме disaster), но не настолько большой, что pending hung txn заблокирует downstream надолго.
+
+---
+
+## Producer pool — reuse vs create
+
+Старые версии Flink создавали **new producer на каждый checkpoint** — это дорого (initTransactions handshake ~50-100ms). KafkaSink 2.x использует **producer pool**:
+
+```
+SinkWriter subtask 0:
+  transactionalId = "prefix-0-0"  ← used checkpoint 1
+  transactionalId = "prefix-0-1"  ← used checkpoint 2
+  ...
+  Pool: [producer для prefix-0-0, producer для prefix-0-1]
+  Round-robin между ними или create new когда pool exhausted.
+```
+
+Configurable через `setProperty("kafka.transaction.timeout.ms", "..."). KafkaSink internally manages lifecycle.
+
+---
+
+## Recovery — recoverAndCommit
+
+После restart Flink инициализирует sink с `recoveredState` — это **transactionalIds от pending committables** (preCommitted в last successful checkpoint, но not yet committed).
+
+```java
+@Override
+public void initializeState(...) {
+    for (KafkaTransactionalId txnId : recoveredState) {
+        // Создаём recovery producer с saved transactionalId
+        KafkaProducer<...> recoveryProducer = new KafkaProducer<>(
+            propsWith("transactional.id", txnId.toString()));
+
+        recoveryProducer.initTransactions();
+        // ↑ Broker recognizes this transactional.id — assign next epoch.
+        // Existing prepared transaction для prior epoch — ABORTED.
+        // Это известная KafkaSink behavior для "zombie producer fencing".
+    }
+}
+```
+
+Wait, тут subtle issue: `initTransactions()` для same `transactional.id` increment epoch и **abort любую existing prepared txn**. Это противоположно тому, что мы хотим (recover and commit).
+
+Реальный flow — `resumePreparedTransaction(txnId, producerId, epoch)`:
+- KafkaSink сохраняет в state не только `transactional.id` но и `producer.id + epoch + offset`.
+- На recovery uses Kafka internal API to **resume** existing transaction (без increment epoch).
+- Вызывает `commitTransaction()` для resumed txn.
+
+Это уровень internal API (`org.apache.kafka.clients.producer.internals.TransactionManager`). Flink использует через reflection в KafkaSink 2.x.
+
+---
+
+## Code: full production-grade KafkaSink
+
+```java
+KafkaSink<Alert> sink = KafkaSink.<Alert>builder()
+    // Connection
+    .setBootstrapServers("kafka-1:9092,kafka-2:9092,kafka-3:9092")
+
+    // Serialization
+    .setRecordSerializer(KafkaRecordSerializationSchema.<Alert>builder()
+        .setTopic("fraud-alerts")
+        .setKeySerializationSchema(alert -> alert.getUserId().getBytes())
+        .setValueSerializationSchema(new AlertJsonSerializer())
+        .setPartitioner(new FlinkKafkaPartitioner<Alert>() {
+            @Override
+            public int partition(Alert a, byte[] key, byte[] value,
+                                  String topic, int[] partitions) {
+                return Math.abs(a.getUserId().hashCode()) % partitions.length;
+            }
+        })
+        .build())
+
+    // EOS
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("fraud-pipeline-v1")  // unique per version
+
+    // Producer tuning
+    .setProperty("transaction.timeout.ms", "3600000")           // 1 hour
+    .setProperty("max.in.flight.requests.per.connection", "5")  // for idempotency
+    .setProperty("compression.type", "zstd")
+    .setProperty("acks", "all")                                 // required для EOS
+    .setProperty("retries", "2147483647")                       // infinite retries
+    .setProperty("batch.size", "65536")                         // 64KB batches
+    .setProperty("linger.ms", "10")                             // slight buffering
+    .setProperty("buffer.memory", "67108864")                   // 64MB total
+
+    .build();
+```
+
+Каждое property — это production-tested value. Без них baseline EOS работает, но performance subpar.
+
+---
+
+## Production gotchas
+
+### 1. transaction.timeout.ms = 15min (default) → data loss на slow restart
+
+**Самый распространённый production bug.** Default 15min не покрывает: K8s pod scheduling delay, slow checkpoint download from S3, JVM warmup, RocksDB reload.
+
+**Fix**: всегда задать 1 hour. И broker `transaction.max.timeout.ms=3600000`.
+
+### 2. transactional.id prefix collision при rolling deploy
+
+Если deploy через `kubectl rollout` без savepoint/cleanup, новые pods могут запуститься с теми же prefix параллельно со старыми → zombie producer fencing → data loss.
+
+**Fix**: stop-with-savepoint old job, start new job с either same prefix (if same job ID) или different prefix (for new pipeline version).
+
+### 3. consumer offsets growth при pending transactions
+
+Pending transactions блокируют LSO (Last Stable Offset). Если consumer slow на advance, накапливаются offsets в `__consumer_offsets`. Большой `__consumer_offsets` означает rebalance latency.
+
+**Fix**: monitor `kafka.broker:type=Group,name=GroupCommitsLatency`. Sensible checkpoint interval (30-60s).
+
+### 4. Mixed isolation levels — partial dedup
+
+Если downstream consumer использует `isolation.level=read_uncommitted` (default!), он видит **and** aborted transactions. EOS гарантия нарушена с consumer side.
+
+**Fix**: documented в team — downstream consumers MUST set `isolation.level=read_committed` для EOS pipelines.
+
+### 5. Kafka cluster без min.insync.replicas=2
+
+`acks=all` waits for `min.insync.replicas` (default 1). Если 1 — записи acked после write в leader только. Broker crash до replication = data loss.
+
+**Fix**: broker `min.insync.replicas=2`, topic replication.factor=3. Producer `acks=all` + ISR=2 даёт durability.
+
+### 6. Long-running transactions блокируют compaction
+
+Kafka log compaction skip-ит segments с pending transactions. Если транзакция hang за hours → segments не compacted → log growth.
+
+**Mitigation**: short timeouts + monitor `kafka.cluster.Partition.LastStableOffsetLag`.
+
+### 7. setProperty наблюдательный — typo silent
+
+```java
+.setProperty("transaction.timeout.ms", "3600000")
+.setProperty("transactionn.timeout.ms", "3600000")  // ❌ typo, silent ignored
+```
+
+KafkaSink принимает any property, передаёт producer. Producer ignores unknown props без error. Result: pre-Flink-2.1 default 60s в effect.
+
+**Fix**: всегда validate через JMX (`kafka-producer-properties.transaction.timeout.ms`). Integration test для config.
+
+### 8. EXACTLY_ONCE с auto.create.topics=false и missing topic
+
+При EXACTLY_ONCE, initial `initTransactions()` пишет в internal topic `__transaction_state`. Если broker has `auto.create.topics.enable=false` и `__transaction_state` не существует — init hangs или fails.
+
+**Fix**: pre-create `__transaction_state` topic с replication.factor=3 на broker level.
+
+---
+
+## Comparison: AT_LEAST_ONCE vs EXACTLY_ONCE
+
+| Setting | AT_LEAST_ONCE | EXACTLY_ONCE |
+|---|---|---|
+| Producer mode | idempotent | transactional |
+| transactional.id | not set | required (prefix-subtask-seq) |
+| transaction.timeout.ms | irrelevant | critical |
+| Consumer isolation | any | read_committed |
+| Throughput | ~110% of EOS | baseline |
+| Latency (visibility) | immediate | wait for commit (avg 1-5s) |
+| Recovery semantics | дубликаты возможны | EOS если timeout правильный |
+| Broker requirements | none | transaction.max.timeout.ms |
+
+`AT_LEAST_ONCE` ~10-15% быстрее но даёт дубликаты на restart. Используется когда downstream идемпотентен (UPSERT в БД).
+
+---
+
+## Cheat sheet
+
+```
+KafkaSink EOS minimal:
+    DeliveryGuarantee.EXACTLY_ONCE
+    + setTransactionalIdPrefix("unique-per-version")
+    + setProperty("transaction.timeout.ms", "3600000")
+    + broker: transaction.max.timeout.ms=3600000
+    + consumer: isolation.level=read_committed
+
+Killer pitfall:
+    transaction.timeout.ms default = 60s
+    Slow restart > timeout → aborted by broker → DATA LOSS
+
+Blue/Green:
+    different transactionalIdPrefix per version
+    avoid epoch collision
+
+Recovery flow:
+    pendingTxnId в state → resumePreparedTransaction → commit
+```
+
+---
+
+<KnowledgeCheck
+  question="Production incident: Flink job с KafkaSink EOS работает stable неделями, потом K8s evicts pods, recovery занимает 45 минут. После recovery видны gaps в downstream Kafka topic — отсутствуют ~3 минуты данных. transaction.timeout.ms на producer = 3600000ms (1 hour), broker transaction.max.timeout.ms = 900000ms (15 min — default). В чём bug и как fix?"
+  answer="**Bug — broker rejected high producer timeout, fell back to broker max**. Kafka API behavior: когда producer requests `transaction.timeout.ms > broker.transaction.max.timeout.ms`, broker returns `InvalidConfigurationException` на `initTransactions()`. Но KafkaSink в некоторых versions silently catches и retries с reduced timeout до broker max — это subtle. После K8s eviction (45 min recovery): (1) prepared transactions от pre-eviction time aged out (15min broker timeout); (2) broker aborted them автоматически; (3) после recovery Flink committer вызывает commit для aborted txnIds → InvalidTxnStateException → data loss для checkpoint cycle между t-15min и t-eviction. Visible: 3-минутный gap (последние 3 минуты до eviction — записи в last 1-2 checkpoint cycles были prepared, потом aged out). Fix эскалация: (1) **PRIMARY** — увеличить broker `transaction.max.timeout.ms=3600000` (1 hour) в `server.properties`, restart broker cluster (rolling). Это позволит producer setting effect. (2) Verify через JMX `kafka.producer.transaction-coordinator-metrics.transaction-timeout-ms` что effective значение = 1h. (3) Add integration test который sets timeout и asserts effective producer config matches. (4) Monitor `kafka.controller.OfflinePartitionsCount` и `kafka.broker.transaction-coordinator.PendingTransactions` для early warning. (5) Reduce eviction frequency через PodDisruptionBudgets и preStop hooks (drain checkpoints before SIGTERM). Дополнительно: рассмотреть Flink Kubernetes Operator с in-place rescaling — faster recovery без full restart."
+/>

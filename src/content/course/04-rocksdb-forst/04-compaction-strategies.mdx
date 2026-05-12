@@ -1,0 +1,413 @@
+---
+title: "Compaction strategies: Leveled vs Universal"
+description: "Leveled (default, non-overlapping levels, low RA) vs Universal (higher overlap, low WA). Когда какой выбрать. Tuning level multiplier и FIFO style"
+order: 4
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Compaction", "Leveled", "Universal", "FIFO", "Write Amplification", "Read Amplification"]
+---
+
+# Compaction strategies: Leveled vs Universal
+
+Compaction — core process LSM-tree, который физически переписывает SST файлы для merge данных и удаления tombstones. Стратегия compaction определяет write/read/space amplification trade-offs. Выбор неправильной стратегии — частая причина production-проблем: write stalls, disk pressure, latency spikes.
+
+В RocksDB 4 compaction styles. В Flink default — **Leveled**. Альтернативы — Universal, FIFO, None (manual).
+
+---
+
+## Leveled compaction (default)
+
+<DiagramContainer title="Leveled compaction: non-overlapping levels" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="L0"
+        tooltip="Special level: SST overlapping (keys могут пересекаться между файлами). Sorted внутри файла, но не между. Flushed напрямую из MemTable."
+      >
+        Overlapping SSTs (4 files)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="L0→L1 merge sort, all overlapping L1 SST too" />
+    <FlowRow>
+      <DataBox
+        label="L1"
+        tooltip="Non-overlapping SSTs. Каждый файл имеет min/max keys, не пересекающиеся с другими в этом level. Target size 256MB (default base)."
+      >
+        Non-overlapping, 256MB target
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="L1→L2 picks SST + overlapping L2 SST" />
+    <FlowRow>
+      <DataBox
+        label="L2"
+        tooltip="10x larger than L1 (multiplier=10). 2.5GB target. Non-overlapping. Compaction picks one L1 SST + overlapping L2 SST → merge → new L2 SST."
+      >
+        2.5GB (10x L1)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="L3..L6"
+        tooltip="Каждый level 10x larger. L3=25GB, L4=250GB, L5=2.5TB, L6=25TB. Compaction touches small portion data per round."
+      >
+        L3..L6 (each 10x)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### How leveled works
+
+1. L0 SST count exceeds `level0_file_num_compaction_trigger` (default 4) → trigger L0→L1
+2. Pick all overlapping L0 SST + all overlapping L1 SST → merge sort → write new L1 SST
+3. If L1 size > `max_bytes_for_level_base` (default 256MB) → trigger L1→L2
+4. Pick **one** L1 SST + overlapping L2 SST → merge → write L2 SST
+5. Same для L2→L3 etc
+
+### Properties
+
+| Property | Leveled |
+|---|---|
+| Read amplification | Low (1-2 SST per read через bloom) |
+| Write amplification | High (50-70x for 7 levels) |
+| Space amplification | Low (~1.1-1.5) |
+| Compaction CPU | Continuous, predictable |
+| Recovery time | Good (small SSTs) |
+
+### Когда использовать Leveled
+
+- **Read-heavy workloads** (most Flink jobs)
+- Хочется stable latency
+- SSD storage с good IOPS
+- State size до TBs
+
+Это **default** в Flink. 90% jobs OK с leveled.
+
+---
+
+## Universal compaction
+
+<DiagramContainer title="Universal compaction: overlap allowed, big merges" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Multiple SST files"
+        tooltip="Все SST в одном logical 'level', sorted internally но overlapping между друг другом. No tiered structure."
+      >
+        SST_1, SST_2, ..., SST_N
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="trigger: file count or size ratio" />
+    <FlowRow>
+      <DataBox
+        label="Pick subset"
+        tooltip="Compaction picker выбирает subset SST на основе heuristics: oldest first, similar size, file count threshold. Trigger: universal_compaction_size_amplification_percent."
+      >
+        Choose SSTs to merge
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="merge sort → big SST" />
+    <FlowRow>
+      <DataBox
+        label="Big merged SST"
+        tooltip="Single large output. Может быть GBs. Это создаёт I/O spike, но меньше total compactions over lifetime."
+      >
+        New large SST
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Properties
+
+| Property | Universal |
+|---|---|
+| Read amplification | Higher (more overlapping SST per read) |
+| Write amplification | Low (~10x) |
+| Space amplification | High (~1.5-2) |
+| Compaction CPU | Spikes на large merges |
+| Recovery time | Slower (big SSTs) |
+
+### Когда использовать Universal
+
+- **Write-heavy workloads** (high throughput state updates)
+- SSD endurance critical (low WA saves writes)
+- Acceptable некоторое read latency degradation
+- Acceptable space overhead (1.5-2x state size)
+
+```yaml
+state.backend.rocksdb.compaction.style: UNIVERSAL
+state.backend.rocksdb.compaction.universal.size-amplification-percent: 100
+state.backend.rocksdb.compaction.universal.size-ratio: 1
+```
+
+### Universal pitfalls
+
+- Огромные compaction I/O spikes (могут freeze writes на seconds)
+- Read latency variable (some queries hit 10 SST, others 2)
+- Cleanup tombstones может lag — old data lingers longer
+
+---
+
+## FIFO compaction
+
+Простейший: когда total size превышает threshold, **delete oldest** SST. Никаких merges.
+
+```yaml
+state.backend.rocksdb.compaction.style: FIFO
+state.backend.rocksdb.compaction.fifo.max-table-files-size: 1gb
+```
+
+### Use case (rare для Flink)
+
+- TTL-only state, где accurate data not critical (best effort cleanup)
+- Time-series data с rolling window
+- Cache-like behavior
+
+**Не подходит для most Flink state** — потому что Flink state требует correctness, не best-effort. FIFO может delete current data если SST containing it old.
+
+---
+
+## Comparison: leveled vs universal numbers
+
+Real workload: 100k writes/sec, 1TB state, NVMe SSD:
+
+| Metric | Leveled | Universal |
+|---|---|---|
+| Write throughput | 100k ops/sec | 110k ops/sec |
+| Read P50 latency | 100μs | 150μs |
+| Read P99 latency | 500μs | 2ms |
+| Write amplification | 60x | 12x |
+| Space amplification | 1.2x | 1.8x |
+| Disk space used | 1.2TB | 1.8TB |
+| Compaction CPU | 30% sustained | 20% avg, 90% spikes |
+| Long compaction events | ~rare | ~every 30min |
+
+Trade-off: universal даёт 10% больше write throughput при cost of variable read latency и более disk space.
+
+---
+
+## Level multiplier tuning
+
+Default `max_bytes_for_level_multiplier = 10`. Это значит каждый next level 10x size previous. Tunable:
+
+```yaml
+# Smaller multiplier (4-5):
+# - Larger L1 (relatively)
+# - Fewer levels total (better read perf)
+# - More frequent L1→L2 compaction (higher WA)
+state.backend.rocksdb.compaction.level.max-size-level-base: 1gb
+state.backend.rocksdb.compaction.level.max-bytes-for-level-multiplier: 5
+```
+
+Math: с multiplier=5 и L1=1GB:
+- L1=1GB, L2=5GB, L3=25GB, L4=125GB, L5=625GB
+- 5 levels total instead of 7 → read amp ~5 vs ~7
+
+С multiplier=10 (default) и L1=256MB:
+- L1=256MB, L2=2.5GB, L3=25GB, L4=250GB, L5=2.5TB
+- 7 levels, total 2.8TB capacity
+
+Recommendation: default (10) hard to beat. Tune only с metrics-driven evidence.
+
+---
+
+## Dynamic level sizing
+
+```yaml
+state.backend.rocksdb.compaction.level.use-dynamic-size: true
+```
+
+С dynamic sizing target level size auto-computed based on database size:
+- L_last всегда target size = actual size
+- Higher levels target = L_last / multiplier^(L_last - i)
+
+Это adapts к actual state size без static config. **Recommended для prod** — само себя balances.
+
+---
+
+## Compaction priority
+
+```yaml
+state.backend.rocksdb.compaction.level.target-file-size-base: 64mb
+state.backend.rocksdb.compaction.level.target-file-size-multiplier: 1
+```
+
+Target SST file size per level. Default 64MB constant. Multiplier > 1 → bigger SST в higher levels:
+- L0/L1: 64MB SST
+- L2: 128MB SST
+- L3: 256MB SST
+- ...
+
+Bigger SST в cold levels = fewer files (less metadata overhead). Smaller в hot = faster compaction.
+
+---
+
+## Subcompactions
+
+Single compaction L_i → L_{i+1} может быть split на parallel subcompactions:
+
+```yaml
+state.backend.rocksdb.thread.num: 8           # total compaction threads
+state.backend.rocksdb.writebuffer.count: 4    # immutable MemTables
+state.backend.rocksdb.compaction.max-subcompactions: 4
+```
+
+С 4 subcompactions один L1→L2 task splits на 4 parallel jobs (по key range). Speeds up compaction 3-4x на CPU-rich machines.
+
+---
+
+## Compaction filters
+
+Custom logic на compaction time. Flink uses это для State TTL:
+
+```cpp
+// CompactionFilter callback при rewriting SST:
+class TTLCompactionFilter {
+    Decision Filter(int level, const Slice& key, const Slice& value) {
+        // Extract ttl_timestamp from value prefix
+        if (now() > ttl + TTL) return kRemove;   // skip expired
+        return kKeep;
+    }
+};
+```
+
+Это означает: TTL cleanup **happens только при compaction**. Если SST not compacted ages, expired entries linger.
+
+---
+
+## Read amplification мониторинг
+
+Метрики для tracking:
+
+```
+rocksdb_estimate_num_keys           # total keys
+rocksdb_num_files_at_level0..6     # SST count per level
+rocksdb_compaction_pending          # waiting compactions
+rocksdb_bytes_compacted_*           # total bytes through compaction
+rocksdb_compact_read_bytes          # bytes read from disk per compaction
+rocksdb_compact_write_bytes         # bytes written
+```
+
+Write amplification = `total_disk_bytes_written / user_bytes_written`. Healthy: 10-30x для leveled. >50x = over-compacting.
+
+---
+
+## Universal compaction tuning
+
+```yaml
+# When trigger:
+state.backend.rocksdb.compaction.universal.min-merge-width: 2       # min SST to merge
+state.backend.rocksdb.compaction.universal.max-merge-width: -1      # max (no limit)
+state.backend.rocksdb.compaction.universal.size-ratio: 1            # size differential trigger
+
+# Space amplification trigger:
+state.backend.rocksdb.compaction.universal.size-amplification-percent: 100
+# 100 = compact when total_size / live_size = 2 (100% overhead)
+```
+
+`size-amplification-percent: 100` означает компакция triggers when space amplification reaches 2x. Lowering до 50 = aggressive compaction (less space, more CPU).
+
+---
+
+## Production gotchas
+
+### 1. Switching compaction style mid-life
+
+```yaml
+# Был leveled:
+state.backend.rocksdb.compaction.style: LEVEL
+# Меняем на universal — restart with old SST files
+state.backend.rocksdb.compaction.style: UNIVERSAL
+```
+
+При restart RocksDB rebalances existing SST к new style. Это может trigger massive one-time compaction (часы для TB state). Plan для maintenance window.
+
+### 2. Universal compaction stalls с low max-merge-width
+
+```yaml
+state.backend.rocksdb.compaction.universal.max-merge-width: 2   # too low!
+```
+
+Restricts how many SST can merge per round. На write-heavy workload SST accumulate faster чем compaction can merge → write stall. Recommended: -1 (no limit) or 10+.
+
+### 3. Compaction starvation на CPU-bound TaskManager
+
+```yaml
+state.backend.rocksdb.thread.num: 1     # ❌ too few
+```
+
+Если TaskManager CPU bound (другие операторы), compaction thread starved. L0 piles up, eventually stops writes. На enterprise hardware (16+ cores) — `thread.num: 8`.
+
+### 4. Disk space spike during compaction
+
+Compaction temporarily duplicates data: original SST + new merged SST on disk concurrently. Worst case L1→L2 может занять 2x L2 size extra space. Plan disk capacity для 1.5-2x state size.
+
+### 5. SST file size mismatch с filesystem block
+
+```yaml
+state.backend.rocksdb.compaction.level.target-file-size-base: 1mb   # too small
+```
+
+Tiny SST files (1MB) → много metadata, slow compaction. Recommended: 32-128MB.
+
+### 6. Tombstone pile-up в universal
+
+Universal compaction merges less frequently than leveled. Tombstones (от state.clear()) can persist for hours. Read performance degrades — need to scan tombstones до finding live data.
+
+**Fix**: aggressive `delete_obsolete_files_period` or switch к leveled для clear-heavy workloads.
+
+### 7. Compaction during checkpoint
+
+Compaction может run concurrently с checkpoint snapshot. Это OK — Flink uses SST snapshot via hard links, compaction creates new SST. Но increases disk pressure during checkpoint.
+
+---
+
+## Decision matrix
+
+| Workload characteristic | Recommended style |
+|---|---|
+| Read-heavy, stable latency required | Leveled |
+| Write-heavy (>50% of ops are writes) | Universal |
+| Large state (>100GB) | Leveled (better read perf) |
+| Small state (<10GB) | Leveled (default OK) |
+| TTL-heavy с frequent clear | Leveled (better tombstone cleanup) |
+| SSD endurance critical | Universal (low WA) |
+| Mixed predictable workload | Leveled |
+| Burst write patterns | Universal с tuning |
+| Acceptable variable latency | Universal |
+
+**Default recommendation**: Stick with Leveled. Change только с specific evidence.
+
+---
+
+## Flink integration: PredefinedOptions
+
+Flink ships set of profiles, encapsulating compaction settings:
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+```
+
+| Profile | Compaction | Other |
+|---|---|---|
+| DEFAULT | Leveled, defaults | Conservative |
+| SPINNING_DISK_OPTIMIZED | Leveled, bigger SST | HDD-friendly |
+| SPINNING_DISK_OPTIMIZED_HIGH_MEM | Leveled, large MemTable | More RAM usage |
+| FLASH_SSD_OPTIMIZED | Leveled, aggressive parallelism | SSD-targeted |
+
+Урок 05 разбирает PredefinedOptions детально.
+
+---
+
+<Callout type="tip">
+Compaction tuning — last optimization, не first. Start с PredefinedOptions, measure (write stall events, read latency P99, write amp metric). Tune только specific bottlenecks. Premature tuning compaction обычно creates more problems than fixes.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Write-heavy workload: 200k writes/sec, 80% writes / 20% reads, NVMe SSD с limited endurance budget. Текущий setup — Leveled compaction, write amplification 60x. SSD будет dead через 2 года. Что менять?"
+  answer="Switch на Universal compaction — это специально решение write-heavy с SSD endurance concerns. Reasoning: Leveled WA 60x = на каждый 1GB user writes 60GB пишется на SSD за lifetime. Universal WA 8-12x — в 5-7 раз меньше disk wear. С 200k writes/sec × 200 bytes value × 60 (leveled WA) = 2.4GB/sec disk writes. Switch к universal: 200k × 200 × 10 = 400MB/sec — SSD endurance продлевается в ~6x. Trade-offs: (1) read latency P99 будет higher (1ms vs 0.5ms) — acceptable для 20% reads; (2) space amplification 1.8x vs 1.2x = +50% disk usage — нужно extra space; (3) compaction spikes — нужен ParallelismController на client side для smooth backpressure. Tuning: state.backend.rocksdb.compaction.style: UNIVERSAL, universal.size-amplification-percent: 100, universal.max-merge-width: -1, увеличить thread.num до 8 для absorb spikes. Validation: monitor rocksdb_bytes_written / user_bytes_written (target <15x), watch для write stalls. Алтернатива если read latency critical — stay leveled, увеличить write_buffer_size до 256MB (меньше flushes), уменьшить multiplier до 5 (меньше levels) — reduces WA до ~30x частично."
+/>

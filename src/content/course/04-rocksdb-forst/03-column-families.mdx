@@ -1,0 +1,381 @@
+---
+title: "Column Families: каждый state primitive = отдельная CF"
+description: "RocksDB Column Families в Flink. Shared write buffer manager, block cache, options cache. Per-CF MemTable и SST. Tuning implications"
+order: 3
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Column Family", "RocksDB", "Write Buffer Manager", "Block Cache", "Memory Sharing"]
+---
+
+# Column Families: каждый state primitive — отдельная CF
+
+В RocksDB **Column Family** (CF) — это logically separate keyspace внутри одного database instance. Это как отдельная table в SQL. Каждая CF имеет свою MemTable, свои SST, свои compaction settings. Database — это collection of CFs + default CF.
+
+Flink использует это для физической изоляции state primitives: каждый ValueState/MapState/ListState/etc — отдельная CF.
+
+---
+
+## Зачем CF в Flink
+
+Без CF все state primitives одного operator-а лежали бы в одной RocksDB instance, перемешанные в одних SST. Проблемы:
+- Compaction touches **все** state primitives при flush одного из них
+- Block cache hot data одного state crowds out другого
+- Per-state metrics невозможно отделить
+- Schema evolution одного state requires touching других
+
+С CF каждый state primitive — physical isolation:
+- Свой MemTable
+- Свои SST files
+- Свои bloom filters
+- Свой compaction queue
+
+---
+
+## Anatomy: RocksDB instance в Flink subtask
+
+<DiagramContainer title="Один RocksDB на subtask, N Column Families" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="RocksDB instance per slot"
+        tooltip="Flink TaskManager имеет N slots. Каждый slot, который имеет keyed state, держит свой RocksDB instance в /tmp/flink-rocksdb-state/{subtask}/. Это physical isolation между slots."
+      >
+        Per-slot RocksDB
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="contains Column Families" />
+    <FlowRow>
+      <DataBox
+        label="CF: 'default'"
+        tooltip="System CF, не используется Flink directly. Создаётся RocksDB automatically."
+      >
+        Default (empty)
+      </DataBox>
+      <DataBox
+        label="CF: 'count-state'"
+        tooltip="ValueState<Long> с name='count-state'. Свой MemTable (64MB), свои SST files. Compaction independent от других CF."
+      >
+        ValueState
+      </DataBox>
+      <DataBox
+        label="CF: 'events-history'"
+        tooltip="ListState<Event> с name='events-history'. Своя CF. Append-optimized format для list operations."
+      >
+        ListState
+      </DataBox>
+      <DataBox
+        label="CF: 'cat-counts'"
+        tooltip="MapState<String, Long> с name='cat-counts'. Каждая entry в map = row в этой CF. Composite key (kgId, ns, userKey, stateName, mapKey)."
+      >
+        MapState
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="all CF share resources" />
+    <FlowRow>
+      <DataBox
+        label="WriteBufferManager"
+        tooltip="Shared memory budget across CFs. Total budget = managed memory × fraction для RocksDB. Когда любая CF MemTable достигает порога, WBM может trigger flush для balance."
+      >
+        Shared write budget
+      </DataBox>
+      <DataBox
+        label="Block Cache"
+        tooltip="Shared LRU cache между всеми CFs. Hot blocks любого state primitive sharing budget. Default 8MB per slot — но Flink managed memory ставит 256MB+."
+      >
+        Shared read cache
+      </DataBox>
+      <DataBox
+        label="OptionsCache"
+        tooltip="Cached RocksDBOptionsFactory. Создаётся раз per backend instance, applied к каждой новой CF при создании. Custom factory = custom options для всех CF."
+      >
+        Per-instance options
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Когда создаются CF
+
+Lazy: на первое use каждого state primitive в open()/processElement():
+
+```java
+public void open(Configuration c) {
+    countState = getRuntimeContext().getState(
+        new ValueStateDescriptor<>("count-state", Long.class));
+    // ← На этом point создаётся CF "count-state" в RocksDB
+
+    eventsState = getRuntimeContext().getListState(
+        new ListStateDescriptor<>("events-history",
+            TypeInformation.of(Event.class)));
+    // ← CF "events-history" создаётся
+}
+```
+
+CF name = state descriptor name. Это namespace для RocksDB.
+
+### Internal naming
+
+Реальное имя CF в RocksDB — не просто state name. Flink делает encode для disambiguation:
+
+```
+<operatorId>_<stateName>
+```
+
+Это нужно для multiple operators в одном subtask (slot sharing).
+
+---
+
+## Per-CF settings
+
+Каждая CF имеет:
+- **MemTable** (default 64MB skiplist, configurable per CF)
+- **Bloom filter** (per SST, settings per CF)
+- **Compression** (per level, per CF)
+- **Compaction style** (default same as instance, но overridable)
+
+```java
+// Custom RocksDBOptionsFactory:
+public ColumnFamilyOptions createColumnOptions(ColumnFamilyOptions opts, ...) {
+    return opts
+        .setWriteBufferSize(128 * 1024 * 1024)  // 128MB для этой CF
+        .setBloomFilter(new BloomFilter(15));   // 15 bits per key
+}
+```
+
+В Flink через PredefinedOptions большинство users используют default — это OK для most cases.
+
+---
+
+## Shared resources
+
+### 1. WriteBufferManager (WBM)
+
+Global budget MemTable memory across CFs. Без WBM каждая CF имеет свой fixed 64MB → 10 CF = 640MB → может exceed slot memory.
+
+С WBM:
+```yaml
+# Total RocksDB managed memory:
+taskmanager.memory.managed.fraction: 0.4   # 40% Flink Memory → RocksDB
+
+# WBM gets a share, например 50% of managed:
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5
+```
+
+WBM tracks total MemTable usage across CFs. Когда threshold reached → triggers flush largest MemTable.
+
+**Critical**: если custom RocksDBOptionsFactory не uses WBM, каждая CF accumulates memory unbounded → OOM-Killed TaskManager (это самый частый production баг!).
+
+### 2. Block Cache
+
+Shared LRU between CF reads. Hot blocks любой CF share единый pool.
+
+```yaml
+state.backend.rocksdb.block.cache-size: 256mb
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1  # filter blocks priority
+```
+
+`high-prio-pool-ratio` reserves часть cache для filter/index blocks (которые critical для read performance) — they не evicted легко.
+
+### 3. OptionsCache
+
+Cache of RocksDBOptions objects. Прозрачно для users.
+
+---
+
+## Иерархия memory budget
+
+```
+TaskManager Process Memory (e.g. 4GB)
+├── JVM Heap (50%)         ~2GB
+├── JVM Direct (10%)
+├── JVM Metaspace
+├── Network buffers
+├── Framework Off-Heap
+└── Managed Memory (40%)   ~1.6GB
+    └── RocksDB (per slot, divided)
+        ├── Block Cache (~50%)
+        ├── WriteBufferManager (~50%)
+        └── Per-CF metadata, indexes
+```
+
+С `state.backend.rocksdb.memory.managed: true`, Flink делит managed memory между slots, дальше между Block Cache и WBM.
+
+---
+
+## Tuning implications
+
+### Многократно state primitives = много CF
+
+Если в operator-е 10 state primitives:
+- 10 CF
+- 10 MemTable (each share WBM)
+- 10x SST files на диске (separate per CF)
+
+Это OK архитектурно, но:
+- Compaction parallelism может быть bottleneck (default 4 threads divided)
+- File handle pressure (`ulimit -n`)
+- Metadata overhead (~50KB per CF в JVM)
+
+### Hot CF / cold CF
+
+Если ValueState `last-login` accessed на каждый event, а ListState `historical-payments` — раз в неделю, current implementation treats them equal. Block cache contention может evict hot data.
+
+Workaround: pin filter blocks (`cache_index_and_filter_blocks_with_high_priority`), separate operators (different slots).
+
+### MapState — много entries vs много CF
+
+```java
+MapState<String, Long> counts = ...;
+// 1M entries → 1M rows в ОДНОЙ CF
+```
+
+vs
+
+```java
+ValueState<HashMap<String, Long>> counts = ...;  // anti-pattern
+```
+
+MapState с millions entries — все в одной CF, RocksDB efficiently handles. Альтернативно создавать `MapState<String, Long>` per logical group — это создаёт N CF, slightly more overhead но лучше изоляция.
+
+---
+
+## Iterating CF metadata
+
+В Flink web UI можно увидеть RocksDB metrics per state:
+
+```
+state.backend.rocksdb.metrics.estimate-num-keys: true
+state.backend.rocksdb.metrics.live-sst-files-size: true
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.num-files-at-level: true
+```
+
+Эти метрики per CF, exposed как Flink metrics. Полезно для:
+- Identifying largest state primitive
+- Debugging compaction lag
+- Right-sizing managed memory
+
+---
+
+## Production gotchas
+
+### 1. Custom OptionsFactory без WBM = OOM
+
+```java
+public class BadFactory implements RocksDBOptionsFactory {
+    @Override
+    public DBOptions createDBOptions(DBOptions opts, ...) {
+        return opts.setMaxOpenFiles(-1)
+                   .setMaxBackgroundJobs(16);
+        // ❌ Не set WriteBufferManager!
+    }
+}
+```
+
+Без WBM каждая CF гребёт memory без shared budget. На 10 CF × 128MB MemTable × 4 slots = 5GB native memory → OOM-Killed.
+
+**Fix**: ALWAYS extend `DefaultConfigurableOptionsFactory` или explicitly set WriteBufferManager from Flink shared resource.
+
+### 2. Too many state primitives in one operator
+
+```java
+private ValueState<Long> v1, v2, ..., v100;  // 100 state primitives!
+```
+
+100 CF = 100 MemTable budget allocations, 100 compaction queues, 100x file handles. Overhead noticeable. Если logically один объект — combine в POJO ValueState.
+
+### 3. ListState performance vs MapState
+
+```java
+// State A:
+ListState<Tuple2<String, Long>> data;  // append, scan через items
+
+// State B:
+MapState<String, Long> data;            // direct lookup
+```
+
+Same data, разные CF behavior:
+- ListState — single key per CF row (entry index optional), append O(1) amortized
+- MapState — composite key (kgId, ns, userKey, stateName, mapKey), per-entry get/put O(log n) RocksDB
+
+Choose based on access pattern.
+
+### 4. CF schema changes
+
+Adding new state primitive к operator → new CF created on first write. Existing checkpoints don't have it — но Flink handles этот case gracefully (старая state intact, new CF starts empty).
+
+Removing state primitive → CF still exists в old checkpoints. Flink leaves it. С `--allowNonRestoredState` можно ignore при restart.
+
+### 5. CF metadata pressure
+
+Each CF ~50KB JVM metadata. 1000 CF на subtask = 50MB pure overhead. Если у вас 100+ different state primitives — пересмотрите architecture.
+
+### 6. RocksDB version compatibility
+
+Flink shapes around RocksDB через FRocksDB fork. CF format может меняться minor versions. Cross-version restore (Flink 1.x → 2.x) handles это, но major version jumps требуют explicit migration.
+
+---
+
+## Performance: separate CF vs flat key
+
+Question: 10 different counters per user в одном operator — separate ValueState<Long> или MapState<String, Long>?
+
+```java
+// Option A: 10 ValueState (10 CF):
+private ValueState<Long> loginCount;
+private ValueState<Long> purchaseCount;
+private ValueState<Long> errorCount;
+// ... 7 more
+
+// Option B: 1 MapState (1 CF):
+private MapState<String, Long> counts;
+// counts.get("login"), counts.get("purchase"), ...
+```
+
+Trade-offs:
+
+| Aspect | Option A (10 CF) | Option B (1 MapState) |
+|---|---|---|
+| Single counter read | 1 GET, no key encoding | 1 GET, mapKey serialized |
+| Memory overhead | 10×CF metadata | 1×CF metadata |
+| Read all counters | 10 GET в разных CF | 10 GET в одной CF, locality benefit |
+| Bloom filter cost | 10× filters (smaller each) | 1× filter (larger) |
+| Compaction overhead | 10 separate compactions | Bigger compactions per CF |
+
+Recommendation: **MapState если counters logically related** (small overhead, better cache locality), **separate ValueState если each имеет different access pattern или TTL**.
+
+---
+
+## CF и Async State API V2
+
+Async API не меняет CF model — каждый state primitive остаётся отдельной CF. Async pumps requests через AEC, который dispatches к RocksDB worker threads. Per-CF physical storage не affected.
+
+---
+
+<Callout type="tip">
+Default Flink RocksDB конфигурация хорошая для most workloads. Думайте о custom OptionsFactory только если: (a) у вас specific bottleneck identified через metrics; (b) workload extreme в одном направлении (e.g. extreme write throughput); (c) hardware specific (HDDs vs NVMe vs S3). Premature CF tuning — main source of production bugs.
+</Callout>
+
+---
+
+## Quick reference: CF lifecycle
+
+```
+1. State descriptor declared в open()
+2. First state.value() / state.update() → CF lazily created
+3. Writes append to CF MemTable
+4. MemTable flushes → CF-specific SST files
+5. Compaction works on CF SST in isolation
+6. CF lives until job stops
+7. На restart CF reloaded from checkpoint SST files
+8. State primitive removed from code → CF не deleted, just orphaned в SST
+```
+
+---
+
+<KnowledgeCheck
+  question="Production issue: TaskManager OOM-Killed после deploy custom RocksDBOptionsFactory. До этого с PredefinedOptions.FLASH_SSD_OPTIMIZED всё работало. Что могло пойти не так?"
+  answer="Самый частый сценарий: custom OptionsFactory не использует Flink-provided WriteBufferManager. Без WBM каждая Column Family имеет свой fixed MemTable budget (e.g. 64-128MB). На state-heavy operator-е с 10 state primitives и 4 slots на TaskManager: 10 CF × 128MB × 4 slots = 5GB native memory только на MemTables, плюс Block Cache, плюс immutable MemTables waiting flush. Это легко превышает managed memory budget → JVM Direct memory exceeded → OS OOM-Killer. PredefinedOptions автоматически интегрируется с Flink managed memory через WriteBufferManager и shared Block Cache. Custom factory должен ИЛИ extend DefaultConfigurableOptionsFactory (preserves WBM setup), ИЛИ manually inject SharedResources from Flink. Best practice: НЕ override DBOptions/ColumnFamilyOptions если не уверены — используйте PredefinedOptions, тонкая настройка через flink-conf properties (writebuffer.size, block.cache-size). Если custom factory необходим — extend дефолтный, добавляйте только specific overrides без removing memory management. Monitor Status.JVM.Memory.Direct + state.backend.rocksdb.size-all-mem-tables metric to catch memory drift раньше OOM."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/05-hybrid-source",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-05",
+    "description": "Quiz для Hybrid Source"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-05-q1",
+      "type": "multiple-choice",
+      "question": "Главное преимущество Hybrid Source (FLIP-150) над traditional Lambda architecture?",
+      "options": [
+        { "id": "a", "text": "Higher throughput" },
+        { "id": "b", "text": "Single Flink pipeline replaces Spark batch + Flink streaming + manual orchestration. Same DataStream, same operator state populated через bounded source, smoothly transitions к unbounded source — same code, single job, exactly-once preserved across switch. State (например per-user baseline) accumulates during historical phase, продолжает в live phase" },
+        { "id": "c", "text": "Меньше disk usage" },
+        { "id": "d", "text": "Lower memory consumption" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Killer value Hybrid Source. Pre-FLIP-150 backfill = Lambda: Spark batch для history + Flink streaming для live + Cassandra/Redis для state sync + manual orchestration для cutover gap. С Hybrid Source — один Flink job, один pipeline, один deployment, same operator state populated through bounded phase (S3 history) и продолжает в unbounded phase (live Kafka). No external orchestration, no cutover gap, exactly-once preserved. Use case: fraud detection нужен 6-month baseline per user — Hybrid Source populates baseline через S3 history, продолжает comparison через live stream. Это foundation modern Kappa architecture в Flink.",
+      "studyHint": "Повторите урок — секция Problem pre-FLIP-150",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m10-05-q2",
+      "type": "multiple-choice",
+      "question": "Build Hybrid Source: S3 history (6 months Parquet) → live Kafka. Как обеспечить seamless transition без gap/overlap?",
+      "options": [
+        { "id": "a", "text": "Static configuration — hardcode Kafka starting timestamp" },
+        { "id": "b", "text": "Dynamic switching через source factory: HybridSource.builder(historicalSource).addSource(switchCtx -> { long lastTs = extractMaxTimestamp(switchCtx.getPreviousEnumeratorState()); return KafkaSource.builder().setStartingOffsets(OffsetsInitializer.timestamp(lastTs)).build(); }, Boundedness.CONTINUOUS_UNBOUNDED). Это позволяет hand-off timestamp determined dynamically from actual historical data" },
+        { "id": "c", "text": "Использовать noWatermarks() strategy" },
+        { "id": "d", "text": "Запустить два отдельных jobs с UNION" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production-grade hand-off — dynamic switch factory с access к previous source state. switchContext exposes HybridSourceEnumeratorState от previous source — extract maximum timestamp processed. Kafka starts at этого timestamp + 1 — no gap (no missed events) and no overlap (no duplicates). Static configuration (hardcoded timestamp) risky: actual historical end timestamp может differ от expected, особенно если historical processing parallel и random ordering. Plus watermark strategy unified (event.getEventTime() works для both phases) — watermark monotonically progresses через switch.",
+      "studyHint": "Повторите урок — секция Dynamic switching",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m10-05-q3",
+      "type": "multiple-choice",
+      "question": "Production: после switch от S3 history к Kafka live, downstream windowing operators не эмитят результаты — events с small timestamps не trigger windows. Что причина?",
+      "options": [
+        { "id": "a", "text": "Kafka broker недоступен" },
+        { "id": "b", "text": "Watermark monotonic — не может go backwards. Historical processed quickly → watermark advanced to max(historical_timestamp). Live Kafka events с current timestamps могут быть позже последнего historical, но если switch hand-off timestamp incorrect (например Kafka starts от much earlier point) — current events 'behind' watermark, treated как late, dropped. Fix: dynamic factory с lastHistoricalTimestamp + 1" },
+        { "id": "c", "text": "Hybrid Source не поддерживает windowing" },
+        { "id": "d", "text": "Нужно отключить event time" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Common production gap — watermark vs hand-off mismatch. Watermark monotonically progresses в Flink — never backwards. Если historical processing fast и watermark advanced до e.g., 2026-05-12 23:59:59, потом Kafka starts от 2026-05-12 00:00:00 — все Kafka events с timestamps между этими points 'late' (timestamp < watermark) → dropped или silent в late side outputs. Fix: dynamic factory ensures Kafka start = last_historical_timestamp + 1ms = continuous progression. Alternative: increase overlap intentionally + downstream de-dup. Universal pattern: hand-off timestamp must align с actual end of historical phase.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-05-q4",
+      "type": "true-false",
+      "question": "Hybrid Source automatically guarantees exactly-once across switch — Flink de-duplicates events на handoff boundary.",
+      "correctAnswer": false,
+      "explanation": "False. HybridSource не de-duplicates automatically across switch boundary. Если historical source emits event X (например timestamp T1) и live Kafka source also emits X (например с overlap configuration) — downstream receives X twice. Exactly-once preservation requires careful hand-off design: (1) tight hand-off timestamp — no overlap; (2) downstream idempotent semantics (например state-based upsert через primary key); (3) source-level de-dup (track seen event IDs в operator state). Это common gotcha — engineers think HybridSource = automatic EOS but really requires explicit hand-off design. Dynamic switch factory с lastHistoricalTimestamp = first defense.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

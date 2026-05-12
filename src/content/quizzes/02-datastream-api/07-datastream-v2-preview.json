@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/07-datastream-v2-preview",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-07",
+    "description": "Use IDs: flink-m02-07-q1, flink-m02-07-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-07-q1",
+      "type": "multiple-choice",
+      "question": "DataStream API V2 (FLIP-409) — что это, и каков status в Flink 2.2?",
+      "options": [
+        { "id": "a", "text": "Полная замена V1, V1 уже deprecated" },
+        { "id": "b", "text": "Переосмысление API после 9 лет: три core building blocks (DataStream + ProcessFunction + Partitioning) + extensions для windows/joins/CEP. EXPERIMENTAL PREVIEW в 2.0-2.2. НЕ для production до 2.3-2.4 (estimate 2027). Production-ready timeline — несколько лет ещё" },
+        { "id": "c", "text": "Аппликейшн mode replacement" },
+        { "id": "d", "text": "Это про SQL API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-409 DataStream V2 — major API rewrite после 9 лет накопленного опыта V1. Motivation: V1 имеет concept overload (DataStream, KeyedStream, ConnectedStreams, WindowedStream, BroadcastStream — 6 abstractions для related concepts), tight coupling watermark machinery, mixed batch/streaming semantics. V2 проще: DataStream + ProcessFunction + Partitioning + extensions. Status в 2.0-2.2: EXPERIMENTAL preview, breaking changes между minor versions. Production timeline: 2.3-2.4 (~2027). Использовать V1 в production до stabilization.",
+      "studyHint": "Повторите урок 07 — раздел 'Когда V2 будет ready'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-07-q2",
+      "type": "multiple-choice",
+      "question": "В начале 2026 ваш team начинает new streaming проект на Flink 2.2. V1 или V2? Какие preparation steps для future migration?",
+      "options": [
+        { "id": "a", "text": "V2 — самый последний и лучший" },
+        { "id": "b", "text": "V1. V2 — experimental в 2.0-2.2. Preparation для будущей migration: ALWAYS .uid() на каждом stateful operator (critical для savepoint compatibility), используйте FLIP-27 fromSource и FLIP-191 sinkTo (не legacy addSource/addSink), POJO discipline (pipeline.generic-types: false), explicit state descriptors с named identifiers, avoid removed APIs (split/select, Queryable State, Reactive Mode)" },
+        { "id": "c", "text": "Использовать Spark вместо Flink" },
+        { "id": "d", "text": "V2, потому что больше features" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Используйте V1 в production. V2 production-ready timeline 2.3-2.4 (2027). Preparation для будущего migration: (1) ВСЕГДА .uid() на stateful operators — critical для savepoint compatibility между V1/V2; (2) FLIP-27 fromSource (legacy SourceFunction removed в 2.0) и FLIP-191 sinkTo (legacy SinkFunction removed); (3) POJO discipline (public class, no-arg ctor, public fields/getters, pipeline.generic-types: false для fail-fast); (4) Explicit state descriptors с named identifiers через constants; (5) Avoid deprecated/removed patterns: split/select, Queryable State, Reactive Mode, flink-conf.yaml old format. With эти preparation migration к V2 будет smooth.",
+      "studyHint": "Повторите урок 07 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m02-07-q3",
+      "type": "multiple-choice",
+      "question": "Что НЕ меняется при переходе V1 → V2?",
+      "options": [
+        { "id": "a", "text": "Меняется всё, V2 — полная новая система" },
+        { "id": "b", "text": "Runtime (JobManager/TaskManager/slots/scheduling), state backends (RocksDB/ForSt), checkpointing (ABS алгоритм, savepoints, 2PC), connectors (FLIP-27 sources, FLIP-191 sinks работают с обоими), Table API/SQL, deployment (Application/Session, K8s Operator). Меняется только DataStream API syntax layer" },
+        { "id": "c", "text": "Только Java версия меняется" },
+        { "id": "d", "text": "State backend полностью пересмотрен" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "V2 — эволюция API layer, не fundament. НЕ меняется: runtime (JobManager/TaskManager/slots — те же), state backends (RocksDB, ForSt — тот же storage), checkpointing (ABS алгоритм, savepoints, 2PC), connectors (FLIP-27/FLIP-191 работают с V1 и V2), Table API/SQL (separate), deployment (Application/Session mode, K8s Operator). Меняется только DataStream API syntax. Это значит — knowledge fundamentals (что в курсе) полностью transferable. ProcessFunction concepts, state, timers, side outputs, async I/O — те же.",
+      "studyHint": "Повторите урок 07 — раздел 'Что НЕ меняется'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-07-q4",
+      "type": "true-false",
+      "question": "В Flink 2.x DataSet API REMOVED, Scala API REMOVED, SourceFunction/SinkFunction REMOVED. DataStream API V2 — experimental preview, не для production до 2.3-2.4. Stateful Functions sunsetted в 2026.",
+      "correctAnswer": true,
+      "explanation": "Major API cleanup в Flink 2.0. DataSet API removed (заменён unified DataStream с Boundedness — boundedness объединяет batch и streaming). Scala API removed (Java-first философия — менее maintenance, less confusion). SourceFunction / RichSourceFunction / SinkFunction removed (FLIP-27 + FLIP-191). DataStream V2 (FLIP-409) — experimental preview в 2.0-2.2, production timeline 2.3-2.4 (~2027). Stateful Functions (StateFun) sunsetted из-за неактивности проекта. Также removed: split/select API, Queryable State, Reactive Mode, flink-conf.yaml format (заменён standard YAML config.yaml).",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

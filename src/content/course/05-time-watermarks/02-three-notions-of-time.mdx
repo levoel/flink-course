@@ -1,0 +1,320 @@
+---
+title: "Три понятия времени: event / processing / ingestion"
+description: "Event time vs processing time vs ingestion time (deprecated). Почему event time критичен для correctness при reprocessing и backfill."
+order: 2
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Event Time", "Processing Time", "Ingestion Time", "Determinism", "Reprocessing"]
+---
+
+# Три понятия времени в Flink
+
+Время — самая коварная абстракция в stream processing. В отличие от batch (где время записи известно из источника), streaming работает с непрерывным потоком, в котором события могут приходить **не в том порядке**, в котором они произошли. Flink выделяет три разных понятия времени, и выбор между ними определяет, будет ли ваш job **детерминированным** или нет.
+
+Этот урок объясняет, почему почти все production Flink jobs должны использовать **event time**, и какие подводные камни ждут тех, кто выбирает processing time «потому что проще».
+
+---
+
+## Три типа времени
+
+<DiagramContainer title="Жизненный цикл события в Flink" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Источник события"
+        tooltip="Mobile app, IoT device, web browser, microservice. Event происходит в реальном мире — клик, транзакция, sensor reading. В этот момент event time embedded в record."
+      >
+        t_event: 12:00:00.000
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="отправка через сеть (задержка 100мс)" />
+    <FlowRow>
+      <DataBox
+        label="Kafka broker"
+        tooltip="Producer присваивает Kafka record timestamp (CreateTime — берётся из producer, или LogAppendTime — от broker). Это НЕ event time для Flink — это log time."
+      >
+        t_kafka: 12:00:00.100
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Flink source читает (задержка 50мс)" />
+    <FlowRow>
+      <DataBox
+        label="Flink Source (TaskManager)"
+        tooltip="Ingestion time — момент, когда запись пересекла границу Flink. Раньше Flink поддерживал ingestion time как отдельный мод TimeCharacteristic. С 1.12 deprecated, в 2.0 removed — но концепцию полезно понимать."
+      >
+        t_ingest: 12:00:00.150
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="через operator chain (5мс)" />
+    <FlowRow>
+      <DataBox
+        label="Process operator"
+        tooltip="Processing time — System.currentTimeMillis() на TaskManager-е в момент обработки записи. Зависит от backpressure, GC, реплея. Недетерминированно."
+      >
+        t_process: 12:00:00.155
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### 1. Event time — когда событие произошло
+
+**Embedded в record**. Назначается источником (mobile app пишет `timestamp` поле в JSON, IoT sensor — UNIX epoch, web server — request received time).
+
+```java
+public class Transaction {
+    long userId;
+    long eventTime;   // ← это event time, заполнен producer-ом
+    BigDecimal amount;
+}
+```
+
+Flink извлекает event time через `TimestampAssigner`:
+
+```java
+WatermarkStrategy
+    .<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((tx, recordTs) -> tx.getEventTime());
+```
+
+**Свойства event time**:
+- **Детерминированный** — при повторной обработке (replay из Kafka offset) результат идентичен
+- **Out-of-order** — события могут приходить в произвольном порядке из-за network jitter, retry, parallelism
+- **Требует watermarks** — для определения, когда «достаточно» данных собрано для emit окна
+
+### 2. Processing time — wall clock TaskManager-а
+
+`System.currentTimeMillis()` на момент обработки записи. **Самый быстрый** режим — никакой логики watermarks, окна просто закрываются по таймеру.
+
+```java
+stream
+    .keyBy(Transaction::getUserId)
+    .window(TumblingProcessingTimeWindows.of(Time.minutes(5)))
+    .process(...);
+```
+
+**Свойства processing time**:
+- **Низкая latency** — нет ожидания watermark
+- **Простая семантика** — окно закрывается ровно в указанный момент
+- **НЕдетерминированный** — replay из того же offset даёт **другие** результаты
+- **Зависит от инфраструктуры** — GC pause 200мс может сдвинуть события между окнами
+
+### 3. Ingestion time — момент входа в Flink
+
+Время, когда запись пересекла границу Flink Source. Источник timestamp — TaskManager wall clock в момент `SourceReader.pollNext()`.
+
+**В Flink 2.x этот режим removed как отдельная TimeCharacteristic**. Можно эмулировать через custom TimestampAssigner:
+
+```java
+.withTimestampAssigner((event, recordTs) -> System.currentTimeMillis())
+```
+
+Но это almost never правильное решение — теряет преимущества event time без выигрыша processing time.
+
+---
+
+## Почему event time — единственный правильный выбор для большинства задач
+
+<DiagramContainer title="Reprocessing scenario: разница event/processing time" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Bug найден в коде"
+        tooltip="Команда обнаружила баг в FraudDetector в среду. За последние 7 дней неправильно классифицированы транзакции. Нужно reprocess и переотправить корректные alerts."
+      >
+        Day 7: bug discovered
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="fix + replay из Kafka 7 дней назад" />
+    <FlowRow>
+      <DataBox
+        label="Replay с event time"
+        tooltip="Записи 7-дневной давности обрабатываются с правильными event time timestamp-ами. Windows для каждого дня закроются как в оригинале. Результат: bit-exact identical корректным результатам, если бы баг не было — кроме fix-а."
+      >
+        Detrministic output
+      </DataBox>
+      <DataBox
+        label="Replay с processing time"
+        tooltip="Записи 7-дневной давности обрабатываются с current wall clock — все попадают в одно 5-минутное окно. Aggregations broken. Side effects неправильные. Reprocessing невозможен."
+      >
+        Broken aggregations
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Концептуальная разница
+
+| Сценарий | Event time | Processing time |
+|---|---|---|
+| Live processing | Окно `[10:00, 10:05)` закрывается когда watermark > 10:05 | Окно закрывается когда wall clock > 10:05 |
+| Replay из 7-дневной давности | Окно `[10:00, 10:05)` 7 дней назад закрывается корректно | Все записи попадают в текущее окно — broken |
+| Backfill из S3 + live Kafka | Hybrid source, events merge по timestamp | Bound to ingestion order — broken |
+| Late event (timestamp 9:58, пришло в 10:07) | Попадает в `[9:55, 10:00)` или late side output | Попадает в `[10:05, 10:10)` — wrong window |
+| GC pause 5 sec на operator | Окно эмитит ровно в правильное время | Окно может пропустить 5 sec данных |
+
+### Реальный кейс: миграция fraud detector
+
+Команда мигрирует с processing time на event time. На replay 1 дня данных через replay из Kafka:
+
+```java
+// PROCESSING TIME — broken on replay
+.window(TumblingProcessingTimeWindows.of(Time.minutes(5)))
+
+// EVENT TIME — replay correct, but требует watermark + TimestampAssigner
+.assignTimestampsAndWatermarks(
+    WatermarkStrategy.<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+        .withTimestampAssigner((tx, ts) -> tx.getEventTime())
+        .withIdleness(Duration.ofMinutes(1))
+)
+.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+```
+
+При reprocessing с event time job катится через Kafka offset с **maximum throughput** (no rate limiting), но aggregations остаются bit-exact. Это и есть **lambda architecture без lambda** — один pipeline для batch и stream.
+
+---
+
+## Когда processing time всё-таки уместен
+
+Есть редкие, но валидные use case для processing time:
+
+### 1. Service-level monitoring
+
+Метрика: «сколько API requests в последнюю минуту». Здесь wall clock — правильное определение «минуты»:
+
+```java
+stream
+    .window(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+    .aggregate(new CountAgg());
+```
+
+### 2. Rate limiting / throttling
+
+Логика «emit не чаще, чем раз в N секунд» естественно processing time:
+
+```java
+.process(new KeyedProcessFunction<>() {
+    public void processElement(Event e, Context ctx, Collector out) {
+        long now = ctx.timerService().currentProcessingTime();
+        if (now - lastEmitTime.value() > 1000) {
+            out.collect(e);
+            lastEmitTime.update(now);
+        }
+    }
+});
+```
+
+### 3. Side effects с wall clock семантикой
+
+«Очистить state если ничего не приходило 1 час» — wall clock 1 час, не event time:
+
+```java
+ctx.timerService().registerProcessingTimeTimer(now + Time.hours(1).toMilliseconds());
+```
+
+### Правило большого пальца
+
+| Use case | Time semantic |
+|---|---|
+| Бизнес-агрегация (sum, count, avg на временном окне) | **Event time** |
+| Stateful detection (fraud, anomaly) | **Event time** |
+| Join двух потоков по времени | **Event time** |
+| Rate metrics (req/sec) | Processing time |
+| TTL очистка state | Processing time |
+| Reactive alerts (notify if N events in M minutes) | Зависит: bizness — event time, infra — processing time |
+
+---
+
+## Hybrid: timestamps for assignment, processing time for triggers
+
+Flink позволяет смешивать: event time для windowing, processing time для emission через **custom triggers**:
+
+```java
+stream
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .trigger(
+        ContinuousProcessingTimeTrigger.of(Time.seconds(30))   // emit каждые 30s
+    )
+    .aggregate(new SumAgg());
+```
+
+Это полезно для **early firing** — показывать промежуточный результат раньше, чем watermark достигнет границы окна.
+
+---
+
+## Multi-source: разные источники, разный event time
+
+Когда job читает несколько Kafka topics, каждый со своим event time, Flink propagates **MIN(input watermarks)** через operator. Это означает:
+
+- Slow source держит watermark всего pipeline
+- Idle source держит watermark в прошлом
+- Backlogged source (replay) может «убежать вперёд» по event time
+
+Решения:
+- `withIdleness(Duration)` — пометить source как idle при отсутствии данных
+- **Watermark Alignment (FLIP-217)** — паузить fast sources (детально в уроке 05)
+
+Эти проблемы и подходы — основная тема следующих 3 уроков.
+
+---
+
+## Production gotchas
+
+### 1. Mixed time semantics в одной job
+
+Использовать event time для windowing, processing time для cleanup timer — OK. Но смешивать event time tumbling window с processing time tumbling window в одной job — путь к hard-to-reason bugs. Старайтесь делать time semantics однородным per logical pipeline.
+
+### 2. Wall clock skew между TaskManager-ами
+
+Processing time зависит от wall clock каждого TaskManager-а. NTP drift в датацентре может быть 100ms+. Если разные TaskManager-ы видят немного разный wall clock — processing time окна закроются в разное время. Очень редкая, но воспроизводимая причина «нондетерминированных» багов. Event time не зависит от wall clock.
+
+### 3. Timezone в event time
+
+Event time = UNIX epoch millis (UTC). Если producer пишет timestamp в local timezone и забыл конвертировать — события «вернутся назад во времени» при DST transition. **Всегда UTC** в event time.
+
+### 4. Reordering из retry
+
+Producer retry: запись отправлена в 12:00:00, потерялась, retry в 12:00:01 успешен. На consumer side — event time 12:00:00, processing time 12:00:01. Если использовать processing time → событие приходит «позже» чем должно. Event time правильно сохранит исходное время.
+
+### 5. Long event time gaps
+
+Если события приходят раз в час (rare events), processing time windowing работает мгновенно (закрывается каждые 5 мин по wall clock). Event time будет ждать watermark — а watermark двигается только когда есть новые события. Без `withIdleness` окно может никогда не закрыться. Это не баг event time — это правильное поведение, но надо понимать.
+
+### 6. Timestamp assigner возвращает null или старый timestamp
+
+Если `TimestampAssigner` возвращает `Long.MIN_VALUE` или старый timestamp, **watermark не движется** — окна не закроются никогда. Type-safe защита:
+
+```java
+.withTimestampAssigner((event, recordTs) -> {
+    if (event.getEventTime() == 0) {
+        // лучше fallback на Kafka timestamp чем Long.MIN_VALUE
+        return recordTs;
+    }
+    return event.getEventTime();
+})
+```
+
+---
+
+## Cheat sheet
+
+```
+Event time   = когда событие произошло (embedded in record)
+             → детерминированный, требует watermarks
+             → выбор по умолчанию
+
+Processing   = System.currentTimeMillis() на TaskManager-е
+             → быстрый, но недетерминированный
+             → только для wall-clock метрик и rate limiting
+
+Ingestion    = wall clock на момент входа в Flink
+             → deprecated в 2.x, эмулируется через TimestampAssigner
+             → almost never правильный выбор
+```
+
+---
+
+<KnowledgeCheck
+  question="Команда мигрирует fraud detection job с processing time на event time. После replay 30-дневной истории из Kafka все aggregations стали странными — sliding 5-min windows пустые, sums нулевые. В чём проблема и как fix?"
+  answer="Проблема в том, что watermark не движется или движется слишком медленно. При replay из Kafka все события 30-дневной давности имеют старые event time timestamp-ы — Flink думает 'мы в прошлом'. Watermark движется на основе maxObservedTs - outOfOrderness; если outOfOrderness слишком большой (например, 1 час), окно `[12:00, 12:05)` закроется только когда maxObservedTs достигнет 13:05. Если события приходят группами с большими gap-ами (replay чанками), watermark может застрять. Возможные причины и fixes: (1) Idle Kafka partition: 0 событий → watermark от этого SourceReader = Long.MIN_VALUE → MIN propagation tanks весь pipeline. Fix: WatermarkStrategy.withIdleness(Duration.ofMinutes(1)) — partition помечается idle и исключается из MIN. (2) outOfOrderness слишком большой: если producer guarantees in-order, можно forMonotonousTimestamps без outOfOrderness — watermark = lastSeenTs. (3) Multi-topic с разной скоростью replay: одна topic улетела на 10 дней вперёд, другая ползёт. Без alignment fast source держит огромный buffer (потенциальный OOM), а sink не emit'ит до slow source. Fix: withWatermarkAlignment с maxAllowedDrift. (4) TimestampAssigner возвращает Long.MIN_VALUE на bad records — watermark не движется. Fix: validate timestamp, fallback на recordTs. (5) Verify, что в коде .window(TumblingEventTimeWindows.of(...)) а не ProcessingTimeWindows — частая ошибка после копипасты."
+/>

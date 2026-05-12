@@ -1,0 +1,343 @@
+---
+title: "File Merging для checkpoints (FLIP-306, Flink 1.20+)"
+description: "FLIP-306 File Merging — меньше DFS файлов для больших installations. Решает 'small files problem' в DFS. Configuration."
+order: 8
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["File Merging", "FLIP-306", "Small Files", "DFS Optimization", "S3 Throttling"]
+---
+
+# File Merging для checkpoints (FLIP-306)
+
+В больших Flink installations (1000+ subtasks, TB state, sub-minute checkpoints) появляется операционная проблема: **слишком много мелких файлов в DFS**. На каждый checkpoint каждый subtask пишет N файлов (SST files, channel state, operator state). На 1000 subtasks × 10 files × 1440 checkpoints/day = **14.4M файлов** в day. S3 throttles, listing slow, manifest size growing.
+
+FLIP-306 (Flink 1.20+) решает это через **file merging** — multiple state pieces от subtasks merge в single physical file на DFS. Этот урок: проблема small files, решение FLIP-306, configuration, и production impact.
+
+---
+
+## Small files problem на DFS
+
+### S3 limits
+
+S3 has per-prefix rate limits:
+- 5,500 GET/HEAD requests per second per prefix
+- 3,500 PUT/COPY/POST/DELETE per second per prefix
+
+На 1000 subtasks одновременно writing checkpoint files → easily exceed 3.5K PUT/s.
+
+**Symptoms**:
+- Slow checkpoints (waiting на S3 retry)
+- 503 SlowDown errors
+- Increased cost (charged per request)
+
+### Listing slowdown
+
+```bash
+# На bucket с 14M files в prefix:
+aws s3 ls s3://bucket/checkpoints/  # → minutes для list completion
+```
+
+Flink's CheckpointCoordinator needs list files для metadata operations, cleanup, recovery. Slow listings → slow operations.
+
+### Manifest bloat
+
+Checkpoint metadata (`_metadata`) contains references to all files. На 14M files = manifest hundreds of MB. Parsing slow, serialization expensive.
+
+---
+
+## FLIP-306: file merging algorithm
+
+<DiagramContainer title="Без vs с file merging" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Без merging: каждый subtask → отдельные files"
+        tooltip="100 subtasks × 5 SST files = 500 files на DFS per checkpoint. На 1440 checkpoints/day = 720K files/day. S3 PUT requests, list slowness, cost."
+      >
+        500 files / checkpoint
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="FLIP-306: merge per file size threshold" />
+    <FlowRow>
+      <DataBox
+        label="С merging: combine small files"
+        tooltip="Files меньше merge.size threshold (default 32MB) combined в bigger physical files. Multiple subtask states share один physical file через offset+length references."
+      >
+        ~10 files / checkpoint (50x reduction)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="State handle: file_path + offset + length"
+        tooltip="StateHandle теперь references часть файла, не whole file. На recovery — download только нужный portion (S3 Range GET)."
+      >
+        Range-based reads
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Merge logic
+
+```java
+// Pseudocode
+public List<StateHandle> mergeFiles(List<File> files) {
+    List<StateHandle> handles = new ArrayList<>();
+    File currentMergedFile = null;
+    long currentOffset = 0;
+
+    for (File file : files) {
+        if (file.size() >= MERGE_SIZE_THRESHOLD) {
+            // Large file — upload как есть
+            handles.add(uploadFile(file));
+        } else {
+            // Small file — append к current merged file
+            if (currentMergedFile == null || currentMergedFile.size() + file.size() > MAX_MERGED_SIZE) {
+                if (currentMergedFile != null) {
+                    uploadFile(currentMergedFile);
+                }
+                currentMergedFile = createNewMergedFile();
+                currentOffset = 0;
+            }
+            currentMergedFile.append(file);
+            handles.add(new RangeStateHandle(currentMergedFile, currentOffset, file.size()));
+            currentOffset += file.size();
+        }
+    }
+    if (currentMergedFile != null) uploadFile(currentMergedFile);
+    return handles;
+}
+```
+
+### Size threshold tuning
+
+```yaml
+state.checkpoints.file-merging.enabled: true
+state.checkpoints.file-merging.max-file-size: 32MB    # ниже — merge
+state.checkpoints.file-merging.pool-blocking-files-threshold: 5
+state.checkpoints.file-merging.max-space-amplification: 2.0
+```
+
+- Files < 32MB merged together
+- Files >= 32MB stored как отдельные
+- max-merged-file-size capped для avoid huge files (default 1GB)
+- space-amplification — допустимый overhead (например, при cleanup partial deletes)
+
+---
+
+## How recovery works с merged files
+
+### State handle format
+
+```
+RangeStateHandle:
+  path: s3://bucket/checkpoints/chk-100/merged-abc.bin
+  offset: 524288    // 512KB into file
+  length: 1048576   // 1MB to read
+```
+
+На recovery TaskManager делает **S3 Range GET**:
+
+```http
+GET /bucket/checkpoints/chk-100/merged-abc.bin
+Range: bytes=524288-1572863
+```
+
+Только needed portion downloaded.
+
+### Sequential reads
+
+Multiple StateHandles может reference same physical file. Smart download — batch reads:
+
+```java
+// Naive — много отдельных GET
+for (RangeStateHandle h : handles) {
+    s3.get(h.path, h.range);   // отдельный HTTP request
+}
+
+// Smart — single GET с multi-range
+RangeReader reader = new RangeReader(s3, allRanges);
+for (RangeStateHandle h : handles) {
+    byte[] data = reader.get(h.offset, h.length);  // от cache
+}
+```
+
+Flink internally optimizes — single download когда возможно.
+
+---
+
+## Space amplification problem
+
+При cleanup older checkpoints, **partial files** могут остаться. Сценарий:
+
+```
+checkpoint 100: merged-100.bin содержит data subtask_0..50
+checkpoint 101: merged-101.bin содержит data subtask_0..50 (new SSTs)
+
+checkpoint 100 expires:
+  Cleanup of merged-100.bin requires checking: still referenced by checkpoint 99?
+  Если references exist — нельзя delete весь file, just mark portions as deleted
+  → space amplification
+```
+
+`max-space-amplification` (default 2.0) — allows up до 2x overhead before forcing compaction (rewrite merged files без deleted portions).
+
+---
+
+## Configuration
+
+```yaml
+# Enable file merging
+state.checkpoints.file-merging.enabled: true
+
+# Size threshold для merging
+state.checkpoints.file-merging.max-file-size: 32MB
+
+# Maximum size of merged file
+state.checkpoints.file-merging.max-space-amplification: 2.0
+
+# Cleanup behaviour
+state.checkpoints.file-merging.across-checkpoint-boundary: true
+```
+
+### Per-job override
+
+```java
+CheckpointConfig config = env.getCheckpointConfig();
+config.enableFileMerging(true);
+config.setMaxFileMergeSize(32 * 1024 * 1024);  // 32MB
+```
+
+---
+
+## Production impact
+
+### Before FLIP-306
+
+```
+Cluster: 1000 subtasks, RocksDB incremental, S3 storage
+Checkpoint interval: 60s
+Files per checkpoint: ~5000 (5 SSTs × 1000 subtasks)
+Daily files generated: 5000 × 1440 = 7.2M files/day
+
+Symptoms:
+- S3 PUT throttling около 3.5K/sec — checkpoints take 5-10 min
+- Listing operations 30+ seconds
+- $50-100/day в S3 request costs
+- 14M files на bucket после week, hard к navigate
+```
+
+### After FLIP-306
+
+```
+Same cluster, file merging enabled, max-file-size=32MB
+Files per checkpoint: ~200 (50x reduction)
+Daily files: ~290K/day
+
+Symptoms:
+- S3 PUT around 100/sec — well below throttling
+- Listings fast (seconds)
+- $5-10/day в S3 costs (10x reduction)
+- Easier ops, debugging
+```
+
+---
+
+## Когда использовать
+
+### Use FLIP-306 if:
+- Parallelism > 200
+- Sub-minute checkpoint intervals
+- Many state primitives per operator
+- S3 throttling observed
+- Long bucket listings
+
+### Maybe skip if:
+- Small parallelism (< 50)
+- Large state per subtask already (files naturally > 32MB)
+- HDFS storage (different limits, не S3)
+- Simple ops, debugging clarity preferred
+
+---
+
+## Comparison с другими optimizations
+
+| Feature | Aim | Where it helps |
+|---|---|---|
+| Incremental checkpoints | Diff state, minimize upload | All scenarios — фундамент |
+| GIC / DSTL | Stable checkpoint duration | Large state, EOS sinks |
+| File merging (FLIP-306) | Fewer DFS files | Large parallelism |
+| Local recovery | Fast restart | Same-node restarts |
+| ForSt | Disaggregated state | Cloud-native, large state |
+
+Они **complementary**, not alternatives. Production setup may use all:
+
+```yaml
+state.backend.type: forst
+state.backend.incremental: true            # base
+state.backend.changelog.enabled: true      # GIC
+state.checkpoints.file-merging.enabled: true   # FLIP-306
+state.backend.local-recovery: true             # local cache
+```
+
+---
+
+## Production gotchas
+
+### 1. Не работает с все backends
+
+FLIP-306 implementation per-backend. RocksDB supported, ForSt supported. Heap state не использует merge (small файлы all-in-one уже).
+
+### 2. Increased cleanup complexity
+
+Cleanup orphan portions внутри merged files требует tracking. Internal Flink mechanism — usually transparent, но bugs возможны (Apache issues mention).
+
+### 3. Recovery performance
+
+Range GETs быстры на S3, но если merged file fragmented (state from many subtasks intermixed), Recovery requires multiple ranges → no perfect sequential read.
+
+**Mitigation**: keep state ordered logically в merged file (per-key-group blocks).
+
+### 4. Manifest size still grows
+
+File merging уменьшает files, но manifest STILL contains all StateHandles (just with offset/length). Manifest size proportional к state primitives count, not file count.
+
+### 5. Backward compatibility
+
+Savepoints в canonical format compatible. Native savepoints с file merging — restored OK same Flink version. Cross-version с different file merging settings — verify.
+
+### 6. Debugging more complex
+
+`aws s3 cp` отдельного SST — easy. С merged files — need byte ranges. Tooling adapts but learning curve.
+
+### 7. Не applies к все file types
+
+Some files specifically не merged: metadata files (_metadata), manifests, materialization indices. Mostly state data files affected.
+
+---
+
+## Cheat sheet
+
+```yaml
+# Production large-installation setup
+state.backend.type: rocksdb           # or forst
+state.backend.incremental: true
+state.checkpoints.dir: s3://bucket/checkpoints
+
+# File merging (Flink 1.20+)
+state.checkpoints.file-merging.enabled: true
+state.checkpoints.file-merging.max-file-size: 32MB
+state.checkpoints.file-merging.max-space-amplification: 2.0
+
+# Combined с GIC и local recovery — full optimization
+state.backend.changelog.enabled: true
+state.backend.local-recovery: true
+```
+
+---
+
+<KnowledgeCheck
+  question="Production setup analysis: cluster 2000 subtasks, RocksDB state 5TB, checkpoint interval 30s, S3 storage. Observed issues: (a) Checkpoints take 8+ min (target 60s); (b) S3 PUT throttling errors; (c) Bucket listing takes 5+ min; (d) $200/day S3 request costs. Recommend optimization stack."
+  answer="Многоуровневая optimization. Diagnose: 2000 subtasks × ~10 state files per checkpoint × 2880 checkpoints/day = 57M files/day generation. S3 PUT throttle 3.5K/sec exceeded by orders of magnitude. Listing на bucket с 50M+ files — slow. Cost driven by request count, not storage. Recommendations: (1) Enable FLIP-306 File Merging (Flink 1.20+): state.checkpoints.file-merging.enabled: true, max-file-size: 64MB. Reduces files 50-100x → 1-2M files/day. S3 throttling resolved, listings fast, costs drop 10-50x. THIS IS PRIMARY FIX for stated issues. (2) Enable GIC (FLIP-158): state.backend.changelog.enabled: true, dstl.dfs.base-path: s3://bucket/dstl, periodic-materialize.interval: 15min. Stable checkpoint duration regardless of state size. Reduces variability — checkpoints predictable 5-15 sec instead of 8+ min. (3) Enable unaligned checkpoints hybrid (FLIP-76): execution.checkpointing.unaligned: true, aligned-checkpoint-timeout: 30s. Backpressure не stalls checkpoint duration. (4) Local recovery: state.backend.local-recovery: true. Saves bandwidth for same-node restarts (frequent в K8s). (5) S3 optimization: (a) Use разные prefixes для checkpoints и DSTL — distributes throttle limits; (b) S3 Transfer Acceleration enabled; (c) Lifecycle policies для cleanup beyond retention; (d) Sharding via prefix randomization (state.checkpoints.dir.shard.enabled if available); (6) Adaptive scheduler + sticky allocation: jobmanager.scheduler: adaptive, preferred-resource-rotation: STICKY — maximizes local recovery hit rate; (7) Consider ForSt instead RocksDB: state.backend.type: forst. Disaggregated state — primary на S3, local-disk cache only. Checkpoint becomes metadata-only operation. 5TB state on local NVMe is significant disk pressure — ForSt removes this. Combined с GIC + file merging это ultimate cloud-native setup; (8) Reduce checkpoint frequency if possible: 30s very aggressive — может быть 60-120s sufficient. Halves load; (9) Operational: monitor S3 metrics (4xx error rate, request count, throttle errors), set alerts. Migrate to monitoring per-prefix to identify hot spots; (10) Cost analysis: predict S3 costs post-optimization. PUT request reduction 50x → costs drop from $200/day к $4-20/day. Even с full ForSt + GIC overhead (DSTL writes always), net DFS bandwidth и request costs typically lower than без optimization. Order of implementation: file merging first (immediate impact on stated issues), then GIC (stable durations), then ForSt (advanced cloud-native). Test each in staging cluster, deploy progressively. Expected result: checkpoint duration 60s → 8sec, S3 request rate 10x reduction, costs $200 → $20/day, bucket manageable. Production rule для large installations (parallelism > 500, state > 1TB): enable file merging + GIC + ForSt as standard baseline."
+/>

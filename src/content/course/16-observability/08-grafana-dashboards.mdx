@@ -1,0 +1,685 @@
+---
+title: "Grafana dashboards: top 12 production metrics, alerting playbook"
+description: "Top 12 production metrics: checkpoint duration p95, state size, busyTime%, backpressure%, watermark lag, RocksDB compaction count, GC time, throughput per source. JSON dashboard template. Alerting playbook"
+order: 8
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Grafana", "Dashboards", "Alerting", "Production Metrics", "PromQL", "Playbook"]
+---
+
+# Grafana dashboards: top 12 production metrics + alerting playbook
+
+Метрики бесполезны без visualization и alerting. Grafana dashboard — это «single pane of glass» для production Flink. Хороший dashboard позволяет за 30 секунд оценить health всего fleet, за 2 минуты locate проблемный job, за 5 минут идентифицировать корневую причину.
+
+В этом уроке препарируем production-ready dashboard: top 12 metrics для оверview, PromQL queries, JSON template, и full alerting playbook с severity tiers.
+
+---
+
+## Dashboard hierarchy
+
+Production observability — это не один dashboard, а **иерархия**:
+
+| Level | Purpose | Audience |
+|---|---|---|
+| **Fleet overview** | Health всего Flink platform | Platform engineers, on-call |
+| **Per-job overview** | Detailed health одного job | Job owners |
+| **Operator drill-down** | Per-operator deep dive | Debugging session |
+| **Backend-specific** | RocksDB, Kafka details | Tuning, root cause |
+
+Каждый dashboard следует «3-секунды правилу»: можно ли разглядеть основное состояние за 3 секунды? Если нет — перегрузка, упрощайте.
+
+---
+
+## Top 12 metrics для production overview
+
+| # | Metric | Visualization | Purpose |
+|---|---|---|---|
+| 1 | Checkpoint duration P95 | Time series | Stability indicator |
+| 2 | State size trend | Time series | Growth detection |
+| 3 | numberOfFailedCheckpoints | Stat (alert > 0) | Failure detection |
+| 4 | currentInputWatermark lag | Time series | Event-time progress |
+| 5 | busyTime% per operator | Heatmap | Bottleneck identification |
+| 6 | backPressuredTime% per operator | Heatmap | Backpressure detection |
+| 7 | numRecordsInPerSecond | Time series | Throughput |
+| 8 | numLateRecordsDropped | Stat | Data loss detection |
+| 9 | GC time / minute | Time series | GC pressure |
+| 10 | Heap usage % | Gauge | Memory pressure |
+| 11 | Direct memory used | Time series | Off-heap leak detection |
+| 12 | RocksDB compaction pending | Time series | Storage tier health |
+
+---
+
+## PromQL queries (top 12)
+
+### 1. Checkpoint duration P95
+
+```promql
+quantile_over_time(0.95,
+  flink_jobmanager_job_lastCheckpointDuration[5m]
+) / 1000
+```
+
+Returns seconds. Alert threshold: > checkpoint timeout × 0.5.
+
+### 2. State size trend
+
+```promql
+flink_jobmanager_job_lastCheckpointSize / 1024 / 1024 / 1024
+```
+
+Returns GB. Sudden growth = state explosion, investigate.
+
+### 3. numberOfFailedCheckpoints
+
+```promql
+sum by (job_name) (
+  increase(flink_jobmanager_job_numberOfFailedCheckpoints[5m])
+)
+```
+
+> 0 в 5min window = alert.
+
+### 4. Watermark lag
+
+```promql
+(time() * 1000 -
+  flink_taskmanager_job_task_operator_currentInputWatermark
+) / 1000
+```
+
+Returns seconds. > 300 (5min) = alert.
+
+### 5. busyTime% per operator
+
+```promql
+avg by (job_name, operator_name) (
+  flink_taskmanager_job_task_operator_busyTimeMsPerSecond / 10
+)
+```
+
+Returns 0-100. Heatmap shows operator activity over time.
+
+### 6. backPressuredTime% per operator
+
+```promql
+avg by (job_name, operator_name) (
+  flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond / 10
+)
+```
+
+Heatmap. > 50 sustained = bottleneck downstream.
+
+### 7. Throughput
+
+```promql
+sum by (job_name) (
+  rate(flink_taskmanager_job_task_operator_numRecordsIn[1m])
+)
+```
+
+Records/sec total для job.
+
+### 8. Late records dropped
+
+```promql
+sum by (job_name) (
+  increase(flink_taskmanager_job_task_operator_numLateRecordsDropped[5m])
+)
+```
+
+> 0 = data loss (если нет side output). Alert.
+
+### 9. GC time / minute
+
+```promql
+sum by (instance) (
+  rate(flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Time[1m]) * 60
+)
+```
+
+Returns milliseconds GC per minute. > 10000 (10s) = pressure.
+
+### 10. Heap usage %
+
+```promql
+flink_taskmanager_Status_JVM_Memory_Heap_Used
+/ flink_taskmanager_Status_JVM_Memory_Heap_Max
+* 100
+```
+
+> 90 sustained = memory pressure.
+
+### 11. Direct memory used
+
+```promql
+flink_taskmanager_Status_JVM_Memory_Direct_MemoryUsed / 1024 / 1024 / 1024
+```
+
+Returns GB. Linear growth = leak (RocksDB custom factory без WBM).
+
+### 12. RocksDB compaction pending
+
+```promql
+sum by (job_name) (
+  flink_taskmanager_state_rocksdb_compaction_pending_bytes
+) / 1024 / 1024
+```
+
+Returns MB. Linear growth = compaction not keeping up, write stall coming.
+
+---
+
+## Dashboard JSON template
+
+```json
+{
+  "title": "Flink Job Overview",
+  "tags": ["flink", "production"],
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "query": "label_values(flink_jobmanager_numRunningJobs, namespace)",
+        "current": { "value": "flink-jobs" }
+      },
+      {
+        "name": "job_name",
+        "type": "query",
+        "query": "label_values(flink_jobmanager_numRunningJobs{namespace=\"$namespace\"}, job_name)"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Checkpoint Duration P95",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "quantile_over_time(0.95, flink_jobmanager_job_lastCheckpointDuration{job_name=\"$job_name\"}[5m]) / 1000",
+          "legendFormat": "P95 duration"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "State Size",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "flink_jobmanager_job_lastCheckpointSize{job_name=\"$job_name\"} / 1024 / 1024 / 1024",
+          "legendFormat": "State size"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "decgbytes" } }
+    },
+    {
+      "id": 3,
+      "title": "Failed Checkpoints (5min window)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(increase(flink_jobmanager_job_numberOfFailedCheckpoints{job_name=\"$job_name\"}[5m]))"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Backpressure Heatmap",
+      "type": "heatmap",
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "avg by (operator_name) (flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond{job_name=\"$job_name\"} / 10)"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Это minimal example. Full dashboard 20+ panels, organized в rows.
+
+---
+
+## Dashboard rows organization
+
+```
+Row 1: Health (overview)
+  - Failed checkpoints | Job uptime | Active TaskManagers | Throughput
+
+Row 2: Pipeline (per-operator visualization)
+  - Backpressure heatmap | busyTime heatmap | numRecordsInPerSecond | watermark lag
+
+Row 3: Checkpoint
+  - Duration P95 | State size | Async/Sync time breakdown | Alignment time
+
+Row 4: JVM
+  - Heap usage % | Direct memory | GC time/min | Threads
+
+Row 5: State backend (RocksDB)
+  - Compaction pending | Block cache hit ratio | MemTable size | Write stalls
+
+Row 6: External dependencies
+  - Kafka consumer lag | Sink commit latency | DB connection pool
+
+Row 7: Errors
+  - Late records | Error counter | Restart count
+```
+
+Variables: `$namespace`, `$job_name`, `$operator_name`, `$tm_id`. Filterable view.
+
+---
+
+## Alerting playbook
+
+Alerts categorized по severity:
+
+### Critical (P0) — page on-call
+
+**1. Job stopped / restarting**
+
+```promql
+flink_jobmanager_numRunningJobs{namespace="prod"} < expected_count
+```
+
+Alert: «Job <name> stopped в production. On-call investigate immediately.»
+
+**2. Persistent checkpoint failures**
+
+```promql
+sum(increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m])) > 2
+```
+
+Alert: «Checkpoint failing repeatedly. Risk of data loss / recovery issues.»
+
+**3. TaskManager OOMKilled**
+
+```promql
+increase(kube_pod_container_status_terminated_reason{
+  pod=~"flink-taskmanager.*",
+  reason="OOMKilled"
+}[5m]) > 0
+```
+
+Alert: «TM OOMKilled. Investigate memory tuning.»
+
+### High (P1) — Slack notify, на on-call hours
+
+**4. Sustained backpressure**
+
+```promql
+avg_over_time(
+  flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond[5m]
+) > 800
+```
+
+For 5min. Alert: «Sustained backpressure в <operator>. Possible bottleneck.»
+
+**5. Watermark stuck**
+
+```promql
+(time() * 1000 - flink_taskmanager_job_task_operator_currentInputWatermark) / 1000 > 300
+```
+
+> 5min. Alert: «Watermark stuck. Event-time processing halted.»
+
+**6. Checkpoint duration spike**
+
+```promql
+quantile_over_time(0.95,
+  flink_jobmanager_job_lastCheckpointDuration[10m]
+) > 300000
+```
+
+> 5min duration. Alert: «Checkpoint duration P95 > 5min.»
+
+**7. Late records dropped**
+
+```promql
+sum by (job_name) (
+  increase(flink_taskmanager_job_task_operator_numLateRecordsDropped[5m])
+) > 0
+```
+
+Alert: «Late records dropped — possible data loss.»
+
+### Medium (P2) — daily digest
+
+**8. State size growth**
+
+```promql
+deriv(flink_jobmanager_job_lastCheckpointSize[1h]) > 0
+  AND
+  rate(flink_jobmanager_job_lastCheckpointSize[6h]) > avg_rate(...)
+```
+
+Daily review: «State growing faster than usual. TTL config check.»
+
+**9. GC time elevated**
+
+```promql
+rate(flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Time[5m]) * 60 > 10000
+```
+
+> 10s/min sustained. Alert: «GC pressure elevated. Consider ZGC migration.»
+
+**10. RocksDB compaction backlog**
+
+```promql
+flink_taskmanager_state_rocksdb_compaction_pending_bytes > 1024 * 1024 * 1024
+```
+
+> 1GB pending. Alert: «RocksDB compaction not keeping up. Consider tuning thread.num.»
+
+### Info (P3) — Slack channel, no action
+
+**11. Throughput drop**
+
+```promql
+rate(flink_taskmanager_job_task_operator_numRecordsIn[5m]) <
+  avg_over_time(rate(flink_taskmanager_job_task_operator_numRecordsIn[5m])[1h:5m]) * 0.7
+```
+
+30% drop vs hourly avg. Possibly upstream slow.
+
+**12. Heap usage elevated**
+
+```promql
+flink_taskmanager_Status_JVM_Memory_Heap_Used /
+  flink_taskmanager_Status_JVM_Memory_Heap_Max * 100 > 80
+```
+
+For 30min. Info: «Heap usage > 80%. Watch growth trend.»
+
+---
+
+## Alerting rule examples (Prometheus)
+
+```yaml
+groups:
+  - name: flink-critical
+    interval: 1m
+    rules:
+      - alert: FlinkJobDown
+        expr: flink_jobmanager_numRunningJobs < 1
+        for: 2m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: "Flink job is down"
+          description: "Job {{ $labels.job_name }} в namespace {{ $labels.namespace }} stopped."
+          runbook: "https://wiki.example.com/runbooks/flink-job-down"
+
+      - alert: FlinkCheckpointFailing
+        expr: sum by (job_name) (increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m])) > 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flink checkpoint failures"
+          description: "Job {{ $labels.job_name }} имеет {{ $value }} failed checkpoints в 10min."
+
+  - name: flink-high
+    interval: 2m
+    rules:
+      - alert: FlinkBackpressureSustained
+        expr: |
+          avg by (job_name, operator_name) (
+            avg_over_time(flink_taskmanager_job_task_operator_backPressuredTimeMsPerSecond[5m])
+          ) > 800
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "Sustained backpressure"
+          description: "Operator {{ $labels.operator_name }} в {{ $labels.job_name }} backpressured > 80% sustained."
+
+      - alert: FlinkWatermarkStuck
+        expr: |
+          (time() * 1000 - flink_taskmanager_job_task_operator_currentInputWatermark) / 1000 > 300
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          summary: "Watermark stuck"
+          description: "Watermark в {{ $labels.operator_name }} не продвигался > 5min."
+
+  - name: flink-medium
+    interval: 5m
+    rules:
+      - alert: FlinkGCElevated
+        expr: |
+          sum by (instance) (
+            rate(flink_taskmanager_Status_JVM_GarbageCollector_G1_Young_Generation_Time[5m]) * 60
+          ) > 10000
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          summary: "GC time elevated"
+          description: "{{ $labels.instance }} имеет G1 Young GC > 10s/min."
+```
+
+---
+
+## Routing alerts
+
+```yaml
+# alertmanager.yml
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: 'pagerduty'
+      group_wait: 30s
+    - match:
+        severity: high
+      receiver: 'slack-high'
+    - match:
+        severity: medium
+      receiver: 'slack-medium'
+
+receivers:
+  - name: 'pagerduty'
+    pagerduty_configs:
+      - service_key: ${PAGERDUTY_KEY}
+
+  - name: 'slack-high'
+    slack_configs:
+      - api_url: ${SLACK_WEBHOOK_HIGH}
+        channel: '#flink-alerts-high'
+
+  - name: 'slack-medium'
+    slack_configs:
+      - api_url: ${SLACK_WEBHOOK_MEDIUM}
+        channel: '#flink-alerts-medium'
+```
+
+---
+
+## Production dashboard patterns
+
+### Pattern 1: Fleet overview (multi-job)
+
+Top-level dashboard:
+- Sum running jobs across cluster
+- Aggregate throughput
+- Top-10 slowest jobs (by checkpoint duration)
+- Recent restarts table
+- Aggregate backpressure heatmap (jobs × operators)
+
+Used by platform team для cluster-wide health check.
+
+### Pattern 2: Per-job detailed
+
+Drill-down from fleet:
+- All 12 top metrics for one job
+- Per-operator breakdown
+- Recent checkpoints history table
+- TaskManager list with resource usage
+
+Used by job owners для daily health check.
+
+### Pattern 3: Incident response
+
+Specialized dashboard:
+- Job filter input
+- Time range pinned к incident window
+- Linked panels: metric → trace ID (Jaeger/Tempo)
+- Linked: metric → logs (Loki)
+
+Used during on-call incident triage.
+
+### Pattern 4: Capacity planning
+
+Historical dashboard:
+- Throughput growth 6-12 month
+- State size trend
+- Resource utilization (CPU, memory)
+- Cost per job
+
+Used quarterly для capacity / cost planning.
+
+---
+
+## Grafana variables
+
+```
+$datasource: Prometheus instance
+$namespace: K8s namespace (label filter)
+$job_name: Flink job (filter)
+$operator_name: Operator (filter)
+$tm_id: TaskManager ID (filter for drill-down)
+$time_range: Override default range
+```
+
+Templated dashboard = одна panel reusable между job-ами.
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Dashboard overload
+
+100 panels на одном dashboard — нечитаемо. Load slow, queries timeout.
+
+**Fix**: hierarchy. Top dashboard ≤ 15-20 panels. Drill-down dashboards для detail.
+
+### Gotcha 2: Heavy queries (range too long)
+
+```promql
+quantile_over_time(0.95, metric[30d])
+```
+
+30-day range = millions samples → seconds query, dashboard slow.
+
+**Fix**: limit ranges. 5m, 15m, 1h типичные. Long historical analysis — separate dashboard, async queries.
+
+### Gotcha 3: Variable cascade
+
+`$job_name` depends on `$namespace`, `$operator` depends on `$job_name`. Каждое change cascade query → slow.
+
+**Fix**: minimize variable depth. Use хорошо filtered initial query.
+
+### Gotcha 4: Stale panels
+
+Job переименован, dashboard panels reference old name. Empty panels.
+
+**Fix**: regular dashboard audit. CI/CD verify panels return data.
+
+### Gotcha 5: Alert fatigue
+
+Every metric alerts → on-call ignores all.
+
+**Fix**: 3 tiers (critical/high/medium). Critical = wake-up рекомендация. Medium = digest, weekly review. Tune thresholds — false positive < 5%.
+
+### Gotcha 6: Missing alert runbook
+
+Alert fires: «Backpressure sustained». On-call: «what do?» — googles десять минут.
+
+**Fix**: each alert annotation links к runbook. Runbook structured: symptoms, diagnosis steps, fixes.
+
+### Gotcha 7: Dashboards as code
+
+Manual dashboards drift, undocumented, lost on Grafana restore.
+
+**Fix**: Terraform Grafana provider, или JSON в Git, Grafana provisioning. Dashboards-as-code = versioned, reviewable.
+
+---
+
+## Configuration tracking
+
+```yaml
+# Grafana provisioning:
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+
+dashboards:
+  - name: 'flink'
+    folder: 'Data Platform'
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards/flink
+```
+
+Dashboards в Git → deployed via CI/CD. Single source of truth.
+
+---
+
+<Callout type="note">
+Production observability — это не «set and forget». Quarterly review dashboards, retire stale panels, add new metrics for emerging concerns (e.g., new dependency). Alert thresholds tune на основе false positive rate. Stale dashboards теряют trust команды.
+</Callout>
+
+---
+
+<Callout type="warning">
+Alert fatigue убивает production reliability. Если on-call игнорирует alerts — система фактически без monitoring. Critical alerts должны быть rare (1-2 раза в месяц), medium — digest format, info — Slack channel без notification. Если alerts firing постоянно — это noise, не signal.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: 50 Flink jobs в кластере, on-call complains об alert fatigue. Analysis показывает: 200+ alerts/week, 90% «backpressure spike» fires но resolve themselves через 2-5 минут (transient). Real incidents (5-10/month) сильно затеряны в шумe. План оптимизации dashboards + alerting?"
+  answer="Анализ root cause: low-quality alerts (transient backpressure spikes), no tiered severity, no de-duplication, дезориентирующий dashboard. План optimization: (1) Triage current alerts. Categorize last 4 weeks of alerts: какой alert fired, какой outcome (real incident vs noise vs auto-resolved). Identify top 5 noisy alerts (likely backpressure, GC, throughput dips). Top 5 useful alerts (job down, checkpoint fail repeatedly, OOMKill). (2) Re-tier по severity. Critical (P0, page): только событий с user-facing impact. Job down (proven service degradation), persistent checkpoint failures (data loss risk), OOMKilled (auto-restart impact). Expected frequency: < 5/month. High (P1, Slack mention): sustained issues (5+ minutes), not transient. Backpressure > 5min sustained, watermark stuck > 10min. Expected: 1-3/week. Medium (P2, digest): trend issues, capacity planning. State growth, GC elevated, throughput downward trend. Expected: weekly digest. Info (P3, Slack channel no notification): observability artifacts, не require action. (3) Add 'for' duration к alerts. Critical insight: 90% backpressure alerts resolve в 2-5 min (transient). Most alerts должны require 'for: 10m' или больше. Backpressure: previously `> 800` (instant), now `avg_over_time[5m] > 800 for 10m` — only sustained backpressure triggers. Reduces transient noise by 80%. (4) De-duplication. Если 30 subtasks backpressured → 30 alerts (anti-pattern). Group by job_name: aggregate alert per job, not per subtask. group_by: ['job_name', 'alertname']. One alert covers multi-subtask incident. (5) Implement alert correlation. CheckpointFailing + Backpressure obвично correlated — they're symptoms of same root cause. Alertmanager inhibition rules: silence Backpressure если CheckpointFailing активен (root cause обычно checkpoint anyway). Reduces double alerts. (6) Add silence windows. Известные maintenance windows (deploy, K8s upgrades) — auto-silence. Reduces false alerts during expected disruption. (7) Runbook discipline. Каждый alert links к runbook с структурой: (a) Symptoms, (b) Diagnosis steps (3-5 step playbook), (c) Common fixes, (d) Escalation. На-call после alert: open runbook, follow checklist. No googling, no guessing. (8) Dashboard simplification. (a) Fleet overview: high-level only — running jobs count, aggregate throughput, recent incidents. Не 30 panels с deep metrics. (b) Per-job dashboard linked from fleet — drill-down on-demand. (c) Specialized 'incident response' dashboard: filtered к specific job + time range, linked к traces/logs. Используется only during incident. (9) Quarterly dashboard review. Stale panels remove. New metrics add (new dependencies, new SLOs). Document changes в Git (dashboards-as-code). (10) Alert quality SLO. Set target: false positive rate < 10% для critical, < 25% для high. Track actually. Если category exceeds threshold, retune. Specific changes для example noise sources: (a) Backpressure: 'for: 10m' instead of '5m' for high severity, 'for: 30m' для critical. Remove instant alert. (b) GC time elevated: change from instant > 10s/min к 'for: 15m sustained > 10s/min'. (c) Throughput drop: only alert если sustained > 30min and не correlated с known upstream issue. (d) Watermark stuck: 'for: 15m' instead of '5m' (small fluctuations don't matter). (11) Implementation timeline. Week 1: identify noisy alerts, document. Week 2: implement 'for' durations, de-duplication, inhibition rules. Week 3: deploy runbooks, dashboards-as-code. Week 4: measure alert volume reduction. Target: 50-70% reduction в alert volume. Expected outcome: 200/week → 60-80/week. Real incidents still firing, noise eliminated. On-call trust restored — alerts now signal, not noise. Lesson: alerting quality > alerting quantity. Less is more — every alert should be actionable, every page should be justified. Continuous tuning required."
+/>

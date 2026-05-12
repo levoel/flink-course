@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/08-streaming-aggregation-correction",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-08",
+    "description": "Quiz for streaming aggregation correction"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-08-q1",
+      "type": "multiple-choice",
+      "question": "Streaming aggregation drift — какие основные источники?",
+      "options": [
+        { "id": "a", "text": "Только bugs в коде" },
+        { "id": "b", "text": "Late events (после watermark, dropped); duplicate events (no proper idempotency, inflated counts); aggressive watermark (forBoundedOutOfOrderness too small); schema drift (V2 events на V1 deserializer); code bugs deployed между windows. Это fundamental tradeoff between latency и correctness в streaming" },
+        { "id": "c", "text": "Streaming не может drift" },
+        { "id": "d", "text": "Только network issues" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Multiple drift sources, кумулятивные. Late events — самый частый: forBoundedOutOfOrderness(5s) при actual p99 lag 30s = 25% events drop. Duplicates — at-least-once producer / Kafka retries без proper idempotency. Watermark — aggressive setting означает window emit раньше чем все события пришли. Schema drift — V2 events с new fields dropped/mis-parsed. Code bugs — deployed fixes не retroact на already-emitted windows. Голос правда: streaming aggregations никогда не совпадут byte-by-byte с batch — нужно bound drift на acceptable level, не страк equality.",
+      "studyHint": "Повторите урок 08 — раздел 'Источники drift'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-08-q2",
+      "type": "multiple-choice",
+      "question": "allowedLateness + side output + idempotent upsert sink — как они работают вместе?",
+      "options": [
+        { "id": "a", "text": "Это три отдельные фичи" },
+        { "id": "b", "text": "1. Window closes когда watermark passes end; 2. allowedLateness=10min — window state остаётся открытым ещё 10 мин, late events apply к existing aggregation, window re-emit-ит updated result; 3. Upsert sink (Iceberg/Paimon с equality fields) — re-emits create UPSERT по (window_start, key), eventual consistency; 4. Past allowedLateness — side output для archive + alerting. Combined дают robust correction model" },
+        { "id": "c", "text": "Это deprecated patterns" },
+        { "id": "d", "text": "Side output только для errors" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Powerful combined pattern. Sequence: (1) Window emits initial result когда watermark passes. (2) Late event arrives within allowedLateness window → state still alive → re-aggregate → re-emit updated result. (3) Sink upsert по equality fields = idempotent overwrite. Downstream queries see latest value. (4) Past allowedLateness — events не drop silently, side output → Kafka archive topic + alerting. Allows manual review для systemic issues. Trade-off: window state retained longer (memory cost), downstream may see multiple updates per window.",
+      "studyHint": "Повторите урок 08 — раздел 'Pattern 1 + 2'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-08-q3",
+      "type": "multiple-choice",
+      "question": "Для money-critical aggregations (billing, invoicing) — что обязательно в архитектуре?",
+      "options": [
+        { "id": "a", "text": "Только streaming aggregate с low latency" },
+        { "id": "b", "text": "Batch reconciliation NON-NEGOTIABLE: nightly Spark job re-aggregates из raw events, computes corrections vs streaming, overwrites authoritative table. Streaming aggregate = fast estimate для dashboards, batch reconciled = source of truth для billing. Это design discipline, не option" },
+        { "id": "c", "text": "Достаточно exactly-once в Flink" },
+        { "id": "d", "text": "Только manual reconciliation by analysts" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical mental model: streaming aggregates имеют fundamental drift (late events, watermark approximations, schema issues). Для money — это unacceptable. Architecture: (1) Streaming Flink → Iceberg streaming aggregate table (с allowedLateness 30-60min); (2) Daily Spark batch reads raw events + streaming aggregates, computes corrections, overwrites reconciled table; (3) Billing system reads ТОЛЬКО reconciled table. Streaming = preview, batch = settle. Без этого даже tiny drift (0.1%) на scale = тысячи $ ошибок. Lesson из реальных incidents — мерчанты получают wrong invoices когда streaming agg = authoritative.",
+      "studyHint": "Повторите урок 08 — раздел 'Pattern 3: Periodic batch reconciliation' и KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-08-q4",
+      "type": "true-false",
+      "question": "Без sideOutputLateData late events просто dropped silently — это безопасно для production analytics.",
+      "correctAnswer": false,
+      "explanation": "Silent late event drop — hidden drift. Без `sideOutputLateData(tag)` Flink просто drops events без metric. Это означает: производственные aggregations untrusted, нет visibility в drift size, нет alerting на systemic issues (например, schema change causes massive late events). Production REQUIREMENT: always configure side output, alerting на counter `numLateRecordsDropped`. Side output → Kafka archive topic для investigation. Если late rate > threshold (0.5%) — alert oncall. Без observability на drift — slowly degrading data quality undetected.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

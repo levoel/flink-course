@@ -1,0 +1,395 @@
+---
+title: "ProcessFunction family: KeyedProcessFunction и BroadcastProcessFunction"
+description: "Самый powerful API в Flink — low-level state + timers access. KeyedProcessFunction, BroadcastProcessFunction. processElement / onTimer / open / close. Stateful fraud detection."
+order: 3
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["ProcessFunction", "KeyedProcessFunction", "BroadcastProcessFunction", "Timers", "State"]
+---
+
+# ProcessFunction family: КилLer-уровень API
+
+`KeyedProcessFunction` — **самый powerful abstraction** в Flink DataStream API. Это building block для всего stateful processing: 99% production Flink jobs можно написать на нём + timers + side outputs. Window-функции, joins, custom aggregations — всё это синтаксический сахар поверх ProcessFunction.
+
+В этом уроке препарируем семейство ProcessFunction-ов: `KeyedProcessFunction` (с state, timers, side outputs), `BroadcastProcessFunction` (для config streams), их lifecycle (open / processElement / onTimer / close), и построим production-ready fraud detector как пример.
+
+---
+
+## Иерархия ProcessFunction-ов
+
+```
+RichFunction
+  ├── RichFunction (open, close, getRuntimeContext)
+  │
+  ├── ProcessFunction<I, O>                    // не keyed, без timers
+  ├── KeyedProcessFunction<K, I, O>            // ★ самый частый
+  ├── CoProcessFunction<I1, I2, O>             // для connect двух streams
+  ├── KeyedCoProcessFunction<K, I1, I2, O>     // keyed two-input
+  ├── BroadcastProcessFunction<I, B, O>        // ★ для config streams
+  ├── KeyedBroadcastProcessFunction<K, I, B, O> // keyed + broadcast
+  ├── ProcessWindowFunction<I, O, K, W>        // для window emit
+  └── ProcessJoinFunction<I1, I2, O>           // для interval join
+```
+
+Main flow: что-то приходит на input → `processElement(record, context, collector)` → optional state update, optional timer registration → `out.collect(result)`. Timers triggered позже через `onTimer(timestamp, context, collector)`.
+
+---
+
+## KeyedProcessFunction — flagship abstraction
+
+`KeyedProcessFunction` доступен после `keyBy(...)`. Даёт три критичных capabilities: keyed state, timers, side outputs.
+
+```java
+public class FraudDetector
+        extends KeyedProcessFunction<Long, Transaction, Alert> {
+
+    // 1. State descriptors инициализируются в open()
+    private transient ValueState<Long> lastTimestampState;
+    private transient ValueState<Double> windowTotalState;
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        lastTimestampState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("last-tx-ts", Long.class));
+        windowTotalState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("window-total", Double.class));
+    }
+
+    @Override
+    public void processElement(
+            Transaction tx,
+            Context ctx,
+            Collector<Alert> out) throws Exception {
+
+        Long lastTs = lastTimestampState.value();
+        Double total = windowTotalState.value();
+        if (total == null) total = 0.0;
+
+        // Detect rapid spending: > 10000 в течение 10 минут
+        long windowStart = tx.getEventTime() - 10 * 60 * 1000;
+        if (lastTs != null && lastTs < windowStart) {
+            total = 0.0;  // reset window
+        }
+
+        total += tx.getAmount();
+
+        if (total > 10000) {
+            out.collect(new Alert(ctx.getCurrentKey(), tx, "Rapid spending: " + total));
+        }
+
+        windowTotalState.update(total);
+        lastTimestampState.update(tx.getEventTime());
+
+        // Register cleanup timer на event-time 11 минут вперёд
+        ctx.timerService().registerEventTimeTimer(tx.getEventTime() + 11 * 60 * 1000);
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<Alert> out)
+            throws Exception {
+        // Cleanup: если window expired без updates — clear state
+        Long lastTs = lastTimestampState.value();
+        if (lastTs != null && timestamp - lastTs > 10 * 60 * 1000) {
+            windowTotalState.clear();
+            lastTimestampState.clear();
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        // cleanup ресурсов (DB connections, etc.)
+    }
+}
+```
+
+Использование:
+
+```java
+stream
+    .keyBy(Transaction::getUserId)
+    .process(new FraudDetector())
+    .uid("fraud-detector")
+    .sinkTo(alertsKafka);
+```
+
+---
+
+## Context: что доступно в processElement
+
+`Context ctx` параметр даёт доступ к Flink runtime:
+
+| Метод | Что возвращает |
+|---|---|
+| `ctx.timestamp()` | Event-time текущей записи (если assigned) |
+| `ctx.timerService()` | TimerService для register/delete timers |
+| `ctx.getCurrentKey()` | Текущий key (set by keyBy) |
+| `ctx.output(tag, value)` | Emit в side output (см. урок 05) |
+
+TimerService:
+
+```java
+ctx.timerService().currentProcessingTime();      // wall clock TM-а
+ctx.timerService().currentWatermark();           // текущий watermark
+ctx.timerService().registerEventTimeTimer(ts);   // timer на event time
+ctx.timerService().registerProcessingTimeTimer(ts); // timer на processing time
+ctx.timerService().deleteEventTimeTimer(ts);
+```
+
+Timers — отдельная большая тема (урок 04).
+
+---
+
+## Lifecycle методов
+
+<DiagramContainer title="Lifecycle KeyedProcessFunction" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="open(parameters)"
+        tooltip="Вызывается ОДИН раз per subtask при старте. Инициализируйте state descriptors, открывайте connections (но lightweight — для heavy resources используйте Async I/O). Можно получить getRuntimeContext() для access к Metrics, State, distributed cache."
+      >
+        Init: state, connections
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="processElement(record, ctx, out)"
+        tooltip="Вызывается per record. Run в mailbox thread — sequentially с onTimer и checkpoint mail. ALL state access безопасен без локов. Если operator keyed — state scoped к ctx.getCurrentKey()."
+      >
+        per record (mailbox thread)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="onTimer(timestamp, ctx, out)"
+        tooltip="Вызывается когда watermark > registered timestamp (event time) или wall clock > registered (processing time). Sequentially с processElement (mailbox thread). Здесь же есть state access — scoped к key, для которого был registered timer."
+      >
+        timer fires
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="close()"
+        tooltip="Вызывается при cancel/finish job. Cleanup connections, flush buffers, release resources. НЕ ГАРАНТИРОВАНО вызывается при failure — для critical cleanup используйте FinalizeOnMaster."
+      >
+        Shutdown cleanup
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+**Critical**: всё это single-threaded (mailbox model, см. урок 03 модуля 01). State access без локов. Race conditions между processElement и onTimer impossible.
+
+---
+
+## State types в KeyedProcessFunction
+
+State scoped по key (текущий ctx.getCurrentKey()):
+
+| Type | API | Use case |
+|---|---|---|
+| **ValueState\<T\>** | `.value() / .update(v) / .clear()` | Single value per key |
+| **ListState\<T\>** | `.add(v) / .get() / .clear()` | Растущий список |
+| **MapState\<K,V\>** | `.put(k,v) / .get(k) / .remove(k)` | Nested map per key |
+| **ReducingState\<T\>** | `.add(v)` (reduces with ReduceFunction) | Incremental aggregation |
+| **AggregatingState\<I,O\>** | `.add(in)` (через AggregateFunction) | Different input/output types |
+
+```java
+private MapState<String, Long> categoryCountsState;
+
+categoryCountsState = getRuntimeContext().getMapState(
+    new MapStateDescriptor<>("categories", String.class, Long.class));
+
+// per key (например, userId):
+// {category1: count1, category2: count2, ...}
+categoryCountsState.put("electronics",
+    Optional.ofNullable(categoryCountsState.get("electronics")).orElse(0L) + 1);
+```
+
+Детально — модуль 03 (State Management).
+
+---
+
+## BroadcastProcessFunction: config streams
+
+Очень частый pattern: у вас main data stream + slow-changing **config stream** (например, fraud rules, ML model weights, lookup tables). Хочется чтобы каждый main record processился с актуальным config.
+
+**Решение**: BroadcastProcessFunction. Config stream broadcasted во все subtasks main stream-а.
+
+```java
+// Main data stream
+DataStream<Transaction> txs = env.fromSource(kafkaTxSource, ...);
+
+// Config stream (например, fraud rules из admin DB)
+DataStream<FraudRule> rules = env.fromSource(rulesSource, ...);
+
+// Broadcast state descriptor
+MapStateDescriptor<String, FraudRule> rulesDescriptor = new MapStateDescriptor<>(
+    "fraud-rules", String.class, FraudRule.class);
+
+// Broadcast rules
+BroadcastStream<FraudRule> ruleBroadcast = rules.broadcast(rulesDescriptor);
+
+// Connect main с broadcast
+DataStream<Alert> alerts = txs
+    .keyBy(Transaction::getUserId)
+    .connect(ruleBroadcast)
+    .process(new RuleBasedFraudDetector());
+
+class RuleBasedFraudDetector
+        extends KeyedBroadcastProcessFunction<Long, Transaction, FraudRule, Alert> {
+
+    @Override
+    public void processElement(
+            Transaction tx,
+            ReadOnlyContext ctx,
+            Collector<Alert> out) throws Exception {
+        // Read broadcast state (read-only здесь)
+        ReadOnlyBroadcastState<String, FraudRule> rulesState =
+            ctx.getBroadcastState(rulesDescriptor);
+
+        for (Map.Entry<String, FraudRule> entry : rulesState.immutableEntries()) {
+            FraudRule rule = entry.getValue();
+            if (rule.matches(tx)) {
+                out.collect(new Alert(tx, rule.getId()));
+            }
+        }
+    }
+
+    @Override
+    public void processBroadcastElement(
+            FraudRule rule,
+            Context ctx,
+            Collector<Alert> out) throws Exception {
+        // Update broadcast state (writable здесь)
+        BroadcastState<String, FraudRule> rulesState =
+            ctx.getBroadcastState(rulesDescriptor);
+        if (rule.isDeleted()) {
+            rulesState.remove(rule.getId());
+        } else {
+            rulesState.put(rule.getId(), rule);
+        }
+    }
+}
+```
+
+### Asymmetric API
+
+- `processElement` — ReadOnlyContext: можно ТОЛЬКО ЧИТАТЬ broadcast state.
+- `processBroadcastElement` — Context: можно ЧИТАТЬ и ПИСАТЬ.
+
+Это design constraint: broadcast state должен быть **identical на всех parallel subtasks**. Writes только из broadcast stream events, не из main stream events.
+
+<Callout type="warning">
+Broadcast state хранится IN-MEMORY на каждом subtask (не в RocksDB). Размер ограничен heap. Не используйте broadcast для huge tables (>100k entries) — лучше Async I/O lookup в внешний store.
+</Callout>
+
+---
+
+## CoProcessFunction: two streams without broadcast
+
+Когда обоих streams нужно обрабатывать симметрично:
+
+```java
+DataStream<Order> orders = ...;
+DataStream<Payment> payments = ...;
+
+orders.keyBy(Order::getOrderId)
+      .connect(payments.keyBy(Payment::getOrderId))
+      .process(new OrderPaymentJoiner());
+
+class OrderPaymentJoiner
+        extends KeyedCoProcessFunction<String, Order, Payment, Match> {
+
+    private ValueState<Order> orderState;
+    private ValueState<Payment> paymentState;
+
+    @Override
+    public void processElement1(Order order, Context ctx, Collector<Match> out) {
+        Payment payment = paymentState.value();
+        if (payment != null) {
+            out.collect(new Match(order, payment));
+            paymentState.clear();
+            orderState.clear();
+        } else {
+            orderState.update(order);
+            ctx.timerService().registerEventTimeTimer(
+                ctx.timestamp() + Duration.ofHours(1).toMillis()
+            );
+        }
+    }
+
+    @Override
+    public void processElement2(Payment payment, Context ctx, Collector<Match> out) {
+        Order order = orderState.value();
+        if (order != null) {
+            out.collect(new Match(order, payment));
+            orderState.clear();
+            paymentState.clear();
+        } else {
+            paymentState.update(payment);
+            ctx.timerService().registerEventTimeTimer(
+                ctx.timestamp() + Duration.ofHours(1).toMillis()
+            );
+        }
+    }
+
+    @Override
+    public void onTimer(long ts, OnTimerContext ctx, Collector<Match> out) {
+        // Timeout без match — emit unmatched
+        if (orderState.value() != null) {
+            // unmatched order
+            orderState.clear();
+        }
+        if (paymentState.value() != null) {
+            // unmatched payment
+            paymentState.clear();
+        }
+    }
+}
+```
+
+Это manual interval join — вместо use Flink built-in interval join API, который под капотом делает то же самое.
+
+---
+
+## Когда process vs встроенные операторы
+
+| Need | Используй |
+|---|---|
+| Простое stateless map / filter | `.map()`, `.filter()` |
+| Aggregation per key (sum, count) | `.reduce()` или `.window().sum()` |
+| Stateful per key, custom logic | **KeyedProcessFunction ★** |
+| Time windows | `.window(...)` (под капотом ProcessFunction) |
+| Joins between streams | `.connect()` + KeyedCoProcessFunction или встроенный interval join |
+| Config / rules apply | KeyedBroadcastProcessFunction |
+| Pattern matching | CEP library (модуль 09) |
+
+**Killer takeaway**: 99% production logic это `KeyedProcessFunction`. Учитесь использовать его — остальные API — обёртки.
+
+---
+
+## Production gotchas
+
+- **Не забывайте `.uid()`** на каждом process operator. Без UID savepoint не восстановит state при topology change.
+- **State не cleanup автоматически** — если key больше не активен, его state остаётся forever. Используйте `StateTtlConfig` (см. модуль 03) или manual cleanup через onTimer.
+- **`open()` вызывается per subtask, не per key** — DB connection here open per worker. Если у вас 8 parallelism → 8 connections.
+- **Heavy work в processElement блокирует mailbox** — слишком сложная логика → checkpoints fail. Refactor heavy CPU в downstream operator с parallelism scaled, или Async I/O для external lookups.
+- **`out.collect` создаёт object** — для high throughput используйте reused objects через `out.collect(reusedAlert)` (но pay attention к serialization side effects).
+- **Broadcast state size limit** — в-memory, не в RocksDB. Не для large reference data.
+- **`close()` не гарантировано** — при failure не всегда вызывается. Critical cleanup через `FinalizeOnMaster` или external mechanism.
+- **Per-key processing fairness** — heavy key (skewed) может голодать соседние keys в том же subtask. Решение: salting (добавлять префикс к ключу для разбиения).
+
+<Callout type="tip">
+Когда видите advice типа "избегайте процесс function, используйте windows" — это outdated. В production reality processFunction даёт максимальный контроль и часто лучше perf чем windows для сложной logic. Window API — convenient wrapper, но добавляет overhead (assigner allocation, window state management).
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Вы пишете KeyedProcessFunction, который для каждой транзакции должен делать lookup в Redis (latency 1-5ms). Throughput 100k tx/sec. Что произойдёт, если делать sync Redis call внутри processElement, и как правильно архитектурно решить?"
+  answer="Sync Redis call в processElement — катастрофа. Mailbox model: каждый subtask имеет один thread, который sequentially обрабатывает processElement / onTimer / checkpoint mail. Sync Redis call блокирует mailbox на 1-5ms per record. Calculations: 100k tx/sec / 8 parallelism = 12500 per subtask = 80μs per record budget. Redis call (1-5ms) превышает в 12-60 раз — pipeline catastrophically backpressured. Последствия: (1) checkpoints стучатся в очередь, не успевают триггериться → checkpoint timeout → job FAILED; (2) watermarks застревают → windows не fire; (3) timers не fire on time; (4) throughput сваливается с 100k до ~200 records/sec/subtask. Правильное решение — Async I/O (модуль 02 урок 06): извлекаем Redis lookup в отдельный async operator ПЕРЕД KeyedProcessFunction. AsyncDataStream.unorderedWait(stream, new AsyncRedisLookup(), 1000, MILLISECONDS, 1000) — capacity 1000 значит до 1000 in-flight requests parallel. Redis async client (Lettuce) возвращает CompletableFuture, что non-blocking. Mailbox thread свободен. Затем KeyedProcessFunction уже получает enriched record и делает свою stateful logic без блокировки. Альтернативный паттерн — embedded cache в keyed state (читать из Redis один раз, кешировать в ValueState), но это работает только для slow-changing data. Третий вариант — BroadcastProcessFunction если data fit в memory. Архитектурное правило: НИКОГДА не делайте blocking I/O внутри Flink operator — всегда Async I/O или state-cached."
+/>

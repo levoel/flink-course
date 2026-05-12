@@ -1,0 +1,380 @@
+---
+title: "Real-world fraud detection: Pattern API vs custom state machine"
+description: "Real fraud detection: 3 login fails within 1 minute → block, sequence of suspicious operations, multi-source correlation. Comparison Pattern API vs state machine (KeyedProcessFunction) — when каждый"
+order: 7
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Fraud Detection", "Brute Force", "KeyedProcessFunction", "State Machine", "Multi-Source", "Account Takeover"]
+---
+
+# Real-world fraud detection — где CEP сияет и где не справляется
+
+В этом capstone уроке модуля разбираем три representative production cases: brute-force login (classic CEP), sequence of suspicious operations (compromise CEP + state machine), и multi-source correlation (state machine territory). Цель — научиться выбирать правильный tool для каждого pattern.
+
+Главный takeaway: **Pattern API/MATCH_RECOGNIZE — это 70% case-ов**, simple temporal sequences с known structure. **Custom KeyedProcessFunction со state machine** — это 30%, когда нужны: complex state transitions, multi-source correlation, dynamic patterns derived from config, или ultra-low latency.
+
+---
+
+## Case 1: brute-force login — pure CEP territory
+
+**Requirement:** 3 LOGIN_FAIL within 1 minute от same user → block user, emit alert.
+
+### Pattern API solution
+
+```java
+Pattern<LoginEvent, ?> bruteForce = Pattern.<LoginEvent>begin("fails")
+    .where(SimpleCondition.of(e -> "LOGIN_FAIL".equals(e.getType())))
+    .times(3)
+    .within(Duration.ofMinutes(1));
+
+DataStream<LoginEvent> input = env.fromSource(kafkaSource, watermarkStrategy, "events");
+
+PatternStream<LoginEvent> ps = CEP.pattern(
+    input.keyBy(LoginEvent::getUserId),
+    bruteForce
+);
+
+DataStream<BlockAlert> alerts = ps.select(
+    (Map<String, List<LoginEvent>> match) -> {
+        List<LoginEvent> fails = match.get("fails");
+        return new BlockAlert(
+            fails.get(0).getUserId(),
+            "Brute force: 3 fails within 1 min",
+            fails.get(0).getEventTime(),
+            fails.get(2).getEventTime()
+        );
+    }
+);
+
+alerts.sinkTo(kafkaBlockSink);
+```
+
+20 lines, declarative, correct. Watermark progression + `within(1 min)` обеспечивает correctness. State per user automatically isolated.
+
+### SQL MATCH_RECOGNIZE equivalent
+
+```sql
+INSERT INTO block_alerts
+SELECT user_id, fail_start_time, fail_end_time, 'brute_force' AS reason
+FROM login_events
+MATCH_RECOGNIZE (
+    PARTITION BY user_id
+    ORDER BY rowtime
+    MEASURES
+        FIRST(F.rowtime) AS fail_start_time,
+        LAST(F.rowtime)  AS fail_end_time
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (F{3,}) WITHIN INTERVAL '1' MINUTE
+    DEFINE F AS F.event_type = 'LOGIN_FAIL'
+);
+```
+
+Same correctness, fully SQL — нет Java deployment, можно update через DDL.
+
+**Verdict для Case 1:** Pattern API или MATCH_RECOGNIZE — **idiomatic CEP**. Простая sequence, single source, clear bounds. Не используйте custom state machine для этого.
+
+---
+
+## Case 2: suspicious operation sequence — hybrid case
+
+**Requirement:** Detect potential account takeover:
+
+1. LOGIN_SUCCESS из нового IP (не в historical IPs пользователя)
+2. Followed by PASSWORD_CHANGE within 5 min
+3. Followed by EMAIL_CHANGE OR PHONE_CHANGE within 10 min from PASSWORD_CHANGE
+4. Followed by HIGH_VALUE_TRANSACTION within 24 hours
+
+Multiple conditional branches, IterativeCondition checks (new IP — depends on historical), wide time window (24h).
+
+### Pattern API attempt
+
+```java
+Pattern<Event, ?> takeover = Pattern.<Event>begin("login")
+    .where(new IterativeCondition<Event>() {
+        // Need access к historical IPs — но IterativeCondition только видит matched events
+        @Override
+        public boolean filter(Event e, Context<Event> ctx) {
+            // Нет access к external state — это limitation
+            return "LOGIN_SUCCESS".equals(e.getType());  // упрощено!
+        }
+    })
+    .followedBy("pwdChange")
+    .where(e -> "PASSWORD_CHANGE".equals(e.getType()))
+    .within(Duration.ofMinutes(5))
+    .followedBy("identityChange")
+    .where(e -> "EMAIL_CHANGE".equals(e.getType()) || "PHONE_CHANGE".equals(e.getType()))
+    .within(Duration.ofMinutes(10))
+    .followedBy("highValueTx")
+    .where(e -> "TRANSACTION".equals(e.getType()) && /* amount check */ true)
+    .within(Duration.ofHours(24));
+```
+
+Проблемы:
+
+1. **«New IP» check** требует access к historical state user-а (set of seen IPs). `IterativeCondition` видит только matched events в текущей partial-match — не historical state. Нужно либо upstream enrichment, либо вообще hybrid решение.
+
+2. **Wide `within(24 hours)`** + `oneOrMore`-like behaviour ⇒ partial matches накапливаются 24h. State size:
+   - 1M active users × ~10 partial matches average × ~5 events each × ~1KB per event = 50GB state.
+   - Реально на production это painful.
+
+3. **Pattern brittleness** — добавить branch (например «OR DEVICE_CHANGE within 5 min») требует pattern rewrite + state migration (NFA structure changes → savepoint incompatibility).
+
+### Hybrid solution: upstream enrichment + Pattern API
+
+```java
+DataStream<EnrichedEvent> enriched = input.keyBy(Event::getUserId)
+    .process(new IPHistoryEnricher());   // adds isNewIP field through KeyedState<Set<String>>
+
+// Теперь CEP видит already-enriched events
+Pattern<EnrichedEvent, ?> takeover = Pattern.<EnrichedEvent>begin("login")
+    .where(e -> "LOGIN_SUCCESS".equals(e.getType()) && e.isNewIP())
+    ...
+```
+
+`IPHistoryEnricher` — обычный KeyedProcessFunction со ValueState<Set<String>> historical IPs. CEP fed уже clean events. Это **production-grade pattern**.
+
+---
+
+## Case 3: multi-source correlation — state machine territory
+
+**Requirement:** Detect coordinated fraud where:
+
+- Account A and Account B (different users) make transactions
+- Both к same merchant within 5 min
+- Both above some threshold
+- A's transaction from one location, B's from far-away location
+
+Это требует joining events from 2 keys (A's and B's transactions), не single-key isolation.
+
+### Pattern API limitation
+
+CEP runs per-key. Pattern над `keyBy(userId)` видит только events одного user. Не можем нативно correlate events across users.
+
+Workarounds:
+- `keyBy(merchant)` — групируем by merchant, потом detect 2 users → но теряем per-user state for unrelated tasks.
+- Pre-aggregation в side stream: window per merchant с user list, потом join с original stream.
+
+Это **awkward** в CEP. Подходящее решение — custom state machine.
+
+### Custom KeyedProcessFunction со state machine
+
+```java
+public class CoordinatedFraudDetector
+        extends KeyedProcessFunction<String, Tx, Alert> {
+    
+    private ValueState<List<TxRecord>> recentTxs;   // per-merchant recent transactions
+    
+    @Override
+    public void open(OpenContext ctx) {
+        StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.minutes(5))
+            .setUpdateType(UpdateType.OnReadAndWrite)
+            .cleanupInRocksdbCompactFilter(1000)
+            .build();
+        ValueStateDescriptor<List<TxRecord>> descriptor = 
+            new ValueStateDescriptor<>("recent", new ListSerializer<>());
+        descriptor.enableTimeToLive(ttl);
+        recentTxs = getRuntimeContext().getState(descriptor);
+    }
+    
+    @Override
+    public void processElement(Tx tx, Context ctx, Collector<Alert> out) throws Exception {
+        if (tx.getAmount() < 1000) return;   // filter early
+        
+        List<TxRecord> recent = recentTxs.value();
+        if (recent == null) recent = new ArrayList<>();
+        
+        long now = tx.getEventTime();
+        recent.removeIf(r -> now - r.timestamp > Duration.ofMinutes(5).toMillis());
+        
+        // Check for matching far-away tx from different user
+        for (TxRecord prev : recent) {
+            if (!prev.userId.equals(tx.getUserId()) 
+                && distance(prev.location, tx.getLocation()) > 1000_000  /* meters */) {
+                out.collect(new Alert(
+                    "Coordinated fraud",
+                    tx.getMerchant(),
+                    List.of(prev.userId, tx.getUserId())
+                ));
+            }
+        }
+        
+        recent.add(new TxRecord(tx.getUserId(), tx.getEventTime(), 
+                                tx.getAmount(), tx.getLocation()));
+        recentTxs.update(recent);
+    }
+}
+
+// Использование:
+input.keyBy(Tx::getMerchant)
+     .process(new CoordinatedFraudDetector())
+     .sinkTo(alertSink);
+```
+
+Преимущества state machine approach:
+
+- **Full control** над state shape — список объектов, не immutable list events.
+- **External lookups** — можно async lookup user profiles, location info.
+- **Dynamic configuration** — можно update thresholds через broadcast state без savepoint break.
+- **Custom emit logic** — emit immediately when condition met, не ждём watermark progression beyond `within`.
+- **Lower memory** — храним только relevant fields, не whole events.
+
+Минусы:
+- **More code** — 50+ lines vs 10 в Pattern API.
+- **Manual state management** — TTL, cleanup, serialization explicit.
+- **No declarative readability** — pattern не visible в коде, нужно читать всю logic.
+
+---
+
+## Comparison decision matrix
+
+<DiagramContainer title="Pattern API vs State Machine — decision flow" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Pattern simple sequence?"
+        tooltip="N events with clear ordering, single key isolation, bounded time window. Examples: 3 fails within 1 min, V-shape stock pattern, login + checkout flow."
+      >
+        Single-key, known structure, bounded
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Да" />
+    <FlowRow>
+      <DataBox
+        label="Pattern API / MATCH_RECOGNIZE"
+        tooltip="Declarative, compact, NFA-optimised. Watermark-driven emission. Type-safe. SQL для embedding в pipelines."
+      >
+        Use Pattern API
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Иначе — далее" />
+    <FlowRow>
+      <DataBox
+        label="Multi-source correlation? Cross-key state?"
+        tooltip="Например: transaction A's user + B's user same merchant. Или join CEP с external CDC. Pattern API runs per-key — multi-key correlation awkward."
+      >
+        Cross-key / multi-source
+      </DataBox>
+      <DataBox
+        label="Dynamic patterns? Config-driven?"
+        tooltip="Patterns derive из user rules engine, broadcast config. Changing pattern шейп runtime. Pattern API NFA fixed at compile."
+      >
+        Dynamic
+      </DataBox>
+      <DataBox
+        label="Need external lookups in flight?"
+        tooltip="Async I/O lookup user profile, GeoIP, fraud score. IterativeCondition не имеет async API. Lookup в pattern check блокирует mailbox."
+      >
+        External I/O
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Любое из этого = state machine" />
+    <FlowRow>
+      <DataBox
+        label="Custom KeyedProcessFunction"
+        tooltip="Full control: state shape, emit logic, timers, broadcast config, async I/O. More code, but flexible. Production examples: Uber Marmaray, Stripe Radar, любые advanced fraud platforms."
+      >
+        State machine
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Combining approaches
+
+Best production architectures **combine** both:
+
+1. **Upstream enrichment** (KeyedProcessFunction with state) — adds context (is_new_ip, user_segment, fraud_score) к events.
+2. **CEP в middle** — declarative pattern matching на enriched events для standard patterns.
+3. **Downstream correlator** (KeyedProcessFunction with broadcast state) — multi-source correlation, dynamic threshold.
+
+```
+Kafka raw events
+    → keyBy(userId).process(EnrichmentFunction)        ← state machine
+    → CEP.pattern(...)                                  ← pattern API
+    → keyBy(merchant).process(CrossUserCorrelator)     ← state machine
+    → sinkTo(alerts)
+```
+
+Each layer focused на одной concern. Easier to maintain, scale, и debug.
+
+---
+
+## Сравнительная таблица: production patterns
+
+| Use case | Recommended approach | Why |
+|---|---|---|
+| 3 fails within 1 min (brute force) | Pattern API / MATCH_RECOGNIZE | Simple, declarative, single-key |
+| V-shape stock pattern | MATCH_RECOGNIZE | Aggregates (FIRST/LAST), SQL embeds in analytics |
+| Cart abandonment (no checkout in 30 min) | Pattern API + `processTimedOutMatch` | Timeout semantics first-class |
+| Account takeover sequence | Hybrid: enrichment + Pattern API | New IP needs historical state — enrichment upstream |
+| Coordinated fraud (multi-user) | KeyedProcessFunction | Cross-key correlation |
+| Dynamic rules (user-config-driven patterns) | KeyedProcessFunction + Broadcast state | Patterns change runtime — NFA can't |
+| ML-augmented fraud scoring | KeyedProcessFunction + Async I/O | External model inference |
+| Cascade IoT alarms | Pattern API | Sequential alarms, time-bounded |
+| Real-time recommendation with N-step session | KeyedProcessFunction | Custom state shape, low-latency emit |
+
+---
+
+## Production gotchas
+
+### 1. CEP не масштабируется horizontally на single hot key
+
+Один очень active user с миллионом events → его key group hot. CEP NFA state grows для этого key. Rest of subtasks idle.
+
+**Mitigation:**
+- Pre-aggregation upstream (например per minute count of events)
+- Sample/filter events перед CEP
+- Move к state machine с specifically tuned state design
+
+### 2. `IterativeCondition` doesn't access external/historical state
+
+`IterativeCondition.Context` даёт только `getEventsForPattern(name)` — matched events в current partial match. Не historical user state, не external store. Это **structural limit** Pattern API.
+
+**Workaround:** enrich upstream (как в Case 2) или use state machine.
+
+### 3. Pattern change = savepoint incompatibility
+
+Changing pattern шейп (добавление state, изменение quantifier) меняет NFA — old savepoint state structure не совпадает. Production deployment requires **drain + clean start** или **explicit migration**.
+
+**Practice:**
+- Treat CEP pattern changes as breaking deployment
+- Run dual-write (старая + новая CEP jobs) во время migration
+- Snapshot state перед migration
+
+### 4. CEP state expensive in RocksDB — verify backend
+
+Pattern state stored в Flink keyed state — uses configured backend (heap/RocksDB/ForSt). Wide patterns + many keys ⇒ MB-GB per key group state.
+
+С RocksDB на large state — compaction может lag, write stalls. С ForSt — async I/O помогает.
+
+**Tuning:**
+- `state.backend.rocksdb.thread.num: 8`
+- `taskmanager.memory.managed.fraction: 0.5`
+- Monitor checkpoint duration — если > 30s, suspect CEP state
+
+### 5. Не использовать CEP для simple stateless rules
+
+Если pattern — это «emit alert если amount > 1000» — это просто filter, не CEP. CEP overhead (NFA engine, state) бессмыслен.
+
+**Rule of thumb:** CEP оправдан только если есть temporal sequence (multiple events с ordering). Single-event predicates → filter/map.
+
+---
+
+## Key takeaways
+
+- **Simple temporal sequences, single-key** → Pattern API / MATCH_RECOGNIZE.
+- **Multi-source correlation, cross-key state, external lookups, dynamic patterns** → KeyedProcessFunction со state machine.
+- **Production architectures combine**: upstream enrichment (state machine) → CEP → downstream correlator (state machine).
+- `IterativeCondition` имеет **structural limit** — access только к matched events текущего partial match, не historical state.
+- **Pattern change = breaking deployment** — drain + clean start обычно required.
+- **CEP overhead** justified только когда есть temporal sequence; single-event predicates → use plain filter/process.
+
+---
+
+<KnowledgeCheck
+  question="У вас задача: detect когда user делает sequence operations с динамически конфигурируемыми patterns (бизнес может update rules через UI). Что выбрать — Pattern API или KeyedProcessFunction?"
+  answer="KeyedProcessFunction со state machine + Broadcast state. Причина: Pattern API компилирует pattern в NFA at job submission time — NFA structure fixed. Изменение pattern требует savepoint stop + start с new code, NFA serialization несовместима. Это incompatible с 'dynamic rules from UI'. С KeyedProcessFunction + BroadcastState: rules update через broadcast stream (Kafka rules topic) → state machine reads current rules per event → applies dynamic logic. State machine evolution через standard schema evolution (POJO + serializer). Plus Broadcast state replicated на все subtasks — every key sees same rules. Это standard pattern для rule engines на Flink (используется в Stripe Radar, Uber DSS)."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "08-table-sql/03-ddl-syntax",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-03",
+    "description": "Quiz for DDL syntax lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-03-q1",
+      "type": "multiple-choice",
+      "question": "Какие три компонента нужны для определения event-time table с watermark в DDL?",
+      "options": [
+        { "id": "a", "text": "Один TIMESTAMP column" },
+        { "id": "b", "text": "(1) TIMESTAMP(3) или TIMESTAMP_LTZ(3) column из payload (либо computed через TO_TIMESTAMP_LTZ из epoch); (2) WATERMARK FOR <column> AS <column> - INTERVAL 'n' SECOND — defines max out-of-orderness tolerance; (3) WITH connector properties (kafka, format и др). Computed columns могут быть использованы в WATERMARK declaration" },
+        { "id": "c", "text": "Только PROCTIME()" },
+        { "id": "d", "text": "Source + Sink DDL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Event-time DDL three pieces: **(1) Time column**: `event_time TIMESTAMP(3)` direct из JSON/Avro field, или computed `event_time AS TO_TIMESTAMP_LTZ(ts_millis, 3)` для Unix epoch millis. TIMESTAMP_LTZ recommended для multi-timezone — represents instant in time, correct globally. **(2) Watermark declaration**: `WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND` — Flink computes watermark как max(event_time observed) - 5s. Records с event_time < watermark считаются late (могут drop или go to side output). Choose interval based on measured P99 out-of-orderness + 50% safety margin. **(3) WITH clause**: connector-specific properties — `'connector' = 'kafka'`, topic, bootstrap servers, format, etc. Без этого DDL не valid. **Common patterns**: (a) Kafka epoch timestamp: `ts BIGINT` raw + `event_time AS TO_TIMESTAMP_LTZ(ts, 3)` computed + watermark on computed. (b) Direct TIMESTAMP в JSON ISO format: `'json.timestamp-format.standard' = 'ISO-8601'` + `event_time TIMESTAMP(3)`. (c) From Kafka metadata: `record_kafka_ts TIMESTAMP_LTZ(3) METADATA FROM 'timestamp'` — use Kafka broker timestamp как event_time. **Critical**: watermark must be on TIMESTAMP(3) or TIMESTAMP_LTZ(3) — other types error at planning.",
+      "studyHint": "Повторите урок — секция 'Event time + watermark'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-03-q2",
+      "type": "multiple-choice",
+      "question": "Метаданные Kafka (timestamp, partition, offset, headers) нужны в Flink SQL. Как extract их в DDL?",
+      "options": [
+        { "id": "a", "text": "Только через UDF после source" },
+        { "id": "b", "text": "Через METADATA columns: `record_kafka_ts TIMESTAMP_LTZ(3) METADATA FROM 'timestamp'`, `record_partition INT METADATA FROM 'partition' VIRTUAL`, `record_offset BIGINT METADATA FROM 'offset' VIRTUAL`, `record_headers MAP<STRING, BYTES> METADATA FROM 'headers' VIRTUAL`. VIRTUAL = read-only (не emit в downstream при INSERT INTO). Headers MAP<STRING, BYTES> — нужен CAST AS STRING для readable values" },
+        { "id": "c", "text": "Через Kafka connector option" },
+        { "id": "d", "text": "Невозможно в SQL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "METADATA columns — declarative way access connector-specific metadata. Syntax `column_name type METADATA FROM 'key' [VIRTUAL]`. **Kafka available metadata**: `timestamp` (TIMESTAMP_LTZ(3) — broker assigned), `partition` (INT), `offset` (BIGINT), `headers` (MAP<STRING, BYTES>), `topic` (STRING), `key` (depends on key format). **VIRTUAL keyword**: column is read-only, не included когда INSERT INTO this table или downstream propagation. Useful для metadata used в query но не emit-ed к sink. **Use cases**: (1) **Dedup by offset**: `SELECT ... FROM events WHERE record_offset = MAX(record_offset) OVER (PARTITION BY business_id)` — deduplicate using Kafka offset. (2) **Use Kafka timestamp как event time**: `event_time AS record_kafka_ts`, watermark on this. Cheap alternative когда payload не имеет timestamp. (3) **Header-based routing**: `WHERE CAST(record_headers['region'] AS STRING) = 'us-east-1'` — filter by Kafka header. (4) **Partition-aware processing**: `PARTITION BY record_partition` — per-partition aggregations. **Format note**: Headers MAP<STRING, BYTES> requires CAST to STRING для readable values: `CAST(record_headers['key'] AS STRING)`. **Other connectors**: each connector exposes own metadata. FileSystem: `file.path`, `file.name`, `partition`. Iceberg: `data_file_path`, `snapshot_id`. CDC: `op` (I/U/D), `before` row, `after` row.",
+      "studyHint": "Повторите урок — секция 'Metadata columns'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-03-q3",
+      "type": "multiple-choice",
+      "question": "Computed columns: какие limitation и use cases?",
+      "options": [
+        { "id": "a", "text": "Stored as physical columns" },
+        { "id": "b", "text": "Computed columns (`col_name AS expression`): (a) not stored (calculated at runtime); (b) can use built-in functions, UDFs; (c) can only reference previously-declared columns (ordering matters); (d) can be used in WATERMARK declaration. Use cases: TO_TIMESTAMP_LTZ conversion, derived fields (total = amount + tax), string manipulation, PROCTIME(), JSON path extraction" },
+        { "id": "c", "text": "Только для aggregations" },
+        { "id": "d", "text": "Не supported в Flink SQL" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Computed columns — declarative derived fields. **Syntax**: `column_name AS expression` в CREATE TABLE column list. **Properties**: (1) **Not stored** — computed at runtime when row accessed. Like Postgres GENERATED ALWAYS AS but virtual. (2) **Reference earlier columns only**: `c AS d + 1` if d не declared yet — planning error. Order columns carefully. (3) **Use built-ins + UDFs**: arithmetic, string functions, time functions, custom UDFs registered. (4) **Used in WATERMARK**: `WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND` where event_time is computed column. **Common patterns**: (a) **Time conversion**: `event_time AS TO_TIMESTAMP_LTZ(ts_millis, 3)` для epoch → TIMESTAMP_LTZ. Then watermark on event_time. (b) **Total с derived value**: `total AS amount + tax` — readable, не store separately. (c) **String manipulation**: `region AS SUBSTRING(user_id, 1, 2)` — extract prefix. (d) **Boolean flags**: `is_large AS amount > 1000`. (e) **PROCTIME()**: `proc_time AS PROCTIME()` — processing time attribute. (f) **JSON extraction**: `details AS JSON_VALUE(payload, '$.metadata.region')`. **Difference vs metadata columns**: computed = expression-based от других columns. Metadata = from connector layer. Both not stored but different sources. **Performance**: computed columns add CPU work — keep simple. Complex transformations better в downstream processing (FROM source SELECT ...).",
+      "studyHint": "Повторите урок — секция 'Computed columns'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-03-q4",
+      "type": "true-false",
+      "question": "`PRIMARY KEY (col) NOT ENFORCED` в Flink SQL — это constraint который Flink валидирует во время writes (как в RDBMS).",
+      "correctAnswer": false,
+      "explanation": "False. **NOT ENFORCED keyword** explicit — Flink does NOT validate uniqueness. Flink — это streaming engine, не database. Не имеет capability проверить uniqueness без full table scan (O(N) per row insert). **What PRIMARY KEY does**: (1) **Metadata signal** для query optimizer — informs cardinality estimates, может switch operator implementations. (2) **Required для upsert-kafka connector** — defines compact topic key. (3) **Required для temporal join target table** — versioned table needs PK для identity. (4) **Required для some sinks** — JDBC upsert (key для ON CONFLICT DO UPDATE), Iceberg equality deletes, Paimon UPSERT. (5) **Influences partitioning at sink** — records hashed by PK columns. **User responsibility**: ensure data actually has unique PK values. If duplicates exist в source: (a) upsert sinks treat as updates (последний wins) — может lose data; (b) joins may produce unexpected duplicates; (c) materialized aggregations show wrong counts. **Composite PK syntax**: `PRIMARY KEY (region, user_id) NOT ENFORCED` — multi-column. Order matters для sharding по hash composite key. **ENFORCED option exists conceptually но not supported** — Flink would need to maintain unique index, costly. Future Flink versions might add для small dim tables. **Always use NOT ENFORCED currently**.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

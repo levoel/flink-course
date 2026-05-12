@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/02-operator-vs-keyed-state",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-02",
+    "description": "Quiz for operator vs keyed state lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-02-q1",
+      "type": "multiple-choice",
+      "question": "В чём ключевое отличие operator state от keyed state?",
+      "options": [
+        { "id": "a", "text": "Operator state хранится только на RocksDB, а keyed — на heap" },
+        { "id": "b", "text": "Operator state per parallel subtask (без keyBy), хранится на heap; Keyed state per key (после keyBy), может быть на heap/RocksDB/ForSt" },
+        { "id": "c", "text": "Никакой разницы — это синонимы" },
+        { "id": "d", "text": "Operator state поддерживает только Long тип" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator state — per-subtask scope (один subtask = один scope), без keyBy. Хранится всегда на heap, размер ограничен JVM. API через CheckpointedFunction.snapshotState/initializeState. Keyed state — per-key, только после keyBy, может жить в любом state backend (heap, RocksDB, ForSt), масштабируется до TBs. Это фундаментально разные scopes с разным API.",
+      "studyHint": "Повторите урок — таблица сравнения сверху",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m03-02-q2",
+      "type": "multiple-choice",
+      "question": "Какой тип operator state НЕЛЬЗЯ использовать для big metadata (>1MB) и почему?",
+      "options": [
+        { "id": "a", "text": "ListState — splits разделяются, OOM невозможен" },
+        { "id": "b", "text": "UnionListState — при rescaling каждый subtask получает все элементы, memory растёт квадратично" },
+        { "id": "c", "text": "BroadcastState — он автоматически compresses" },
+        { "id": "d", "text": "Все три безопасны для big data" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "UnionListState имеет union redistribution: при scale-up каждый subtask получает весь list. При rescale 8→32 каждый из 32 subtask получает все 8×items elements — memory взрывается. Это главный источник OOM на больших state. Используйте только для small metadata (<1KB-100KB). ListState (split redistribution) безопасно — items делятся между subtask.",
+      "studyHint": "Повторите урок — три подвида operator state",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-02-q3",
+      "type": "multiple-choice",
+      "question": "В BroadcastState pattern, где можно МУТИРОВАТЬ broadcast state?",
+      "options": [
+        { "id": "a", "text": "В processElement, через ReadOnlyContext" },
+        { "id": "b", "text": "Везде, нет ограничений" },
+        { "id": "c", "text": "Только в processBroadcastElement — там получаем mutable BroadcastState. В processElement только ReadOnlyBroadcastState" },
+        { "id": "d", "text": "В open() метод RichFunction" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "BroadcastState read/write asymmetric намеренно. processBroadcastElement получает BroadcastState (mutable) — можно put/remove. processElement получает ReadOnlyBroadcastState — только read через immutableEntries. Это гарантирует bit-identical копии broadcast state across все subtask: только broadcast stream может изменять state, все остальные операции — read-only.",
+      "studyHint": "Повторите урок — BroadcastState пример",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-02-q4",
+      "type": "true-false",
+      "question": "Operator state можно хранить в RocksDB backend для масштабирования до TBs.",
+      "correctAnswer": false,
+      "explanation": "False. Operator state ВСЕГДА на heap (в JVM memory). RocksDB и ForSt backends работают ТОЛЬКО для keyed state. Это намеренное design decision — operator state предназначен для small per-subtask metadata (Kafka offsets, configs). Если operator state >100MB на subtask — это design smell, нужен redesign на keyed state.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

@@ -1,0 +1,491 @@
+---
+title: "Async snapshots, incremental checkpoints, Changelog backend"
+description: "Async snapshot phase, incremental checkpoints recap, GIC (Generic Incremental Checkpoints, Changelog state backend) для stable latency. Production setup"
+order: 9
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Checkpoints", "Async Snapshot", "Incremental", "Changelog Backend", "GIC", "Production"]
+---
+
+# Async snapshots, incremental checkpoints, Changelog backend
+
+Checkpoint в Flink — это momentous distributed snapshot всего state. Если делать его блокирующе (stop-the-world), на 100GB state это секунды-минуты pause. Async snapshot phase решает эту проблему: stream processing продолжается, snapshot serializes в background.
+
+В этом уроке препарируем три механизма ускорения checkpoint: async snapshot phase, incremental checkpoints (RocksDB-only), и Generic Incremental Checkpoints (GIC) — Changelog state backend, который обещает sub-second checkpoints для любого backend.
+
+---
+
+## Async snapshot phase
+
+Checkpoint barrier приходит к operator-у. Sync phase (короткая):
+1. Stop processing (mailbox pause).
+2. **Snapshot state metadata** (pointers, не данные).
+3. Resume processing.
+
+Async phase (длинная):
+1. **Background thread** serializes state к durable storage.
+2. Stream processing продолжается параллельно.
+3. По завершении — `acknowledgeCheckpoint` к JobManager.
+
+```
+Time:  ====== sync (10ms) ====== ============ async (5s) ============
+Processing:  on            paused (10ms)              on (continues)
+Snapshot writing:                              ► writing к S3/HDFS ►
+```
+
+Все production state backend-ы (RocksDB, ForSt, HashMap) поддерживают async snapshot. Sync-only — это deprecated/legacy backends.
+
+<DiagramContainer title="Async snapshot phases" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Barrier injection"
+        tooltip="JobManager инжектит checkpoint barrier в каждый source subtask. Barrier propagates через DAG, операторы snapshot своё state на receipt of barrier."
+      >
+        JobManager → Source barriers
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="барьер достигает operator" />
+    <FlowRow>
+      <DataBox
+        label="Sync phase (~10ms)"
+        tooltip="Operator получает barrier. Mailbox processor паузу. Snapshot state metadata: RocksDB snapshot iterator (pointers), HashMap state references. State не копируется, только marked. Resume processing."
+      >
+        Pause → snapshot metadata → resume
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="snapshot ready" />
+    <FlowRow>
+      <DataBox
+        label="Async phase (seconds-minutes)"
+        tooltip="Background thread writes state к durable storage (S3, HDFS, filesystem). Processing continues parallel. RocksDB iterator snapshots immutable view — modifications во время async НЕ влияют."
+      >
+        Background write to durable storage
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="completion" />
+    <FlowRow>
+      <DataBox
+        label="Acknowledgement"
+        tooltip="Operator после async complete → acknowledgeCheckpoint to JobManager. Когда все operators acknowledge → checkpoint complete → notifyCheckpointComplete callback (для 2PC sinks)."
+      >
+        ack → JobManager → checkpoint complete
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Конфигурация checkpoint
+
+```yaml
+# Базовая активация:
+execution.checkpointing.interval: 60s                  # каждую минуту
+execution.checkpointing.timeout: 10min                 # max длительность
+execution.checkpointing.min-pause: 30s                 # min между чекпоинтами
+execution.checkpointing.max-concurrent-checkpoints: 1  # parallel чекпоинты
+
+# Mode:
+execution.checkpointing.mode: EXACTLY_ONCE             # или AT_LEAST_ONCE
+
+# Storage:
+execution.checkpointing.dir: s3://bucket/flink/checkpoints
+execution.checkpointing.savepoint-dir: s3://bucket/flink/savepoints
+
+# Retention:
+execution.checkpointing.num-retained: 3                # keep last 3
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+```
+
+Java API:
+
+```java
+env.enableCheckpointing(60_000);
+CheckpointConfig cfg = env.getCheckpointConfig();
+cfg.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+cfg.setCheckpointTimeout(600_000);
+cfg.setMinPauseBetweenCheckpoints(30_000);
+cfg.setMaxConcurrentCheckpoints(1);
+cfg.setExternalizedCheckpointRetention(
+    ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION);
+cfg.enableUnalignedCheckpoints(true);   // FLIP-76
+cfg.setAlignedCheckpointTimeout(Duration.ofSeconds(30));
+```
+
+---
+
+## Incremental checkpoints (RocksDB)
+
+Default RocksDB checkpoints — **incremental** (since 1.10):
+
+```yaml
+state.backend.incremental: true
+```
+
+Как работает:
+1. RocksDB hard-link новые SST files к checkpoint dir на каждом snapshot.
+2. Только **новые** SST files copy к durable storage.
+3. Old SST files (unchanged) — reference остаётся в metadata.
+
+Result: на 100GB state с 10% delta per checkpoint, инкрементал = 10GB, не 100GB. **10× speedup**.
+
+### Метаданные incremental
+
+Каждый checkpoint:
+```
+checkpoint-N/
+  _metadata           ← Flink metadata (operator state pointers)
+  taskmanager-X/
+    job-handle.bin     ← references к SST files
+    sst-1.sst         ← shared, может referenced многими checkpoint-ами
+    sst-2.sst
+```
+
+Чтобы сделать checkpoint **self-contained** (independent restore без зависимостей):
+
+```yaml
+state.backend.incremental.local-recovery: true   # local cache для fast recovery
+```
+
+### Gotcha incremental: file accumulation
+
+Старые SST files не удаляются сразу. Flink retains last N checkpoints (`num-retained: 3`). Каждый checkpoint держит references → old SSTs не purged.
+
+Симптом: S3 bucket растёт линейно. После 1 месяц — TBs.
+
+**Fix**: tune `num-retained`, либо `execution.checkpointing.externalized-checkpoint-retention: DELETE_ON_CANCELLATION` (auto-cleanup на cancel).
+
+---
+
+## Generic Incremental Checkpoints (Changelog backend, FLIP-158)
+
+Проблема incremental RocksDB: **bursty** size. Если compaction объединяет large L0 в L1, на следующем checkpoint все эти new L1 SSTs нужно ship → checkpoint size spikes. Тысячи раз в секунду checkpoint становится 50GB.
+
+**Решение**: **Changelog state backend** (1.15+ as experimental, 1.16+ stable). Записывает каждое state mutation в **changelog log** (как WAL для всего state). Checkpoint = current changelog cursor position. Background thread materializes changelog в state backend (RocksDB/HashMap).
+
+```yaml
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+state.backend.changelog.dstl.dfs.base-path: s3://bucket/flink/changelog
+```
+
+### Architecture
+
+<DiagramContainer title="Changelog state backend architecture" color="orange">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="State mutation"
+        tooltip="Любая запись в state (ValueState.update, MapState.put, ListState.add) пишется одновременно в state backend AND в changelog stream."
+      >
+        valueState.update(x)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="dual write" />
+    <FlowRow>
+      <DataBox
+        label="Underlying backend (RocksDB)"
+        tooltip="State backend (RocksDB или HashMap) обновляется как обычно. Async materialization periodically копирует changelog в backend для compaction."
+      >
+        State backend (RocksDB)
+      </DataBox>
+      <DataBox
+        label="Changelog log (DFS)"
+        tooltip="Каждое state mutation записывается в changelog file на DFS (S3, HDFS). Sequential write — fast. Checkpoint = current log cursor position. Размер per-checkpoint = delta с последнего checkpoint."
+      >
+        Changelog stream (S3/HDFS)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="periodic materialization" />
+    <FlowRow>
+      <DataBox
+        label="Materialization (~minutes)"
+        tooltip="Background process копирует accumulated changelog к state backend snapshot. После materialization старая часть changelog может быть удалена. Independent от checkpoint interval."
+      >
+        Background changelog → state snapshot
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Benefits Changelog backend
+
+| Metric | RocksDB incremental | Changelog |
+|---|---|---|
+| **Checkpoint size** | Bursty (depends on compaction) | Constant (size of delta) |
+| **Checkpoint duration** | Variable (seconds-minutes) | Sub-second consistent |
+| **Recovery time** | Fast | Slower (replay changelog) |
+| **DFS writes** | Большие SSTs | Many small writes |
+| **Storage cost** | Lower (compressed SSTs) | Higher (raw mutations) |
+
+### Когда использовать Changelog
+
+**Используйте Changelog когда**:
+- Нужна stable, sub-second checkpoint duration.
+- Backpressure spike корреляция с checkpoint duration.
+- EXACTLY_ONCE latency requirement (transactional sink latency = checkpoint interval).
+- Variable state mutation pattern с compaction spikes.
+
+**Не используйте Changelog когда**:
+- State largely stable, мало mutations.
+- Recovery time критично (changelog replay slower).
+- DFS storage cost важен (changelog больше bytes).
+- Workload tight на RocksDB level (compaction уже tuned).
+
+### Configuration changelog
+
+```yaml
+# Активация:
+state.backend.changelog.enabled: true
+state.backend.changelog.storage: filesystem
+
+# Path для changelog logs:
+state.backend.changelog.dstl.dfs.base-path: s3://bucket/flink/changelog
+
+# Materialization interval:
+state.backend.changelog.dstl.dfs.compression.enabled: true
+state.backend.changelog.periodic-materialize.enabled: true
+state.backend.changelog.periodic-materialize.interval: 10min
+
+# Underlying backend:
+state.backend.type: rocksdb   # OR hashmap
+```
+
+`periodic-materialize.interval` балансирует:
+- Маленький (1min): меньше changelog backlog, faster recovery, но больше DFS write throughput.
+- Большой (30min): меньше DFS overhead, но recovery slower (больше log replay).
+
+10min — sweet spot для большинства production.
+
+---
+
+## Unaligned checkpoints (FLIP-76)
+
+Aligned checkpoints (default EXACTLY_ONCE): operator ждёт barrier по всем input channels → может занимать минуты под backpressure.
+
+**Unaligned checkpoints**: in-flight data включается в snapshot. Barriers emit сразу.
+
+```yaml
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s   # try aligned, fallback unaligned
+```
+
+- Aligned-checkpoint-timeout=0: всегда unaligned.
+- =Default Long.MAX: всегда aligned (без timeout).
+- =30s: aligned attempt first, switch к unaligned после 30s alignment time.
+
+**Trade-off**: unaligned checkpoints включают in-flight data → размер больше (sometimes 2-5×), но duration предсказуемая.
+
+---
+
+## End-to-end EOS latency
+
+```
+End-to-end latency =
+  checkpoint interval / 2 (average)
+  + checkpoint duration (alignment + async)
+  + transaction commit latency
+  + downstream consumer poll
+```
+
+Для transaction Kafka sink EOS:
+- Checkpoint interval: 60s → average commit visible через 30s.
+- Checkpoint duration: 5-30s (depending on state size).
+- Plus Kafka commit ~50ms.
+
+С Changelog backend + unaligned: duration падает до 1-2s, latency drop в разы.
+
+---
+
+## Production patterns
+
+### Pattern 1: Стандартный production EOS
+
+```yaml
+execution.checkpointing.interval: 60s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 5min
+execution.checkpointing.min-pause: 30s
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+
+state.backend.type: rocksdb
+state.backend.incremental: true
+state.backend.changelog.enabled: false
+```
+
+90% production deployments — этот baseline. Working.
+
+### Pattern 2: Low-latency EOS
+
+```yaml
+execution.checkpointing.interval: 10s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 2min
+execution.checkpointing.unaligned: true
+
+state.backend.type: rocksdb
+state.backend.incremental: true
+state.backend.changelog.enabled: true
+state.backend.changelog.periodic-materialize.interval: 5min
+state.backend.changelog.dstl.dfs.base-path: s3://bucket/flink/changelog
+```
+
+10s checkpoint + changelog → end-to-end EOS visible через ~5s.
+
+### Pattern 3: Large state, less frequent checkpoint
+
+```yaml
+execution.checkpointing.interval: 5min
+execution.checkpointing.timeout: 20min
+execution.checkpointing.min-pause: 2min
+execution.checkpointing.max-concurrent-checkpoints: 1
+
+state.backend.type: rocksdb
+state.backend.incremental: true
+state.backend.changelog.enabled: false   # changelog больше overhead
+```
+
+10TB state, recovery time matters → infrequent large checkpoint preferred.
+
+### Pattern 4: ForSt disaggregated state (Flink 2.x)
+
+```yaml
+state.backend.type: forst
+state.backend.forst.cache.size: 4gb
+state.backend.forst.checkpoint.async-fsm.enabled: true
+
+execution.checkpointing.interval: 30s
+execution.checkpointing.unaligned: true
+```
+
+ForSt — checkpoint metadata-only (state already on S3). Sub-second даже на TB.
+
+---
+
+## Метрики checkpoint
+
+```promql
+# Duration:
+flink_jobmanager_job_lastCheckpointDuration
+flink_jobmanager_job_lastCheckpointSize
+
+# Counts:
+flink_jobmanager_job_numberOfCompletedCheckpoints
+flink_jobmanager_job_numberOfFailedCheckpoints
+
+# Alignment:
+flink_taskmanager_job_task_alignmentDurationMs
+flink_taskmanager_job_task_checkpointStartDelayNanos
+
+# Async phase:
+flink_taskmanager_job_task_lastCheckpointAsyncDuration
+
+# Changelog backend:
+flink_taskmanager_job_task_changelog_storage_uploadTotalQueueSize
+```
+
+Alert rules:
+
+```yaml
+- alert: FlinkCheckpointDurationHigh
+  expr: flink_jobmanager_job_lastCheckpointDuration > 300000
+  for: 5m
+  annotations:
+    summary: "Checkpoint duration > 5min — investigate state size / backpressure"
+
+- alert: FlinkCheckpointFailing
+  expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) > 0
+  for: 1m
+  annotations:
+    summary: "Checkpoint failures detected — high severity"
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Checkpoint timeout < state size requirement
+
+10TB state с slow S3 (50MB/s) → 2 hours для full upload. `timeout: 10min` → failure.
+
+**Fix**: timeout sized по: state_size / upload_throughput × 1.5. Или incremental + changelog для smaller deltas.
+
+### Gotcha 2: Checkpoint interval < min-pause
+
+```yaml
+execution.checkpointing.interval: 30s
+execution.checkpointing.min-pause: 60s   # ← longer than interval
+```
+
+Эффективный interval = max(interval, min-pause + duration). Может surprise.
+
+**Fix**: min-pause ≤ interval/2.
+
+### Gotcha 3: max-concurrent-checkpoints: 2+ с RocksDB
+
+С 2 параллельными checkpoints RocksDB не может evict immutable MemTables (referenced both checkpoints). MemTable accumulation → write stall.
+
+**Fix**: max-concurrent: 1 для RocksDB. 2+ только для HashMap state.
+
+### Gotcha 4: Changelog backend recovery slow
+
+Recovery с Changelog: load materialization + replay changelog. На 30min log replay — significant.
+
+**Fix**: balance materialize interval. Если recovery critical → 5min interval (больше DFS, меньше replay).
+
+### Gotcha 5: Externalized checkpoints + cancellation
+
+```yaml
+execution.checkpointing.externalized-checkpoint-retention: DELETE_ON_CANCELLATION
+```
+
+Cancel job → checkpoints deleted. **Cannot recover** после cancel.
+
+**Fix для production**: RETAIN_ON_CANCELLATION, manual delete после verify.
+
+### Gotcha 6: Aligned checkpoint timeout с EXACTLY_ONCE Kafka sink
+
+Если aligned-checkpoint-timeout=30s и Kafka transaction.timeout.ms=60s — transaction может expire прежде чем checkpoint complete → data loss.
+
+**Fix**: Kafka transaction.timeout.ms > checkpoint timeout × 2.
+
+### Gotcha 7: Async snapshot не значит free
+
+Async snapshot уменьшает sync pause, но **сжирает CPU/network** в background. На high-throughput job background IO может interfere с steady-state processing.
+
+**Symptom**: checkpoint duration грustьс ~30s, throughput сдыхает 30%.
+
+**Fix**: tune `state.backend.rocksdb.thread.num` (compaction parallelism), либо bigger TaskManager (больше CPU headroom для async).
+
+---
+
+## Diagnostic checklist для checkpoint issues
+
+1. **Checkpoint duration trend**: stable или растёт?
+2. **Async vs alignment time**: где время теряется?
+3. **State size**: incremental working? size growth linear или delta-based?
+4. **Network upload throughput** к S3/HDFS: bottleneck?
+5. **Backpressure корреляция**: checkpoint duration spikes coincide с backpressure?
+6. **Try unaligned checkpoints**: помогает aligned timeout?
+7. **Consider Changelog backend** если duration variability problematic.
+
+---
+
+<Callout type="note">
+Changelog state backend (GIC) — это не silver bullet. Он решает variability в checkpoint duration ценой higher DFS write throughput и slower recovery. Для большинства production setups baseline (RocksDB incremental + unaligned aligned-timeout=30s) — sufficient. Changelog включайте когда у вас конкретная проблема со spikes checkpoint duration.
+</Callout>
+
+---
+
+<Callout type="warning">
+Не оставляйте externalized-checkpoint-retention=DELETE_ON_CANCELLATION в production. Случайный cancel (от UI клика, оператора, automated retry) удалит state. Set RETAIN_ON_CANCELLATION и cleanup через scheduled job с verification.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job: 500GB state в RocksDB, checkpoint interval 60s, EXACTLY_ONCE. Метрики: lastCheckpointDuration варьируется 5s-120s (sawtooth pattern), lastCheckpointSize варьируется 5GB-50GB. Job стабильный по throughput, но downstream Kafka consumer видит latency spikes (50s-150s) corresponding с длинными checkpoint duration. Какой план fix? Объясните trade-offs."
+  answer="Анализ: sawtooth pattern checkpoint size 5-50GB — classic RocksDB compaction effect. После L0→L1 compaction много nb SST files → next checkpoint должен ship всё в S3 → 50GB. Then несколько cycles снова small (only L0 delta) → 5GB. Это причина variability в duration. EXACTLY_ONCE downstream latency = checkpoint visibility latency, потому что transactional sink commits в notifyCheckpointComplete callback — duration spike прямо transmitted к downstream. Solution plan (приоритизированно): (1) Включить Changelog state backend (GIC, FLIP-158). state.backend.changelog.enabled: true, state.backend.changelog.storage: filesystem, state.backend.changelog.dstl.dfs.base-path: s3://bucket/changelog, state.backend.changelog.periodic-materialize.interval: 10min. Это THE fix для variability problem. Changelog uncoupled от RocksDB compaction — каждая state mutation писана в changelog log on DFS. Checkpoint = current cursor position → constant small size (delta с last checkpoint). Expected: checkpoint duration падает до 1-3s consistent. (2) Verify Changelog working. Metrics flink_taskmanager_job_task_changelog_storage_uploadTotalQueueSize должен plateau (не растёт), lastCheckpointSize должен быть ~10-100MB consistent (не varying GBs). (3) Unaligned checkpoints для extra safety. execution.checkpointing.unaligned: true, execution.checkpointing.aligned-checkpoint-timeout: 30s — fallback на unaligned если alignment долгий. (4) Trade-offs Changelog: (a) DFS write throughput выше — каждая mutation писана в log (vs только compacted SSTs). Verify DFS не bottleneck — для S3 это обычно ОК. (b) Recovery slower — нужно replay changelog с последней materialization. 10min materialization interval → max 10min log replay. Acceptable для большинства cases. (c) Storage cost выше — raw mutations не compressed как SST files. На 500GB state expect 2-3× storage в DFS (compensation: deduplication через materialization periodically). (5) Alternative if Changelog не подходит: increase compaction parallelism RocksDB — state.backend.rocksdb.thread.num: 8, плюс tune level0_file_num_compaction_trigger выше (позже compact, но менее bursty). Не решает fundamental variability, только сглаживает. (6) Alternative: increase checkpoint interval до 5min — fewer checkpoints, downstream visibility latency больше, но менее frequent spikes. Acceptable если EOS latency не critical (e.g., analytic dashboard, не real-time decision). (7) Monitor пост-fix: lastCheckpointDuration должен быть < 5s consistent (was 5-120s), downstream Kafka latency должен быть < 15s consistent (was 50-150s). Lesson: Changelog backend specifically designed для этого проблема — sub-second predictable checkpoints даже на huge state. Production rule: для EOS workloads с downstream latency requirements + variable state mutation pattern → enable Changelog как baseline."
+/>

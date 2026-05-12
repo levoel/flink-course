@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/07-restart-strategies",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-07",
+    "description": "Quiz for restart strategies and failover regions lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-07-q1",
+      "type": "multiple-choice",
+      "question": "Default restart strategy с Flink 1.18+ если checkpointing enabled?",
+      "options": [
+        { "id": "a", "text": "fixed-delay (10 attempts, 30s delay)" },
+        { "id": "b", "text": "exponential-delay: initialBackoff=1s, maxBackoff=1min, multiplier=1.5, resetThreshold=1h, jitter=0.1. Exponential backoff с reset после successful 1h. Handles transient failures без hammering, eventually recovers. Recommended default — avoid thundering herd через jitter" },
+        { "id": "c", "text": "failure-rate (3 failures за 5 min)" },
+        { "id": "d", "text": "none (job fails immediately)" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Default с Flink 1.18+: exponential-delay если checkpointing enabled (interval > 0). Configuration: initial-backoff=1s, max-backoff=1min, multiplier=1.5, reset-backoff-threshold=1h, jitter-factor=0.1, attempts-before-reset-backoff=8. Behaviour: attempt 1 wait 1s, attempt 2 wait 1.5s, attempt 3 wait 2.25s, capped at 1min. После 1h без failure — reset backoff. Plus jitter ±10% — avoid thundering herd когда множественные TM restart одновременно. Это encourages best practice: handle transient failures without burning cluster CPU rapidly retrying. Persistent issues eventually fail (or alerts trigger). Если checkpointing disabled — default is none (no restart).",
+      "studyHint": "Повторите урок — раздел 'Default selection'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m06-07-q2",
+      "type": "multiple-choice",
+      "question": "Region failover strategy — что это и какой default?",
+      "options": [
+        { "id": "a", "text": "Full failover — default, всегда restart job целиком" },
+        { "id": "b", "text": "Region failover (default с Flink 1.10+). Identifies pipelined regions — transitively connected operators через forward exchanges (no shuffle). При task failure restart только region containing failed task, не весь job. Independent regions continue running. 2-10x speedup recovery. Configuration: jobmanager.execution.failover-strategy: region" },
+        { "id": "c", "text": "Region failover deprecated в 2.x" },
+        { "id": "d", "text": "Это same as restart strategy" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Region failover — default с Flink 1.10+. Different from restart strategy (which determines WHEN retry). Failover strategy determines SCOPE restart. Pipelined region: subgraph operators connected by forward edges (no network shuffle). Hash/rebalance/broadcast — region boundaries. На task failure restart all subtasks в region of failed task. Independent regions continue normally. Configuration: jobmanager.execution.failover-strategy: region (default). Alternative: full (legacy) — restart entire job. Real impact: simple linear (1 region) = no benefit. Multi-source merge job (3-4 regions) = 2-10x recovery speedup. Restart scope, recovery time, business impact все significantly lower с region failover. Restart strategy + region failover are complementary settings.",
+      "studyHint": "Повторите урок — раздел 'Failover region strategy'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-07-q3",
+      "type": "multiple-choice",
+      "question": "Local recovery — что это и когда помогает?",
+      "options": [
+        { "id": "a", "text": "Recovery от local backup file" },
+        { "id": "b", "text": "state.backend.local-recovery: true — Flink keeps local SST copies на disk after checkpoint upload. На restart if TM placed на same node (rescheduled там же) — uses local copy instead of S3 download. Recovery 1TB state: без LR = 10-30min S3 download, с LR = 30-120sec local read. 20x speedup для same-node restart (transient TM failures, K8s pod restarts)" },
+        { "id": "c", "text": "Local recovery means recovery from local backup site" },
+        { "id": "d", "text": "Это работает только для batch jobs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Local recovery — major optimization для recovery time. Configuration: state.backend.local-recovery: true. Mechanics: после каждого successful checkpoint Flink keeps local copy SST files (не just upload then delete). На restart, если TaskManager process restarted на same physical node (или K8s pod rescheduled to same node) — Flink uses local SST files instead of downloading from DFS. Recovery time для 1TB state: without local recovery = state_size / DFS_bandwidth = 10-30 min S3 download; with local recovery = local NVMe read = 30-120 seconds. 20-30x speedup. Constraints: (a) Only same-node restarts — different node still requires DFS download; (b) Disk usage doubles (live + local recovery copies); (c) Most effective combined с Adaptive Scheduler sticky allocation (FLIP-291) — maximizes same-node likelihood. K8s pod affinity also helps.",
+      "studyHint": "Повторите урок — раздел 'Local recovery'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-07-q4",
+      "type": "true-false",
+      "question": "Restart strategy и failover strategy — синонимы, одно и то же.",
+      "correctAnswer": false,
+      "explanation": "False. Two different concepts that combine. Restart strategy: WHEN to retry restart. exponential-delay (backoff), fixed-delay (constant interval), failure-rate (rate-based threshold), none (no restart). Controls timing — wait between attempts. Configuration: restart-strategy.type. Failover strategy: WHAT to restart (scope). region (default 1.10+, restart only pipelined region of failed task) vs full (legacy, restart entire job). Controls extent — which operators affected. Configuration: jobmanager.execution.failover-strategy. Combined behaviour: task fails → failover strategy determines scope (region of failed task) → restart strategy determines timing (1s backoff initial, exponential) → wait, attempt restart of region. Both should be configured separately. Production recommended: exponential-delay + region. Misconception conflating them leads to wrong configuration.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

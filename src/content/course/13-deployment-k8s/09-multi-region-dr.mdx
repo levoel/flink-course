@@ -1,0 +1,354 @@
+---
+title: "Multi-region setup и disaster recovery"
+order: 9
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Multi-Region", "Disaster Recovery", "Cross-Region Savepoints", "RPO", "RTO"]
+---
+
+# Multi-region setup и DR
+
+В production высоконагруженный Flink работает в одном регионе. Но что если регион выйдет из строя (AWS us-east-1 outage, AZ-wide failure)? **Disaster recovery** для streaming — это не trivial backup-restore, как для databases. Это вопрос: куда уходит state, как быстро поднимается job в новом регионе, какое время потерь (RPO) приемлемо, какое recovery time (RTO).
+
+В этом уроке: multi-region patterns, cross-region savepoints, active-passive vs active-active, RPO/RTO trade-offs, real-world examples.
+
+---
+
+## RPO и RTO в контексте Flink
+
+**RPO (Recovery Point Objective)** — максимальное время data loss приемлемое после disaster. «Сколько секунд/минут events мы можем потерять».
+
+**RTO (Recovery Time Objective)** — максимальное время restoration. «Через сколько минут/часов job должен снова работать».
+
+В Flink:
+
+- **RPO** определяется **checkpoint interval** + replication lag. Если checkpoint каждую минуту → max 1 минута RPO для state. Плюс reply Kafka offsets.
+- **RTO** определяется **savepoint restore time** + cluster provisioning. Большое state (TB) → restore минуты-часы. Cluster boot — минуты на K8s.
+
+| Pattern | RPO | RTO | Cost |
+|---|---|---|---|
+| Single-region | N/A (region down = lost data) | Часы (rebuild region) | Cheapest |
+| Multi-region cross-region savepoints | 5-60min (savepoint frequency) | 30-90min | Moderate |
+| Active-passive с continuous replication | менее 5min | 10-30min | High |
+| Active-active dual-write | менее 1s | менее 1min | Very high |
+
+Большинство production deploys в 2026 — **multi-region cross-region savepoints** (RPO 15-60min, RTO 30min).
+
+---
+
+## Pattern 1: Single-region (no DR)
+
+Default deployment: один K8s cluster, один регион, savepoints в S3 same region.
+
+```yaml
+spec:
+  flinkConfiguration:
+    state.checkpoints.dir: s3://flink-us-east-1/checkpoints/
+    state.savepoints.dir: s3://flink-us-east-1/savepoints/
+    high-availability.storageDir: s3://flink-us-east-1/ha/
+```
+
+**Failure modes:**
+
+- AZ failure: K8s обычно multi-AZ → pods reschedule, job recovery нормально. OK.
+- Region failure: S3 region down → checkpoint writes fail → job CRASH. Recovery невозможен пока region не восстановлен.
+- S3 bucket deletion (operator error): catastrophic, state lost forever.
+
+Single-region acceptable для: dev/staging, не-critical batch, internal tools.
+
+---
+
+## Pattern 2: Cross-region savepoints (recommended)
+
+Активная job работает в одном регионе. Savepoints периодически копируются в другой регион.
+
+<DiagramContainer title="Cross-region savepoint replication" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Primary region (us-east-1)"
+        tooltip="Active K8s cluster + Flink Operator + FlinkDeployment. Production traffic. Checkpoints в S3 us-east-1. Periodic savepoints triggered."
+      >
+        active Flink job
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="periodic savepoint" />
+    <FlowRow>
+      <DataBox
+        label="S3 us-east-1: savepoints/"
+        tooltip="Origin storage savepoints. Тут они создаются. Retention: 7-30 дней."
+      >
+        primary S3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="S3 Cross-Region Replication" />
+    <FlowRow>
+      <DataBox
+        label="S3 us-west-2: savepoints/ (replica)"
+        tooltip="S3 CRR копирует savepoint в другой регион асинхронно. Replication lag обычно секунды-минуты. Альтернатива: rclone cron job, AWS DataSync."
+      >
+        DR S3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="ON DISASTER" />
+    <FlowRow>
+      <DataBox
+        label="Secondary region (us-west-2)"
+        tooltip="При disaster: deploy K8s cluster + Flink Operator в us-west-2 (заранее или on-demand). FlinkDeployment с initialSavepointPath из replicated savepoint."
+      >
+        deploy from savepoint
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Implementation
+
+```yaml
+spec:
+  flinkConfiguration:
+    state.checkpoints.dir: s3://flink-us-east-1/checkpoints/
+    state.savepoints.dir: s3://flink-us-east-1/savepoints/
+
+  job:
+    autoSavepointSeconds: 1800       # savepoint каждые 30 минут
+    savepointHistory:
+      maxCount: 100
+      maxAgeHours: 168               # keep 7 дней
+```
+
+S3 Cross-Region Replication (CRR) на bucket-level:
+
+```text
+S3 bucket: flink-us-east-1
+  ↓ CRR enabled (replicate prefix savepoints/)
+S3 bucket: flink-us-west-2
+  Replicated savepoint copies
+  Async replication, lag 5-30 секунд obычно
+```
+
+### DR procedure
+
+```bash
+# 1. Disaster: us-east-1 not available
+# 2. Provision K8s cluster в us-west-2 (заранее или via Terraform)
+
+# 3. Latest savepoint в us-west-2 bucket
+LATEST_SAVEPOINT=$(aws s3 ls s3://flink-us-west-2/savepoints/fraud-detector/ \
+  --recursive | sort -k1,2 | tail -1 | awk '{print $4}')
+
+# 4. Deploy FlinkDeployment в us-west-2 cluster
+cat <<EOF | kubectl apply --context=us-west-2 -f -
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector
+  namespace: streaming-prod
+spec:
+  image: registry.example.com/fraud-detector:1.42.0
+  flinkVersion: v2_2
+  flinkConfiguration:
+    state.backend.type: forst
+    state.checkpoints.dir: s3://flink-us-west-2/checkpoints/
+    state.savepoints.dir: s3://flink-us-west-2/savepoints/
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://flink-us-west-2/ha/
+  jobManager:
+    replicas: 2
+    resource: { cpu: 2, memory: 4096m }
+  taskManager:
+    resource: { cpu: 4, memory: 8192m }
+  job:
+    jarURI: local:///opt/flink/usrlib/fraud-detector.jar
+    parallelism: 8
+    initialSavepointPath: "s3://flink-us-west-2/$LATEST_SAVEPOINT"
+    upgradeMode: savepoint
+EOF
+
+# 5. Verify
+kubectl get flinkdeployment -n streaming-prod --context=us-west-2
+
+# 6. Update DNS / Load Balancer для Kafka producers и consumers point at us-west-2
+```
+
+**Trade-offs:**
+- RPO = savepoint interval (30min) + CRR lag (~30s) = ~30 минут data loss
+- RTO = cluster provisioning (15-30 минут если cold) + restore time (5-30 минут для большого state) = 30-60 минут
+- Cost: ~1.5x single-region (CRR + replicated S3 storage)
+
+---
+
+## Pattern 3: Active-passive с continuous replication
+
+Сложнее: passive cluster постоянно «warm», ready to take over.
+
+```text
+Primary (us-east-1):
+  - Flink job RUNNING, processes events
+  - Checkpoints в S3 us-east-1 (every 60s)
+  - Periodic savepoints (every 15min)
+  - Both replicated to us-west-2
+
+Standby (us-west-2):
+  - K8s cluster RUNNING (idle)
+  - Flink Operator installed
+  - FlinkDeployment NOT yet applied (saved as Helm chart / YAML)
+  - At disaster: instant apply with latest savepoint
+```
+
+RTO drops to ~10-15 минут (no cluster provisioning, only Flink boot + state restore).
+
+Cost: 2x infra (running standby cluster). Justifiable для very critical jobs (financial trading, regulatory compliance).
+
+---
+
+## Pattern 4: Active-active (rare, complex)
+
+Обе версии job-а active в обоих регионах, processing same input stream через partition assignment или routing.
+
+```text
+Kafka topic 32 partitions:
+  us-east-1 job consumes partitions 0-15 (50% traffic)
+  us-west-2 job consumes partitions 16-31 (50% traffic)
+
+При region failure:
+  surviving region rebalances → берёт все 32 partitions
+  Doubles work, но no downtime
+```
+
+**Подвохи:**
+- State isolated по partitions → нет cross-region state (e.g. per-user fraud detector работает только если все user events идут в один partition).
+- Output deduplication необходим (если obе версии могут output one event).
+- Latency tax: cross-region coordination сложен.
+- Cost: 2x.
+
+Используется только для truly latency-critical, geographically distributed workloads (CDN analytics, ad serving). Most fraud/analytics workloads — active-passive достаточно.
+
+---
+
+## Kafka в multi-region
+
+Flink state — лишь половина задачи. **Kafka offsets** тоже нужны для replay при DR:
+
+```text
+Primary region Kafka cluster:
+  topic transactions: partitions 0-31
+
+DR options:
+1. MirrorMaker 2 → replica Kafka cluster в us-west-2
+   - Replicates topic events
+   - При disaster Flink consumer reads from replica
+   - Offset tracking сложен (different offsets в replica)
+
+2. Kafka stretched cluster (multi-region brokers)
+   - Brokers распределены по регионам
+   - Один cluster, multiple AZ/regions
+   - При region down — brokers в другом регионе available
+   - Higher latency, harder to operate
+
+3. Confluent Cluster Linking (managed service)
+   - Bidirectional replication offsets preserved
+   - Easier than MM2
+```
+
+Best practice 2026: **Kafka MirrorMaker 2 → consumer group migration** для DR. Flink читает из mirrored topic, offsets translated через MM2 metadata.
+
+---
+
+## Cross-region savepoint format considerations
+
+При savepoint в один регион, restore в другой:
+
+- **Format** — canonical (cross-version safe, cross-backend safe). Native может работать но риск.
+- **State backend** — должен match (ForSt в primary → ForSt в DR). Cross-backend требует canonical + полная regeneration.
+- **Flink version** — same major (v2_2 → v2_2). Major upgrade при DR — нет (test везде сначала).
+- **ForSt primary URI** — если ForSt с disaggregated state на S3 us-east-1, при restore в us-west-2 нужно update primary URI на us-west-2 bucket. Иначе job reads from down region.
+
+```yaml
+# DR config different from primary
+spec:
+  flinkConfiguration:
+    state.backend.forst.primary-dir: s3://flink-us-west-2/state/   # DR bucket
+```
+
+---
+
+## Cost optimization для DR
+
+- **Не replicate checkpoints** — они частые и большие. Replicate только savepoints (реже, важнее).
+- **Glacier для old savepoints** — после 7 дней move на cold storage.
+- **S3 lifecycle policies** — auto-delete savepoints старше N дней.
+- **Standby cluster small** — для active-passive standby cluster может быть meнше TM-ов, scale up при failover (Adaptive Scheduler).
+
+```yaml
+# S3 lifecycle policy для DR bucket
+Rules:
+  - Id: glacier-old-savepoints
+    Filter:
+      Prefix: savepoints/
+    Transitions:
+      - Days: 7
+        StorageClass: GLACIER
+    Expiration:
+      Days: 90
+```
+
+---
+
+## Production gotchas
+
+- **CRR async** — replication lag 30s-5min. Newest savepoint может НЕ быть в DR region при disaster. Use latest available, accept RPO impact.
+- **IAM permissions** — DR cluster нужны permissions для DR S3 bucket. ServiceAccount должен support cross-region access.
+- **DNS for Kafka** — Kafka bootstrap-servers hardcoded → cluster down → cannot connect. Use DNS aliases / Service Mesh.
+- **State backend type mismatch** — primary с ForSt, DR config без `state.backend.type: forst` → restore fails. Always exact backend config replication.
+- **Forgotten high-availability storageDir** — при DR new cluster использует old HA path → conflict с corrupted state. Use new DR-specific path.
+- **Test DR quarterly** — DR procedure must be tested. Untested DR = no DR. Real failover drill раз в квартал на staging.
+- **Cross-region data transfer cost** — replication petabytes между регионами дорого. Compute trade-off vs single-region risk.
+- **ForSt cross-region restore latency** — ForSt с primary в primary region S3. Restore в other region — high latency. Может потребоваться bootstrap primary в DR region: copy primary data перед restore.
+- **Consumer group continuity** — Flink Kafka consumer group в DR cluster — same name as primary? Different? Trade-offs (no duplicates vs no recovery from last offset).
+
+<Callout type="warning">
+DR plan который не tested = no DR plan. Quarterly drill: симулируйте region failure (block S3 access из primary), provision DR cluster, restore from latest savepoint, verify correctness. Document procedure (runbook), update после каждого drill. Real disaster — не время debug «как было правильно».
+</Callout>
+
+<Callout type="tip">
+В 2026 для most production жобов **active-passive с cross-region savepoints (Pattern 2)** — sweet spot. RPO 15-30min, RTO 30-60min приемлем для analytics, fraud detection, ETL. Active-active (Pattern 4) только для truly latency-critical workloads с geographic distribution. Single-region (Pattern 1) только для dev/staging.
+</Callout>
+
+---
+
+## Реальный пример: финтех
+
+Real fraud detection company:
+
+```text
+Architecture:
+- Primary: AWS us-east-1
+- DR: AWS us-west-2
+- Kafka: Confluent Cloud multi-region cluster
+- Flink: Self-managed EKS clusters в both regions
+
+DR setup:
+- Savepoints каждые 15 минут
+- S3 CRR на savepoints prefix
+- DR EKS cluster RUNNING (cost), но Flink Operator deployed, FlinkDeployment not applied
+- Terraform module для apply FlinkDeployment с latest savepoint
+- Confluent Cluster Linking для Kafka topic mirroring
+
+Quarterly DR drill:
+- Simulate us-east-1 outage (block AWS API в Terraform)
+- Run runbook: Terraform apply for DR FlinkDeployment
+- Verify: job RUNNING в us-west-2, processing events from mirrored Kafka
+- Measure: RTO actual ~25 минут, RPO ~10 минут (latest savepoint + CRR lag)
+- Improvements: pre-build EKS node group для скорости
+
+Cost: ~1.6x single-region
+Justification: $50M/year fraud prevented, 6-hour outage = $2M loss
+```
+
+---
+
+<KnowledgeCheck
+  question="Команда задаёт RPO=15min, RTO=30min для critical fraud detection job со 200GB state. Какая deployment стратегия и какие конфигурации нужны?"
+  answer="Pattern 2 (cross-region savepoints) с tuning. Setup: (1) Primary EKS в us-east-1, DR EKS в us-west-2 (DR cluster может быть smaller для cost, scale up при failover через Adaptive Scheduler). (2) Savepoint interval = 10 минут (для RPO 15min — savepoint каждые 10min + CRR lag 1-2min = 12min RPO worst case). (3) S3 CRR enabled на savepoints prefix (replication async). (4) State backend = ForSt с disaggregated state — savepoint становится metadata-only operation, savepoint 200GB занимает секунды а не минуты (огромный win для RPO). (5) Pre-provisioned DR EKS cluster (минусует ~15min provisioning time). (6) Terraform/scripted FlinkDeployment apply с initialSavepointPath из latest replicated savepoint. (7) Kafka MM2 или Confluent Cluster Linking для consumer offset continuity. (8) Quarterly DR drill на staging — measure actual RTO. Конфиги: spec.job.autoSavepointSeconds=600, S3 lifecycle policy для savepoint retention 30 дней, S3 CRR rule, separate flink-us-east-1 / flink-us-west-2 buckets. Без ForSt RPO 15min для 200GB state нереально достижим — native savepoint format 200GB занимает 5-10 минут just to write. ForSt делает «light savepoint» возможным."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/07-late-events-side-output",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-07",
+    "description": "Quiz for late events and side output lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-07-q1",
+      "type": "multiple-choice",
+      "question": "Default behaviour для late events (WM > windowEnd, allowedLateness=0, no side output)?",
+      "options": [
+        { "id": "a", "text": "Flink выдаёт error, job останавливается" },
+        { "id": "b", "text": "Late events автоматически попадают в следующее окно" },
+        { "id": "c", "text": "SILENTLY DROPPED. Метрика numLateRecordsDropped++ но никакого error, никакого callback. События исчезают. Это одна из самых частых production ошибок 'почему в dashboard данных не хватает'. Production must: .allowedLateness() + .sideOutputLateData() для critical pipelines" },
+        { "id": "d", "text": "События логируются в stderr с warning" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Late events default behaviour — SILENT DROP. Это критично понимать: Flink не throws exception, не logs error, не invokes callback. Только увеличивает counter numLateRecordsDropped в metrics (видно в Web UI/Prometheus, но никто на неё не смотрит обычно). Это причина 80% incidents 'данные пропали из дашборда'. Production safety: ALWAYS .allowedLateness(Duration.ofMinutes(N)) — window state удерживается N минут past WM, late events re-fire window. PLUS .sideOutputLateData(lateTag) — events past lateness попадают в side stream для capture (DLQ, recovery pipeline). Без явных этих двух — silent data loss.",
+      "studyHint": "Повторите урок — раздел 'Что такое late event'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m05-07-q2",
+      "type": "multiple-choice",
+      "question": "Production: window emit-ит result в Kafka sink, потом приходит late event → window re-fires → emit обновлённый result. Какой downstream pattern обеспечивает consistency?",
+      "options": [
+        { "id": "a", "text": "Никакой — late events нельзя обработать корректно" },
+        { "id": "b", "text": "Compacted Kafka topic с key = window_start + entity_id (latest wins), или OLAP DB с upsert (ReplacingMergeTree, ON CONFLICT DO UPDATE), или append-only с version field (downstream filters latest)" },
+        { "id": "c", "text": "Просто игнорировать second emit" },
+        { "id": "d", "text": "Manually deduplicate в downstream code" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Re-fire emit'ит second result для того же window. Downstream должен handle: (1) Compacted Kafka topic с key=(window_start, user_id) — Kafka log compaction keeps только latest message per key, re-fire overrides initial; (2) ClickHouse ReplacingMergeTree(inserted_at) ORDER BY (key) — keeps last by inserted_at on merge; (3) Postgres ON CONFLICT (pk) DO UPDATE — explicit upsert per row; (4) Append-only с fireVersion field — downstream filters MAX(fireVersion). Choice based on store: Kafka → compaction, ClickHouse → ReplacingMergeTree, OLTP → ON CONFLICT. ANTI-pattern: simply append без deduplication → duplicates в analytics.",
+      "studyHint": "Повторите урок — раздел 'Late event downstream consistency'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-07-q3",
+      "type": "multiple-choice",
+      "question": "OutputTag declaration — почему важна anonymous subclass {}?",
+      "options": [
+        { "id": "a", "text": "Это stylistic preference" },
+        { "id": "b", "text": "Anonymous subclass `new OutputTag<Event>('tag'){}` preserves generic type info через reflection. Без `{}` — type erasure, Flink не может infer TypeInformation, compilation error в runtime: 'Cannot determine TypeInformation'. Это особенность Java reflection — generics erased, anonymous subclass keeps type в class hierarchy" },
+        { "id": "c", "text": "Это deprecated синтаксис" },
+        { "id": "d", "text": "Anonymous subclass быстрее" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Java generics suffer от type erasure — `List<String>` и `List<Integer>` имеют ту же runtime class. Flink использует TypeInformation extraction через reflection. Anonymous subclass `new OutputTag<Event>('tag'){}` создаёт class который extends OutputTag<Event> — generic info сохранён в class hierarchy (можно extract через getGenericSuperclass()). Без anonymous subclass `new OutputTag<>('tag')` — type erasure, Flink не can determine Event type, runtime error 'Cannot determine TypeInformation for type'. Это identical pattern как Jackson TypeReference, Guava TypeToken — все полагаются на anonymous subclass для type preservation.",
+      "studyHint": "Повторите урок — раздел 'OutputTag — anonymous subclass'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-07-q4",
+      "type": "true-false",
+      "question": "Side output работает только для late events — обычные ProcessFunction не могут emit к OutputTag.",
+      "correctAnswer": false,
+      "explanation": "False. Side output — general mechanism, не только для late events. Любой ProcessFunction / KeyedProcessFunction / CoProcessFunction может emit к OutputTag через ctx.output(tag, value). Use cases: (1) error handling — invalid events to error stream; (2) splitting streams по condition (fraud alerts to alerts topic, audit to audit topic); (3) sampling — 1% events to dedicated stream для ML training; (4) late events (sideOutputLateData — это convenience wrapper). Multiple side outputs возможны с разными tags. Result: main stream + N side streams, доступны через getSideOutput(tag).",
+      "bloomLevel": "applied"
+    }
+  ]
+}

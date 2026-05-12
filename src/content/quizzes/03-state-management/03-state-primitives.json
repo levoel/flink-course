@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/03-state-primitives",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-03",
+    "description": "Quiz for state primitives lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-03-q1",
+      "type": "multiple-choice",
+      "question": "Per-user counter с 500 различных event types per user. Какой state primitive выбрать?",
+      "options": [
+        { "id": "a", "text": "ValueState<HashMap<String, Long>> — простая модель" },
+        { "id": "b", "text": "MapState<String, Long> — per-entry lazy serialization в RocksDB" },
+        { "id": "c", "text": "ListState<Tuple2<String, Long>>" },
+        { "id": "d", "text": "ReducingState<Long> с sum" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MapState — правильный выбор. ValueState<HashMap> антипаттерн на RocksDB: каждый state.value() десериализует весь map (до 500 entries), update сериализует обратно. MapState хранит каждую entry как отдельную RocksDB row с composite key (kgId, ns, userKey, stateName, mapKey), поэтому get(eventType) — один GET (~10μs), put — один PUT. Per-access ускорение ~500x в этом сценарии.",
+      "studyHint": "Повторите урок — MapState internal layout",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-03-q2",
+      "type": "multiple-choice",
+      "question": "В чём отличие ReducingState от AggregatingState?",
+      "options": [
+        { "id": "a", "text": "ReducingState только для чисел, AggregatingState для строк" },
+        { "id": "b", "text": "ReducingState: input и output одного типа T, ReduceFunction<T> merges. AggregatingState: input/accumulator/output могут быть разных типов (IN/ACC/OUT), AggregateFunction более гибкий" },
+        { "id": "c", "text": "Никакой разницы — ReducingState deprecated" },
+        { "id": "d", "text": "AggregatingState работает только на keyed stream" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ReducingState<T> — input == output == T, ReduceFunction<T> делает T merge(T, T). Подходит для sum/min/max аккумуляторов. AggregatingState<IN, OUT> с AggregateFunction<IN, ACC, OUT> — input, accumulator, output могут быть разные. Например: input Long, accumulator AvgAccumulator (sum+count), output Double (avg). Critical: в backend хранится ACC, не OUT; getResult вызывается на .get().",
+      "studyHint": "Повторите урок — секции 4 и 5",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-03-q3",
+      "type": "multiple-choice",
+      "question": "Что физически гарантирует, что state.value() для userId=42 не возвращает state userId=43?",
+      "options": [
+        { "id": "a", "text": "Mutex per key — Flink держит lock при access" },
+        { "id": "b", "text": "RocksDB key composition: (keyGroupId, namespace, userKey, stateName) — разные userKey дают разные RocksDB keys → физическая изоляция" },
+        { "id": "c", "text": "Hash collision rate настолько низок, что коллизии не случаются" },
+        { "id": "d", "text": "Каждый key хранится в отдельной database" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Per-key isolation физически гарантируется композицией RocksDB key. Когда current key context = 42, state.value() резолвится в GET с composite key (kgId(42), namespace, serialize(42), stateName). Для userId=43 — другой composite key. Разные физические rows в Column Family. Никаких mutex не нужно — single-threaded mailbox обрабатывает один key context за раз, изоляция через key namespace.",
+      "studyHint": "Повторите урок — диаграмма Key context → RocksDB key composition",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-03-q4",
+      "type": "true-false",
+      "question": "Можно вызвать getRuntimeContext().getState(descriptor) в constructor RichFunction для оптимизации.",
+      "correctAnswer": false,
+      "explanation": "False. В constructor RuntimeContext == null (Flink ещё не инициализировал function). NPE. State доступен только в open() и позже. Используйте transient field, lazy инициализированный в open(): private transient ValueState<Long> state; в open(): state = getRuntimeContext().getState(descriptor). Это паттерн обязательный для всех state declarations.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

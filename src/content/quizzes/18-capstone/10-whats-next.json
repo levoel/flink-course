@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/10-whats-next",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-10",
+    "description": "Quiz for capstone what's next"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-10-q1",
+      "type": "multiple-choice",
+      "question": "После курса — какой capability вы могут confidently claim в interview, и что требует ещё production experience?",
+      "options": [
+        { "id": "a", "text": "Все equally confident" },
+        { "id": "b", "text": "Confident: design streaming architectures, implement Flink jobs с state/watermarks/EOS, K8s deployment foundations. Need 6-12 months production: troubleshooting expertise (3 AM debugging), capacity planning + cost optimization, cross-team architecture decisions, specific scale claims (50k events/sec exactly-once)" },
+        { "id": "c", "text": "Только theory, no practice" },
+        { "id": "d", "text": "Все требует years experience" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Honest self-assessment important для career growth + interview integrity. Confident claims: курс daught foundations + capstone built — verifiable via portfolio (architecture diagrams, code, design decisions discussed). Need production experience: troubleshooting depth from incidents, capacity reality from observation, cross-team decisions from interactions. Interview framing: 'Built capstone production-grade pipeline. Looking forward to applying в team production scale. Strong fundamentals, comfortable learning, hungry for incident response experience.' This is true и appropriate — overstating production credibility-risk.",
+      "studyHint": "Повторите урок 10 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-10-q2",
+      "type": "multiple-choice",
+      "question": "Continuous learning стратегии для staying current в streaming systems в 2026+?",
+      "options": [
+        { "id": "a", "text": "Один раз learn, done forever" },
+        { "id": "b", "text": "(1) Subscribe Flink release notes; (2) Active в Apache Flink Slack; (3) Quarterly review what's new (Flink, Paimon, Iceberg, Kafka); (4) Practical experimentation с new features в side projects; (5) Network с другими Flink engineers (meetups, conferences); (6) Internal knowledge sharing (presentations, docs); (7) Follow VLDB papers; (8) Annual conference attendance (Flink Forward)" },
+        { "id": "c", "text": "Только vendor courses" },
+        { "id": "d", "text": "Только reading documentation" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Streaming evolves rapidly. 1.x → 2.x had massive changes. 2.x → 3.x будет тоже. Skills compound через continuous engagement: (1) Release notes catch breaking changes early; (2) Slack — first-line awareness of new features через community discussion; (3) Quarterly review — structured, doesn't depend on news showing; (4) Hands-on experimentation > reading — true learning; (5) Network — Flink engineers share war stories, patterns; (6) Teach — best way solidify knowledge; (7) Papers — depth; (8) Conferences — overview + networking. Career investment in niche streaming expertise long-term high upside.",
+      "studyHint": "Повторите урок 10 — раздел 'Continuous learning'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-10-q3",
+      "type": "multiple-choice",
+      "question": "Path к open source contribution (Flink committer) — realistic timeline и steps?",
+      "options": [
+        { "id": "a", "text": "Submit one PR — instant committer" },
+        { "id": "b", "text": "Realistic 1-2 years sustained contribution: (1) Use Flink at scale (production experience); (2) Report bugs constructively (minimal reproductions, clear context); (3) Fix small bugs ('good first issue' tagged); (4) Add tests/documentation (accepted contributions, less risk); (5) Review others' PRs; (6) Propose features / write FLIP; (7) Speak at meetups/conferences. Multiple sustained signals required для committer recognition" },
+        { "id": "c", "text": "Только large feature PRs" },
+        { "id": "d", "text": "Pay для committer status" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Apache committer recognition based на sustained valuable contributions. Not transactional (one PR = committer). Multiple signals over time: bug fixes, reviews, mailing list participation, FLIPs, talks. Path: (1) production experience → (2) bug reports → (3) small fixes → (4) tests/docs → (5) reviews → (6) feature proposals → (7) visibility. Each step builds reputation в community. Committer status = community trust earned. Career value: signals deep technical expertise, network effect, opportunity (talks, employment). Не easy or fast, но достижимо для committed engineers.",
+      "studyHint": "Повторите урок 10 — раздел 'Open source contribution'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-10-q4",
+      "type": "true-false",
+      "question": "Streaming systems expertise — niche skill с limited career value в 2026+.",
+      "correctAnswer": false,
+      "explanation": "Opposite of true. Streaming + real-time data engineering — growing demand, limited supply expertise. 2026 market signals: senior+ Flink engineers commanding $200-350k+ US (comparable EU/UK senior), specialty roles в FAANG/large e-commerce/finance, increased corporate streaming adoption (real-time CDC, ML pipelines, agent runtime). Niche enough that few engineers have deep production experience — competitive advantage. Expertise compounds — 5+ years production Flink experience = senior+ level. Investment в depth here long-term career upside. Streaming + AI/ML intersection (ML_PREDICT, Flink Agents) further increases demand. Not 'just niche' — valuable specialty.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

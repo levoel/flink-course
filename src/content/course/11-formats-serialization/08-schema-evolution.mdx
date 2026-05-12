@@ -1,0 +1,435 @@
+---
+title: "Schema evolution через TypeSerializerSnapshot"
+description: "TypeSerializerSnapshot mechanism. Что Flink делает автоматически, что нет. State Processor API как escape hatch для невозможных migrations."
+order: 8
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Schema Evolution", "TypeSerializerSnapshot", "State Migration", "State Processor API"]
+---
+
+# Schema evolution через TypeSerializerSnapshot
+
+Stateful Flink jobs живут годами. Pipeline, deployed в Q1, к Q4 видит десятки изменений domain types: добавлены fields, переименованы, удалены, типы расширены, версии классов изменились в результате refactoring. Каждое из этих изменений потенциально breaks compatibility с existing checkpoint/savepoint — state hardware на диске был serialized старой версией класса.
+
+Flink имеет встроенный mechanism для schema evolution через **TypeSerializerSnapshot** API. На каждый checkpoint state-related serializer **сохраняет snapshot конфигурации** (schema). На recovery новый serializer (с потенциально изменённой schema) сравнивается со сохранённым snapshot через `resolveSchemaCompatibility()`. Результат — одна из четырёх категорий: совместимо без миграции, совместимо после reconfiguration, требуется migration, или incompatible.
+
+В этом уроке: TypeSerializerSnapshot mechanism, что Flink handles автоматически для POJO/Avro/Tuple/Protobuf, escape hatch через State Processor API для невозможных эволюций.
+
+---
+
+## TypeSerializerSnapshot — общая модель
+
+Каждый `TypeSerializer<T>` имеет связанный `TypeSerializerSnapshot<T>` — сериализованное описание schema. На checkpoint:
+
+```java
+TypeSerializerSnapshot<T> snapshot = serializer.snapshotConfiguration();
+snapshot.writeSnapshot(out);   // записывается рядом со state в checkpoint
+```
+
+На recovery:
+
+```java
+// Читаем сохранённый snapshot
+TypeSerializerSnapshot<T> savedSnapshot = ... readFromCheckpoint();
+// Создаём новый serializer (потенциально новая schema)
+TypeSerializer<T> newSerializer = info.createSerializer(executionConfig);
+// Спрашиваем compatibility
+TypeSerializerSchemaCompatibility<T> result = savedSnapshot.resolveSchemaCompatibility(newSerializer);
+```
+
+`TypeSerializerSchemaCompatibility<T>` возвращает одно из четырёх:
+
+<DiagramContainer title="Schema compatibility outcomes" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="compatibleAsIs()"
+        tooltip="New serializer полностью совпадает со old. Никаких изменений в state. Чтение/запись без modification. Самый частый случай — minor code change без schema impact."
+      >
+        AS-IS
+      </DataBox>
+      <DataBox
+        label="compatibleWithReconfiguredSerializer()"
+        tooltip="Serializer needs minor reconfiguration (например, fields reordered). Flink использует old field order для compat, но logically всё совместимо."
+      >
+        RECONFIGURE
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="compatibleAfterMigration()"
+        tooltip="Нужна миграция state: Flink reads с старым serializer, пишет с новым. Это дороже — full state rewrite на recovery. Example: добавлен new nullable field в POJO."
+      >
+        MIGRATION
+      </DataBox>
+      <DataBox
+        label="incompatible()"
+        tooltip="Schemas несовместимы. Job НЕ стартует. Например, required field removed, type changed (long → String). Recovery невозможен."
+      >
+        INCOMPATIBLE → fail
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## PojoSerializer schema evolution
+
+`PojoSerializerSnapshot` — самый sophisticated в Flink. Поддерживает:
+
+| Change | Compatibility |
+|---|---|
+| Add new nullable field | `compatibleAfterMigration()` |
+| Add new non-nullable field (primitive default) | `compatibleAfterMigration()` |
+| Remove field | `compatibleAfterMigration()` (data lost) |
+| Reorder fields | `compatibleWithReconfiguredSerializer()` |
+| Rename field | **Incompatible** (Flink не знает что rename) |
+| Change field type (Long → Integer) | **Incompatible** |
+| Change class name (package move) | **Incompatible** by default |
+
+### Example: добавление nullable field
+
+```java
+// Old (v1)
+public class Order {
+    public long id;
+    public String customer;
+    public Order() {}
+}
+```
+
+State checkpoint содержит OrderV1 records. Затем код:
+
+```java
+// New (v2)
+public class Order {
+    public long id;
+    public String customer;
+    public String region;  // ← NEW field, default null
+    public Order() {}
+}
+```
+
+На recovery PojoSerializerSnapshot замечает: один field added. Возвращает `compatibleAfterMigration()`. Flink:
+
+1. Создаёт reconciling serializer, который reads OrderV1 (без region) и returns Order с `region=null`.
+2. Перепаковывает state с новым PojoSerializer (с region field).
+
+Cost: full state rewrite на recovery. Для 100GB state на S3 — может занять 10+ минут.
+
+### Example: removed field
+
+```java
+// Old (v1)
+public class Order {
+    public long id;
+    public String customer;
+    public String deprecated;
+    public Order() {}
+}
+
+// New (v2) — deprecated removed
+public class Order {
+    public long id;
+    public String customer;
+    public Order() {}
+}
+```
+
+PojoSerializerSnapshot видит: field `deprecated` есть в snapshot, отсутствует в new serializer. Compatibility: `compatibleAfterMigration()` — data в `deprecated` поле теряется при rewrite.
+
+### Example: rename — incompatible
+
+```java
+// Old (v1)
+public class Order {
+    public long id;
+    public String customer;
+    public Order() {}
+}
+
+// New (v2)
+public class Order {
+    public long id;
+    public String clientName;  // ← renamed customer → clientName
+    public Order() {}
+}
+```
+
+PojoSerializerSnapshot сравнивает field names byte-by-byte: `customer ≠ clientName`. Видит one field removed (`customer`), one added (`clientName`). Возвращает `compatibleAfterMigration()` с потерей данных — `customer` data lost, `clientName` всегда null after migration.
+
+Если бы Flink был "умнее", он мог бы trust developer intent и rename. Но без хинтов нет способа отличить rename от drop+add.
+
+**Workaround — custom PojoSerializer**, который обрабатывает rename. Или используйте Avro с aliases:
+
+```json
+{"name": "clientName", "type": "string", "aliases": ["customer"]}
+```
+
+Avro Specific обнаружит alias и сделает proper rename.
+
+---
+
+## AvroSerializer schema evolution
+
+Avro имеет нативный schema evolution через **reader/writer schema resolution**. AvroSerializer хранит schema в snapshot:
+
+```java
+public class AvroSerializerSnapshot<T> implements TypeSerializerSnapshot<T> {
+    private Schema runtimeSchema;     // schema на момент checkpoint
+    // ...
+    @Override
+    public TypeSerializerSchemaCompatibility<T> resolveSchemaCompatibility(
+            TypeSerializer<T> newSerializer) {
+        Schema newSchema = ((AvroSerializer<T>) newSerializer).getSchema();
+        SchemaCompatibility.SchemaPairCompatibility compat =
+            SchemaCompatibility.checkReaderWriterCompatibility(newSchema, runtimeSchema);
+        // ...
+    }
+}
+```
+
+Avro semantics:
+
+| Change | Avro evolution | Flink result |
+|---|---|---|
+| Add field with default | OK | `compatibleAsIs()` (reader-schema applies default) |
+| Add field without default | Backward incompatible | `incompatible()` |
+| Remove field | OK if reader не expects | `compatibleAsIs()` |
+| Rename via `aliases` | OK | `compatibleAsIs()` |
+| Type widen (int → long) | OK | `compatibleAfterMigration()` |
+| Type narrow (long → int) | Risk overflow | `incompatible()` |
+| Reorder fields | OK (Avro field-by-name) | `compatibleAsIs()` |
+
+Avro evolution **сильнее** чем POJO — rename через aliases, type widening работает gracefully. Это одна из главных причин выбирать Avro для long-running stateful jobs.
+
+---
+
+## TupleSerializer evolution — limited
+
+Tuple-types: positional, без field names. Evolution rules:
+
+| Change | Result |
+|---|---|
+| Same arity, compatible component types | `compatibleAsIs()` |
+| Add component (Tuple2 → Tuple3) | **Incompatible** (arity changed) |
+| Remove component | **Incompatible** |
+| Change component type (Long → Double) | **Incompatible** |
+
+Tuple типы имеют **almost no evolution capability**. Это deliberate trade-off: Tuple — для intermediate fast streams, не для long-lived state. Если ваш state в keyed state — никогда не используйте Tuple, используйте POJO/Avro.
+
+---
+
+## Custom TypeSerializerSnapshot
+
+Для complex types или когда built-in rules недостаточно — пишем custom snapshot:
+
+```java
+public class OrderSerializerSnapshot implements TypeSerializerSnapshot<Order> {
+
+    private static final int CURRENT_VERSION = 2;
+    private List<String> fieldNames;
+
+    @Override
+    public int getCurrentVersion() { return CURRENT_VERSION; }
+
+    @Override
+    public void writeSnapshot(DataOutputView out) throws IOException {
+        out.writeInt(fieldNames.size());
+        for (String name : fieldNames) {
+            out.writeUTF(name);
+        }
+    }
+
+    @Override
+    public void readSnapshot(int readVersion, DataInputView in, ClassLoader cl)
+            throws IOException {
+        int size = in.readInt();
+        fieldNames = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            fieldNames.add(in.readUTF());
+        }
+    }
+
+    @Override
+    public TypeSerializerSchemaCompatibility<Order> resolveSchemaCompatibility(
+            TypeSerializer<Order> newSerializer) {
+        if (!(newSerializer instanceof OrderSerializer)) {
+            return TypeSerializerSchemaCompatibility.incompatible();
+        }
+        OrderSerializer ns = (OrderSerializer) newSerializer;
+        List<String> newFields = ns.getFieldNames();
+
+        // Custom logic: handle rename customer → clientName
+        if (fieldNames.contains("customer") && newFields.contains("clientName")
+                && !fieldNames.contains("clientName")) {
+            // Rename detected, migration needed
+            return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+        }
+
+        if (fieldNames.equals(newFields)) {
+            return TypeSerializerSchemaCompatibility.compatibleAsIs();
+        }
+        return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+    }
+
+    @Override
+    public TypeSerializer<Order> restoreSerializer() {
+        return new OrderSerializer(fieldNames);
+    }
+}
+```
+
+Это работа — но позволяет evolution scenarios, недоступные built-in PojoSerializer.
+
+---
+
+## State Processor API — escape hatch
+
+Когда schema evolution в principle невозможен (типы too different, или нужно complex transformation), используем **State Processor API** — отдельный batch job, который читает savepoint, transforms, пишет новый savepoint.
+
+```xml
+<dependency>
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-state-processor-api</artifactId>
+    <version>2.2.0</version>
+</dependency>
+```
+
+```java
+public class MigrateOrderState {
+    public static void main(String[] args) throws Exception {
+        ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+
+        // Read old savepoint
+        ExistingSavepoint existing = Savepoint.load(
+            env, "s3://savepoints/old-v1/", new HashMapStateBackend());
+
+        // Read keyed state for "order-state" operator UID
+        DataStream<KeyedState<Long, OrderV1>> oldState = existing.readKeyedState(
+            "order-state-uid",
+            new KeyedStateReaderFunction<Long, OrderV1>() {
+                private ValueStateDescriptor<OrderV1> desc;
+
+                @Override
+                public void open(Configuration conf) {
+                    desc = new ValueStateDescriptor<>("order", OrderV1.class);
+                }
+
+                @Override
+                public void readKey(Long key, Context ctx, Collector<OrderV1> out)
+                        throws Exception {
+                    OrderV1 value = getRuntimeContext().getState(desc).value();
+                    if (value != null) out.collect(value);
+                }
+            });
+
+        // Transform OrderV1 → OrderV2
+        DataStream<KeyedState<Long, OrderV2>> newState = oldState.map(ov1 -> {
+            OrderV2 ov2 = new OrderV2();
+            ov2.id = ov1.id;
+            ov2.clientName = ov1.customer;  // ← rename: customer → clientName
+            ov2.region = "UNKNOWN";          // ← new field
+            return new KeyedState<>(ov1.id, ov2);
+        });
+
+        // Write new savepoint
+        NewSavepoint newSp = Savepoint.create(new HashMapStateBackend(), maxParallelism);
+        newSp.withKeyedState("order-state-uid", new KeyedStateBootstrapFunction<>() {
+            // populate new state
+        }, newState);
+
+        newSp.write("s3://savepoints/new-v2/");
+        env.execute("migrate-savepoint");
+    }
+}
+```
+
+State Processor API даёт **full control** — любые transformations, splits/merges, deletions. Trade-off: write separate batch job, run before deploying new streaming version.
+
+### Использование
+
+```bash
+# 1. Stop streaming job со savepoint
+flink stop -s s3://savepoints/old-v1/ <job-id>
+
+# 2. Run migration batch job
+flink run migrate-order-state.jar
+
+# 3. Restart streaming job с new savepoint
+flink run -s s3://savepoints/new-v2/ new-streaming-job.jar
+```
+
+---
+
+## State migration strategies — decision tree
+
+```
+Q: Schema change?
+├─ No → no action needed
+└─ Yes
+   ├─ Q: Built-in support?
+   │  ├─ POJO add nullable field → automatic migration на recovery
+   │  ├─ POJO remove field → automatic migration, data lost
+   │  ├─ Avro additive change → automatic compatibility
+   │  └─ Avro alias for rename → automatic
+   │
+   ├─ Q: Custom TypeSerializerSnapshot?
+   │  └─ Possible если можно express logic в resolveSchemaCompatibility
+   │
+   └─ Q: Невозможно через snapshot?
+      └─ State Processor API batch migration
+```
+
+---
+
+## Production gotchas
+
+- **`@uid("explicit")` обязательны для всех stateful operators** — без UID Flink назначает auto-UID на основе operator position, и любой code change ломает state mapping. Production rule: каждый operator с state → explicit UID.
+- **Operator chain breaks invalidate UIDs** — если стояла chain `.map().filter().keyBy()`, изменение в map может re-organize chain → state lost. UIDs приклеивают state к operators independent от chaining.
+- **PojoSerializer field ordering — alphabetical** — если class имеет fields `userId, customer`, после change в `customer, userId` snapshot всё ещё ok (sort by name internally). Но если **field renamed** — это catastrophe.
+- **Avro Logical Types snapshot** — некоторые Flink versions имеют bugs в `AvroSerializerSnapshot` для `timestamp-millis`, `decimal`. Test explicitly при upgrade.
+- **Class loaders** — если migration class в другом jar, ClassLoader на recovery должен видеть оба versions. Flink Application mode упрощает.
+- **State Processor API stability** — было experimental до Flink 1.15, stable в 1.16+. Перед production migration test thoroughly на staging savepoint.
+- **Savepoint size limits** — для very large state (TBs) State Processor API job может running часами. Сplitting savepoint by key range и parallel migration help.
+- **Forwards compatibility** — если новая version of job отказывается читать old savepoint (incompatible result), и old job уже стопнут — вы lose state. Always test recovery in staging BEFORE production deploy.
+- **TypeSerializerSnapshot evolution** — сам snapshot класс может эволюционировать. `getCurrentVersion()` и `readSnapshot(int readVersion, ...)` позволяют handle разные versions snapshot самого.
+- **State TTL и evolution** — `StateTtlConfig` не сериализуется в snapshot. Изменение TTL на recovery — пропускается, retains old TTL до full migration.
+
+<Callout type="warning">
+**State evolution checklist для production deploy** с schema change:
+
+1. Explicit `@uid` для всех stateful operators (всегда, не только при schema change).
+2. Local test: создать savepoint от old version, попытаться recovery с new version, verify result.
+3. Staging test: same flow, full pipeline integration.
+4. Production: deploy с savepoint от previous version. Monitor recovery time (может быть длиннее обычного из-за migration).
+5. Plan rollback: keep old savepoint accessible. Rollback к old code/savepoint должен быть possible.
+6. Если используете State Processor API: run batch migration в staging first, validate output savepoint.
+</Callout>
+
+<Callout type="tip">
+Architectural rule: для long-lived state используйте **Avro Specific** или **carefully designed POJO** — никогда Tuple, Kryo, или Map<K, Object>. Schema evolution capability должна быть first-class concern при дизайне state types. Если можно "ничего не менять годами" в state types — pipeline хрупкий, любое business change forces migration.
+</Callout>
+
+---
+
+## Schema governance в команде
+
+В реальных production deployments schema evolution — командный процесс:
+
+1. **Schema as code** — `.avsc` файлы в repo, под VCS.
+2. **CI lint** — `buf` (Protobuf), `avro-tools` (Avro) validate против previous version (backward compat check).
+3. **PR review checklist** — schema changes review-ятся отдельно от business logic.
+4. **Staging savepoint mirror** — production savepoint mirror в staging. Тесты восстановления нового code с этим savepoint.
+5. **Documentation** — каждый schema change документирован: что added, что removed, migration plan.
+6. **Versioning** — major version bumps когда breaking schema change нужен (rename, type narrow). Параллельные old/new jobs до migration.
+
+Schema evolution — не magic Flink feature, а discipline команды. Flink даёт tools, governance — на вас.
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job хранит per-user state как POJO `UserProfile { long userId, String email, String phone, Instant signupDate }`. Бизнес требует: (1) rename `phone` → `phoneNumber`, (2) добавить `subscriptionTier: enum { FREE, PRO, ENTERPRISE }`, (3) разделить `signupDate` на `signupYear: int + signupMonth: int`. Опишите detailed migration plan с conkretними шагами и rollback strategy."
+  answer="**Анализ изменений**: (1) rename `phone → phoneNumber` — **incompatible** для PojoSerializer (Flink видит drop + add). (2) Add `subscriptionTier` — **compatible** (new nullable enum), automatic migration. (3) Split `signupDate: Instant → signupYear: int + signupMonth: int` — **incompatible** (one field removed, two added, derivation logic). **Decision**: built-in evolution недостаточно, нужен State Processor API. **Migration plan по шагам**: **Step 1 — Define new POJO**. `UserProfileV2 { long userId, String email, String phoneNumber, Instant signupDate, int signupYear, int signupMonth, SubscriptionTier subscriptionTier }`. Сохраняем `signupDate` параллельно с `signupYear/Month` для transition period — позволяет dual-read. **Step 2 — Schema migration logic**. Создаём State Processor API batch job `MigrateUserProfileV1ToV2`: (a) Read existing savepoint via `Savepoint.load(env, path, backend)`. (b) Read keyed state `user-profile-state-uid` через `KeyedStateReaderFunction<Long, UserProfileV1>`. (c) Map UserProfileV1 → UserProfileV2: `v2.userId = v1.userId; v2.email = v1.email; v2.phoneNumber = v1.phone; // RENAME v2.signupDate = v1.signupDate; v2.signupYear = v1.signupDate.atZone(UTC).getYear(); v2.signupMonth = v1.signupDate.atZone(UTC).getMonthValue(); v2.subscriptionTier = SubscriptionTier.FREE; // sensible default`. (d) Write new savepoint через `NewSavepoint.create(backend).withKeyedState(...)`. **Step 3 — Deploy plan**. (3a) Pre-flight: explicit `@uid('user-profile-state')` на ValueState operator (должно быть уже сделано — проверить). (3b) Stop streaming job with savepoint: `flink stop -s s3://savepoints/v1-final/ <job-id>`. Получаем consistent savepoint v1. (3c) Run migration batch job в staging: `flink run migrate-user-profile.jar --input s3://savepoints/v1-final/ --output s3://savepoints/v2-staging/`. Validate sample records: assert phoneNumber populated, subscriptionTier=FREE, signupYear/Month derived correctly. (3d) Deploy new streaming job v2 в staging from staging savepoint: `flink run -s s3://savepoints/v2-staging/ new-job.jar`. Smoke test 24h. (3e) Production migration window: stop prod v1 job with savepoint, run migration batch (может занять 30+ min для 500GB state), deploy v2 prod with new savepoint. **Step 4 — Rollback strategy**. (a) Keep v1 savepoint immutable (S3 versioning или separate bucket). (b) Keep v1 binary artifact deployable. (c) Rollback path: stop v2 job (savepoint v2), redeploy v1 binary with original v1 savepoint. Note: data в v2 (после migration cutover) **не propagated** обратно в v1 state — accept either dual-write window или forward-only. (d) Practice rollback в staging до prod cutover. **Step 5 — Post-migration cleanup**. После 2 weeks production stable: (a) Remove `signupDate` field из V2 POJO (state still keeps it from migration step — second migration через State Processor API removes it). (b) Eventual cleanup of derivedfields if not needed. **Alternative: phased migration без State Processor API**. Если migrationdowntime неприемлем: (1) Deploy V2 job that reads OLD savepoint with TolerantPojoSerializer wrapping V2 schema (custom snapshot handles rename mapping). (2) ValueState desc registers OLD class V1 + new class V2 — operator reads V1 if encountered, writes V2 going forward. (3) Background batch updates остающихся V1 entries по TTL. **Production tips**: (a) В CI добавить test `assertSavepointRecoverable(oldSavepoint, newJobMain)` — auto-detect schema breaks. (b) State Processor API jobs — run on dedicated cluster, not production. (c) `subscriptionTier: SubscriptionTier` — обязательно `@NoArgsConstructor` на enum-containing POJO, enum itself — Flink-native `EnumSerializer` (no Kryo). (d) `signupYear: int` vs `Integer` — primitive faster, but no null marker — нет migration capability later. Trade-off."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/08-chaos-testing",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-08",
+    "description": "Quiz for capstone chaos testing"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-08-q1",
+      "type": "multiple-choice",
+      "question": "Chaos engineering principles — что critical для responsible chaos testing?",
+      "options": [
+        { "id": "a", "text": "Break stuff и see what happens" },
+        { "id": "b", "text": "(1) Define hypothesis перед testing (expected vs actual); (2) Limit blast radius — start small (one TM, не cluster); (3) Have rollback plan; (4) Document expected vs actual для learnings; (5) Iterate — fix issues found, retest; (6) Staging first, production только в game days с safety; (7) Reconciliation verifies data loss или integrity issues" },
+        { "id": "c", "text": "Только production testing matters" },
+        { "id": "d", "text": "Random failures без planning" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Chaos engineering — structured testing, не destruction. Principles ensure value extraction without harm. Hypothesis: 'killing TM should recover в RTO 2 min с zero data loss' — testable, measurable. Blast radius limits — one TM not whole cluster. Rollback plan ensures recovery if test goes worse than expected. Documentation captures learnings для future. Iteration — fix issues, retest, verify. Staging first ensures safety. Reconciliation script (continuously running) verifies no data loss invisibly. Без principles: 'chaos' becomes 'destruction' with no learning value.",
+      "studyHint": "Повторите урок 08 — раздел 'Chaos testing schedule'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-08-q2",
+      "type": "multiple-choice",
+      "question": "Scenario: Kill JobManager (leader) в staging chaos test. Что expected behavior, и какие verification критичны?",
+      "options": [
+        { "id": "a", "text": "Job fails permanently" },
+        { "id": "b", "text": "Expected: K8s lease released (~15s), standby JM acquires leadership, reads JobGraph + checkpoint pointer из S3 HA storage, restarts job (coordinates с TMs to restore from checkpoint). Recovery 60-180s. Verification: (1) Reconciliation source = sink (no data loss); (2) No duplicates в sinks (EOS works); (3) Side outputs consistent (no late events 'hole'); (4) Web UI shows restart timeline; (5) Recovery time within SLO" },
+        { "id": "c", "text": "Manual savepoint restore" },
+        { "id": "d", "text": "Cluster needs full rebuild" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "HA design at work. Two JM pods running, only one active leader через K8s lease. На leader crash: (1) K8s lease lifetime ~15s, не renewed = released; (2) Standby acquires lease (атомарная operation); (3) Reads HA storage (S3 path) — JobGraph для job structure + checkpoint pointer; (4) Restarts job — coordinates с TMs, restores state from checkpoint; (5) Job resumes processing. Total recovery 60-180s for healthy cluster. Verification critical: data integrity (reconciliation), no duplicates (EOS), no side output gap, timeline visible.",
+      "studyHint": "Повторите урок 08 — раздел 'Scenario 2'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-08-q3",
+      "type": "multiple-choice",
+      "question": "Chaos test result: source 1,000,000 events, sink Paimon 1,000,032. EOS supposedly enabled. 32 extra events discrepancy. Diagnosis approach?",
+      "options": [
+        { "id": "a", "text": "Acceptable drift, ignore" },
+        { "id": "b", "text": "Multiple hypotheses: (1) Sink not truly idempotent (verify merge-engine=deduplicate, primary-key, EXACTLY_ONCE delivery guarantee explicitly); (2) Checkpoint partial commit (JM logs for inconsistencies); (3) 2PC transaction recommit bug; (4) Sink config defaulting at-least-once. Diagnostics: query duplicates SQL, Paimon snapshot history, sink subtask metrics. Fix the bug, retest" },
+        { "id": "c", "text": "Re-enable EXACTLY_ONCE checkpoint mode" },
+        { "id": "d", "text": "Это всегда происходит" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "32 extra events ≠ EOS. Real diagnosis required. Hypotheses by probability: (1) Sink config — most common gotcha. Paimon needs merge-engine=deduplicate + primary-key + explicit EXACTLY_ONCE delivery guarantee. Default might be at-least-once. Verify через test query SELECT order_id, COUNT(*) GROUP BY having > 1. (2) Checkpoint partial commit — some operators succeeded, others timed out. JM logs 'checkpoint partial failure' messages. (3) 2PC transaction recommit — if commit notification lost (JM crashed между barrier and notification), recovery commits twice if state imperfect. Paimon snapshot history shows 'recovered transaction'. (4) Version compatibility bugs. Critical lesson: EOS bugs surface only under failure scenarios. Chaos testing catches them — this is the exact value proposition.",
+      "studyHint": "Повторите урок 08 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m18-08-q4",
+      "type": "true-false",
+      "question": "'Мы chaos-тестировали один раз' — достаточно для production-ready streaming pipeline.",
+      "correctAnswer": false,
+      "explanation": "Chaos testing — ongoing requirement, не one-time. Production environments evolve: new features added, scale changes, infrastructure migrations, dependencies upgraded. Annual chaos coverage should include all critical scenarios. New incident types discovered в production add to chaos suite. 'We chaos-tested it once' — false sense of security. Production maturity practices: weekly staging chaos для key scenarios, monthly broader coverage, quarterly production game days. Mature companies (Netflix Chaos Monkey origin) treat chaos as routine, not exceptional. Without ongoing testing — drift between tested и actual production behavior expands invisibly.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

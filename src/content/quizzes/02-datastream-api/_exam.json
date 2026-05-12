@@ -1,0 +1,117 @@
+{
+  "moduleId": "02-datastream-api",
+  "title": "Module 02 Exam — DataStream API",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m02-exam",
+    "description": "8-question integrated exam for Module 02"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-exam-q1",
+      "type": "multiple-choice",
+      "question": "Modern Flink 2.x source/sink API — что использовать в production?",
+      "options": [
+        { "id": "a", "text": "env.addSource(new FlinkKafkaConsumer) + stream.addSink(new KafkaSink)" },
+        { "id": "b", "text": "FLIP-27 для sources: env.fromSource(KafkaSource.builder()...build(), watermarkStrategy, name) — SplitEnumerator + SourceReader архитектура. FLIP-191 для sinks: stream.sinkTo(KafkaSink.builder()...build()) — SinkV2 с SinkWriter/Committer/Pre/Post topology. Legacy SourceFunction/SinkFunction REMOVED в 2.0" },
+        { "id": "c", "text": "env.readKafka(...).writeTo(...)" },
+        { "id": "d", "text": "В Flink 2.x нет sources/sinks, только Table API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink 2.x требует FLIP-27 (Source) + FLIP-191 (SinkV2). FLIP-27: env.fromSource(source, watermarkStrategy, name), source имеет SplitEnumerator (один в JM) + SourceReader (N в TMs). Unified API для bounded/unbounded через Boundedness. FLIP-191 SinkV2: stream.sinkTo(sink), поддерживает SinkWriter + optional Committer (для EOS) + pre/post-commit topologies (для Iceberg/Paimon multi-stage commits). Legacy SourceFunction, RichSourceFunction, SinkFunction, TwoPhaseCommitSinkFunction — все REMOVED в 2.0.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-exam-q2",
+      "type": "multiple-choice",
+      "question": "Какие три критичных capabilities делают KeyedProcessFunction самым powerful API в Flink?",
+      "options": [
+        { "id": "a", "text": "Только map + filter" },
+        { "id": "b", "text": "(1) Keyed state: ValueState, ListState, MapState, ReducingState, AggregatingState — все scoped к ctx.getCurrentKey; (2) Timers: registerEventTimeTimer / registerProcessingTimeTimer + onTimer callback (event-time fires by watermark, processing-time fires by wall clock); (3) Side outputs: ctx.output(tag, value) для multi-output stream. 99% production logic пишется на этом API + timers + side outputs" },
+        { "id": "c", "text": "Только асинхронность" },
+        { "id": "d", "text": "Только windowing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "KeyedProcessFunction — flagship abstraction. Три capabilities: (1) keyed state — все state primitives через getRuntimeContext().getState(descriptor), scoped к current key; (2) timers через ctx.timerService() — событийные и processing-time, callback в onTimer; (3) side outputs через ctx.output(tag, value) — типизированные multi-output streams. Windowing/joins — wrappers поверх ProcessFunction, часто хуже perf и менее flexible для custom logic.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-exam-q3",
+      "type": "multiple-choice",
+      "question": "Event-time vs processing-time timer — когда какой и какая ключевая проблема event-time timers в production?",
+      "options": [
+        { "id": "a", "text": "Они одинаковые" },
+        { "id": "b", "text": "Event-time fires когда watermark > registered_ts (event-time progress), deterministic, reproducible. Processing-time fires по wall clock TM, non-deterministic at replay. Главная prod проблема event-time: 'watermark stuck' — idle Kafka partition → весь stream watermark stuck → timers НЕ FIRE. Fix: WatermarkStrategy.withIdleness(Duration.ofMinutes(1))" },
+        { "id": "c", "text": "Event-time только для batch" },
+        { "id": "d", "text": "Processing-time deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Event-time timer: trigger by watermark progress, deterministic (reproducible при replay), used для event semantics (window expiry, event-based timeouts, late detection). Processing-time: trigger by wall clock, non-deterministic at replay, для real-time SLA / periodic flushes / debouncing. Critical production issue event-time: 'watermark stuck' — stream watermark = MIN watermarks parallel sources, один idle partition → весь stream stuck → timers и windows не fires. Fix: withIdleness в WatermarkStrategy, чтобы idle partitions игнорировались в watermark computation.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-exam-q4",
+      "type": "multiple-choice",
+      "question": "Side outputs use cases в production. Который из них — самый частый source потери данных без proper setup?",
+      "options": [
+        { "id": "a", "text": "Multi-output split" },
+        { "id": "b", "text": "Late event capture. БЕЗ .sideOutputLateData(tag) в windowed aggregation late events SILENTLY DROPPED — самый частый production data loss. Production rule: ВСЕ windowed operations должны иметь sideOutputLateData + Prometheus alert на late_events_count. Также exception routing (DLQ) и timer side output — другие use cases" },
+        { "id": "c", "text": "Type splitting" },
+        { "id": "d", "text": "Никакой — все безопасные" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Late event capture — критический use case side outputs. Без sideOutputLateData late events (event_time < watermark - allowedLateness) silently dropped. Production manifestation: aggregate metrics не match source, downstream data gap, невозможно объяснить customer. Rule: ALWAYS .allowedLateness(Duration).sideOutputLateData(lateTag).aggregate(...) для windowed ops. Plus Prometheus alert. Без alert blind. Other side output use cases: exception routing (DLQ — capture malformed records), multi-output split (single stream → multiple destinations by type), process timer side output (timeouts).",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m02-exam-q5",
+      "type": "multiple-choice",
+      "question": "Production AsyncFunction: throughput 100k events/sec, parallelism 16, p99 PG latency 20ms. Что нужно для production-grade setup?",
+      "options": [
+        { "id": "a", "text": "Sync JDBC внутри asyncInvoke — async-обёртка делает его non-blocking" },
+        { "id": "b", "text": "Async client (R2DBC для PG, не sync JDBC!). Capacity = throughput/parallelism × p99 latency = 6250 × 0.020 = 125 → round up 200 (headroom). Timeout = 3-5× p99 = ~100ms. ExponentialBackoff retry на network exceptions (не data errors). unorderedWait по умолчанию (head-of-line blocking avoided). Plus Redis cache layer для repeated lookups, metrics (hit rate, latency histogram)" },
+        { "id": "c", "text": "Capacity 1, timeout 30 секунд" },
+        { "id": "d", "text": "ExponentialBackoff с retry навсегда" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production AsyncFunction stack: (1) **Async client** — R2DBC для PG, Lettuce для Redis, AsyncHttpClient. Sync JDBC внутри asyncInvoke блокирует mailbox — defeats purpose. (2) **Capacity** = target_throughput_per_subtask × p99_latency. Round up для headroom. Слишком низкое → backpressure, слишком высокое → external system OOM. (3) **Timeout** = 3-5× p99. Absorbs tail latency. (4) **Retry strategy** ExponentialBackoff с ifException(t -> t instanceof SocketTimeoutException || t instanceof IOException) — только network errors, не data errors. (5) **unorderedWait** для no head-of-line blocking. (6) **Cache layer** (Redis перед PG) — hit rate ~80%+ сильно reduces external load. (7) **Metrics**: cache hit rate, latency histogram, error rate — observability critical.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m02-exam-q6",
+      "type": "multiple-choice",
+      "question": "BroadcastProcessFunction vs Async I/O — для какого use case какой подходит?",
+      "options": [
+        { "id": "a", "text": "Они равнозначные, выбор стилистический" },
+        { "id": "b", "text": "Broadcast: для slowly-changing config / rules / small reference data (in-memory, не RocksDB, размер ограничен heap, <100k entries). Identical state на всех subtasks. Async I/O: для huge или fast-changing external data (DB lookup, API call, ML inference). Когда identifier/data слишком большое для broadcast или нужен real-time access" },
+        { "id": "c", "text": "Только Async I/O для production" },
+        { "id": "d", "text": "Только Broadcast" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Choice based on data size + change frequency. **BroadcastProcessFunction**: для slowly-changing reference data (fraud rules, ML model weights, lookup tables). Config stream .broadcast(descriptor) → identical state на всех subtasks. ВАЖНОЕ limitation — broadcast state в-memory (не RocksDB), размер ограничен heap. Не для >100k entries. processElement — READ-ONLY broadcast state, processBroadcastElement — UPDATE. **Async I/O**: для huge external data (millions entries) или fast-changing (real-time updates needed). Decoupled lookup, обращается к external store. Trade-off: Broadcast — fast (local), Async I/O — flexible (any size, any data).",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m02-exam-q7",
+      "type": "multiple-choice",
+      "question": "DataStream V2 (FLIP-409) — статус и стратегия для new projects в 2026?",
+      "options": [
+        { "id": "a", "text": "V2 production-ready, используйте для new projects" },
+        { "id": "b", "text": "V2 — experimental preview в 2.0-2.2, production timeline 2.3-2.4 (~2027). Используйте V1 для new projects. Preparation для future migration: ALWAYS .uid() на stateful operators (savepoint compatibility), FLIP-27 sources / FLIP-191 sinks (не legacy addSource), POJO discipline, explicit state descriptors, avoid removed APIs. Migration ~2-3 years coexistence как DataSet→DataStream" },
+        { "id": "c", "text": "V2 не существует" },
+        { "id": "d", "text": "V1 deprecated, нужно V2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "V2 status в Flink 2.2: experimental preview, breaking changes между minor versions, less mature tooling/documentation, minimal community resources. Production readiness timeline: 2.3-2.4 (~2027). Strategy для new projects в 2026: используйте V1 (production-grade, mature ecosystem). Preparation для будущей migration: (1) .uid() на каждом stateful operator — критично для savepoint compatibility; (2) FLIP-27 sources / FLIP-191 sinks вместо legacy; (3) POJO discipline для type safety; (4) explicit state descriptors с named ids; (5) avoid removed APIs (split/select, Queryable State, Reactive Mode). Migration через 1-2 года будет smooth.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m02-exam-q8",
+      "type": "true-false",
+      "question": "В production Flink 2.x всегда нужны: .uid() на каждом stateful operator (savepoint compatibility), pipeline.generic-types: false (fail-fast на Kryo fallback), .sideOutputLateData(tag) на windowed operations (no silent data loss), Async I/O для external lookups (no mailbox blocking).",
+      "correctAnswer": true,
+      "explanation": "Этот четыре правила — fundament production-grade Flink. (1) .uid('descriptive-id') на каждом stateful operator — без UID Flink генерирует hash от topology, любое изменение pipeline ломает savepoint restoration. (2) pipeline.generic-types: false — fail-fast при Kryo fallback (50% perf hit). Force POJO discipline. (3) .sideOutputLateData(lateTag) — без этого late events silently dropped, самый частый source data loss. (4) Async I/O для external calls — без него sync calls блокируют mailbox, catastrophic backpressure (12-60x slowdown), checkpoints fail. Это checklist для каждого new production job.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

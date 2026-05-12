@@ -1,0 +1,436 @@
+---
+title: "Memory Model FLIP-49: anatomy TaskManager memory"
+description: "Полная декомпозиция TaskManager memory: Total Process = Total Flink (heap framework/task + off-heap framework/task + network + managed) + Metaspace + JVM Overhead. Tuning fractions"
+order: 2
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["FLIP-49", "Memory Model", "Managed Memory", "Network Buffers", "JVM Tuning"]
+---
+
+# Memory Model FLIP-49
+
+В Flink 1.10 (FLIP-49 — Unified Memory Configuration for TaskExecutors) случилась самая значимая reorganization памяти за всю историю проекта. До FLIP-49 каждый компонент конфигурировался отдельно: `taskmanager.heap.size`, `taskmanager.network.memory.fraction`, `taskmanager.memory.size` для batch — несогласованная мозаика, где увеличение одной части могла не оставить памяти другой и TaskManager падал на старте либо в runtime.
+
+FLIP-49 ввёл **единую decomposition** через `taskmanager.memory.process.size` (или `.flink.size`), где все компоненты выводятся через fractions и hard limits. Сегодня это foundation production memory tuning — без понимания этой декомпозиции tuning RocksDB, GC, network — это шаманство.
+
+В этом уроке препарируем каждую секцию: что она содержит, кто её аллоцирует, какие fractions её ограничивают и как считать budget руками.
+
+---
+
+## Total Process Memory — что это такое
+
+`taskmanager.memory.process.size` — это **общий бюджет TaskManager-процесса**. В Kubernetes это совпадает с `resources.limits.memory` пода (минус padding для sidecar containers).
+
+Декомпозиция:
+
+```
+Total Process Memory =
+  Total Flink Memory
+  + JVM Metaspace
+  + JVM Overhead
+```
+
+JVM Metaspace и JVM Overhead — это «налог» JVM на bytecode и runtime structures. Flink Memory — то, чем непосредственно оперирует Flink runtime.
+
+<DiagramContainer title="TaskManager Total Process Memory decomposition (FLIP-49)" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Total Process Memory"
+        tooltip="Конфигурируется через taskmanager.memory.process.size (e.g. 8g). Должен совпадать с K8s pod memory limit. JVM-уровневый бюджет для всего TaskManager процесса."
+      >
+        e.g. 8 GB (K8s pod limit)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="распадается на" />
+    <FlowRow>
+      <DataBox
+        label="Total Flink Memory"
+        tooltip="Сумма всего, чем оперирует Flink runtime: JVM Heap + Off-Heap (Direct + Native). Конфигурируется через taskmanager.memory.flink.size либо выводится из process.size минус JVM tax."
+      >
+        Total Flink Memory (~6.5 GB)
+      </DataBox>
+      <DataBox
+        label="JVM Metaspace"
+        tooltip="taskmanager.memory.jvm-metaspace.size. Default 256MB. Хранит class metadata. Увеличивайте если много dynamically loaded classes (PyFlink, big user JARs)."
+      >
+        JVM Metaspace (256 MB)
+      </DataBox>
+      <DataBox
+        label="JVM Overhead"
+        tooltip="taskmanager.memory.jvm-overhead.fraction (default 0.1). Min 192MB, max 1GB. JIT compiler, thread stacks, GC structures, internal JVM buffers."
+      >
+        JVM Overhead (~800 MB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Total Flink Memory разделяется на:" />
+    <FlowRow>
+      <DataBox
+        label="JVM Heap"
+        tooltip="Framework Heap + Task Heap. Управляется GC. Здесь живут operators, user code, heap state backend (HashMapStateBackend), framework data structures."
+      >
+        JVM Heap (~3 GB)
+      </DataBox>
+      <DataBox
+        label="Off-Heap (Direct + Native)"
+        tooltip="Framework Off-Heap + Task Off-Heap + Network Memory + Managed Memory. Direct buffers (ByteBuffer.allocateDirect) и native allocations (RocksDB JNI)."
+      >
+        Off-Heap (~3.5 GB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Framework Heap"
+        tooltip="taskmanager.memory.framework.heap.size, default 128MB. Внутренние data structures Flink runtime: actor system, metric reporters, RPC clients."
+      >
+        Framework Heap (128 MB)
+      </DataBox>
+      <DataBox
+        label="Task Heap"
+        tooltip="Output: process - framework heap - off-heap - metaspace - overhead. JVM heap для user code: operators, functions, ListState/MapState на HashMapStateBackend."
+      >
+        Task Heap (~2.9 GB)
+      </DataBox>
+      <DataBox
+        label="Framework Off-Heap"
+        tooltip="taskmanager.memory.framework.off-heap.size, default 128MB. Direct buffers для serialization, network codec, internal."
+      >
+        Framework Off-Heap (128 MB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Task Off-Heap"
+        tooltip="taskmanager.memory.task.off-heap.size, default 0. Direct/native memory для user-defined native libraries (JNI). Если user code не использует JNI — оставляйте 0."
+      >
+        Task Off-Heap (0 MB default)
+      </DataBox>
+      <DataBox
+        label="Network Memory"
+        tooltip="taskmanager.memory.network.fraction (default 0.1), min/max через .min/.max. Off-heap buffers для shuffle между subtasks. Credit-based flow control."
+      >
+        Network Memory (~650 MB)
+      </DataBox>
+      <DataBox
+        label="Managed Memory"
+        tooltip="taskmanager.memory.managed.fraction (default 0.4). Off-heap, Flink-managed. Используется RocksDB (WriteBufferManager + BlockCache), PyFlink, batch sort/join, ForSt cache."
+      >
+        Managed Memory (~2.6 GB)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Математика на типовом TaskManager
+
+Возьмём типичный production config: 8GB pod, 4 task slots.
+
+```yaml
+taskmanager.memory.process.size: 8g
+taskmanager.numberOfTaskSlots: 4
+taskmanager.memory.managed.fraction: 0.4
+taskmanager.memory.network.fraction: 0.1
+taskmanager.memory.jvm-metaspace.size: 256m
+taskmanager.memory.jvm-overhead.fraction: 0.1
+taskmanager.memory.jvm-overhead.min: 192m
+taskmanager.memory.jvm-overhead.max: 1g
+taskmanager.memory.framework.heap.size: 128m
+taskmanager.memory.framework.off-heap.size: 128m
+```
+
+Алгоритм derivation (упрощённо):
+
+```
+1) JVM Overhead = clamp(0.1 × 8GB, 192MB, 1GB) = 800MB
+2) JVM Metaspace = 256MB
+3) Total Flink Memory = 8GB - 800MB - 256MB = 6.95GB
+4) Network = clamp(0.1 × 6.95GB, min, max) = 695MB
+5) Managed = 0.4 × 6.95GB = 2.78GB
+6) Framework Heap = 128MB, Framework Off-Heap = 128MB
+7) Task Off-Heap = 0
+8) Task Heap = 6.95GB - 128 - 128 - 0 - 695 - 2780 = 3.22GB
+```
+
+Эту таблицу Flink логирует на старте TaskManager. Production tip — **читайте этот лог при старте**, чтобы убедиться, что бюджет распилен ожидаемо:
+
+```
+INFO  TaskManagerRunner - Final TaskExecutor Memory configuration:
+  Total Process Memory:    8.000gb (8589934592 bytes)
+    Total Flink Memory:    6.949gb (7460794368 bytes)
+      Total JVM Heap Memory:    3.349gb (3596615680 bytes)
+        Framework:               128.000mb
+        Task:                    3.224gb
+      Total Off-Heap Memory:    3.600gb (3864178688 bytes)
+        Managed:                 2.779gb (2984207564 bytes)
+        Total JVM Direct Memory: 850.000mb
+          Framework:             128.000mb
+          Task:                  0 bytes
+          Network:               722.000mb
+    JVM Metaspace:                256.000mb
+    JVM Overhead:                 818.000mb
+```
+
+---
+
+## Detailed roles секций
+
+### Framework Heap (~128MB)
+
+Маленький, обычно не трогается. Хранит:
+- Akka actor system (replaced на Pekko в 2.0)
+- Metric reporters (Prometheus, OTel)
+- RPC clients для общения с JobManager
+- Internal data structures runtime
+
+Увеличивать редко нужно. Если видите GC pressure именно тут — issue в Flink, не в user code.
+
+### Task Heap (вычисляется автоматически)
+
+Главный «пользовательский» бюджет:
+- Operator instances (KeyedProcessFunction, MapFunction)
+- HashMapStateBackend state (если используется heap backend)
+- Watermark generators, timers (heap timers)
+- User-allocated objects
+
+GC давление здесь типично — тут живут short-lived event objects.
+
+### Framework Off-Heap (~128MB)
+
+Direct buffers для:
+- Codec для kryo/avro serialization (некоторые декодеры holdят off-heap buffers)
+- Network codec
+- Internal serialization
+
+### Task Off-Heap (default 0)
+
+Только если user code загружает native libraries (JNI). Например:
+- Custom decompression library
+- Hardware acceleration (CUDA для ML)
+- Native crypto
+
+Не путать с RocksDB — RocksDB живёт в Managed Memory.
+
+### Network Memory (~10% Flink Memory)
+
+Off-heap buffers для shuffle между subtasks. Credit-based flow control аллоцирует buffers per channel:
+
+```
+network buffers per subtask =
+  numChannelsIn × buffers-per-channel
+  + numChannelsOut × buffers-per-channel
+  + floating buffers
+```
+
+Default `buffers-per-channel: 2` (1.14+ может быть динамически 0-2 через debloating).
+
+**Когда увеличивать**: большие parallel jobs (>200 subtasks), много shuffle через `keyBy/rebalance`, lots of operator pairs.
+
+**Симптом нехватки**: «Insufficient number of network buffers» exception на старте.
+
+### Managed Memory (~40% Flink Memory, default)
+
+Самая важная секция для state-heavy jobs. Off-heap, **Flink-managed** (не JVM Direct buffer-ы — это native allocations через RocksDB JNI). Используется:
+
+| Consumer | Доля по умолчанию |
+|---|---|
+| RocksDB (WriteBufferManager + BlockCache) | 100% (когда state.backend.rocksdb.memory.managed: true) |
+| PyFlink (Python worker процессы) | дельте через consumer-weights |
+| Batch sort/hash join (legacy DataSet, Table batch) | дельте |
+| ForSt cache | через state.backend.forst.cache.size |
+
+С 2.0 добавился механизм `taskmanager.memory.managed.consumer-weights`:
+
+```yaml
+taskmanager.memory.managed.consumer-weights: OPERATOR:70,STATE_BACKEND:70,PYTHON:30
+```
+
+---
+
+## Fractions vs absolute sizes
+
+FLIP-49 поддерживает **оба** способа задания:
+
+```yaml
+# Через fractions (предпочтительно):
+taskmanager.memory.process.size: 8g
+taskmanager.memory.managed.fraction: 0.4
+
+# Через absolute:
+taskmanager.memory.managed.size: 3g
+```
+
+Если задан и fraction, и size — **size выигрывает**, fraction игнорируется (logged warning). Это позволяет вынести memory tuning в orchestrator templates: один process.size, fractions подобраны под workload.
+
+Min/max bounds дополнительно ограничивают вычисленные fractions:
+
+```yaml
+taskmanager.memory.network.min: 64mb
+taskmanager.memory.network.max: 1gb
+```
+
+Защищает от extreme значений: на маленьком pod (1GB process.size) с network.fraction=0.1 получится 64-100MB, что недостаточно для большого fan-out — поднимите .min.
+
+---
+
+## Production tuning patterns
+
+### Pattern 1: State-heavy job (RocksDB-only)
+
+```yaml
+taskmanager.memory.process.size: 16g
+taskmanager.memory.managed.fraction: 0.55   # больше RocksDB
+taskmanager.memory.network.fraction: 0.08
+taskmanager.memory.jvm-metaspace.size: 256m
+```
+
+Logic: RocksDB любит память (Block Cache + WriteBufferManager), user code lightweight. 55% managed = ~7GB native RocksDB budget.
+
+### Pattern 2: Heavy user code (ML inference, large lookups)
+
+```yaml
+taskmanager.memory.process.size: 16g
+taskmanager.memory.managed.fraction: 0.2    # меньше managed
+taskmanager.memory.network.fraction: 0.1
+```
+
+Logic: ML модели, async lookup caches живут на heap → нужен большой Task Heap. Managed снижен до 20% — RocksDB живёт меньшим budget, но JVM heap получает ~9GB.
+
+### Pattern 3: PyFlink-heavy
+
+```yaml
+taskmanager.memory.process.size: 12g
+taskmanager.memory.managed.fraction: 0.35
+taskmanager.memory.managed.consumer-weights: PYTHON:60,STATE_BACKEND:40
+```
+
+Logic: PyFlink Python workers — отдельные процессы, и memory для них берётся из Managed через bundle. Consumer-weights отдают 60% Python, 40% RocksDB.
+
+### Pattern 4: Stateless transform (lightweight)
+
+```yaml
+taskmanager.memory.process.size: 4g
+taskmanager.memory.managed.fraction: 0.1
+taskmanager.memory.network.fraction: 0.15  # больше для fan-out
+```
+
+Logic: state минимальный (HashMapStateBackend), zero RocksDB — managed практически не нужна. Network важнее для shuffle.
+
+---
+
+## Critical configuration mistakes
+
+### Ошибка 1: pod memory limit < process.size
+
+K8s pod limit 8GB, `process.size: 8g`. В runtime JVM Overhead и Metaspace оккупируют 1GB, OS overhead (cgroup memory tracking, sockets) ещё 200MB — выходит ~9.2GB суммарно. Pod получает OOMKill.
+
+Правило: **pod limit = process.size + 10-15% headroom** для cgroup overheads.
+
+```yaml
+# K8s deployment:
+resources:
+  limits:
+    memory: "9Gi"   # 8g process.size + 1Gi headroom
+# Flink config:
+taskmanager.memory.process.size: 8g
+```
+
+### Ошибка 2: managed=true с custom RocksDBOptionsFactory без super.create*()
+
+Custom factory не вызывает `super.createDBOptions()` → WriteBufferManager не injected → RocksDB allocates без budget → OOM-killed через несколько часов после deploy.
+
+Симптом: `Status.JVM.Memory.Direct.MemoryUsed` растёт линейно, не plateau.
+
+Фикс: extend `DefaultConfigurableOptionsFactory` и обязательно вызывать super.
+
+### Ошибка 3: managed.fraction=0 на state-heavy
+
+Кто-то «оптимизировал» managed=0 «потому что мы не используем batch sort». RocksDB теряет budget → fallback к per-CF defaults (64MB × 10 CF × 4 slots = 2.5GB) → unbounded native growth.
+
+Правило: для streaming с RocksDB **никогда** не ставьте managed.fraction в 0.
+
+### Ошибка 4: Slots and per-slot memory
+
+```yaml
+taskmanager.numberOfTaskSlots: 8     # 8 slots
+taskmanager.memory.process.size: 8g  # 8GB → 1GB per slot
+```
+
+8 slots × 1GB = state per slot маленький. RocksDB будет тесно, частые stalls. Лучше:
+
+```yaml
+taskmanager.numberOfTaskSlots: 4     # меньше slots
+taskmanager.memory.process.size: 8g  # 2GB per slot
+```
+
+Или scale-out: больше TaskManager-ов вместо больше slots.
+
+---
+
+## Diagnostic checklist
+
+1. **TaskManager start log** — печатает финальное memory layout. Сверьте с ожиданиями.
+2. **`flink_taskmanager_Status_JVM_Memory_Heap_Used`** — task heap usage. Plateau или растёт?
+3. **`flink_taskmanager_Status_JVM_Memory_Direct_MemoryUsed`** — direct (managed + network). Линейный рост = leak.
+4. **`flink_taskmanager_Status_JVM_GarbageCollector_*_Time`** — GC pressure. Если G1 Young > 200ms/min — heap pressure.
+5. **K8s pod memory** — должен plateau ниже limit.
+
+---
+
+## Configuration template (production baseline)
+
+```yaml
+# Process memory:
+taskmanager.memory.process.size: 8g
+
+# Fractions:
+taskmanager.memory.managed.fraction: 0.4
+taskmanager.memory.network.fraction: 0.1
+
+# JVM tax:
+taskmanager.memory.jvm-metaspace.size: 256m
+taskmanager.memory.jvm-overhead.fraction: 0.1
+taskmanager.memory.jvm-overhead.min: 192m
+taskmanager.memory.jvm-overhead.max: 1g
+
+# Framework:
+taskmanager.memory.framework.heap.size: 128m
+taskmanager.memory.framework.off-heap.size: 128m
+
+# Slots:
+taskmanager.numberOfTaskSlots: 4
+
+# Network buffers tuning:
+taskmanager.memory.network.min: 256mb
+taskmanager.memory.network.max: 2gb
+taskmanager.network.memory.buffer-debloat.enabled: true  # 1.14+
+
+# RocksDB через managed:
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1
+```
+
+Это baseline для 90% production deployments. Tune fractions только с данными от metrics.
+
+---
+
+<Callout type="warning">
+FLIP-49 — единственная корректная модель памяти Flink с 1.10. Если у вас остались legacy конфиги с `taskmanager.heap.size` / `taskmanager.memory.size` — это значит вы не пользуетесь современным mechanism. В Flink 2.x legacy keys удалены, конфиг **обязан** быть в FLIP-49 терминологии. Проверьте свои Helm charts / Terraform modules — там часто остаётся mess из старых ключей.
+</Callout>
+
+---
+
+<Callout type="note">
+Не пытайтесь tune fractions без baseline measurements. Дефолты (0.4 managed, 0.1 network) подобраны разработчиками Flink через год реальной production эксплуатации. Tuning имеет смысл только когда: (1) есть конкретный bottleneck в metrics; (2) baseline уже работает 1-2 недели в production; (3) tuning гипотеза вытекает из метрик, а не из «давайте попробуем».
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="TaskManager pod в Kubernetes имеет limit 16GB, taskmanager.memory.process.size=16g, managed.fraction=0.4, network.fraction=0.1, slots=4. Job state-heavy с RocksDB. После deploy через 2-3 часа pod периодически OOMKilled. JVM heap stable, direct memory stable. K8s events: 'OOMKilled' (exit 137). Что произошло и как fix?"
+  answer="Это классическая ошибка отсутствия headroom между process.size и pod limit. Разбор: при process.size=16g Flink аллоцирует ~16GB суммарно (Heap + Direct + Metaspace + Overhead). Но OS-level накладные расходы (cgroup memory accounting, page cache для mmap-нутых RocksDB SST файлов, socket buffers, /tmp/* tmpfs если LocalStorage) добавляют 1-2GB поверх. К8s pod limit=process.size → нет места для overhead → OOMKill через cgroup. Симптом: JVM не fail (heap/direct OK), но pod kill — exit 137. Решение: (1) Уменьшить process.size до 14-14.5g, оставив 1.5-2GB headroom для OS/page cache: taskmanager.memory.process.size: 14g (pod limit оставить 16Gi). (2) Альтернатива — увеличить pod limit, но process.size трогать не надо: pod.limit=18Gi, process.size=16g. (3) Учесть RocksDB mmap behavior: SST файлы могут быть mmap-нуты, page cache считается в cgroup memory.usage. Disable mmap или ограничить tmpfs. (4) Verify через метрики: container_memory_working_set_bytes должен plateau с margin к pod.limit, не upthwarting. Profilevent tooling: kubectl top pod, kubectl describe pod (events с OOMKilled с указанием cgroup memory.usage), prometheus container_memory metrics. Prevention rule в IaC: pod.limit = process.size × 1.15 минимум. Также проверить: state.backend.rocksdb.localdir указывает на tmpfs (e.g. /tmp в default K8s pods)? Tmpfs counts в cgroup memory. Переместите на emptyDir с medium=Memory исключён, либо на PVC."
+/>

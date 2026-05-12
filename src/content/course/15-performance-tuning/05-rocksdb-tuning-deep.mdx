@@ -1,0 +1,498 @@
+---
+title: "RocksDB tuning deep: PredefinedOptions, custom factory, managed memory"
+description: "PredefinedOptions vs custom RocksDBOptionsFactory, managed memory integration (WriteBufferManager), Bloom filter cache, block cache, write buffer count tuning"
+order: 5
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["RocksDB", "Tuning", "WriteBufferManager", "Block Cache", "Bloom Filter", "Managed Memory"]
+---
+
+# RocksDB tuning deep
+
+RocksDB — embedded LSM-tree key-value store, который Flink использует как state backend для больших state (TBs). У RocksDB 100+ tunable parameters, и неверное tuning может убить performance в 10x или вызвать OOM-Killed через несколько часов после deploy.
+
+В этом уроке препарируем продакшен-tuning: PredefinedOptions, корректную custom RocksDBOptionsFactory, integration с Flink managed memory (WriteBufferManager + Block Cache), и тонкие настройки — Bloom filter cache, write buffer count, level sizes.
+
+---
+
+## PredefinedOptions: курированные профили
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+```
+
+Четыре опции:
+
+| Профиль | Hardware | Workload |
+|---|---|---|
+| `DEFAULT` | Conservative | Dev / unknown |
+| `SPINNING_DISK_OPTIMIZED` | HDD | Streaming |
+| `SPINNING_DISK_OPTIMIZED_HIGH_MEM` | HDD + RAM | Large state |
+| `FLASH_SSD_OPTIMIZED` | NVMe SSD | Production (рекомендация) |
+
+`FLASH_SSD_OPTIMIZED` — стандарт для production:
+
+```
+WriteBuffer size:           64MB
+MaxWriteBufferNumber:       4
+TargetFileSizeBase:         64MB  (parallel compaction friendly)
+MaxBackgroundJobs:          4
+MaxOpenFiles:               -1    (unlimited, SSD random OK)
+Compression:                LZ4   (быстрее snappy на SSD)
+CompactionStyle:            Leveled
+Level0FileNumCompactionTrigger: 4
+BloomFilter:                10 bits/key, whole-key
+```
+
+Это **starting point**, не endpoint. Дальнейший tuning через managed memory + custom factory.
+
+---
+
+## Managed memory integration
+
+С Flink 1.10+ RocksDB интегрирован с FLIP-49 managed memory через **shared WriteBufferManager** и **shared Block Cache**:
+
+```yaml
+state.backend.rocksdb.memory.managed: true                    # default true
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5          # 50% managed → WBM
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1        # 10% BC → high-priority
+```
+
+С `managed: true`:
+- **WriteBufferManager (WBM)** ограничивает суммарный size всех MemTable между всеми CFs и slots.
+- **Block Cache** shared между CFs — single LRU cache на TaskManager.
+- **High-priority pool** — резервирует часть Block Cache для filter/index blocks (Bloom filters, SST индексы).
+
+<DiagramContainer title="Managed memory → RocksDB через WriteBufferManager + Block Cache" color="orange">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Managed Memory pool (e.g. 3GB)"
+        tooltip="taskmanager.memory.managed.fraction × Total Flink Memory. Off-heap, Flink-managed. Не JVM Direct buffer (это native allocations через RocksDB JNI)."
+      >
+        3 GB total managed
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="разбивается на" />
+    <FlowRow>
+      <DataBox
+        label="WriteBufferManager budget"
+        tooltip="write-buffer-ratio (default 0.5) × managed. Контролирует суммарный size MemTables по всем CFs и slots. Когда суммарно превышено — trigger flush самой большой MemTable."
+      >
+        WBM: 1.5 GB (50%)
+      </DataBox>
+      <DataBox
+        label="Block Cache budget"
+        tooltip="(1 - write-buffer-ratio) × managed. Shared LRU cache для disk blocks (data + filter + index). Cache hit avoids disk read."
+      >
+        Block Cache: 1.5 GB (50%)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="WBM enforces" />
+    <FlowRow>
+      <DataBox
+        label="MemTable CF1 slot1"
+        tooltip="Active MemTable текущего write для column family. Размер до WriteBufferSize per CF (default 64MB), либо WBM-triggered flush раньше."
+      >
+        MemTable (e.g. 64MB)
+      </DataBox>
+      <DataBox
+        label="MemTable CF2 slot1"
+        tooltip="Каждая column family имеет свою active MemTable. WBM считает суммарный size — когда > budget → flush largest."
+      >
+        MemTable (e.g. 64MB)
+      </DataBox>
+      <DataBox
+        label="MemTable CF1 slot2"
+        tooltip="Other slot's CF. WBM shared across slots → fairness между slots достигается через cross-slot flush triggers."
+      >
+        MemTable (e.g. 64MB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Block Cache" />
+    <FlowRow>
+      <DataBox
+        label="High-prio pool (10%)"
+        tooltip="high-prio-pool-ratio (default 0.1). Резервирует часть BC для filter/index blocks (Bloom filters, SST индексы). Эти blocks critical — без них Bloom filter check требует disk read."
+      >
+        Filter/Index blocks: 150 MB
+      </DataBox>
+      <DataBox
+        label="Regular pool"
+        tooltip="Оставшиеся 90% BC. LRU eviction для data blocks. Cache hits avoid disk reads."
+      >
+        Data blocks: 1.35 GB
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Custom RocksDBOptionsFactory: правильный способ
+
+Custom factory нужен когда PredefinedOptions недостаточно — например для специфического hardware или workload. **Критично**: extend `DefaultConfigurableOptionsFactory`, иначе теряется WBM/BC injection.
+
+```java
+public class MyOptionsFactory extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        // КРИТИЧНО: super первым — injects WriteBufferManager
+        opts = super.createDBOptions(opts, handles);
+
+        return opts
+            .setMaxBackgroundJobs(8)         // больше compaction threads
+            .setMaxBackgroundFlushes(2)
+            .setBytesPerSync(1024 * 1024)    // 1MB — incremental fsync
+            .setWalBytesPerSync(1024 * 1024);
+    }
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        // КРИТИЧНО: super первым — injects Block Cache
+        opts = super.createColumnOptions(opts, handles);
+
+        BlockBasedTableConfig tableConfig =
+            (BlockBasedTableConfig) opts.tableFormatConfig();
+        tableConfig
+            .setBlockSize(16 * 1024)                    // 16KB blocks
+            .setFilterPolicy(new BloomFilter(10, false)) // 10 bits/key
+            .setOptimizeFiltersForMemory(true)
+            .setPinL0FilterAndIndexBlocksInCache(true)
+            .setCacheIndexAndFilterBlocks(true)
+            .setCacheIndexAndFilterBlocksWithHighPriority(true);
+        opts.setTableFormatConfig(tableConfig);
+
+        return opts
+            .setMaxWriteBufferNumber(4)
+            .setMinWriteBufferNumberToMerge(1)
+            .setLevelCompactionDynamicLevelBytes(true);
+    }
+}
+```
+
+Configuration:
+
+```yaml
+state.backend.rocksdb.options-factory: com.example.MyOptionsFactory
+```
+
+### Чего НЕ делать
+
+```java
+// АНТИПАТТЕРН: fresh DBOptions без super
+@Override
+public DBOptions createDBOptions(DBOptions opts,
+                                  Collection<AutoCloseable> handles) {
+    return new DBOptions()            // ← FRESH! WBM потерян!
+        .setMaxBackgroundJobs(8);
+}
+```
+
+Симптом: TaskManager растёт по memory, через несколько часов K8s OOMKill. `Status.JVM.Memory.Direct.MemoryUsed` растёт линейно.
+
+---
+
+## Bloom filter tuning
+
+Bloom filter — probabilistic data structure: для каждого key возвращает «возможно есть» или «гарантированно нет». Используется в RocksDB SST блоках чтобы избежать disk reads для несуществующих keys.
+
+```java
+tableConfig.setFilterPolicy(new BloomFilter(
+    10,      // bits per key (default 10)
+    false    // useBlockBasedBuilder (false = full filter, рекомендация)
+));
+```
+
+| Bits/key | False positive rate | Memory cost |
+|---|---|---|
+| 5 | ~6% | half size |
+| 10 (default) | ~1% | baseline |
+| 15 | ~0.1% | 1.5× size |
+| 20 | ~0.01% | 2× size |
+
+**Когда tune**:
+
+- **Read-heavy** workload с many «not exists» queries: 15-20 bits для меньшего false positive.
+- **Memory pressure**: drop to 8 bits, accept higher false positive rate.
+- **Range scans dominate**: Bloom filter не помогает (только для point lookups), можно disable: `setFilterPolicy(null)`.
+
+### Cache filter blocks с high priority
+
+```java
+tableConfig.setCacheIndexAndFilterBlocks(true);
+tableConfig.setCacheIndexAndFilterBlocksWithHighPriority(true);
+tableConfig.setPinL0FilterAndIndexBlocksInCache(true);
+```
+
+Это критично: без этих опций filter blocks могут эвиктиться LRU → каждый «not exists» check требует disk read → read latency cliff.
+
+`PinL0FilterAndIndexBlocksInCache` дополнительно гарантирует, что L0 filter/index blocks никогда не эвиктятся (L0 файлы read часто, eviction expensive).
+
+---
+
+## Write buffer count tuning
+
+```java
+.setMaxWriteBufferNumber(4)         // max immutable MemTables awaiting flush
+.setMinWriteBufferNumberToMerge(1)  // min to merge перед flush
+```
+
+Default 2 MemTable: active + 1 immutable awaiting flush. При write spike active быстро заполняется → если flush не успевает, новые writes блокируются (write stall).
+
+**Bump to 4+**: даёт буфер для абсорбции write spikes. Cost: больше memory (4 × write_buffer_size per CF).
+
+`MinWriteBufferNumberToMerge`: сколько immutable MemTables собрать перед записью в один SST. Larger = меньше L0 SSTs (good), но дольше delay до visible на disk.
+
+---
+
+## Level sizes и compaction triggers
+
+```java
+.setMaxBytesForLevelBase(256 * 1024 * 1024)   // L1 target size
+.setMaxBytesForLevelMultiplier(10)            // L2 = 10× L1, etc.
+.setLevelCompactionDynamicLevelBytes(true)    // auto-balance levels
+```
+
+`LevelCompactionDynamicLevelBytes(true)` — игнорирует fixed multiplier, dynamically rebalances levels по actual data size. Recommended **на всегда**. Решает классическую проблему «small DB, level 6 пустой, level 0 переполнен».
+
+```java
+.setLevel0FileNumCompactionTrigger(4)     // L0 → L1 trigger
+.setLevel0SlowdownWritesTrigger(20)       // throttle writes
+.setLevel0StopWritesTrigger(36)           // STOP writes
+```
+
+Default: L0 files >4 → trigger compaction. >20 → throttle writes. >36 → stop writes.
+
+Если видите write stalls — increase `Level0FileNumCompactionTrigger` (компакция позже, accept higher read amp temporarily) ИЛИ increase `MaxBackgroundJobs` (parallel compactions, разгрузит L0).
+
+---
+
+## Compression tuning
+
+```java
+.setCompressionType(CompressionType.LZ4_COMPRESSION)
+.setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)
+```
+
+Smart strategy:
+- **Top levels (L0-L5)**: LZ4 — быстрый decompress, hot data.
+- **Bottom level (Lmax, обычно L6)**: ZSTD — лучший compression ratio, holds 90% data.
+
+ZSTD сжимает 30-40% больше Snappy/LZ4 на типовых state. На bottommost level (где живёт большинство данных) экономия диска огромная. CPU cost ZSTD выше, но decompress all-level требуется реже.
+
+---
+
+## Production tuning: write-heavy workload
+
+```java
+public class WriteHeavyFactory extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public DBOptions createDBOptions(DBOptions opts,
+                                      Collection<AutoCloseable> handles) {
+        opts = super.createDBOptions(opts, handles);
+        return opts
+            .setMaxBackgroundJobs(8)                    // more compaction parallelism
+            .setMaxBackgroundFlushes(2)
+            .setBytesPerSync(1024 * 1024);
+    }
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        opts = super.createColumnOptions(opts, handles);
+        return opts
+            .setMaxWriteBufferNumber(6)                          // больше buffer
+            .setLevel0FileNumCompactionTrigger(8)                // позже compact
+            .setLevel0SlowdownWritesTrigger(40)
+            .setLevel0StopWritesTrigger(60)
+            .setMaxBytesForLevelBase(512 * 1024 * 1024)
+            .setLevelCompactionDynamicLevelBytes(true);
+    }
+}
+```
+
+Также:
+
+```yaml
+state.backend.rocksdb.memory.write-buffer-ratio: 0.6    # bigger MemTable budget
+state.backend.rocksdb.thread.num: 8
+```
+
+---
+
+## Production tuning: read-heavy
+
+```java
+public class ReadHeavyFactory extends DefaultConfigurableOptionsFactory {
+
+    @Override
+    public ColumnFamilyOptions createColumnOptions(
+            ColumnFamilyOptions opts, Collection<AutoCloseable> handles) {
+        opts = super.createColumnOptions(opts, handles);
+        BlockBasedTableConfig tableConfig =
+            (BlockBasedTableConfig) opts.tableFormatConfig();
+        tableConfig
+            .setBlockSize(8 * 1024)                              // smaller blocks
+            .setFilterPolicy(new BloomFilter(15, false))         // 15 bits/key
+            .setOptimizeFiltersForMemory(true)
+            .setPinL0FilterAndIndexBlocksInCache(true)
+            .setCacheIndexAndFilterBlocks(true)
+            .setCacheIndexAndFilterBlocksWithHighPriority(true);
+        opts.setTableFormatConfig(tableConfig);
+        return opts.setLevelCompactionDynamicLevelBytes(true);
+    }
+}
+```
+
+И:
+
+```yaml
+state.backend.rocksdb.memory.write-buffer-ratio: 0.3        # больше BC
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.2      # больше filter cache
+taskmanager.memory.managed.fraction: 0.5                    # больше total managed
+```
+
+---
+
+## Метрики для tuning
+
+```yaml
+# Включить RocksDB metrics:
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+state.backend.rocksdb.metrics.block-cache-miss: true
+state.backend.rocksdb.metrics.compaction-pending-bytes: true
+state.backend.rocksdb.metrics.num-running-compactions: true
+state.backend.rocksdb.metrics.num-immutable-mem-table: true
+state.backend.rocksdb.metrics.estimate-num-keys: true
+state.backend.rocksdb.metrics.estimate-table-readers-mem: true
+```
+
+Key indicators:
+
+| Metric | Healthy | Action |
+|---|---|---|
+| `block-cache-hit / (hit+miss)` | >90% | <50% → increase managed memory |
+| `size-all-mem-tables` | < write-buffer-ratio × managed | Если ≥ — WBM не enforcing (custom factory?) |
+| `num-running-compactions` | 1-2 sustained | Растёт постоянно → thread.num bump |
+| `compaction-pending-bytes` | Plateau or oscillate | Линейно растёт → write stall coming |
+| `num-immutable-mem-table` | < MaxWriteBufferNumber | == MaxWriteBufferNumber → write stall |
+| `estimate-table-readers-mem` | Plateau | Растёт → file descriptors leak |
+
+---
+
+## Production gotchas
+
+### Gotcha 1: PredefinedOptions без managed memory
+
+```yaml
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: false   # ← АНТИПАТТЕРН
+```
+
+Без managed memory PredefinedOptions используют per-CF defaults (64MB MemTable, 8MB BC) — суммарно превышает разумный budget. OOM eventually.
+
+**Fix**: оставьте `managed: true` (default). Disable только если знаете конкретную причину.
+
+### Gotcha 2: Custom factory ломает WBM
+
+См. выше. Симптом: linear direct memory growth → OOMKill через часы.
+
+**Fix**: extend `DefaultConfigurableOptionsFactory`, вызывайте super.create*().
+
+### Gotcha 3: write_buffer_size слишком большой
+
+```java
+.setWriteBufferSize(512 * 1024 * 1024)    // 512MB MemTable
+```
+
+Каждый flush → 512MB L0 SST. Эти large L0 dominate всего DAG: compaction L0→L1 берёт долго, write stalls.
+
+**Best practice**: 64-128MB. Меньше = больше files (read amp), больше = compaction blocks.
+
+### Gotcha 4: Bloom filter не помогает range scans
+
+KeyedState с `MapState.entries()` — это range scan. Bloom filter polls per-key и НЕ помогает.
+
+**Fix**: оптимизируйте data layout (prefix keys для locality), use range tombstones.
+
+### Gotcha 5: Local disk vs SST file size
+
+Если `target_file_size_base: 256MB` и state 100GB → 400+ SST files. Каждый file = open file handle. Default OS limit 1024 → exceed.
+
+**Fix**: `ulimit -n 1048576` для TaskManager process. В K8s — securityContext или container.
+
+### Gotcha 6: PinL0FilterAndIndexBlocksInCache memory cost
+
+С 10 CF, large L0 (4 files each) и big SST size — pinned blocks занимают значимую часть BC. На stuck-cache можно увидеть BC hit ratio падает потому что pinned blocks доминируют.
+
+**Trade-off**: либо высокий read latency для L0 (без pin), либо больше BC budget (с pin). Default pin=true — стандарт.
+
+### Gotcha 7: tmpfs для RocksDB local dir
+
+```yaml
+state.backend.rocksdb.localdir: /tmp/flink-rocksdb
+```
+
+Если /tmp — tmpfs, RocksDB пишет в RAM. State фактически живёт в memory. Pod memory blowup. K8s OOMKill.
+
+**Fix**: использовать persistent volume или emptyDir с medium != Memory. Никогда tmpfs для state.
+
+---
+
+## Recommended production baseline (NVMe SSD, mixed workload)
+
+```yaml
+# State backend:
+state.backend.type: rocksdb
+state.backend.rocksdb.predefined-options: FLASH_SSD_OPTIMIZED
+state.backend.rocksdb.memory.managed: true
+state.backend.rocksdb.memory.write-buffer-ratio: 0.5
+state.backend.rocksdb.memory.high-prio-pool-ratio: 0.1
+
+# Compaction parallelism:
+state.backend.rocksdb.thread.num: 4
+
+# Local dir (persistent disk!):
+state.backend.rocksdb.localdir: /flink-state/rocksdb
+
+# Incremental checkpoints:
+state.backend.incremental: true
+
+# Metrics:
+state.backend.rocksdb.metrics.size-all-mem-tables: true
+state.backend.rocksdb.metrics.block-cache-hit: true
+state.backend.rocksdb.metrics.block-cache-miss: true
+state.backend.rocksdb.metrics.compaction-pending-bytes: true
+state.backend.rocksdb.metrics.num-running-compactions: true
+
+# Memory:
+taskmanager.memory.process.size: 8g
+taskmanager.memory.managed.fraction: 0.45
+```
+
+90% production deployments работают на этом baseline. Tune только при metric-driven evidence.
+
+---
+
+<Callout type="warning">
+RocksDB tuning без metric-driven evidence — это шаманство. Всегда: (1) baseline FLASH_SSD_OPTIMIZED + managed:true; (2) profile с метриками (block-cache hit, compaction-pending-bytes, write stalls); (3) targeted tune против конкретной метрики; (4) measure improvement. Не копируйте «магический» config из StackOverflow без понимания.
+</Callout>
+
+---
+
+<Callout type="note">
+В Flink 2.0+ появился ForSt — «For Streaming» state backend, LSM-tree поверх RocksDB но с remote primary storage (S3) и async I/O. Для новых production deployments рассмотрите ForSt если ваш state больше локального SSD: compaction уезжает на S3, локально только cache. Migration RocksDB → ForSt — отдельная история, но direction понятен.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job: 1.5TB state в RocksDB, 16GB managed memory, FLASH_SSD_OPTIMIZED. Read-heavy: 70% read / 30% write. Симптомы: read latency P99 = 200ms (target 20ms), block-cache hit ratio = 65% (low), compaction OK, no write stalls, memory usage stable. Какой tuning применить? Объясните trade-offs."
+  answer="Анализ: target P99 20ms, actual 200ms — 10× regression. Главный indicator — block-cache hit ratio 65% (healthy >90%). Cache misses требуют disk reads → 100µs-1ms per SST file lookup → P99 inflation. Tuning plan: (1) Increase total Block Cache budget. Текущий: 16GB managed × (1 - write-buffer-ratio=0.5) = 8GB BC. Для read-heavy workload write_buffer_ratio default 0.5 неоптимален. Switch к state.backend.rocksdb.memory.write-buffer-ratio: 0.25 → BC becomes 12GB (50% больше). Cost: меньше WBM budget (8GB → 4GB) → MemTables smaller → больше L0 files. Но writes только 30%, можем себе позволить. (2) Increase high-prio-pool-ratio. state.backend.rocksdb.memory.high-prio-pool-ratio: 0.2 (default 0.1). Удваивает space для filter+index blocks → Bloom filter checks all in-memory → не triggers disk reads на 'not exists' lookups. Critical для read-heavy. (3) Increase managed.fraction глобально. taskmanager.memory.managed.fraction: 0.55 (default 0.4). Дополнительные ~6GB managed → дополнительный BC. Проверить headroom: total Flink memory 40GB на 64GB pod, OK margin. (4) Bloom filter to 15 bits/key через custom factory. Снижает false positive с 1% до 0.1% → меньше unnecessary disk reads. Custom factory extends DefaultConfigurableOptionsFactory — критично super.createColumnOptions(): tableConfig.setFilterPolicy(new BloomFilter(15, false)). Memory cost: 50% больше filter size, but goes в high-prio pool which мы уже увеличили. (5) Smaller block size: tableConfig.setBlockSize(8 * 1024) — 8KB blocks (default 16KB). Trade-off: more block headers, но cache hits более granular — лучше cache utilization. (6) Block cache pinning: tableConfig.setPinL0FilterAndIndexBlocksInCache(true), setCacheIndexAndFilterBlocksWithHighPriority(true). Без этого filter blocks может эвиктиться. (7) Если state на NVMe SSD и hit ratio все равно < 90% — рассмотрите ForSt (FLIP-427) с remote state на S3 + larger local cache. Validation: после changes block-cache-hit / (hit+miss) → >90%, P99 read latency должен упасть до <30ms. Iterative — apply changes одно за одним, measure impact. Avoid wholesale changes — теряется attribution. Не trade off: 8GB → 12GB BC = больше memory для cache, но WBM меньше → если writes начнут backlog (write stalls появятся), переключайтесь к balanced 0.4 write-buffer-ratio."
+/>

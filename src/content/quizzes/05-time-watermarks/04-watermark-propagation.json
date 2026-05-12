@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "05-time-watermarks/04-watermark-propagation",
+  "moduleId": "05-time-watermarks",
+  "_meta": {
+    "idPrefix": "flink-m05-04",
+    "description": "Quiz for watermark propagation lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-04-q1",
+      "type": "multiple-choice",
+      "question": "Operator с 3 input channels получает watermarks: WM1=100, WM2=80, WM3=120. Какой будет currentInputWatermark и почему?",
+      "options": [
+        { "id": "a", "text": "MAX(100, 80, 120) = 120 — для самой свежей информации" },
+        { "id": "b", "text": "AVG = 100 — среднее по всем inputs" },
+        { "id": "c", "text": "MIN(100, 80, 120) = 80 — это безопасная нижняя граница. Если оператор объявит WM=120, события с ts=85 с input 2 будут late (потому что WM(in2)=80 значит события с ts<=80 уже все пришли, но с ts=85 ещё могут прийти)" },
+        { "id": "d", "text": "Зависит от input rate каждого channel" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "MIN propagation rule — fundamental. currentInputWatermark = MIN(inputs, excluding idle channels). Это safe lower bound: WM(in)=T значит на этом channel события с ts<=T уже все пришли. Если operator declare WM=MAX(100,80,120)=120, события с ts=85 с input 2 будут late — input 2 ещё в WM=80, может прислать что-то > 80. WM=80 гарантирует, что больше нечего ожидать с ts<=80. Output WM operator-а ≤ currentInputWatermark.",
+      "studyHint": "Повторите урок — раздел 'MIN propagation rule'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m05-04-q2",
+      "type": "multiple-choice",
+      "question": "Production: intervalJoin двух Kafka source. Web UI: KafkaSource(orders) WM=1700000000000, KafkaSource(inventory) WM=Long.MIN_VALUE. Join operator WM=Long.MIN_VALUE. Что делать?",
+      "options": [
+        { "id": "a", "text": "Increase parallelism inventory source" },
+        { "id": "b", "text": "Disable watermarks на inventory" },
+        { "id": "c", "text": "Inventory source имеет idle partitions без withIdleness — их WM = Long.MIN_VALUE. MIN propagation в join: MIN(orders, inventory) = Long.MIN_VALUE. Fix: добавить .withIdleness(Duration.ofMinutes(2)) в WatermarkStrategy inventory. После 2min без events partitions markIdle → MIN исключает их → WM продвигается на основе активных" },
+        { "id": "d", "text": "Restart job — это всегда транзиентная проблема" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Classic case: один source имеет idle partitions без withIdleness. KafkaSource WM = MIN(per-partition WM) = MIN(active, Long.MIN_VALUE) = Long.MIN_VALUE. Downstream Join: MIN(orders, inventory) = Long.MIN_VALUE → all event-time timers frozen. Fix: withIdleness в WatermarkStrategy inventory source. Сопутствующие fixes: (1) orders тоже должна иметь withIdleness — тот же баг переедет в slack hours; (2) для long-term resurrection (idle partition просыпается через час) — добавить allowedLateness + sideOutputLateData; (3) если drift между источниками известен — watermark alignment (FLIP-217).",
+      "studyHint": "Повторите урок — раздел 'Idle source pitfall'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-04-q3",
+      "type": "multiple-choice",
+      "question": "Как propagate-ятся watermarks через keyBy?",
+      "options": [
+        { "id": "a", "text": "Watermarks тоже partition по hash(key) — каждый downstream subtask видит только свои watermarks" },
+        { "id": "b", "text": "Watermarks broadcast на ВСЕ downstream subtasks (даже если data partition по hash). Each downstream subtask видит ВСЕ upstream watermarks и вычисляет MIN. Это разная семантика propagation: data partition'ятся, watermarks broadcast" },
+        { "id": "c", "text": "Watermarks обрабатываются только в Source operator-е" },
+        { "id": "d", "text": "Watermarks отбрасываются после keyBy" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Watermarks broadcast на ВСЕ downstream subtasks, data partition'ятся по hash(key). Это важная асимметрия: watermark — глобальное consensus, не keyed. Не имеет смысла иметь разный watermark per key (key X events могут приходить только в один subtask по hashing). Все downstream subtasks видят one stream watermarks от каждого upstream subtask, вычисляют MIN. Same для forward(), rebalance(), broadcast() — watermark всегда broadcast. Implications: если хоть один upstream subtask отстаёт по WM — все downstream видят MIN включая его.",
+      "studyHint": "Повторите урок — раздел 'Propagation через keyBy'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m05-04-q4",
+      "type": "true-false",
+      "question": "Bounded source при завершении emit-ит Watermark.MAX_WATERMARK (Long.MAX_VALUE) — это сигнал для всех окон fire final result.",
+      "correctAnswer": true,
+      "explanation": "True. Когда bounded source (FileSource, HybridSource в bounded mode, Kafka с end offset) завершает чтение всех данных, он emit-ит Watermark(Long.MAX_VALUE) — special marker 'все события прошли'. Все open event-time windows fire final emit (windowEnd < Long.MAX_VALUE для любого реального окна). Все event-time timers fire. После этого operator переходит в shutdown, finishOperator(), checkpoint final, terminate. На unbounded sources (Kafka без end offset) MAX_WATERMARK не приходит никогда — окна закрываются только когда WM пересекает их windowEnd на основе actual events. Это why batch (bounded) и streaming (unbounded) могут использовать тот же windowing API — same WatermarkOperator, разная семантика end-of-stream.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

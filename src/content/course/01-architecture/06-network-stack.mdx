@@ -1,0 +1,253 @@
+---
+title: "Network stack: credit-based flow control и backpressure"
+description: "Credit-based flow control (FLIP-1 era), backpressure detection через mailbox timings (busy/idle/backpressured), buffer debloating (1.14+). Сравнение с старым TCP-window blocking."
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Network", "Credit-based Flow Control", "Backpressure", "Buffer Debloating"]
+---
+
+# Network stack: credit-based flow control и backpressure
+
+Network stack Flink — одно из самых тонких мест архитектуры. От него зависит, как быстро данные проходят через pipeline, как detect-ируется backpressure, и почему checkpoints могут стать stuck. До Flink 1.5 использовался naive подход через TCP-window blocking, что давало catastrophic backpressure поведение. С 1.5 (FLIP-1 era) применяется **credit-based flow control** — fundamentally другая модель.
+
+В этом уроке разберём network buffers, credit protocol, как мерить backpressure через mailbox timings, и buffer debloating для адаптивного network sizing.
+
+---
+
+## Зачем нужен flow control
+
+Flink — async pipeline: source читает быстрее, чем sink пишет. Без flow control upstream operator завалит downstream buffer-ами и съест всю память.
+
+```
+Source: 100k records/sec → Map: 100k r/s → Sink: 10k r/s (slow DB)
+                                            ↑
+                            sink не успевает, нужно сказать upstream "STOP"
+```
+
+Two подхода:
+
+1. **Block on full buffer** (старый Flink, до 1.5; raw TCP-based). Producer thread блокируется на send. Каскадно блокирует upstream. Проблема: blocking sender может блокировать выполнение barriers (для checkpoints) — checkpoint stuck.
+2. **Credit-based** (Flink 1.5+; FLIP-1 era). Producer посылает только когда есть credits от consumer. Никаких блокирующих TCP-write — данные либо влезают в buffer pool, либо drop-аются в overflow queue.
+
+---
+
+## Credit-based flow control
+
+Концепция: **consumer объявляет credits** (= количество свободных buffer-ов у него). Producer не отправляет больше, чем consumer заявил.
+
+<DiagramContainer title="Credit-based protocol" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Producer subtask"
+        tooltip="Upstream operator. Имеет output buffer pool. Перед send в channel проверяет: есть ли credits от consumer-а на этот channel? Если 0 — данные ждут в local buffer queue, не идут в network."
+      >
+        Map subtask A0
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="data + sequence number" />
+    <FlowRow>
+      <DataBox
+        label="Network channel"
+        tooltip="ResultPartition → InputGate. Несёт data buffers и control messages. На LocalInputChannel — direct memory copy (нет TCP). На RemoteInputChannel — Netty TCP."
+      >
+        ResultPartition → InputGate
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="up" label="credit announce (числа buffers)" />
+    <FlowRow>
+      <DataBox
+        label="Consumer subtask"
+        tooltip="Downstream operator. Объявляет credits, когда buffer становится свободным. Если consumer slow — credits не announce-аются, producer перестаёт слать."
+      >
+        Filter subtask B0
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Buffer types
+
+| Buffer | Where lives | Назначение | Sizing |
+|---|---|---|---|
+| **Floating Buffers** | Shared per ResultPartition | Адаптивные, перераспределяются между channels | `taskmanager.network.memory.floating-buffers-per-gate` (8 default) |
+| **Exclusive Buffers** | Per channel | Reserved для конкретного channel | `taskmanager.network.memory.buffers-per-channel` (2 default) |
+| **Network Memory Pool** | Per TaskManager | Total pool для всех channels | `taskmanager.memory.network.fraction/min/max` |
+
+**Total formula**: `total_buffers = numTaskmanagers × numSlots × parallelism × buffers-per-channel + floating buffers`.
+
+Buffer size — по умолчанию 32 KB. Размер крупных событий определяет, сколько событий помещается в один buffer.
+
+### Credit lifecycle
+
+1. **Initial credits announce**: при подключении consumer объявляет `exclusive-buffers-per-channel` credits.
+2. **Producer sends data**: при отправке записи decrement credit.
+3. **Consumer обрабатывает запись**: освобождает buffer, добавляет credit.
+4. **Consumer announce обновление**: посылает `AddCredit` message обратно producer-у.
+5. **Producer pause when credits = 0**: больше не шлёт, ждёт `AddCredit`.
+
+---
+
+## Old TCP-window blocking (что было до 1.5)
+
+До credit-based Flink работал на raw TCP buffers. Когда consumer slow:
+
+1. Consumer не читает из socket → TCP receive window заполняется.
+2. Sender's TCP send window blocked → producer thread блокируется в `socket.write()`.
+3. **Vsё на одном TCP-соединении блокируется** — включая control messages для checkpoints (barriers).
+
+Catastrophic side effect: **checkpoint barriers застревали в backpressured channel**. Один slow sink блокировал checkpoints всей job-ы, потому что barriers не могли пройти через socket.
+
+Credit-based решил это: data buffers и credit messages идут через **separate logical channels** в одном TCP. Backpressure не блокирует control plane.
+
+---
+
+## Backpressure detection через mailbox timings
+
+С Flink 1.13+ backpressure measure-ится через **mailbox timings** (FLIP-26). Каждый subtask имеет три счётчика:
+
+| Metric | Что значит |
+|---|---|
+| **`busyTimeMsPerSecond`** | Time, потраченное в processElement / userCode |
+| **`idleTimeMsPerSecond`** | Time waiting for input |
+| **`backPressuredTimeMsPerSecond`** | Time waiting for free output buffer |
+
+Сумма ≤ 1000 ms/s (= один полный second).
+
+```
+Healthy:    busy=600, idle=400, bp=0     (есть spare capacity)
+Bottleneck: busy=1000, idle=0, bp=0      (CPU-bound)
+Backpressured: busy=0, idle=0, bp=1000   (downstream slow)
+```
+
+В Web UI это визуализируется цветами: красный=busy, синий=idle, чёрный=backpressured.
+
+### Локализация bottleneck
+
+Анализируем по pipeline:
+
+```
+Source:   busy=500, bp=300    ← немного backpressure
+Filter:   busy=400, bp=500    ← заметно backpressured
+Process:  busy=900, bp=50     ← bottleneck! почти 100% CPU, backpressures upstream
+Sink:     busy=200, idle=800  ← OK
+```
+
+В этом примере process — CPU bottleneck. Решение: увеличить parallelism process, оптимизировать processElement, или offload в Async I/O.
+
+```bash
+# REST API для метрик
+curl http://jobmanager:8081/jobs/<jobId>/vertices/<vertexId>/subtasks/metrics
+```
+
+<Callout type="note">
+**Backpressure ≠ ошибка**. Backpressure — это **regulation**, не failure. В healthy production pipeline нормально иметь sustained bp=100-300 ms/s — это значит, sink немного медленнее source-а, и система регулирует throughput. Проблема, когда bp=900+ ms/s — это означает, источник почти не вычисляет.
+</Callout>
+
+---
+
+## Buffer debloating (Flink 1.14+)
+
+Проблема: large network buffers (default 32 KB) хороши для throughput, но **плохи для latency и checkpoint barriers**. Если buffer почти полон, барьер не может пройти раньше, чем все предшествующие data records будут processed.
+
+**Buffer debloating** (FLIP-183) — adaptive size buffer-ов в зависимости от throughput.
+
+```yaml
+taskmanager.network.memory.buffer-debloat.enabled: true
+taskmanager.network.memory.buffer-debloat.period: 200ms
+taskmanager.network.memory.buffer-debloat.target: 1000ms   # data in buffer не более 1 секунды
+taskmanager.network.memory.buffer-debloat.threshold-percentages: 25
+```
+
+Как работает:
+
+1. Каждые `period` (200ms) measure-ит actual throughput через channel.
+2. Adjust-ит **effective buffer size** так, чтобы данные в buffer ≤ `target` времени.
+3. Низкий throughput → small effective buffers → fast barrier propagation.
+4. Высокий throughput → big effective buffers → throughput-optimal.
+
+Результат: checkpoint duration снижается в 5-10x для backpressured jobs.
+
+<Callout type="tip">
+**Buffer debloating рекомендован к включению в production по умолчанию**. Cost: малый CPU overhead (1-2%). Gain: drastically лучше checkpoint behaviour под backpressure. С 2.0 это default в некоторых profiles, но проверьте config — может быть отключено в legacy configs.
+</Callout>
+
+---
+
+## Local vs Remote channels
+
+| Channel type | Когда | Mechanism | Overhead |
+|---|---|---|---|
+| **LocalInputChannel** | Sender и receiver в одном JVM (TM) | Direct memory queue, без сериализации | Минимальный (memory copy) |
+| **RemoteInputChannel** | Разные TM | Netty TCP с credit-based protocol | TCP + serialization |
+
+**Implication**: slot sharing groups (default) + chaining делают многие channels local. Это огромная экономия. Когда вы видите cross-TM shuffle — это hash partitioning через network. Для high-throughput jobs минимизируйте cross-TM shuffles (один большой TM > много маленьких).
+
+---
+
+## Network buffer exhaustion
+
+```
+java.io.IOException: Insufficient number of network buffers:
+required N, but only M available
+```
+
+Это значит, что requested buffers > available pool. Причины:
+
+- Слишком high parallelism + много inputs (N × M × buffers-per-channel взлетает).
+- `taskmanager.memory.network.fraction` слишком низкая.
+- Legacy `taskmanager.network.numberOfBuffers` (deprecated) выставлен низко.
+
+Fixes:
+
+```yaml
+# Увеличить total network memory
+taskmanager.memory.network.fraction: 0.15
+taskmanager.memory.network.min: 256mb
+taskmanager.memory.network.max: 2gb
+
+# Снизить buffers per channel (меньше pool требуется)
+taskmanager.network.memory.buffers-per-channel: 1
+taskmanager.network.memory.floating-buffers-per-gate: 4
+```
+
+Trade-off: меньше buffers — больше backpressure под burst load.
+
+---
+
+## Backpressure cascade
+
+Когда один operator backpressured, давление propagate-ится upstream:
+
+```
+Sink slow → bp=900ms/s
+Process: video bp on sink → output buffer fills → bp=800ms/s
+Filter: same → bp=700ms/s
+Source: same → bp=600ms/s, чтение из Kafka замедляется
+```
+
+В Web UI это видно как «волна» backpressure от sink к source. Bottleneck — самый upstream operator с **более низким** bp value, чем у соседа downstream (он голодает первым, но не может ничего делать).
+
+---
+
+## Production gotchas
+
+- **Network buffer exhaustion на large parallelism** — buffers требуются N (channels) × M (per-channel). При parallelism=64 и 4 inputs это 64×64×4 = 16384 buffers только на один task. Увеличьте `network.fraction` или снижайте per-channel.
+- **Latency spikes с большими buffers** — без buffer debloating buffer 32 KB × low throughput означает latency до секунды. Включайте debloating.
+- **Checkpoint stuck в backpressure** — без buffer debloating и unaligned checkpoints (см. модуль 06), backpressure → barrier alignment timeout → checkpoint fail. С 2.x обычно включают unaligned + debloating вместе.
+- **TCP retransmissions на K8s** — если node-to-node network unreliable (cloud VPC overlay), Netty будет retransmit, что портит latency. Использовать host networking или dedicated VPC peering.
+- **`busyTimeMsPerSecond` near 1000 без bp** — CPU-bound subtask, не backpressure. Решение: parallelism up, или process optimisation.
+- **Local vs Remote skew** — если parallelism source = parallelism map, но они на разных TM-ах, между ними remote shuffle (хоть partitioning forward). Используйте slot sharing groups для co-location.
+- **Backpressure без видимой причины** — проверьте RocksDB compaction (write-pause), GC pauses, slow checkpoint async (RocksDB upload в S3).
+
+<Callout type="warning">
+**Buffer size в byte-streaming jobs (Kafka, large messages)** — если ваши events 1 MB+, buffer 32 KB разбивает каждое событие на части. Увеличивайте `taskmanager.memory.segment-size` до 64-256 KB, но проверяйте latency tradeoff. Очень крупные records (> 4 MB) — отдельный pain point, лучше не делать.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="У вас Flink pipeline: Source → Map → keyBy → Window → Sink. Все parallelism=8. В Web UI: Source busy=400, bp=500. Map busy=300, bp=600. Window busy=950, bp=20. Sink busy=200, idle=800. Где bottleneck, что делать, и почему backpressure на Source и Map высокий, хотя они не «виноваты»?"
+  answer="Bottleneck — **Window operator** (busy=950, bp=20). Он почти полностью CPU-bound (950ms из 1000) и не успевает обрабатывать данные. Sink имеет idle=800 — ждёт работы, значит downstream OK. Source и Map имеют высокий backpressure (500 и 600), но это **cascading** — они вынуждены замедляться, потому что Window не успевает потреблять их output. Они сами по себе быстры (busy=400/300 — есть spare CPU), но network credits от Window закончились, output buffers полны, дальше слать нельзя. Это classic backpressure cascade от downstream к upstream. Что делать (в порядке приоритета): (1) **Increase Window parallelism** — если есть spare slots и keyBy permits. С 8 → 16 может half-load на каждый Window subtask. (2) **Оптимизировать Window function** — если processWindow логика CPU-heavy (например, парсит JSON или делает sync DB call), переписать на efficient. (3) **State backend tuning** — если Window держит большой keyed state, RocksDB compaction может вызывать spikes. Включить `state.backend.changelog.enabled` (GIC) для предсказуемой latency. (4) **Если Window требует external lookup** — переписать с Async I/O в отдельный operator до Window. (5) **Slot sharing group** — изолировать Window в свою group, чтобы дать ему dedicated managed memory для RocksDB cache. Высокий bp на upstream — следствие, не причина. Никогда не «фиксите» backpressure через увеличение upstream parallelism — это только усугубит, потому что downstream и так не успевает."
+/>

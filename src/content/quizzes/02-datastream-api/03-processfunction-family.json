@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "02-datastream-api/03-processfunction-family",
+  "moduleId": "02-datastream-api",
+  "_meta": {
+    "idPrefix": "flink-m02-03",
+    "description": "Use IDs: flink-m02-03-q1, flink-m02-03-q2, ... for MC/TF"
+  },
+  "questions": [
+    {
+      "id": "flink-m02-03-q1",
+      "type": "multiple-choice",
+      "question": "Какая capability KeyedProcessFunction делает её самым powerful API в Flink? Что доступно?",
+      "options": [
+        { "id": "a", "text": "Только map + filter combined" },
+        { "id": "b", "text": "Доступ к: keyed state (ValueState/ListState/MapState/ReducingState/AggregatingState scoped к ctx.getCurrentKey), timers (event-time и processing-time), side outputs (ctx.output(tag, value)). Это building block для всего stateful processing — windows, joins, aggregations — синтаксический сахар поверх ProcessFunction" },
+        { "id": "c", "text": "Только timers" },
+        { "id": "d", "text": "Только async I/O" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "KeyedProcessFunction — flagship abstraction. Три критичных capabilities: (1) keyed state — ValueState, ListState, MapState, ReducingState, AggregatingState, все scoped к ctx.getCurrentKey; (2) timers — registerEventTimeTimer / registerProcessingTimeTimer + onTimer callback; (3) side outputs — ctx.output(tag, value) для multi-output. 99% production Flink jobs можно написать на KeyedProcessFunction + timers + side outputs. Higher-level API (windows, joins) — wrappers, часто хуже perf и менее flexible.",
+      "studyHint": "Повторите урок 03 — раздел 'KeyedProcessFunction — flagship abstraction'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m02-03-q2",
+      "type": "multiple-choice",
+      "question": "У вас main stream events + config stream (fraud rules, slowly changing). Хочется применять актуальные rules к каждому event. Какой API использовать?",
+      "options": [
+        { "id": "a", "text": "Two отдельных Flink jobs, обмен через Kafka" },
+        { "id": "b", "text": "BroadcastProcessFunction (или KeyedBroadcastProcessFunction). Config stream .broadcast(descriptor) → ruleBroadcast. mainStream.connect(ruleBroadcast).process(...). processElement — READ-ONLY broadcast state, processBroadcastElement — UPDATE broadcast state. Identical state на всех parallel subtasks" },
+        { "id": "c", "text": "CoProcessFunction" },
+        { "id": "d", "text": "Async I/O lookup в DB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "BroadcastProcessFunction — точный паттерн для config / rules / slowly-changing reference data. Config stream broadcasted во все subtasks main stream-а через .broadcast(MapStateDescriptor). Asymmetric API: processElement получает ReadOnlyContext (только чтение broadcast state — design constraint, broadcast state идентичен на всех subtasks), processBroadcastElement получает writable Context для update-а. Limitation: broadcast state в-memory, не RocksDB → не для huge reference tables (>100k entries). Для very large reference data — Async I/O lookup в external store.",
+      "studyHint": "Повторите урок 03 — раздел 'BroadcastProcessFunction: config streams'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m02-03-q3",
+      "type": "multiple-choice",
+      "question": "Sync Redis call (1-5ms) внутри processElement при throughput 100k tx/sec / 8 parallelism. Что произойдёт?",
+      "options": [
+        { "id": "a", "text": "Всё OK, mailbox thread pool обрабатывает parallel" },
+        { "id": "b", "text": "Catastrophe: mailbox = один thread, sync call блокирует 1-5ms per record. Budget 80μs per record при 12.5k/sec/subtask. Throughput коллапсирует с 100k до ~200/sec/subtask (12-60x slowdown). Checkpoints fail, watermarks stuck. Решение — Async I/O в отдельный operator" },
+        { "id": "c", "text": "Уменьшится parallelism на 50%" },
+        { "id": "d", "text": "Redis call cached автоматически" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Mailbox model: каждый subtask — один thread, sequential processing processElement / onTimer / mail. Sync Redis call 1-5ms блокирует mailbox per record. Budget 80μs per record при 12.5k/sec/subtask = 1/12500. Redis call 1-5ms = 12.5-62.5× over budget. Backpressure cascade: checkpoint barriers застревают → checkpoint timeout, watermarks stuck → windows не fire, timers не fire. Решение: Async I/O (модуль 02 урок 06) — extract lookup в отдельный operator с AsyncDataStream.unorderedWait, использовать async client (Lettuce для Redis), capacity 100-1000 parallel in-flight requests.",
+      "studyHint": "Повторите урок 03 — KnowledgeCheck",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m02-03-q4",
+      "type": "true-false",
+      "question": "В KeyedProcessFunction.open() рекомендуется открывать external connections (DB, HTTP), потому что open() вызывается один раз per subtask при старте.",
+      "correctAnswer": true,
+      "explanation": "open() вызывается ОДИН раз per subtask при старте — perfect место для инициализации lightweight ресурсов: state descriptors, connection pools, metrics counters. ВАЖНО: для heavy I/O (DB queries в hot path) используйте Async I/O — открытие connection в open() OK, но синхронные queries в processElement блокируют mailbox. Connection поддерживается между processElement calls, recommended pattern. close() вызывается при shutdown — но не гарантирован при failure, для critical cleanup используйте external mechanism.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

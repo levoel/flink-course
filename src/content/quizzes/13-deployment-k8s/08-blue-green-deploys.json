@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/08-blue-green-deploys",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-08",
+    "description": "Quiz for Blue/green deploys lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-08-q1",
+      "type": "multiple-choice",
+      "question": "Blue/green в Flink — что делает Operator с upgradeMode: savepoint при изменении image?",
+      "options": [
+        { "id": "a", "text": "Запускает обе версии параллельно, дeleg-ит cutover пользователю" },
+        { "id": "b", "text": "Sequential: trigger savepoint → wait DONE → cancel old job → update JM Deployment с new image → wait JM ready → submit new job from savepoint" },
+        { "id": "c", "text": "Restart pod с новым image без savepoint" },
+        { "id": "d", "text": "Создаёт второй FlinkDeployment с новым именем" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Operator делает sequential savepoint-restart, не parallel blue/green. Шаги: (1) Trigger savepoint REST POST /jobs/{id}/savepoints; (2) Poll status, wait DONE; (3) Cancel job; (4) Update JM Deployment с новым image; (5) Wait pod ready; (6) Submit job с --fromSavepoint. Между шагами 3-6 — gap (downtime). Для true parallel blue/green (обе версии одновременно processing) нужна manual choreography с двумя FlinkDeployments + shadow topic verification — operator этого не делает automatically.",
+      "studyHint": "Повторите урок — Через Flink Kubernetes Operator: upgradeMode: savepoint",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-08-q2",
+      "type": "multiple-choice",
+      "question": "Savepoint format choice: когда canonical, когда native?",
+      "options": [
+        { "id": "a", "text": "Всегда native — быстрее" },
+        { "id": "b", "text": "Native — для regular upgrades (same major version, same backend) — 3-5x быстрее. Canonical — для major Flink upgrade или backend migration (RocksDB→ForSt) — cross-version и cross-backend safe" },
+        { "id": "c", "text": "Всегда canonical — safer" },
+        { "id": "d", "text": "Format не имеет значения" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Native: backend-specific format, 3-5x быстрее savepoint creation, но locked к конкретному backend (RocksDB native ≠ ForSt native). OK для most upgrades same major version + same backend. Canonical: universal format, медленнее (полная reserialize state), но cross-version, cross-backend. Используйте canonical для: Flink 1.20 → 2.2 major upgrade, RocksDB → ForSt migration, любая ситуация где может потребоваться restore в different configuration. Default — native. Override: `state.savepoints.type: canonical` или `execution.savepoint.format: canonical`.",
+      "studyHint": "Повторите урок — Savepoint format choice: canonical vs native",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-08-q3",
+      "type": "multiple-choice",
+      "question": "5 минут после cutover Prometheus alerts: checkpoint failure 100%, RocksDB errors. Что делать?",
+      "options": [
+        { "id": "a", "text": "Wait — может self-heal" },
+        { "id": "b", "text": "Rollback: получить savepoint path из status.jobStatus.savepointInfo, kubectl patch FlinkDeployment с прежним image + initialSavepointPath = saved path. Operator делает rollback workflow" },
+        { "id": "c", "text": "Delete FlinkDeployment и пересоздать" },
+        { "id": "d", "text": "Restart JM pod вручную" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Срочный rollback workflow: (1) Найти savepoint path triggered перед upgrade: kubectl get flinkdeployment -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}'. (2) kubectl patch с прежним image tag + initialSavepointPath=path. (3) Operator делает rollback. Pre-deploy checks которые помогли бы: staging environment с production savepoint, schema evolution validation tests, UID stability checks, canary deployment, quarterly rollback drill. Critical: savepoint retention должен быть >= rollback window (минимум 24-48 часов).",
+      "studyHint": "Повторите урок — Production gotchas + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-08-q4",
+      "type": "true-false",
+      "question": "С ForSt и disaggregated state savepoint становится metadata-only operation — практически instant независимо от state size, что даёт near-zero downtime blue/green upgrades.",
+      "correctAnswer": true,
+      "explanation": "True. ForSt с disaggregated state (FLIP-427) хранит primary state на S3, локальный диск только cache. Savepoint = запись metadata pointers, не копирование state data. Savepoint 200GB занимает секунды а не минуты. Это game-changer для blue/green: downtime между шагами 1 (trigger savepoint) и 5 (start new from savepoint) — секунды. Combined с FLIP-291 in-place rescale получаем near-zero-downtime deployments. RocksDB local — savepoint требует физического copy, всё ещё медленно для большого state.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

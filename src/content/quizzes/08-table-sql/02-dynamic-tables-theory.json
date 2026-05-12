@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "08-table-sql/02-dynamic-tables-theory",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-02",
+    "description": "Quiz for Dynamic Tables theory lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-02-q1",
+      "type": "multiple-choice",
+      "question": "Опишите stream-table duality в Flink SQL — две операции interpretation.",
+      "options": [
+        { "id": "a", "text": "Stream обновляет таблицу, ничего не emit-ит" },
+        { "id": "b", "text": "(1) Stream → Table — changelog accumulation: каждый event interpreted как +I (insert) для append-only, или +I/+U/-D для PK-keyed (upsert). (2) Table → Stream — changelog emission: dynamic table emits сhanges как append stream (+I), retract stream (-U, +U pairs), или upsert stream (+I, +U, -D с PK). Choice автоматически determined query optimizer по semantics" },
+        { "id": "c", "text": "Tables и streams независимы" },
+        { "id": "d", "text": "Только batch tables" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Stream-table duality — foundational concept Flink Table API/SQL. **Stream → Table direction**: stream of events accumulates в table. Append-only interpretation — каждый event новая row (transaction log). Upsert interpretation с PK — new event для existing PK обновляет row (state of dimension). **Table → Stream direction**: dynamic table changes over time, emit как stream. Three modes: (1) **Append**: only +I events. Used для query results which only add rows — projection/filter on append source, windowed aggregations (each window completes once). (2) **Retract**: -U (retract previous) и +U (insert new) pairs. Used для GROUP BY без window — counter updates emit retract+insert. (3) **Upsert**: +I, +U, -D events с PK. Used когда result table has PK — compact representation. Flink optimizer chooses output mode based on query structure + sink capabilities. Critical insight: same SQL может produce different stream types depending on source и transformations.",
+      "studyHint": "Повторите урок — секции 'Stream → Table' и 'Table → Stream'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-02-q2",
+      "type": "multiple-choice",
+      "question": "Query `SELECT user_id, COUNT(*) FROM events GROUP BY user_id` написана для streaming. Какой output stream и какие sinks принимают?",
+      "options": [
+        { "id": "a", "text": "Append stream — все sinks принимают" },
+        { "id": "b", "text": "Retract stream (-U previous count, +U new count). Append-only sinks (regular Kafka, basic FileSystem) REJECT при planning с 'Table sink doesn't support consuming update changes'. Принимают: print connector (debug), JDBC с PK, upsert-kafka, Iceberg с equality deletes, Paimon. Fix для regular Kafka: wrap query в TUMBLE window для append output, или use upsert-kafka с PRIMARY KEY (user_id)" },
+        { "id": "c", "text": "Upsert stream автоматически" },
+        { "id": "d", "text": "Insert-only" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "GROUP BY без window produces retract semantics. Каждое event для existing user_id → counter increment → emit -U(user, old_cnt) + +U(user, new_cnt) pair. Это classic retract stream pattern. **Compatibility issue**: regular Kafka connector — insert-only (just appends to log). Cannot 'retract' previously-sent message. Flink optimizer detects mismatch при planning, throws TableException. **Compatible sinks**: (a) **upsert-kafka** с PRIMARY KEY — emit upsert events (+I/+U/-D), Kafka topic compacted, downstream consumers handle tombstones. (b) **JDBC** с PK — performs UPDATE under the hood. (c) **Iceberg** с equality deletes — delete file emits для retracted rows, new data file для new value. (d) **Paimon** с PK — LSM merge handles update natively. (e) **print** — debug only, shows -U/+U markers. **Fix options**: (1) add windowing: `SELECT user_id, TUMBLE_START(t, INTERVAL '1' MIN), COUNT(*) GROUP BY user_id, TUMBLE(t, INTERVAL '1' MIN)` — window completes once → append output. (2) Change sink к upsert-capable — `'connector'='upsert-kafka'` + PRIMARY KEY. (3) Accept retract output для downstream Flink consumer которое handle changelog stream.",
+      "studyHint": "Повторите урок — секция 'Examples — choice of changelog mode'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-02-q3",
+      "type": "multiple-choice",
+      "question": "Когда нужно SET 'table.exec.state.ttl' в streaming SQL pipeline?",
+      "options": [
+        { "id": "a", "text": "Никогда — Flink auto-cleans state" },
+        { "id": "b", "text": "Когда GROUP BY без window — state grows unbounded с unique keys (e.g., per-user counter forever). Также regular joins без time bound. TTL release state entries после N hours без access. Production typical 24-48h. Windowed aggregations имеют natural cleanup через watermark + allowed_lateness — TTL не нужен" },
+        { "id": "c", "text": "Только для small datasets" },
+        { "id": "d", "text": "Для batch queries" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**State TTL критичен для unbounded queries**. Two scenarios: **(1) GROUP BY без window**: `SELECT user_id, COUNT(*) FROM events GROUP BY user_id` — state per user_id stored indefinitely. Linearly growing с unique users. После недель/месяцев — TBs state, RocksDB OOM или out-of-disk. Fix: `SET 'table.exec.state.ttl' = '24h'` — user_id entries unused > 24h removed. **(2) Regular joins**: `SELECT * FROM a JOIN b ON a.id = b.id` — каждая incoming row stored by join key indefinitely. Same OOM risk. Fix: same TTL setting. **(3) When NOT needed**: Windowed aggregations (`GROUP BY ..., TUMBLE(t, INTERVAL '5' MIN)`) — state released после watermark + allowed_lateness passes window_end. Interval joins (`BETWEEN`) — bounded by max interval. Temporal joins — bounded by event lag. Lookup joins — only cache size. **Trade-off**: TTL too aggressive (1h) — analytics correctness broken (count resets). Too long (30 days) — state still grows large. Production sweet spot 24-72h matches business reset cadence. **Note**: TTL applies globally per session — affects ALL stateful operators in pipeline. Flink 2.x — per-operator TTL hints для finer control.",
+      "studyHint": "Повторите урок — секция 'State implications'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m08-02-q4",
+      "type": "true-false",
+      "question": "PROCTIME() и event-time watermarked column дают одинаковый детерминированный результат при replay (например, после restart).",
+      "correctAnswer": false,
+      "explanation": "False. **PROCTIME() — НЕ deterministic при replay**. PROCTIME returns current TaskManager wall clock time. После restart pipeline reads same records, but processing time different (now vs original). Windowed aggregations с PROCTIME будут разные на replay — different window assignments, different counts. Это by design — PROCTIME для use cases где latency и simplicity matter, не correctness. **Event-time WATERMARK — deterministic при replay**. Event_time extracted from record payload (e.g., `event_time TIMESTAMP(3)`, ingested from Kafka message). Same record → same event_time → same window assignment, regardless of when processed. Watermark progression deterministic (advance based on event_time progression, not wall clock). Replay produces identical results. **Implications**: (1) Production EOS pipelines should use event_time для correctness — same input always produces same output. (2) PROCTIME OK для approximations, dashboards, latency-critical use cases где deterministic replay не required. (3) Mixed usage — sometimes event_time для logic, PROCTIME для cache invalidation (`lookup_join FOR SYSTEM_TIME AS OF proc_time`). (4) Production tests should run replay scenarios — assert event_time-based queries produce identical output across runs.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "lessonSlug": "08-table-sql/06-pattern-recognition",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-06",
+    "description": "Quiz for MATCH_RECOGNIZE pattern recognition lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-06-q1",
+      "type": "multiple-choice",
+      "question": "Какие clauses содержит MATCH_RECOGNIZE и их назначение?",
+      "options": [
+        { "id": "a", "text": "Только SELECT и WHERE" },
+        { "id": "b", "text": "(1) PARTITION BY — group rows by key per state machine; (2) ORDER BY — chronological order (time attribute); (3) MEASURES — output columns derived from match (LAST/FIRST/COUNT special functions); (4) ONE ROW PER MATCH / ALL ROWS PER MATCH — emit mode; (5) AFTER MATCH SKIP — strategy после match (PAST LAST ROW, TO NEXT ROW, TO FIRST/LAST var); (6) PATTERN — regex-like sequence (A, A+, A*, A?, A{n,m}); (7) WITHIN INTERVAL — time bound (critical for production); (8) DEFINE — predicates per row variable" },
+        { "id": "c", "text": "Только PATTERN и DEFINE" },
+        { "id": "d", "text": "SQL standard syntax" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "MATCH_RECOGNIZE — full SQL:2016 syntax. Each clause critical. **PARTITION BY**: per-partition state machine. PARTITION BY user_id — independent pattern detection per user. Без PARTITION BY — single global state machine (rarely useful). **ORDER BY**: must be temporal attribute (event_time или proc_time). Pattern matches require chronological order. **MEASURES**: defines output columns. Special functions: `LAST(var.col)` final value matched as var, `FIRST(var.col)` first, `COUNT(var.*)` count rows matched, `RUNNING SUM/AVG` cumulative. **ONE ROW vs ALL ROWS PER MATCH**: ONE ROW — single output per match (typical для alerts). ALL ROWS — every matched row emitted с annotations (`CLASSIFIER()` shows variable, `MATCH_NUMBER()` shows match index) — debug-friendly. **AFTER MATCH SKIP** four strategies: (1) **PAST LAST ROW** (default-like, non-overlapping matches); (2) **TO NEXT ROW** (overlapping matches, O(N²) explosion risk); (3) **TO FIRST var** (skip to first row matched as var); (4) **TO LAST var** (skip to last). Choice depends on use case. **PATTERN**: regex over row variables. Quantifiers: `A`, `A?`, `A*`, `A+`, `A{n}`, `A{n,m}`, `A | B`, `(A B)` grouping. **WITHIN INTERVAL** — bounds state. Match must complete within interval. **CRITICAL для production** — без WITHIN state grows unbounded если pattern never terminates. **DEFINE**: SQL predicates per variable. `LAST(var.col, N)` accesses N-th-to-last value matched as var. RUNNING semantics in DEFINE (predicate evaluated at decision time).",
+      "studyHint": "Повторите урок — секция 'Базовый синтаксис'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-06-q2",
+      "type": "multiple-choice",
+      "question": "Production deployment MATCH_RECOGNIZE без WITHIN clause обнаружил unbounded state growth. Почему и как fix?",
+      "options": [
+        { "id": "a", "text": "Watermark не set" },
+        { "id": "b", "text": "Без WITHIN — pending matches retain в state indefinitely если pattern never terminates. Example: PATTERN (A B+ C) с rare C events — каждая incoming A starts new pending match, B+ accumulates, ждёт C. State per partition растёт unbounded. Fix: ВСЕГДА add WITHIN INTERVAL 'n' UNIT matching realistic completion time. Match expires после interval, state released. Choose interval based on use case (5 minutes for transactions, 1 hour for sessions)" },
+        { "id": "c", "text": "Это normal behavior" },
+        { "id": "d", "text": "Increase parallelism" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**WITHIN INTERVAL — mandatory production practice** для bounded state. **Without WITHIN — failure mode**: pattern с quantifiers (`A B+ C`, `F{3,} S`) requires tail rows (C, S) to complete. If tail rare (or never arrives), every incoming start row begins new pending match. State per partition grows linearly с time. RocksDB OOM eventually. **Real example**: pattern `(BROWSE+ CART CHECKOUT)` для customer journeys. Browse events common, CHECKOUT rare (5% of sessions). Без WITHIN: каждая сессия с BROWSE starts pending match, accumulates browse events forever если no checkout. **With WITHIN INTERVAL '1' HOUR**: match must complete from first BROWSE to CHECKOUT within 1 hour. After 1 hour expiration — pending matches abandoned, state released. **Choose interval based on realistic completion**: (a) **Fraud detection** transactions — 10-30 minutes typical attack window. (b) **Customer journey** — 1-24 hours для session, days для multi-session funnel. (c) **Stock price patterns** — minutes to hours depending on chart timeframe. (d) **Login anomaly** — 5-30 minutes. **Trade-offs**: too short — miss legitimate slow patterns; too long — state larger, late detection. **Monitoring**: track `match_pending_count` per partition. Alert если growing unbounded — indicates predicate too strict, или interval too long. **Alternative bounded patterns**: (a) **Use SESSION window** — `... GROUP BY user_id, SESSION(event_time, INTERVAL '30' MIN)` — natural session boundary. (b) **Tumbling window**: pattern within fixed interval. (c) **State TTL** as fallback safety net — even if WITHIN forgotten, TTL releases entries.",
+      "studyHint": "Повторите урок — секция 'Production gotchas — Без WITHIN'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-06-q3",
+      "type": "multiple-choice",
+      "question": "Сравните MATCH_RECOGNIZE (SQL) vs Flink CEP API (Java) — когда какой использовать?",
+      "options": [
+        { "id": "a", "text": "MATCH_RECOGNIZE всегда лучше" },
+        { "id": "b", "text": "MATCH_RECOGNIZE: declarative SQL:2016 syntax, analysts могут писать, EXPLAIN PLAN debug, simpler patterns. CEP API (Java): pattern + after match conditions, Java lambdas в conditions, complex stateful predicates, custom output transformations, mixing с DataStream. Choose SQL для simple patterns + analyst writers, CEP API для advanced custom processing"
+        },
+        { "id": "c", "text": "Только CEP API works" },
+        { "id": "d", "text": "Identical APIs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Both implement pattern matching на streams, but different abstraction levels. **MATCH_RECOGNIZE (SQL)**: (1) **Syntax**: declarative SQL:2016 — readable, analyst-friendly, matches Oracle/Vertica/Snowflake conventions. (2) **Pattern expressiveness**: regex с quantifiers, alternation, grouping. SQL:2016 standard. (3) **Conditions**: SQL predicates в DEFINE (access via LAST/FIRST/PREV). Limited к expressions on row variables. (4) **Output**: relational rows (MEASURES) — fits в SELECT result. (5) **Debugging**: EXPLAIN PLAN shows pattern automaton. CLASSIFIER()/MATCH_NUMBER() для inspection. (6) **Maintenance**: SQL in version control, code review by analysts. (7) **Productivity**: high — minutes to write/iterate. **Flink CEP API (Java)**: (1) **Syntax**: Java DSL — `Pattern.<Event>begin('first').where(...).next('second').where(...)`. Programmatic. (2) **Pattern expressiveness**: regex + 'after match' conditions (e.g., 'iterative condition' checking against previous matched events programmatically). (3) **Conditions**: Java lambdas — full expressiveness, access state, side outputs. Can call external systems в predicate. (4) **Output**: stream of matched events — PatternFlatSelectFunction generates output. Flexible — multi-output, side outputs, custom transformations. (5) **Debugging**: manual instrumentation, less standard tooling. (6) **Maintenance**: Java codebase, requires Flink expertise. (7) **Productivity**: lower — Java boilerplate, JAR build/deploy cycle. **When use SQL**: declarative needs, analyst writers, simple-to-moderate complexity, ad-hoc queries. **When use CEP API**: (a) complex stateful predicates (count matches across patterns), (b) custom output transformations beyond MEASURES, (c) mixing pattern detection с custom DataStream operators, (d) very high throughput where Java-level control matters, (e) integration с existing Flink Java codebase. **Performance**: comparable — both compile to similar NFA-based execution. Choice mostly developer experience.",
+      "studyHint": "Повторите урок — секция 'Comparison: MATCH_RECOGNIZE vs CEP API'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-06-q4",
+      "type": "true-false",
+      "question": "AFTER MATCH SKIP TO NEXT ROW позволяет overlapping matches — каждая matched row может participate в multiple matches.",
+      "correctAnswer": true,
+      "explanation": "True. **AFTER MATCH SKIP TO NEXT ROW** = next match attempt starts at row immediately after start of current match. Resulting behavior: same row может participate в multiple matches if pattern allows. **Example**: rows r1-r5, pattern `(A B+)`. Match 1: r1 (A), r2-r4 (B+). After SKIP TO NEXT ROW: next match attempt starts at r2. Match 2 possible: r2 (A), r3-r5 (B+). **Implications**: (a) **Output explosion**: O(N²) growth potential. With 1000 rows и pattern matching every row, ~500K matches. Storage and downstream consumer impact massive. (b) **State complexity**: pattern automaton tracks multiple overlapping pending matches per partition. State higher than SKIP PAST LAST ROW. (c) **Use case**: when overlapping matches semantically meaningful — e.g., detecting all upward price trends, не just first per trend. **Compare AFTER MATCH SKIP options**: (1) **PAST LAST ROW** (default-like, recommended for production): next match starts row после last matched. Non-overlapping matches. Cleanest semantics. (2) **TO NEXT ROW**: overlapping (described above). (3) **TO FIRST var**: next match starts at first row matched as var. Useful для nested patterns. (4) **TO LAST var**: next match starts at last row matched as var. Pattern continuation. **Decision rule**: default к **SKIP PAST LAST ROW** unless explicit need for overlapping. Cost of overlapping (state + output volume) usually outweighs benefit. **Edge case**: SKIP TO NEXT ROW combined с greedy patterns (`A B+`) — combinatorial explosion possible. Add `WITHIN INTERVAL 'n' UNIT` для bound. Monitor output rate carefully in production.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

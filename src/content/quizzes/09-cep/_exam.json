@@ -1,0 +1,89 @@
+{
+  "moduleId": "09-cep",
+  "title": "Module 09 Exam — CEP (Complex Event Processing)",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m09-exam",
+    "description": "Integrated exam for Module 09 CEP — Pattern API, MATCH_RECOGNIZE, NFA, time semantics, real-world"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-exam-q1",
+      "type": "multiple-choice",
+      "question": "Pattern API: Pattern.<E>begin('a').where(p1).followedBy('b').where(p2). На sequence [A1, X, A2, X, B1, B2] какие matches эмитятся (default contiguity, AFTER MATCH SKIP PAST LAST EVENT)?",
+      "options": [
+        { "id": "a", "text": "(A1, B1), (A1, B2), (A2, B1), (A2, B2) — все combinations" },
+        { "id": "b", "text": "(A1, B1) — followedBy single match: A1 завершается на first B (=B1), потом SKIP PAST LAST EVENT, дальше нет A для второго match" },
+        { "id": "c", "text": "(A2, B1) — second A wins" },
+        { "id": "d", "text": "(A1, B2) — last B wins" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "followedBy — relaxed contiguity, single match per A. На [A1, X, A2, X, B1, B2]: A1 matched as 'a', X ignored, A2 starts second partial match (also 'a'), X ignored, B1 matches 'b' — first partial match (A1, B1) completed. AFTER MATCH SKIP PAST LAST EVENT puts cursor после B1, остальные partial matches discarded. Дальше B2, нет A — no match. followedByAny эмитил бы все 4 combinations. consecutive не применим к followedBy.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-exam-q2",
+      "type": "multiple-choice",
+      "question": "MATCH_RECOGNIZE: PATTERN (A B+ C), DEFINE B AS B.price < PREV(price). Что означает PREV(price) здесь?",
+      "options": [
+        { "id": "a", "text": "Цена предыдущего events который matched B" },
+        { "id": "b", "text": "Цена physical previous row in ORDER BY — независимо от того matched ли previous row. Это даёт 'текущая цена ниже physical previous' — natural для downtrend detection" },
+        { "id": "c", "text": "Цена first event in partition" },
+        { "id": "d", "text": "Среднее за previous N events" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Без variable PREV(price) references physical previous row in ORDER BY — это всегда predecessor independent of matching. Альтернатива PREV(B.price) — previous row которая matched variable B (skip-ит над non-B rows). Для downtrend detection PREV(price) natural — 'current cheaper than immediately preceding'. PREV(B.price) даёт 'current cheaper than last B' что redundant (current = B уже). Common pitfall — confusing эти две semantics, ведёт к subtle bugs.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m09-exam-q3",
+      "type": "multiple-choice",
+      "question": "Production: CEP job показывает growing checkpoint duration (10s → 60s → 300s). Pattern: Pattern.<E>begin('a').where(...).oneOrMore().followedByAny('b').where(...) без within. Что fix?",
+      "options": [
+        { "id": "a", "text": "Увеличить parallelism" },
+        { "id": "b", "text": "Главная причина — unbounded partial matches state из-за: (1) отсутствия within() → partial matches накапливаются forever; (2) followedByAny — cartesian product N×M matches; (3) oneOrMore greedy. Fix: добавить within(Duration), заменить followedByAny на followedBy (если не нужны overlapping), bound oneOrMore через times(min, max)" },
+        { "id": "c", "text": "Перейти на heap state backend" },
+        { "id": "d", "text": "Отключить checkpoints" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это classic CEP production deterioration. Чек все три факторы: unbounded within → state grows linearly per key forever; followedByAny → N×M combinatorial matches при busy keys; oneOrMore greedy → каждый matching event extends partial match. Combined эффект — exponential state growth, checkpoint duration scales с state size, eventually OOM. Fix: tight within(), prefer followedBy unless explicit need overlapping, bound через times(min,max). Если эти изменения compromise semantics — migrate к custom state machine.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-exam-q4",
+      "type": "multiple-choice",
+      "question": "Use case: 'IoT cascade alarm: device emits HIGH_TEMP, потом within 5 min same device emits SHUTDOWN, потом within 10 min adjacent device emits HIGH_TEMP'. Какие approaches?",
+      "options": [
+        { "id": "a", "text": "Pure Pattern API — все в одном pattern" },
+        { "id": "b", "text": "Pure MATCH_RECOGNIZE" },
+        { "id": "c", "text": "Hybrid: упрощённый Pattern API/MATCH_RECOGNIZE для per-device sequence (HIGH_TEMP → SHUTDOWN within 5 min) + downstream KeyedProcessFunction keyBy(area) для cross-device correlation. Per-device CEP не может correlate adjacent devices structurally" },
+        { "id": "d", "text": "Single KeyedProcessFunction для всего" }
+      ],
+      "correctAnswer": "c",
+      "explanation": "Three-step pattern имеет mix per-device (steps 1-2) + cross-device (step 3 — adjacent device). Pattern API runs per-key (deviceId) — может handle steps 1-2, но cross-device correlation для adjacent device требует joining streams from different keys. Production architecture: layer 1 — per-device CEP detects HIGH_TEMP + SHUTDOWN sequence, emits 'device-down' alerts. Layer 2 — KeyedProcessFunction keyBy(area) собирает 'device-down' alerts + tracks recent HIGH_TEMP events from adjacent devices через ValueState, applies cross-device condition.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m09-exam-q5",
+      "type": "multiple-choice",
+      "question": "В каком случае выбрать AFTER MATCH SKIP TO NEXT ROW вместо SKIP PAST LAST ROW?",
+      "options": [
+        { "id": "a", "text": "Всегда — это default" },
+        { "id": "b", "text": "Когда хотите все overlapping matches: каждый row может быть start нового match. Например 'every 3-event subset showing downtrend' — нужны overlapping triplets. Caveat: pattern не должен admit empty match (PATTERN (A?) с TO NEXT ROW → runtime error из infinite loop)" },
+        { "id": "c", "text": "Только для batch mode" },
+        { "id": "d", "text": "Когда нужна max parallelism" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SKIP TO NEXT ROW — для use cases когда хотите все overlapping sub-matches. Например finance analytics 'every triplet showing downtrend' — sliding window over всех matching triplets. SKIP PAST LAST ROW даёт disjoint matches (skips весь matched range), теряются overlapping. Trade-off: TO NEXT ROW даёт significantly больше matches → больше state, больше output. Constraint: pattern должен require non-empty match — иначе infinite loop, Flink throws compile error. Production usage rare — обычно SKIP PAST LAST ROW correct.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m09-exam-q6",
+      "type": "true-false",
+      "question": "Best production CEP architecture обычно combines layers: upstream enrichment (KeyedProcessFunction со state) → Pattern API/MATCH_RECOGNIZE для standard temporal sequences → downstream correlator (KeyedProcessFunction для cross-key/multi-source correlation).",
+      "correctAnswer": true,
+      "explanation": "Правда. Production-grade CEP architectures rarely pure Pattern API. Layered approach: (1) enrichment layer добавляет context (is_new_ip, fraud_score, user_segment) через KeyedProcessFunction со ValueState; (2) CEP layer применяет declarative patterns на enriched events; (3) correlator layer joins cross-key state, applies dynamic rules через broadcast state. Каждый layer focuses на одной concern — easier to maintain, scale, debug. Pure Pattern API ограничен structurally (no async I/O, no cross-key, no dynamic patterns), pure state machine — verbose for simple sequences. Combine для best of both.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

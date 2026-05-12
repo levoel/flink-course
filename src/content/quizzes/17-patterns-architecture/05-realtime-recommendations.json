@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/05-realtime-recommendations",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-05",
+    "description": "Quiz for real-time recommendations с ML_PREDICT"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-05-q1",
+      "type": "multiple-choice",
+      "question": "ML_PREDICT (Flink 2.2, FLIP-526) — что это и какие use cases решает?",
+      "options": [
+        { "id": "a", "text": "Built-in TensorFlow training в Flink" },
+        { "id": "b", "text": "SQL function для inference ML моделей прямо из streaming SQL. CREATE MODEL регистрирует remote endpoint (OpenAI, Anthropic, TF Serving) или embedded ONNX. ML_PREDICT(model, features) — async batched. Снимает дублирование Flink + external ML microservice — inference inline в pipeline" },
+        { "id": "c", "text": "Это legacy API из Flink 1.x" },
+        { "id": "d", "text": "Только для PyFlink" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ML_PREDICT — game-changer для streaming ML. Раньше: Flink pipeline → HTTP call к Python ML service → response → continue. Теперь: ML_PREDICT inline. Под капотом — AsyncTableFunction (non-blocking), batching (если provider supports), built-in retry/timeout/circuit breaker, metrics emit. Providers: OpenAI/Anthropic REST, TensorFlow Serving, ONNX Runtime (embedded — low latency). Modern recommendation/fraud/personalization pipelines в одном SQL.",
+      "studyHint": "Повторите урок 05 — раздел 'ML_PREDICT inline в Streaming SQL'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-05-q2",
+      "type": "multiple-choice",
+      "question": "Production scenario: 500k events/sec, latency budget 50ms, $1000/day inference budget. Какая architecture optimal?",
+      "options": [
+        { "id": "a", "text": "Все через GPT-4-turbo для best quality" },
+        { "id": "b", "text": "Гибрид: 99% ONNX embedded inference (1-5ms, $0 per call) для cheap pre-ranking, 0.9% GPT-3.5/Haiku batched, 0.1% GPT-4 для critical decisions. Plus predictions cache TTL 1 min для popular pairs (5-10x QPS reduction). Это reality production recommendation systems — multi-tier ML" },
+        { "id": "c", "text": "Только OpenAI batch API" },
+        { "id": "d", "text": "Чистый rule-based, без ML" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pure GPT-4: latency 200-500ms (NOT в 50ms budget), cost 100k events × $0.01/1k × 500 tokens = $3500/hour (NOT в $1000/day). Pure ONNX: latency OK, cost OK, но quality для finalization gaps. Гибрид pattern: (1) cheap ONNX на all 500k events/sec — pre-ranking, score 0-1; (2) top-10% routed к Haiku/GPT-3.5 batched (50 records/batch); (3) top-0.1% (most important decisions) — GPT-4; (4) cache identical user-product pairs 1 min. Result: latency 5-15ms average, cost $X00/day. Multi-tier ML — production reality.",
+      "studyHint": "Повторите урок 05 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-05-q3",
+      "type": "multiple-choice",
+      "question": "VECTOR_SEARCH (FLIP-540) — что это и где применяется в recommendation pipeline?",
+      "options": [
+        { "id": "a", "text": "Search SQL functionality для text indexes" },
+        { "id": "b", "text": "k-NN поиск в векторных индексах (Pinecone, Qdrant, OpenSearch k-NN) прямо из Flink SQL. LATERAL TABLE для multi-output. Используется для semantic similarity recommendations (collaborative filtering): для viewed product найти top-K похожих по embedding. Latency 5-20ms через native client" },
+        { "id": "c", "text": "Это просто WHERE clause optimization" },
+        { "id": "d", "text": "Удалено в 2.2" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "VECTOR_SEARCH — Flink 2.2 SQL function для k-NN поиска поверх vector DB. Регистрация vector index через CREATE TABLE с connector (qdrant/pinecone/weaviate/elasticsearch k-NN). Use case: для каждого user_action найти top-50 похожих products по embedding cosine distance. LATERAL TABLE синтаксис для row explosion (one input → K outputs). Combined с ML_PREDICT даёт complete recommendation: semantic similarity → personalized ranking. Latency 5-20ms на k-NN search depending на index size и K. Production scale — vector DB cluster (Pinecone shards / Qdrant cluster) обязателен для high QPS.",
+      "studyHint": "Повторите урок 05 — раздел 'VECTOR_SEARCH'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-05-q4",
+      "type": "true-false",
+      "question": "ML_PREDICT с remote endpoints (OpenAI, Anthropic) можно использовать в production critical path без production safeguards.",
+      "correctAnswer": false,
+      "explanation": "External API dependency в critical path — recipe для outages. Production REQUIRES: (1) circuit breaker — fallback на rule-based после N consecutive failures (Flink job не должен die когда OpenAI имеет outage); (2) multi-provider strategy — failover OpenAI → Anthropic → self-hosted; (3) cost budgets + kill switches (alerting на $X/hour spike); (4) predictions cache для identical requests (snazzy cache=identical features → identical prediction); (5) timeout settings strict; (6) graceful degradation. Без guard-ов один OpenAI outage = downtime recommendation engine, что unacceptable.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

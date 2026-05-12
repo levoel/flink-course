@@ -1,0 +1,397 @@
+---
+title: "Async I/O: non-blocking external lookups"
+description: "AsyncDataStream.unorderedWait / orderedWait, capacity (parallel in-flight), timeout, retry strategies (1.16+). Use case: external API/DB lookups без блокировки thread."
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Async I/O", "AsyncFunction", "External Lookups", "Retry Strategies"]
+---
+
+# Async I/O: non-blocking external lookups
+
+Внешние lookups (Redis, RDBMS, REST API, ML inference service) — самая частая причина backpressure в production Flink. Mailbox-model (см. урок 03 модуля 01) single-threaded — blocking sync call в `processElement` останавливает весь subtask: checkpoints fail, watermarks stuck, throughput коллапсирует.
+
+**Async I/O (AsyncFunction API)** — fundamental capability Flink для non-blocking external calls. Позволяет до N parallel in-flight requests per subtask без блокировки mailbox thread. Это **must-know production pattern**.
+
+В этом уроке: AsyncFunction API, unorderedWait vs orderedWait, capacity и timeout sizing, retry strategies (FLIP-260, 1.16+), production-grade async DB lookup.
+
+---
+
+## Проблема: blocking I/O в processElement
+
+```java
+// ANTI-PATTERN: sync DB call в processElement
+public class EnrichmentBad extends KeyedProcessFunction<Long, Tx, EnrichedTx> {
+    private Connection dbConn;
+
+    @Override
+    public void processElement(Tx tx, Context ctx, Collector<EnrichedTx> out) {
+        // Synchronous! Блокирует mailbox.
+        User user = dbConn.lookupUser(tx.userId);  // 10ms typical
+        out.collect(new EnrichedTx(tx, user));
+    }
+}
+```
+
+Допустим throughput 10k tx/sec/subtask. Time per call = 10ms. Mailbox обрабатывает по очереди → max throughput = 100 records/sec/subtask. **100x degradation**. Соседние operations (checkpoint barriers, watermarks, timers) застревают за каждым DB call.
+
+---
+
+## Async I/O решение
+
+AsyncFunction позволяет mailbox thread иметь **множество одновременно in-flight requests** и обрабатывать responses асинхронно.
+
+<DiagramContainer title="Async I/O architecture" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Mailbox thread"
+        tooltip="Single thread, не блокирующий. Получает record, вызывает asyncInvoke(), возвращается к следующему record. НЕ ждёт ответа от external system."
+      >
+        processElement
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="asyncInvoke(record, resultFuture)" />
+    <FlowRow>
+      <DataBox
+        label="In-flight requests pool"
+        tooltip="До capacity (например 100) одновременных requests. Каждый — non-blocking future от async client (Lettuce для Redis, AsyncHttpClient для REST, R2DBC для PG)."
+      >
+        capacity = 100
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="future.complete(response)" />
+    <FlowRow>
+      <DataBox
+        label="Callback в mailbox"
+        tooltip="Когда async response готов, callback enqueued в mailbox. Mailbox thread выполняет emit() на следующем idle cycle. Order preservation в зависимости от unordered/ordered mode."
+      >
+        out.collect(enriched)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+```java
+public class AsyncRedisLookup extends RichAsyncFunction<Tx, EnrichedTx> {
+    private transient StatefulRedisConnection<String, String> conn;
+    private transient RedisAsyncCommands<String, String> async;
+
+    @Override
+    public void open(Configuration parameters) {
+        // Async Redis client (Lettuce) — non-blocking
+        RedisClient client = RedisClient.create("redis://redis:6379");
+        conn = client.connect();
+        async = conn.async();
+    }
+
+    @Override
+    public void asyncInvoke(Tx tx, ResultFuture<EnrichedTx> resultFuture) {
+        // Non-blocking: возвращает CompletableFuture
+        RedisFuture<String> future = async.get("user:" + tx.userId);
+
+        future.whenComplete((userJson, throwable) -> {
+            if (throwable != null) {
+                resultFuture.completeExceptionally(throwable);
+            } else {
+                User user = JSON.parse(userJson, User.class);
+                resultFuture.complete(Collections.singletonList(
+                    new EnrichedTx(tx, user)));
+            }
+        });
+    }
+
+    @Override
+    public void timeout(Tx tx, ResultFuture<EnrichedTx> resultFuture) {
+        // Вызывается если operation не завершилось за timeout
+        // Можно emit fallback или completeExceptionally
+        resultFuture.complete(Collections.singletonList(
+            new EnrichedTx(tx, User.unknown())));
+    }
+
+    @Override
+    public void close() {
+        if (conn != null) conn.close();
+    }
+}
+```
+
+Использование:
+
+```java
+DataStream<EnrichedTx> enriched = AsyncDataStream.unorderedWait(
+    txStream,
+    new AsyncRedisLookup(),
+    1000,                           // timeout ms
+    TimeUnit.MILLISECONDS,
+    100                             // capacity (parallel in-flight)
+).uid("redis-enrichment");
+```
+
+---
+
+## unorderedWait vs orderedWait
+
+| Mode | Semantics | Performance | Use case |
+|---|---|---|---|
+| **unorderedWait** | Emit как только results ready. Order watermark-preserving (results within same watermark не reorder), но within watermark можно any order | Лучше (no head-of-line blocking) | Default choice |
+| **orderedWait** | Emit в strict input order. Если record N slow, records N+1..N+K wait | Хуже (head-of-line blocking) | Когда downstream require strict ordering |
+
+### unorderedWait — recommended default
+
+```java
+AsyncDataStream.unorderedWait(stream, asyncFunc, 1000, MILLISECONDS, 100);
+```
+
+Внутри: maintains watermark boundaries. Records одного watermark interval могут reorder, но не cross watermark boundary. Это критично для event-time correctness — downstream operators получат records в order watermark-аxis.
+
+### orderedWait — когда нужно strict ordering
+
+```java
+AsyncDataStream.orderedWait(stream, asyncFunc, 1000, MILLISECONDS, 100);
+```
+
+Если record A в queue, и его response slow, все records B, C, D после A waiting в emit queue даже если их responses ready. Это создаёт head-of-line blocking.
+
+**Используйте orderedWait только если downstream operator действительно требует strict order** (например, sequence reconstruction). Иначе unorderedWait значительно быстрее.
+
+---
+
+## Capacity sizing
+
+`capacity` — максимум одновременных in-flight requests per subtask. Sizing:
+
+```
+capacity = target_throughput_per_subtask × p99_latency_external_system
+```
+
+Пример: Redis lookup 1-5ms (p99=5ms), target throughput 100k records/sec / 8 parallelism = 12.5k records/sec/subtask. Capacity = 12500 × 0.005 = 62.5 → **round up до 100**.
+
+Trade-offs:
+
+| Capacity | Throughput | Memory | Backpressure point |
+|---|---|---|---|
+| **Слишком низкое (10)** | Limited by capacity | Низкое | Backpressure rapidly |
+| **Optimal (100)** | Близко к target | Moderate | Smooth |
+| **Слишком высокое (10000)** | OK | Высокое (each request retains data) | Может OOM external system |
+
+**Production heuristic**: 100-1000 для нормальных DB / cache lookups. 10-50 для slow external services (>100ms).
+
+---
+
+## Timeout
+
+Timeout — max time для completion одного request. Если превышен — вызывается `timeout(input, resultFuture)` callback.
+
+```java
+@Override
+public void timeout(Tx tx, ResultFuture<EnrichedTx> resultFuture) {
+    // Strategy 1: emit fallback
+    resultFuture.complete(Collections.singletonList(new EnrichedTx(tx, User.unknown())));
+
+    // Strategy 2: drop запись
+    // resultFuture.complete(Collections.emptyList());
+
+    // Strategy 3: fail job (default)
+    // resultFuture.completeExceptionally(new TimeoutException(...));
+}
+```
+
+Sizing: `timeout = 3 × p99_latency` (для absorption of tails). При timeout=1000ms и p99=100ms у вас 10× headroom для tails.
+
+---
+
+## Retry Strategies (FLIP-260, Flink 1.16+)
+
+В Flink 1.16+ AsyncFunction поддерживает встроенный retry. Это game changer — раньше нужно было ручной retry logic.
+
+```java
+AsyncRetryStrategy<EnrichedTx> retryStrategy =
+    new AsyncRetryStrategies.FixedDelayRetryStrategyBuilder<EnrichedTx>(
+        3,                              // max attempts
+        100                             // delay ms
+    )
+    .ifResult(empty)                    // retry если empty result
+    .ifException(throwable ->           // retry если specific exception
+        throwable instanceof SocketTimeoutException
+        || throwable instanceof IOException)
+    .build();
+
+DataStream<EnrichedTx> enriched = AsyncDataStream.unorderedWaitWithRetry(
+    txStream,
+    new AsyncRedisLookup(),
+    1000, TimeUnit.MILLISECONDS,
+    100,                                // capacity
+    retryStrategy
+);
+```
+
+### Available retry strategies
+
+- **FixedDelay**: повторяет с фиксированным delay (например, 3 attempts × 100ms).
+- **ExponentialBackoff**: doubling delay (100ms, 200ms, 400ms, ...).
+- **NoRestart**: no retry (legacy behavior).
+
+### Predicate functions
+
+- `ifResult(predicate)` — retry если result matches (e.g., empty list).
+- `ifException(predicate)` — retry если exception specific type.
+
+Retry decrement-ит capacity для retry-я duration. Будьте careful с aggressive retry на overloaded external system — это создаёт cascade.
+
+---
+
+## Production AsyncFunction: full example
+
+```java
+public class AsyncUserLookup extends RichAsyncFunction<Transaction, EnrichedTx> {
+
+    private transient AsyncHttpClient httpClient;
+    private transient RedisAsyncCommands<String, byte[]> redisCache;
+    private transient Counter cacheHitsMetric;
+    private transient Counter cacheMissesMetric;
+    private transient Histogram lookupLatencyMetric;
+
+    @Override
+    public void open(Configuration parameters) {
+        // HTTP client с pool
+        httpClient = Dsl.asyncHttpClient(Dsl.config()
+            .setMaxConnections(100)
+            .setMaxConnectionsPerHost(50)
+            .setRequestTimeout(800));
+
+        // Redis cache для hot lookups
+        RedisClient redisClient = RedisClient.create("redis://cache:6379");
+        redisCache = redisClient.connect(new ByteArrayCodec()).async();
+
+        // Metrics
+        cacheHitsMetric = getRuntimeContext().getMetricGroup().counter("cache_hits");
+        cacheMissesMetric = getRuntimeContext().getMetricGroup().counter("cache_misses");
+        lookupLatencyMetric = getRuntimeContext().getMetricGroup().histogram(
+            "lookup_latency_ms", new DescriptiveStatisticsHistogram(1000));
+    }
+
+    @Override
+    public void asyncInvoke(Transaction tx, ResultFuture<EnrichedTx> resultFuture) {
+        long start = System.currentTimeMillis();
+        String cacheKey = "user:" + tx.getUserId();
+
+        // Step 1: Try Redis cache
+        redisCache.get(cacheKey.getBytes()).whenComplete((cached, redisErr) -> {
+            if (redisErr == null && cached != null) {
+                cacheHitsMetric.inc();
+                lookupLatencyMetric.update(System.currentTimeMillis() - start);
+                User user = User.fromBytes(cached);
+                resultFuture.complete(Collections.singletonList(new EnrichedTx(tx, user)));
+                return;
+            }
+
+            cacheMissesMetric.inc();
+
+            // Step 2: Cache miss — go to upstream API
+            httpClient.prepareGet("https://api/users/" + tx.getUserId())
+                .execute()
+                .toCompletableFuture()
+                .whenComplete((response, apiErr) -> {
+                    if (apiErr != null) {
+                        resultFuture.completeExceptionally(apiErr);
+                        return;
+                    }
+                    User user = JSON.parse(response.getResponseBody(), User.class);
+
+                    // Write-through cache (fire and forget)
+                    redisCache.setex(cacheKey.getBytes(), 300, user.toBytes());
+
+                    lookupLatencyMetric.update(System.currentTimeMillis() - start);
+                    resultFuture.complete(Collections.singletonList(new EnrichedTx(tx, user)));
+                });
+        });
+    }
+
+    @Override
+    public void timeout(Transaction tx, ResultFuture<EnrichedTx> resultFuture) {
+        // Fallback: emit с unknown user (preserve event)
+        resultFuture.complete(Collections.singletonList(new EnrichedTx(tx, User.UNKNOWN)));
+    }
+
+    @Override
+    public void close() {
+        if (httpClient != null) httpClient.close();
+        if (redisCache != null) redisCache.getStatefulConnection().close();
+    }
+}
+```
+
+Использование с retry:
+
+```java
+AsyncRetryStrategy<EnrichedTx> retry = new ExponentialBackoffDelayRetryStrategyBuilder<EnrichedTx>(
+    3, 100, 1000, 2.0
+).ifException(t -> t instanceof TimeoutException).build();
+
+DataStream<EnrichedTx> enriched = AsyncDataStream.unorderedWaitWithRetry(
+    txStream,
+    new AsyncUserLookup(),
+    2000, TimeUnit.MILLISECONDS,
+    200,
+    retry
+).uid("user-enrichment");
+```
+
+---
+
+## State и checkpoints в AsyncFunction
+
+`AsyncFunction` НЕ keyed — не имеет access к keyed state. Если нужен keyed state:
+
+1. **AsyncFunction перед keyBy** — для stateless enrichment. Затем keyBy + KeyedProcessFunction для stateful processing.
+2. **State через external** — Redis, DB. AsyncFunction делает get + put.
+3. **Async State API V2** в Flink 2.0 — позволяет ProcessFunction делать non-blocking state access (см. модуль 03).
+
+Checkpoints с AsyncFunction:
+- In-flight requests **persist в state**. При checkpoint snapshot включает list of pending requests.
+- На recovery requests **re-issued**. Это может cause duplicate side effects (если external system non-idempotent).
+- Watermarks aligned: AsyncFunction блокирует watermark propagation до завершения all in-flight requests с timestamps ≤ watermark.
+
+<Callout type="warning">
+Async I/O semantics — at-least-once for external system. Если ваш lookup имеет side effects (insert, update), используйте idempotency keys. Pure reads — safe (idempotent by nature).
+</Callout>
+
+---
+
+## Production gotchas
+
+- **Sync client вместо async** — JDBC standard sync, blocking даже внутри asyncInvoke. Решение: R2DBC для PG/MySQL, Lettuce для Redis, AsyncHttpClient для REST, Netty-based clients.
+- **`asyncInvoke` blocked** — если вы внутри случайно вызвали sync method, вся async benefit потеряна. Profile thread dump для проверки.
+- **Capacity слишком высокая** — может OOM external system. Если у вас 64 parallelism × 1000 capacity = 64000 одновременных connections to DB — DB упадёт.
+- **Timeout слишком короткий** — false timeouts при normal load spike. Add 3-10x headroom над p99.
+- **Forgotten `resultFuture.complete()`** — если ни complete ни completeExceptionally не called, request stuck в queue forever → capacity exhaustion → backpressure.
+- **Не используйте Async I/O для in-memory ops** — оверхед callbacks превышает benefit. Async только когда external network call ≥1ms.
+- **Cache warming** — при cold start cache empty, все lookups идут к slow upstream. Pre-warming via state Processor API или separate warmup job.
+- **Metrics обязательны** — cache hit rate, latency histogram, error rate. Без них вы слепые в production.
+- **`open()` per subtask, не per record** — конструктор external client в open(), не в asyncInvoke().
+
+<Callout type="tip">
+Architectural pattern: Async I/O + local cache (in-state). Первый lookup идёт к external, результат cache-ится в keyed state (если AsyncFunction после keyBy + state в downstream operator). Это уменьшает external load 10-100x для repeated keys.
+</Callout>
+
+---
+
+## Comparison vs alternative patterns
+
+| Pattern | Pros | Cons |
+|---|---|---|
+| **Async I/O** | Non-blocking, scalable | Complex setup, at-least-once |
+| **Sync I/O в processElement** | Simple | Catastrophic backpressure |
+| **State cache (Broadcast)** | Fast, deterministic | Limited size (memory), no real-time updates |
+| **Lookup в Async State API V2** | Native Flink primitives | Только 2.0+, experimental |
+| **Two-stream join (CDC)** | No external dep, deterministic | Complex, requires lookup data stream |
+
+Async I/O — production default для external lookups. Лучшие alternatives только для specific niches.
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job требует enrichment events с user data из PostgreSQL. Throughput target 100k events/sec, parallelism 16, p99 PG query latency 20ms. Опишите архитектуру AsyncFunction: capacity sizing, timeout, retry strategy, и почему просто sync JDBC внутри asyncInvoke не работает."
+  answer="Throughput per subtask = 100k / 16 = 6250 events/sec/subtask. Latency p99 = 20ms. Capacity = 6250 × 0.020 = 125 → round up до **200** (50% headroom для spikes). Timeout = **100ms** (5× p99, absorption tails). Retry strategy: **ExponentialBackoffDelay** с 3 attempts, начальный delay 50ms, max 500ms, multiplier 2.0. ifException(t -> t instanceof SocketTimeoutException || t instanceof IOException) — retry на network errors, не на data errors (которые indicate bug). Total config: AsyncDataStream.unorderedWaitWithRetry(stream, new AsyncPgLookup(), 100, MILLISECONDS, 200, retry).uid('pg-enrich'). Client: **R2DBC PG client** (not JDBC!) — это async non-blocking driver. unorderedWait а не orderedWait — order не критичен для enrichment. Почему sync JDBC внутри asyncInvoke НЕ работает: AsyncFunction документирует contract 'asyncInvoke must return immediately' — реальная async требует non-blocking client. Sync JDBC: connection.executeQuery() блокирует caller thread (mailbox!) на 20ms. Внутри asyncInvoke это: (1) all 200 capacity dispense сериализуется через sync calls → effective concurrency=1; (2) mailbox thread блокирован на каждом lookup → 50 lookups/sec/subtask max → 800 events/sec/job vs target 100k → 125x degradation; (3) checkpoint barriers stuck → checkpoint failures; (4) watermarks frozen. Решение: R2DBC (reactive driver) → connection.execute() возвращает Publisher<Result>, который non-blocking. resultFuture.complete вызывается из callback ОТДЕЛЬНОГО executor thread. Mailbox свободен. Additional optimizations: (a) Redis cache layer перед PG — для repeated lookups, cache hit rate >80%; (b) connection pool 50 per subtask; (c) p99 lookup latency metric — alert при >40ms; (d) cache hit rate metric — alert при <70%. Production-grade setup."
+/>

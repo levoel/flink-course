@@ -1,0 +1,89 @@
+{
+  "moduleId": "06-checkpointing-savepoints",
+  "title": "Module 06 Exam — Checkpointing и Savepoints (KILLER)",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m06-exam",
+    "description": "6-question integrated exam for Module 06 ultimate killer module"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-exam-q1",
+      "type": "multiple-choice",
+      "question": "Опишите полный ABS algorithm cycle. Что и где блокирует, а что async?",
+      "options": [
+        { "id": "a", "text": "Простой synchronous snapshot всего state" },
+        { "id": "b", "text": "(1) CheckpointCoordinator (JobManager) triggers checkpoint каждые interval, injects barrier во все sources через RPC параллельно. (2) Sources snapshot offsets, emit barrier downstream. (3) Stateless operators forward barrier. (4) Stateful operator с N inputs: alignment phase — block channels after barrier, wait barrier на всех N (BLOCKING, может minute+ под backpressure). (5) Sync snapshot (BLOCKING, ms — RocksDB native hardlinks, COW heap). (6) Forward barrier downstream, async upload к DFS (NOT blocking processing). (7) Sink ack to coordinator. (8) All acks received → notifyCheckpointComplete callbacks для 2PC sinks commit transactions" },
+        { "id": "c", "text": "Только Source operators делают snapshot" },
+        { "id": "d", "text": "Coordinator делает full state copy on JobManager" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Full ABS cycle с blocking/async breakdown: (1) Trigger: CheckpointCoordinator on JobManager, periodic timer, parallel RPC to all sources; (2) Source: snapshot Kafka offsets, emit CheckpointBarrier через output; (3) Barrier propagation: stateless operators forward, almost no-op chained; (4) Alignment phase (BLOCKING aligned): operator с N inputs blocks channel A after first barrier, buffers records, продолжает читать B/C, blocking until barrier on ALL N — under backpressure 1-30min; (5) Sync phase (BLOCKING but FAST, ms-100ms): RocksDB native snapshot = hardlinks на immutable SST files (O(1)), heap state = CopyOnWriteStateMap increment version. Per TB state still milliseconds; (6) Forward barrier immediately downstream, async upload to DFS begins (NOT blocking mainline processing); (7) Sink (terminal): получил barrier на все inputs, snapshot pending transactions, ack to coordinator; (8) Coordinator collects acks, persists checkpoint metadata, invokes notifyCheckpointComplete on all operators — critical для 2PC sinks (Kafka commit, Iceberg manifest publish). Total: alignment + sync ≈ ms-minutes (mostly alignment под backpressure), async upload ≈ seconds-minutes (network bound). Optimizations addressing each phase: unaligned (FLIP-76) removes alignment, GIC (FLIP-158) stabilizes async через DSTL.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-exam-q2",
+      "type": "multiple-choice",
+      "question": "Production checkpoint duration on TB state varies 30s-10min, occasionally fails. Спроектируйте optimization stack для stable checkpoints.",
+      "options": [
+        { "id": "a", "text": "Increase checkpoint timeout" },
+        { "id": "b", "text": "Multi-layer fix: (1) Enable hybrid unaligned (execution.checkpointing.unaligned: true + aligned-checkpoint-timeout: 30s) — escalate to unaligned под backpressure, bounded duration. (2) Enable buffer debloating (taskmanager.network.memory.buffer-debloat.enabled: true) — minimize ChannelState size. (3) Enable GIC (state.backend.changelog.enabled: true + dstl.dfs.base-path) — STABLE checkpoint duration через DSTL (append-only log), independent от state size. (4) Enable incremental checkpoints (state.backend.incremental: true) — diff SSTs only для materializations. (5) Enable local recovery (state.backend.local-recovery: true) — fast same-node recovery. (6) Consider ForSt state backend — disaggregated state на S3, checkpoint metadata-only. (7) Increase Kafka transaction.timeout.ms к 30min - 1h для EOS safety. Monitor lastCheckpointAlignmentDuration alert если > 5s sustained" },
+        { "id": "c", "text": "Switch на batch processing" },
+        { "id": "d", "text": "Disable EXACTLY_ONCE mode" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Comprehensive checkpoint stability solution. Layered approach addressing each potential bottleneck: (1) Unaligned hybrid — handles backpressure без long alignment, bounded duration. Important: combine с buffer debloating иначе ChannelState explodes. (2) Buffer debloating — dynamically adjusts buffer size к ~1s data, minimizes ChannelState (potentially TBs without). Must-have с unaligned. (3) GIC/DSTL — fundamental shift: stable seconds checkpoint duration regardless of state size. DSTL append-only log flushed on checkpoint (ms), materialization separate periodic cycle (10 min). На TB state без GIC = minutes, with = seconds. (4) Incremental — diff SST upload for materializations, 5-20% bandwidth vs full. (5) Local recovery — local SST copies для same-node restart (20x speedup). (6) ForSt — disaggregated state on S3, checkpoint becomes metadata-only operation, recovery time independent of state size. Cloud-native, but adds latency for state access (mitigated by Async State API V2). (7) Kafka transaction timeout buffer — accommodates max checkpoint duration × 2. Without all layers: variable duration causes transaction expiration → data loss. Production-grade EOS pipelines требуют complete stack.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-exam-q3",
+      "type": "multiple-choice",
+      "question": "В чём concept difference incremental checkpoints (RocksDB native) и GIC (FLIP-158)?",
+      "options": [
+        { "id": "a", "text": "Они идентичны" },
+        { "id": "b", "text": "Incremental — diff SST files между current и previous checkpoint, upload only new SSTs, reference existing через SharedStateRegistry. Duration depends on SST churn (heavy compaction → spike). GIC — каждая mutation duplicated в DSTL (append-only log на DFS), checkpoint = small DSTL flush (ms). Materialization separate periodic cycle (RocksDB native snapshot upload). Они COMPLEMENT — GIC wraps incremental: DSTL для checkpoint cadence, RocksDB native for periodic materializations (which themselves are incremental). Production: enable BOTH" },
+        { "id": "c", "text": "Incremental для streaming, GIC для batch" },
+        { "id": "d", "text": "Они mutually exclusive" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Fundamental difference в timing/architecture. Incremental checkpoints — on-demand при checkpoint trigger: diff current SSTs с previous, upload new ones, reuse existing references. Performance depends на SST churn — heavy compaction (post-rescale, post-config-change) → many new SSTs → spike in upload. Variable duration. GIC — continuous: каждая state.update() мгновенно duplicated в DSTL append-only log. На checkpoint trigger — small DSTL flush (recent mutations only, ms). Constant time independent of state size or RocksDB internal state. Materialization happens separately (periodic, 10 min default) — uses RocksDB native snapshot (incremental!). State в DFS = latest materialization + DSTL log since materialization. They COMPLEMENT, not alternatives. Architecture: ChangelogStateBackend (GIC) wraps RocksDB (incremental). GIC frequency-stable, incremental size-efficient. Production: enable BOTH для TB-scale jobs.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-exam-q4",
+      "type": "multiple-choice",
+      "question": "Migration plan: switch RocksDB → ForSt + upgrade Flink 1.18 → 2.2 на 5TB state job. Required steps?",
+      "options": [
+        { "id": "a", "text": "Просто restart с new config" },
+        { "id": "b", "text": "(1) Ensure все stateful operators имеют explicit .uid(). (2) Update code: Async State API V2 for ForSt (state.asyncValue() not state.value()), remove deprecated SourceFunction. (3) Stop with CANONICAL savepoint (not native — required для cross-backend AND cross-version): flink stop --savepoint-format canonical --savepoint-timeout 4h. На 5TB = 1-3h. (4) Deploy new Flink 2.2 cluster с ForSt config (state.backend.type: forst, primary-dir: s3://, async-io). Enable GIC. (5) Restore: flink run -s <canonical-savepoint> updated-job.jar. Restore time hours для 5TB canonical. (6) Validation 24-72h parallel running с old cluster. (7) Cutover downstream consumers. (8) Retain old savepoint 30 days для rollback option" },
+        { "id": "c", "text": "Use native savepoint format" },
+        { "id": "d", "text": "Migration impossible с existing state" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production migration multi-step procedure. Critical aspects: (1) Explicit UIDs prerequisites — без них state не restored after topology changes (Flink 2.2 may have implicit topology changes). (2) Code updates для compatibility: Flink 2.0 removed SourceFunction/SinkFunction/DataSet — refactor; ForSt requires Async State API V2 (sync calls degrade to sync DFS reads — catastrophic latency). (3) Canonical savepoint — REQUIRED для cross-backend (RocksDB → ForSt) AND cross-version (1.18 → 2.2) migration. Native не work. Timing: 1-3h для 5TB (canonical is full serialization, 3-10x slower than native). Set --savepoint-timeout 4-6h. (4) New cluster deployment с ForSt + GIC standard. ForSt configuration: primary-dir на S3, local cache для performance. (5) Restore deserializes canonical к ForSt-native format. Hours. (6) Parallel validation — run обе clusters reading same Kafka offset (separate consumer groups), compare outputs. (7) Cutover gradual — switch downstream consumers, monitor metrics. (8) Retention — keep old savepoint 30 days, can rollback к 1.18 + RocksDB. Total elapsed: 2-3 weeks safe (prep, migration day, validation). Без canonical savepoint impossible — would need full state rebuild via Kafka replay (weeks).",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-exam-q5",
+      "type": "multiple-choice",
+      "question": "Production: 2000 subtasks, 5TB RocksDB state, S3 storage. Checkpoints take 8+ min, S3 throttling errors. Какая комплексная optimization?",
+      "options": [
+        { "id": "a", "text": "Switch на HDFS" },
+        { "id": "b", "text": "(1) FLIP-306 File Merging (state.checkpoints.file-merging.enabled: true) — 50-100x reduction в file count, resolves S3 throttling. (2) GIC (state.backend.changelog.enabled: true) — stable checkpoint duration seconds independent of state size. (3) Unaligned hybrid (FLIP-76) — bounded under backpressure. (4) Local recovery — fast same-node restart. (5) Adaptive scheduler with sticky allocation — maximizes local recovery hit rate. (6) Consider ForSt — disaggregated state, checkpoint metadata-only. (7) S3 prefix sharding между checkpoints и DSTL. (8) Monitor metrics: lastCheckpointDuration, alignmentDuration, S3 error rates. Test in staging. Expected: 8min → 8sec checkpoints, throttling resolved, $200/day → $20/day costs" },
+        { "id": "c", "text": "Reduce parallelism к 200" },
+        { "id": "d", "text": "Disable checkpointing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Layered optimization for large installation. Diagnose: 2000 × 10 files × 2880 checkpoints/day = 57M files/day. S3 PUT throttle 3.5K/sec вдребезги exceeded. Listings slow, costs high. Solutions: (1) FLIP-306 file merging — PRIMARY fix для stated symptoms. 50-100x file count reduction → 1-2M files/day, well below throttling, listings fast, costs 10-50x lower. Default with Flink 1.20+. (2) GIC — addresses checkpoint duration variability. Stable seconds checkpoints regardless of state size. Critical для EOS. (3) Unaligned hybrid — handles backpressure без blocking checkpoint. (4) Local recovery — fast same-node restart, 20x speedup для transient TM failures. (5) Adaptive scheduler — sticky placement increases local recovery hit. (6) ForSt — ultimate cloud-native (disaggregated state, S3 primary). Adds latency to state access (mitigated by Async State API V2), removes local disk constraint. (7) S3 prefix sharding — distributes throttle limits between checkpoint, DSTL, materialization. Different bucket prefixes recommended. (8) Monitoring: Prometheus metrics для lastCheckpointDuration, lastCheckpointAlignmentDuration, S3 4xx error rate. Alerts on degradation. Implementation order: file merging first (immediate biggest impact), GIC second (stability), ForSt third (cloud-native). Test each in staging. Expected result: stated 8min duration → 8sec, throttling resolved, costs $200/day → $20/day. Production rule для large installations (>500 parallelism, >1TB state): file merging + GIC mandatory baseline.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-exam-q6",
+      "type": "true-false",
+      "question": "Для production EOS pipeline с Kafka transactional sink mandatory enabled: incremental checkpoints + GIC + unaligned hybrid + region failover + local recovery — это required baseline configuration, не optional optimizations.",
+      "correctAnswer": true,
+      "explanation": "True. Production EOS pipelines с Kafka transactional sinks требуют layered protection. Каждый component addresses specific failure mode: (1) Incremental checkpoints (state.backend.incremental: true) — упгрейд: SST sharing, 5-20% bandwidth vs full. Без него — every checkpoint full upload, infeasible на TB scale. (2) GIC (state.backend.changelog.enabled: true + DSTL config) — STABLE checkpoint duration through DSTL append-only log. Without GIC checkpoint duration variable (p99 minutes), Kafka transaction.timeout.ms must be conservatively long (1h+), more memory pressure on brokers, periodic transaction expirations → data loss. (3) Unaligned hybrid (FLIP-76) — bounded duration under backpressure. Buffer debloating mandatory companion. Without — backpressure spikes cause alignment timeout, checkpoint failures cascade. (4) Region failover (default Flink 1.10+, verify enabled) — isolated restart scope, 2-10x recovery speedup. Without — every transient failure restart entire job. (5) Local recovery (state.backend.local-recovery: true) — fast same-node recovery (20x speedup for transient failures). Without — every restart downloads TB from S3. Each layer protects от specific failure mode. Missing any одного introduces unbounded recovery time, data loss risk, OR production toil. Production rule этот baseline = required configuration, not optional. Code reviews should check it. Это validated сотнями production incidents.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,323 @@
+---
+title: "Capstone — sink layer: Iceberg/Paimon с EOS, compaction, partitioning"
+description: "Lakehouse sink implementation: Iceberg/Paimon EOS через 2PC, partitioning strategy (date+category), pre-commit compaction sub-topology, manifest publish, retention policy."
+order: 5
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Sink", "Iceberg", "Paimon", "EOS", "Compaction", "Partitioning"]
+---
+
+# Capstone — sink layer: Iceberg/Paimon с EOS, compaction, partitioning
+
+Phase 3 implementation: sink layer. Главная задача — exactly-once writes в lakehouse с правильной partitioning, compaction для small file problem, и retention для cost control.
+
+В capstone мы используем **Paimon как primary sink** (native streaming), плюс **Iceberg mirror** для critical tables для broader analytics ecosystem (Trino, Snowflake, Spark).
+
+---
+
+## Architecture: SinkV2 с pre-commit topology
+
+Flink SinkV2 (FLIP-191) даёт extensibility points:
+- `SinkWriter` — emits Committables на barrier.
+- `Committer` — actual commit.
+- `SupportsPreCommitTopology` — sub-topology между Writer и Committer для compaction.
+- `SupportsPostCommitTopology` — для manifest publish (Iceberg).
+
+<DiagramContainer title="SinkV2 с pre-commit compaction topology" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Enriched stream"
+        tooltip="DataStream<EnrichedOrder> из UserAggregator. Parallelism 8."
+      >
+        Enriched events
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="" />
+    <FlowRow>
+      <DataBox
+        label="SinkWriter"
+        tooltip="Writes data files (Parquet). На barrier: flush, emit Committable (file metadata). State: open file handles, partial buffers."
+      >
+        Writer (parallelism 8)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Committables (file metadata)" />
+    <FlowRow>
+      <DataBox
+        label="Pre-commit topology"
+        tooltip="Compaction operator. Reads multiple small files in window, rewrites as single bigger file. Reduces small-file count к minimum. Parallelism 1-4 (heavy ops). Emits compacted Committables."
+      >
+        Compaction sub-tasks
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Compacted Committables" />
+    <FlowRow>
+      <DataBox
+        label="Committer"
+        tooltip="Single-instance commit operator. На notifyCheckpointComplete callback: atomically commit batch of Committables к Iceberg/Paimon snapshot. Single thread = atomicity guarantee."
+      >
+        Committer (parallelism 1)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="snapshot manifest" />
+    <FlowRow>
+      <DataBox
+        label="Post-commit topology"
+        tooltip="Optional: manifest publish, snapshot expiration trigger, metrics emit. For Iceberg — может publish manifest list."
+      >
+        Post-commit hooks
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Paimon sink configuration
+
+```java
+PaimonSink<EnrichedOrder> sink = PaimonSink.<EnrichedOrder>builder()
+    .catalogOptions(Map.of(
+        "metastore", "hive",
+        "uri", "thrift://hive-metastore:9083",
+        "warehouse", "s3://capstone/paimon"
+    ))
+    .tableIdentifier("capstone.fact_orders_enriched")
+    .tableOptions(Map.of(
+        "bucket", "16",                          // bucket count
+        "bucket-key", "user_id",                 // distribution key
+        "primary-key", "order_id",
+        "partition", "order_date,category",
+        "changelog-producer", "input",
+        "merge-engine", "deduplicate",
+        "snapshot.expire.execution-mode", "async",
+        "snapshot.num-retained.min", "30",
+        "snapshot.num-retained.max", "1000",
+        "snapshot.expire.limit", "10",
+        "compaction.min.file-num", "5",
+        "compaction.max.file-num", "50",
+        "compaction.early-max.file-num", "12",
+        "compaction.delete.minimum-file-num", "1",
+        "file.format", "parquet",
+        "parquet.compression", "zstd",
+        "manifest.target-file-size", "8mb",
+        "manifest.merge-min-count", "30"
+    ))
+    .build();
+
+enrichedStream
+    .sinkTo(sink)
+    .uid("paimon-enriched-sink")
+    .name("Paimon Enriched Orders");
+```
+
+Critical options:
+
+| Option | Value | Why |
+|---|---|---|
+| `bucket` | 16 | Matches downstream parallelism, 2× sink parallelism |
+| `bucket-key` | user_id | Co-locates user data, optimizes user-centric queries |
+| `partition` | order_date, category | Time-based + analytical partitioning |
+| `changelog-producer` | input | Downstream CDC consumers получают full change events |
+| `merge-engine` | deduplicate | UPSERT по primary-key, latest wins |
+| `snapshot.num-retained.min` | 30 | 30 snapshots min для time-travel |
+| `compaction.min.file-num` | 5 | Trigger compaction если ≥ 5 small files |
+| `parquet.compression` | zstd | ZSTD — best ratio для analytics data |
+
+---
+
+## Partitioning strategy
+
+Bad partitioning → too many small files OR partition skew. Good partitioning critical для query performance.
+
+**Choice для capstone fact_orders_enriched:**
+
+```
+partition by order_date, category
+```
+
+- **order_date** — natural time partitioning. Most queries filter on date range (last 7 days, last quarter).
+- **category** — analytical dimension. Most queries filter on category.
+
+**Anti-patterns:**
+
+| Anti-pattern | Why bad |
+|---|---|
+| `partition by user_id` | Too many partitions (200M), tiny files |
+| `partition by order_id` | Each row is its own partition |
+| `partition by created_at` (full timestamp) | Per-second partitions = millions |
+| No partitioning | Full table scan even для date queries |
+
+**Cardinality check:**
+
+```
+order_date: ~365 partitions / year (manageable)
+category: ~100 (manageable)
+Combined: 365 × 100 = 36,500 partitions / year — OK
+```
+
+---
+
+## Small file problem и pre-commit compaction
+
+Streaming sink natural problem: каждый checkpoint commits new files. 60-second checkpoint × 1440 checkpoints/day × 16 buckets = 23,040 files/day per partition. Storage explodes, query performance degrades.
+
+**Pre-commit compaction** в Paimon: между Writer и Committer есть compaction sub-task что merge multiple small files.
+
+```yaml
+table.properties.compaction.min.file-num: 5      # Trigger threshold
+table.properties.compaction.max.file-num: 50     # Max в одной compaction batch
+table.properties.compaction.early-max.file-num: 12  # Earlier trigger для hot partitions
+```
+
+Effect: instead of 23k tiny files/day, после compaction ~100-500 well-sized files. Query performance 10-100x faster.
+
+**Configuration trade-off**:
+- Слишком aggressive compaction (min.file-num=2) → CPU overhead, slow commits.
+- Слишком lazy (min.file-num=20) → query performance suffers.
+- Default min.file-num=5 — reasonable starting point.
+
+---
+
+## EOS through 2PC
+
+Paimon sink EOS реализован через alignment с Flink checkpoint:
+
+1. **Writer phase**: data files written к temp location.
+2. **Pre-commit (на barrier)**: Writer emits Committables (file metadata). State persisted в checkpoint.
+3. **Compaction** (pre-commit topology): merge small files.
+4. **Committer**: на `notifyCheckpointComplete()` callback, atomic Paimon snapshot commit. Adds files to manifest, publishes snapshot ID.
+5. **Recovery после crash**: pending Committables в state, re-applied на restart. Idempotent — duplicate commit detected, skipped.
+
+```yaml
+# Flink job config
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.interval: 60s
+execution.checkpointing.tolerable-failed-checkpoints: 3
+```
+
+Без EXACTLY_ONCE Paimon snapshots могут содержать duplicate data на retries.
+
+---
+
+## Iceberg sink (mirror table для Trino/Snowflake)
+
+Для broader ecosystem compat зеркалируем critical tables в Iceberg:
+
+```java
+IcebergSink<EnrichedOrder> icebergSink = IcebergSink.<EnrichedOrder>builder()
+    .catalogProperties(Map.of(
+        "type", "hive",
+        "uri", "thrift://hive-metastore:9083",
+        "warehouse", "s3://capstone/iceberg"
+    ))
+    .table("capstone.fact_orders_iceberg")
+    .tableProperties(Map.of(
+        "write.format.default", "parquet",
+        "write.parquet.compression-codec", "zstd",
+        "write.target-file-size-bytes", "536870912",  // 512 MB
+        "write.distribution-mode", "hash",
+        "format-version", "2",
+        "write.upsert.enabled", "true",
+        "write.merge.mode", "merge-on-read"
+    ))
+    .deliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .build();
+
+enrichedStream
+    .sinkTo(icebergSink)
+    .uid("iceberg-mirror-sink")
+    .name("Iceberg Mirror");
+```
+
+Different from Paimon:
+- Iceberg V2 spec — merge-on-read, delete files.
+- Compaction — external service (Iceberg compaction job через Spark/Trino) OR Iceberg-Flink runtime compaction.
+- write.distribution-mode=hash — distributes писатели по partition keys.
+
+---
+
+## Retention policy
+
+Storage costs scale linearly с data volume × retention. Capstone budget — $1k/month для storage. Active retention:
+
+```yaml
+# Paimon снимки и files
+table.properties.snapshot.num-retained.min: 30      # 30 snapshots min для time-travel
+table.properties.snapshot.num-retained.max: 1000
+table.properties.snapshot.time-retained: 30d        # 30 days time travel
+table.properties.snapshot.expire.execution-mode: async  # background cleanup
+
+# Data files
+table.properties.data.file.retain.recent: 100       # retain последние 100 data files
+table.properties.changelog.time-retained: 7d        # changelog 7 days
+```
+
+```sql
+-- Manual cleanup expired snapshots:
+CALL paimon.system.expire_snapshots('capstone.fact_orders_enriched', NOW() - INTERVAL '30' DAY);
+
+-- Orphan file cleanup (один раз в неделю):
+CALL paimon.system.remove_orphan_files('capstone.fact_orders_enriched', '7d');
+```
+
+For Iceberg:
+
+```sql
+-- Iceberg snapshot expiration
+ALTER TABLE capstone.fact_orders_iceberg
+SET TBLPROPERTIES (
+    'history.expire.max-snapshot-age-ms' = '2592000000',  -- 30 days
+    'history.expire.min-snapshots-to-keep' = '30'
+);
+
+CALL iceberg.system.expire_snapshots('capstone.fact_orders_iceberg', TIMESTAMP '2026-04-01');
+```
+
+---
+
+## Sink monitoring
+
+```yaml
+# Prometheus metrics
+flink_taskmanager_job_task_operator_numRecordsOutPerSecond{operator=~".*Sink.*"}
+flink_taskmanager_job_task_operator_checkpointDuration
+
+# Custom Paimon metrics (через FlinkSink):
+paimon_snapshot_commit_duration_ms
+paimon_compaction_file_count
+paimon_partition_count
+```
+
+Grafana panels:
+- Records/sec в sink.
+- Checkpoint duration trend.
+- Compaction frequency и file count.
+- Snapshot commit duration.
+- Disk space по partition.
+
+---
+
+## Production gotchas
+
+- **Bucket count vs parallelism mismatch** — bucket count определяет parallelism в sink. Если bucket=4 и parallelism=8, четыре subtask idle. Match bucket к sink parallelism или 2x.
+- **Partition cardinality explosion** — bad partition choice (high-cardinality column) creates миллионы tiny partitions. Always estimate partition count перед deploy.
+- **Compaction blocking commit** — heavy compaction может delay commit duration. Trade-off: aggressive compaction = fewer files, slower commits. Tune `compaction.max.file-num` и schedule heavy compaction in off-peak.
+- **EXACTLY_ONCE требует proper Flink config** — `execution.checkpointing.mode: EXACTLY_ONCE`, не AT_LEAST_ONCE. Default — EXACTLY_ONCE с Flink 2.x, но verify.
+- **Snapshot retention vs query latency** — keeping 1000 snapshots для time-travel — большой metadata. Если не используете time-travel, retention 30 days enough.
+- **Schema evolution propagation в Iceberg vs Paimon** — оба support, но differing semantics для DROP COLUMN, RENAME. Test schema changes в staging.
+- **Iceberg V1 vs V2** — V1 read-only after write, V2 supports upsert/delete. Для CDC sink — V2 required.
+- **Manifest merging** — Iceberg metadata растёт; periodic manifest merge через Iceberg maintenance procedures.
+- **Cost monitoring** — S3 storage costs накапливаются. Monitor `s3:GetObject`, `s3:ListBucket` API calls — caching client помогает.
+
+<Callout type="warning">
+**Не запускайте compaction concurrent с heavy reads** — compaction rewrites files atomically, но reads могут получить stale file IDs. Modern Iceberg/Paimon handle через MVCC, но edge cases есть. Schedule heavy compaction (manual `OPTIMIZE` команды) в off-peak windows. Background incremental compaction (built-in) обычно safe.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Sink layer review: вы deploy Paimon sink с bucket=16, partition=(order_date, category), но через 2 недели observability показывает: 1) checkpoint duration вырос с 5s до 45s; 2) query performance degraded — analyst reports SELECT * FROM fact_orders WHERE order_date = '2026-05-10' AND category = 'electronics' занимает 30 секунд (был 2s); 3) S3 storage cost вырос на 40%. Diagnose root causes и proposed fixes."
+  answer="Multi-layer diagnostic. Likely root cause — **small files problem despite compaction**. Analysis: (1) Checkpoint duration 45s — Writer flush + Compaction overhead + Committer commit. Investigate breakdown через web UI 'Checkpoint Details': how long в Writer (probably normal), Committer (probably slow due to many files to register), Compaction (если pre-commit topology — может быть bottleneck). (2) Query 30s — partition имеет thousands files, Trino scans all metadata перед select. Each file open = S3 GetObject + Parquet footer read = 50ms × thousands files = seconds. (3) Storage 40% — many small files have overhead (Parquet footer ~10KB per file, manifest entries metadata). Diagnosis steps: (a) Query Paimon system tables: `SELECT partition, file_count, size_in_bytes FROM capstone.fact_orders_enriched$files GROUP BY partition` — should be < 100 files per partition; if seeing 1000+ — compaction not keeping up. (b) Check compaction metrics: `paimon_compaction_file_count` — frequency и last run. (c) Verify config: `compaction.min.file-num` 5 — actually triggering? Maybe too small to actively compact (хотя default OK). Fixes в порядке impact: **(1) Aggressive compaction tuning** — `compaction.min.file-num: 3, compaction.early-max.file-num: 8, compaction.max.file-num: 30` — more eager compaction. **(2) Manual one-time compaction** — `CALL paimon.system.compact('capstone.fact_orders_enriched')` — full rewrite all partitions. Schedule in off-peak. **(3) Increase commit interval** — checkpoint каждые 60s = 1440 commits/day per bucket × 16 = 23k files/day. If checkpoint каждые 5 min = 288 commits/day, 80% fewer files. Trade-off: data latency 5min vs 1min. **(4) Re-evaluate partitioning** — category may have skew (electronics gets 80% orders → partition huge; obscure_category tiny). If skew detected, partition by (order_date, category_bucketed) using hash. **(5) Orphan file cleanup** — `CALL paimon.system.remove_orphan_files('capstone.fact_orders_enriched', '7d')` cleans up partially-written files from crashed checkpoints. Saves storage 5-15%. **(6) Snapshot expiration** — if retain 1000 snapshots × 16 buckets = lots metadata; reduce to 30-100. Monitoring: setup alerts on `paimon_partition_file_count > 200`, `paimon_compaction_lag_seconds > 600`. Lesson: streaming sink небольшая project ничего не делает — production scale exposes operational issues. Compaction is critical, not 'set and forget'."
+/>

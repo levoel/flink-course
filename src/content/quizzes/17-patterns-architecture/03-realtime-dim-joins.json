@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "17-patterns-architecture/03-realtime-dim-joins",
+  "moduleId": "17-patterns-architecture",
+  "_meta": {
+    "idPrefix": "flink-m17-03",
+    "description": "Quiz for real-time dim joins"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-03-q1",
+      "type": "multiple-choice",
+      "question": "Broadcast join — когда применять и каковы ограничения?",
+      "options": [
+        { "id": "a", "text": "Для любой dim таблицы — самый быстрый join" },
+        { "id": "b", "text": "Только для small dim (≤ 100-500 MB), redко обновляются (минуты-часы). Полная копия dim хранится в BroadcastState на каждом subtask в HEAP памяти. Cost = N parallelism × dim_size. На parallelism=32 и dim=1GB = 32GB RAM total. Не TTL-able" },
+        { "id": "c", "text": "Только для real-time updates тысячи в секунду" },
+        { "id": "d", "text": "Только когда нужны historical versions" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Broadcast join — replicate full dim на каждый subtask. Подходит: country list (250 entries), feature flags (1k), small product catalog (10k). BroadcastState хранится в HEAP, не RocksDB → не TTL-able, нет off-heap, считается в taskmanager.memory.task.heap.size. На parallelism=64 и dim 500 MB нужно ≥32 GB heap per TM. Updates через broadcast stream — для редких updates OK; для тысяч updates/sec — bottleneck (надо delivered каждому subtask).",
+      "studyHint": "Повторите урок 03 — раздел 'Pattern 1: Broadcast join'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-03-q2",
+      "type": "multiple-choice",
+      "question": "Temporal join (FOR SYSTEM_TIME AS OF) vs lookup join — фундаментальное различие в semantics?",
+      "options": [
+        { "id": "a", "text": "Temporal join быстрее" },
+        { "id": "b", "text": "Lookup всегда возвращает CURRENT value (eventual consistency). Temporal join возвращает HISTORICAL VERSION dim на event time fact-а — point-in-time correctness, deterministic для replay/reprocessing. Critical для financial/billing pipelines где reprocessing должен давать identical results" },
+        { "id": "c", "text": "Temporal только для SQL, lookup для DataStream" },
+        { "id": "d", "text": "Они работают identically" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical semantic difference. Reprocessing scenario: запускаете job 1 January для replay транзакций с 1 ноября. Цена продукта изменилась 15 ноября ($100 → $120). Lookup join (всегда current): возвращает $120 для всех transactions — НЕПРАВИЛЬНО (financial reports не reproducible). Temporal join (FOR SYSTEM_TIME AS OF order_time): возвращает $100 для transactions до 15 ноября, $120 после — CORRECT historical pricing. Для billing, finance, compliance — temporal обязателен. Для real-time enrichment с current value (recommendations, fraud) — lookup faster и проще.",
+      "studyHint": "Повторите урок 03 — раздел 'Pattern 3: Temporal join'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-03-q3",
+      "type": "multiple-choice",
+      "question": "Production: 50k events/sec, нужно enrich из 200M user profile (~2KB each). Какой pattern и почему?",
+      "options": [
+        { "id": "a", "text": "Broadcast — fastest" },
+        { "id": "b", "text": "Async I/O lookup в Cassandra/Redis. 200M × 2KB = 400GB total — broadcast невозможен (× parallelism = TBs). Async I/O с capacity=1000-5000 per subtask, Caffeine L1 cache (5min TTL) для hot users. unorderedWait для performance. Current value enough — не нужен temporal" },
+        { "id": "c", "text": "Temporal join — best correctness" },
+        { "id": "d", "text": "Прямой sync JDBC call" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Memory analysis: 200M × 2KB = 400GB. Broadcast невозможен — × parallelism = 12.8TB на parallelism=32. Temporal требует ВСЁ держать в state с versions — даже хуже. Async I/O — единственный sane choice. Components: (1) external KV (Cassandra/Redis Cluster/ScyllaDB); (2) RichAsyncFunction с Caffeine L1 cache; (3) unorderedWait — emit когда ready, не сохраняет ordering (для enrichment OK); (4) capacity tuned под Cassandra QPS / parallelism. Sync JDBC = death — 50k × 10ms/call = 500s/sec на subtask, невозможно.",
+      "studyHint": "Повторите урок 03 — раздел 'Pattern 2: Lookup join'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-03-q4",
+      "type": "true-false",
+      "question": "Async I/O capacity параметр не критичен — Flink сам подберёт оптимальное значение.",
+      "correctAnswer": false,
+      "explanation": "Capacity tuning critical. Слишком низкий = bottleneck (in-flight requests stuck, low throughput, backpressure). Слишком высокий = downstream DB overload (latency spikes, errors). Rule of thumb: capacity = expected_qps × latency_seconds / parallelism + 30% буфер. Например: 50k req/sec target, 10ms DB latency, 32 parallelism → capacity = 50000 × 0.01 / 32 = 15.6 → set ~25 minimum, 50 better. Monitor in-flight + backpressure to tune dynamically.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

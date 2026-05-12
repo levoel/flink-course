@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/02-memory-model-flip49",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-02",
+    "description": "Quiz for FLIP-49 Memory Model lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-02-q1",
+      "type": "multiple-choice",
+      "question": "Опишите полную декомпозицию TaskManager Total Process Memory по FLIP-49.",
+      "options": [
+        { "id": "a", "text": "Total Process = JVM Heap + Off-Heap" },
+        { "id": "b", "text": "Total Process Memory = Total Flink Memory + JVM Metaspace + JVM Overhead. Total Flink Memory = JVM Heap (Framework Heap + Task Heap) + Off-Heap (Framework Off-Heap + Task Off-Heap + Network Memory + Managed Memory)" },
+        { "id": "c", "text": "Process Memory это просто heap size" },
+        { "id": "d", "text": "Память делится только на managed и unmanaged" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-49 ввёл единую decomposition. Total Process Memory = K8s pod limit. Внутри: JVM Metaspace (class metadata, default 256MB), JVM Overhead (10% или 192MB-1GB clamped), и Total Flink Memory. Total Flink Memory разделяется на JVM Heap (Framework Heap 128MB + Task Heap = вычисляется) и Off-Heap (Framework Off-Heap 128MB + Task Off-Heap для JNI + Network Memory 10% default + Managed Memory 40% default). Без понимания этой decomposition — tuning RocksDB, GC, network — это шаманство.",
+      "studyHint": "Повторите урок — TaskManager Total Process Memory decomposition",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-02-q2",
+      "type": "multiple-choice",
+      "question": "Что определяет Managed Memory и кто её потребители?",
+      "options": [
+        { "id": "a", "text": "JVM heap для user code" },
+        { "id": "b", "text": "Off-heap pool, Flink-managed (не JVM Direct buffer — native allocations). Потребители: RocksDB (через WriteBufferManager + Block Cache), PyFlink Python workers, batch sort/hash join, ForSt cache. Default taskmanager.memory.managed.fraction: 0.4" },
+        { "id": "c", "text": "Network buffers для shuffle" },
+        { "id": "d", "text": "Metaspace для bytecode" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Managed Memory — главное для state-heavy jobs. Off-heap pool, но не плоский JVM Direct buffer — это native allocations через RocksDB JNI. Flink контролирует budget. Default 40% от Total Flink Memory. Consumer-weights (2.0+) позволяют разделить между RocksDB и PyFlink: taskmanager.memory.managed.consumer-weights: OPERATOR:70,STATE_BACKEND:70,PYTHON:30. Если managed.fraction=0 на state-heavy → RocksDB fallback к per-CF defaults → unbounded native growth → OOM.",
+      "studyHint": "Повторите урок — Managed Memory роли",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-02-q3",
+      "type": "multiple-choice",
+      "question": "K8s pod memory limit 16GB, taskmanager.memory.process.size=16g, state-heavy RocksDB job. Через 2-3 часа pod OOMKilled. JVM heap/direct memory stable. K8s events 'OOMKilled' (exit 137). Что произошло и какой fix?",
+      "options": [
+        { "id": "a", "text": "RocksDB leak — restart job" },
+        { "id": "b", "text": "Нет headroom между process.size и pod limit. OS-level overhead (cgroup accounting, page cache для mmap RocksDB SST files, /tmp tmpfs) добавляет 1-2GB поверх Flink memory budget. cgroup memory.usage exceeds pod limit → K8s OOMKill (не JVM). Fix: уменьшить process.size до 14g (оставив 1.5-2GB headroom), либо увеличить pod limit до 18Gi. Pod.limit = process.size × 1.15 минимум" },
+        { "id": "c", "text": "Java heap слишком маленький" },
+        { "id": "d", "text": "Network buffers leak" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic K8s vs JVM memory mismatch. JVM не видит OS-level overhead: cgroup accounting, page cache для mmap'нутых RocksDB SST файлов, socket buffers, /tmp tmpfs. Pod limit считает RSS — растёт пока cgroup не превышен. Симптом: JVM heap/direct OK, но pod kill — exit 137 (SIGKILL от kernel). Fix rule: pod.limit = process.size × 1.15 минимум. Также verify state.backend.rocksdb.localdir НЕ на tmpfs (default K8s emptyDir может быть memory-backed). Без headroom — гарантированный OOMKill через несколько часов под steady-state.",
+      "studyHint": "Повторите урок — Critical configuration mistakes",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-02-q4",
+      "type": "true-false",
+      "question": "С Flink 2.x legacy ключи taskmanager.heap.size и taskmanager.memory.size удалены, и конфиг обязан быть в FLIP-49 терминологии (process.size + fractions).",
+      "correctAnswer": true,
+      "explanation": "True. FLIP-49 stable с 1.10. В 2.x legacy keys убраны. Это значит: если у вас Helm chart / Terraform с taskmanager.heap.size — TaskManager fails to start, или ключ silently ignored с warning. Production audit: ищите legacy keys в всех configs, мигрируйте на process.size + managed.fraction + network.fraction. Также verify pod.limit имеет headroom (15% min). FLIP-49 — foundation для всего production memory tuning, без неё RocksDB/GC tuning слепое.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

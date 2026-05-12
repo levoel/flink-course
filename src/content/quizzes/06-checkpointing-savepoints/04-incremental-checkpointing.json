@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "06-checkpointing-savepoints/04-incremental-checkpointing",
+  "moduleId": "06-checkpointing-savepoints",
+  "_meta": {
+    "idPrefix": "flink-m06-04",
+    "description": "Quiz for incremental checkpointing lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m06-04-q1",
+      "type": "multiple-choice",
+      "question": "На каком property LSM-tree основан incremental checkpoint механизм?",
+      "options": [
+        { "id": "a", "text": "LSM-tree быстрее на reads" },
+        { "id": "b", "text": "SST files в LSM IMMUTABLE — once written, никогда не modified. Compaction создаёт new SSTs, deletes old, но never modifies existing. Между checkpoints большинство SSTs те же. Flink upload-ит только new SSTs (diff vs previous checkpoint), references existing SSTs через SharedStateRegistry" },
+        { "id": "c", "text": "LSM-tree имеет hierarchical structure" },
+        { "id": "d", "text": "Это работает через B-tree pages" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Immutability SST files — fundamental property RocksDB LSM. После write никогда не modified. Compaction создаёт new SSTs (merging old), deletes old, но не in-place updates. Flink эксплуатирует это: между checkpoints большинство SSTs те же (только flush + occasional compaction generates new). На каждом checkpoint Flink делает diff с previous checkpoint manifest — uploads только new SSTs, references existing через SharedStateRegistry. Typical 5-20% upload vs full state. 10-50x bandwidth reduction для steady-state jobs. Без LSM immutability — incremental невозможен в этой форме.",
+      "studyHint": "Повторите урок — раздел 'Foundation'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m06-04-q2",
+      "type": "multiple-choice",
+      "question": "Что делает SharedStateRegistry и где живёт?",
+      "options": [
+        { "id": "a", "text": "Это компонент TaskManager-а" },
+        { "id": "b", "text": "На JobManager (per-job). Reference counting: tracks какие SST files referenced какими checkpoints. Map: sstKey → set of checkpointIds. На каждый checkpoint registerReference(sst, ckpt). При expiration checkpoint — unregisterReference. Когда refs={} — safe to delete SST из DFS. Critical для cleanup без losing данных другими checkpoints" },
+        { "id": "c", "text": "Storage SST files на S3" },
+        { "id": "d", "text": "Это deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SharedStateRegistry — per-job on JobManager. Reference counting algorithm для cleanup shared state. Mechanics: Map<sstKey, Set<checkpointId>>. На каждый incremental checkpoint manifest — registerReference для each SST. На checkpoint expiration — unregisterReference, refs decrement. Когда refs={} — SST safe for DFS deletion. Это why incremental works correctly: SST_001 created в checkpoint 1, reused в 2, 3, ... 10. Checkpoint 1 expires — SST_001 still in 2-10. Eventually all expire — SST_001 deleted. Без registry — leak DFS storage. DFS layout: shared/ directory для shared SSTs, exclusive/ для per-checkpoint state.",
+      "studyHint": "Повторите урок — раздел 'SharedStateRegistry'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m06-04-q3",
+      "type": "multiple-choice",
+      "question": "После rescale (parallelism 100 → 200) incremental checkpoint upload spike до 80% от full. Почему и mitigation?",
+      "options": [
+        { "id": "a", "text": "Bug в Flink — нужен upgrade" },
+        { "id": "b", "text": "Rescale redistributes key groups → каждый subtask получает другой subset keys → RocksDB SSTs completely differ from previous checkpoint. SharedStateRegistry diff = ~100%, эквивалентно full checkpoint. Plus heavy compaction после rescale generates many new SSTs. Inherent — нет magic fix. Mitigations: increase timeout, wait для stabilization (5-10 checkpoints), enable GIC (DSTL независим от SST layout), enable ForSt (disaggregated state, нет re-upload)" },
+        { "id": "c", "text": "Increase parallelism еще больше" },
+        { "id": "d", "text": "Switch на heap state backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Inherent limitation incremental + rescale combination. При changing parallelism (100 → 200): Flink redistributes key groups между subtasks. Each subtask теперь contains different subset of keys → RocksDB на каждом subtask completely different SSTs from previous checkpoint. SharedStateRegistry diff = ~100% — все SSTs new. Plus после rescale RocksDB compaction reorganizes state по new key distribution → еще more new SSTs. Mitigations: (1) Increase execution.checkpointing.timeout temporary (30-60min); (2) Wait 5-10 checkpoints для stabilization; (3) ENABLE GIC — DSTL log не зависит от SST layout, checkpoint = log flush (constant time independent of compaction); (4) ENABLE ForSt — state на S3 уже, нет re-upload, just remapping metadata. Production: для jobs с frequent rescale (autoscaling) — ENABLE GIC + ForSt mandatorily.",
+      "studyHint": "Повторите урок — раздел 'Production gotchas'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m06-04-q4",
+      "type": "true-false",
+      "question": "Savepoints поддерживают incremental — это speedup vs full snapshot.",
+      "correctAnswer": false,
+      "explanation": "False. Savepoints — ALWAYS full snapshot, не incremental. Reasoning: savepoints must быть self-contained (independent of any other snapshots). Если savepoint incremental — он depend на previous checkpoints, которые могут быть deleted/expired. Self-containment delete portability и lifecycle independence. Performance impact: savepoints значительно медленнее checkpoints. На 1TB state savepoint может быть minutes-hours. Checkpoints с incremental — 5-20% размер. Это why stop-with-savepoint медленнее чем checkpoint. Если нужен fast savepoint-like operation — use retained checkpoint (RETAIN_ON_CANCELLATION) который is incremental but tied к Flink job (не portable cross-version).",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

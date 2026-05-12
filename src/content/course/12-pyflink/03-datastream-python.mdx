@@ -1,0 +1,422 @@
+---
+title: "DataStream API в Python: limited subset, growing"
+description: "DataStream API в Python — ProcessFunction, KeyedProcessFunction, state в Python. Differences с Java API."
+order: 3
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["PyFlink", "DataStream", "ProcessFunction", "KeyedProcessFunction", "State"]
+---
+
+# DataStream API в Python: limited subset, growing
+
+PyFlink DataStream API — Python мост к Flink's stream processing primitives. Изначально (Flink 1.11) — очень ограниченный, имел только базовые transformations. К Flink 2.2 — покрыл большинство production patterns: ProcessFunction, KeyedProcessFunction, timers, side outputs, basic state primitives (ValueState, ListState, MapState). Но **parity с Java всё ещё не достигнута** — нет SinkV2 builder Python wrapper, нет async I/O Python API (до 2.2 — см. урок 08), нет complex windowing operators, нет CEP API.
+
+В этом уроке: какие features доступны, какие patterns работают, key differences от Java API, и где придётся fallback на Table API (см. урок 04) когда DataStream не достаточен.
+
+---
+
+## DataStream API: что доступно в 2.2
+
+Доступно в Python:
+
+- Source/Sink basics: `from_collection`, `from_source`, `add_sink`.
+- Transformations: `map`, `filter`, `flat_map`, `key_by`, `reduce`, `process`.
+- ProcessFunction, KeyedProcessFunction (since 1.14).
+- Side outputs through `OutputTag`.
+- Watermark strategies через `WatermarkStrategy`.
+- State primitives: ValueState, ListState, MapState (registered в `RuntimeContext`).
+- Timers (Event time + Processing time).
+- Connected streams (`connect`, `co_process`).
+- Broadcast state (limited).
+
+**Не доступно / limited**:
+
+- Async I/O API — только в 2.2+ для async UDFs (см. урок 08).
+- Window assigners — limited subset, complex windowing лучше через Table API.
+- CEP (FlinkCEP) — Java-only.
+- DataStream V2 (FLIP-409) — Java-only experimental.
+- Custom SourceFunction/SinkFunction (removed в 2.0) — но не было Python API для них anyway.
+- AggregateFunction с RICH context — partial.
+- Custom partitioners — limited.
+
+---
+
+## Базовый pipeline
+
+```python
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext
+from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
+from pyflink.common import Types, Time
+from pyflink.common.watermark_strategy import WatermarkStrategy
+
+env = StreamExecutionEnvironment.get_execution_environment()
+env.set_parallelism(4)
+env.enable_checkpointing(60_000)
+
+# Source
+stream = env.from_collection(
+    [(1, "click", 1234567890),
+     (2, "view", 1234567891),
+     (1, "purchase", 1234567892)],
+    type_info=Types.TUPLE([Types.INT(), Types.STRING(), Types.LONG()]))
+
+# Transformations
+result = (stream
+    .filter(lambda r: r[1] != "view")
+    .key_by(lambda r: r[0], key_type=Types.INT())
+    .process(MyProcessFn(), output_type=Types.STRING()))
+
+result.print()
+env.execute("py-datastream")
+```
+
+Note: **тип info обязателен** для большинства operations — без `output_type` Flink не знает, как сериализовать results на JVM side.
+
+---
+
+## ProcessFunction / KeyedProcessFunction в Python
+
+```python
+from pyflink.datastream.functions import KeyedProcessFunction
+from pyflink.datastream.state import ValueStateDescriptor
+
+
+class FraudDetector(KeyedProcessFunction):
+
+    def open(self, runtime_context: RuntimeContext):
+        # State descriptor — same pattern как Java
+        descriptor = ValueStateDescriptor(
+            name="last_tx_amount",
+            value_type_info=Types.DOUBLE())
+        self.last_amount = runtime_context.get_state(descriptor)
+
+    def process_element(self, value, ctx):
+        user_id, event_type, ts, amount = value
+
+        # State access — Python dict-like через value()/update()
+        last = self.last_amount.value()
+        if last is None:
+            self.last_amount.update(amount)
+            return
+
+        # Business logic
+        if amount > last * 10:
+            yield f"FRAUD: user {user_id} amount {amount} vs last {last}"
+
+        self.last_amount.update(amount)
+
+        # Register timer (event time)
+        ctx.timer_service().register_event_time_timer(ts + 60_000)
+
+    def on_timer(self, timestamp, ctx):
+        # Called when registered timer fires
+        yield f"timer at {timestamp} for key {ctx.get_current_key()}"
+```
+
+Использование:
+
+```python
+events_stream
+    .key_by(lambda e: e[0], key_type=Types.INT())
+    .process(FraudDetector(), output_type=Types.STRING())
+```
+
+Key points:
+
+- `KeyedProcessFunction` — стандартный pattern для stateful processing.
+- `RuntimeContext` — доступ к state, metrics, distributed cache.
+- `ValueStateDescriptor` — same concept как Java.
+- Timers — `register_event_time_timer(timestamp)` / `register_processing_time_timer(timestamp)`.
+- `process_element` — generator pattern (`yield` instead of `out.collect()`).
+
+---
+
+## State primitives
+
+Поддерживаются три основных:
+
+### ValueState
+
+```python
+from pyflink.datastream.state import ValueStateDescriptor
+
+descriptor = ValueStateDescriptor("count", Types.LONG())
+self.count_state = runtime_context.get_state(descriptor)
+
+# Usage
+current = self.count_state.value()    # None if empty
+self.count_state.update(42)
+self.count_state.clear()
+```
+
+### ListState
+
+```python
+from pyflink.datastream.state import ListStateDescriptor
+
+descriptor = ListStateDescriptor("recent_events", Types.STRING())
+self.events = runtime_context.get_list_state(descriptor)
+
+self.events.add("event-1")
+for e in self.events.get():
+    print(e)
+self.events.update(["new", "list"])  # replace
+self.events.clear()
+```
+
+### MapState
+
+```python
+from pyflink.datastream.state import MapStateDescriptor
+
+descriptor = MapStateDescriptor("device_counts", Types.STRING(), Types.LONG())
+self.devices = runtime_context.get_map_state(descriptor)
+
+self.devices.put("device-1", 100)
+count = self.devices.get("device-1")  # 100
+self.devices.contains("device-2")     # False
+for k, v in self.devices.entries():
+    print(k, v)
+self.devices.clear()
+```
+
+Все state primitives serialize values через configured TypeInformation. Python objects → JVM bytes через PyFlink's serializer layer (cloudpickle для complex objects, native serializers для primitives).
+
+---
+
+## Differences от Java API — пятёрка важных
+
+<DiagramContainer title="Python vs Java DataStream API" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Diff 1: type_info обязателен"
+        tooltip="Java: TypeExtractor выводит types из generic signatures. Python: typing hints не подходят, Flink requires explicit `output_type` parameter. Без него ошибка или fallback на cloudpickle Generic."
+      >
+        Type hints required
+      </DataBox>
+      <DataBox
+        label="Diff 2: yield vs Collector"
+        tooltip="Java: `out.collect(value)` имerative. Python: `yield value` generator pattern. Естественнее для Python, but no batch emit (collect множества elements). Multiple yields в одном process_element поддерживаются."
+      >
+        yield generator
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Diff 3: lambda OK"
+        tooltip="Java: lambdas + generics проблемны (см. M11 урок 04). Python lambdas работают без issues — type info передаётся explicit. .map(lambda r: r[0], output_type=Types.INT()) без problems."
+      >
+        Lambdas work natively
+      </DataBox>
+      <DataBox
+        label="Diff 4: Tuples — Python tuples"
+        tooltip="Java: flink.Tuple2/3/... с f0/f1 fields. Python: native `tuple` (r[0], r[1]). PyFlink преобразует automatically. Однако TypeInformation использует Types.TUPLE([...])."
+      >
+        Native tuples
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Diff 5: Performance"
+        tooltip="Java: ~100% baseline. Python process mode: ~30-50% (IPC overhead, см. урок 05). Python thread mode (PEMJA): ~70-90% (см. урок 06). Pandas UDFs vectorized: ~90-95% (Arrow zero-copy, урок 07)."
+      >
+        Performance gap
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Practical: full fraud detection job в Python
+
+```python
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext
+from pyflink.datastream.functions import KeyedProcessFunction
+from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
+from pyflink.common import Types, WatermarkStrategy, Duration
+from pyflink.datastream.connectors.kafka import KafkaSource, KafkaSink, KafkaOffsetsInitializer
+
+
+class FraudDetector(KeyedProcessFunction):
+
+    def open(self, runtime_context: RuntimeContext):
+        self.recent_purchases = runtime_context.get_map_state(
+            MapStateDescriptor("recent", Types.LONG(), Types.DOUBLE()))
+        self.last_alert_time = runtime_context.get_state(
+            ValueStateDescriptor("last_alert", Types.LONG()))
+
+        # Metrics
+        self.fraud_counter = runtime_context.get_metric_group().counter("fraud_alerts")
+        self.amount_histogram = runtime_context.get_metric_group().histogram(
+            "amounts", DescriptiveStatisticsHistogram(1000))
+
+    def process_element(self, value, ctx):
+        user_id = value['user_id']
+        amount = value['amount']
+        ts = ctx.timestamp()
+
+        # Update histogram
+        self.amount_histogram.update(int(amount))
+
+        # Recent purchases tracking
+        self.recent_purchases.put(ts, amount)
+
+        # Cleanup old entries (older than 5 min)
+        cutoff = ts - 5 * 60 * 1000
+        old_keys = [k for k in self.recent_purchases.keys() if k < cutoff]
+        for k in old_keys:
+            self.recent_purchases.remove(k)
+
+        # Fraud detection: sum за 5 min > $1000
+        total_5min = sum(self.recent_purchases.values())
+        if total_5min > 1000.0:
+            # Throttle alerts — не more than 1 per minute per user
+            last_alert = self.last_alert_time.value()
+            if last_alert is None or ts - last_alert > 60_000:
+                self.last_alert_time.update(ts)
+                self.fraud_counter.inc()
+                yield {
+                    'user_id': user_id,
+                    'alert_type': 'HIGH_VELOCITY',
+                    'total_5min': total_5min,
+                    'timestamp': ts
+                }
+
+
+def main():
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(8)
+    env.enable_checkpointing(60_000)
+
+    # Kafka source
+    source = (KafkaSource.builder()
+        .set_bootstrap_servers("kafka:9092")
+        .set_topics("transactions")
+        .set_group_id("py-fraud-detector")
+        .set_starting_offsets(KafkaOffsetsInitializer.latest())
+        .set_value_only_deserializer(JsonDeserializer())
+        .build())
+
+    watermark_strategy = (WatermarkStrategy
+        .for_bounded_out_of_orderness(Duration.of_seconds(20))
+        .with_timestamp_assigner(EventTimeAssigner()))
+
+    transactions = env.from_source(source, watermark_strategy, "kafka-tx")
+
+    # Fraud detection pipeline
+    fraud_alerts = (transactions
+        .key_by(lambda tx: tx['user_id'], key_type=Types.LONG())
+        .process(FraudDetector(), output_type=Types.MAP(Types.STRING(), Types.STRING())))
+
+    # Kafka sink
+    sink = (KafkaSink.builder()
+        .set_bootstrap_servers("kafka:9092")
+        .set_record_serializer(...)
+        .build())
+
+    fraud_alerts.sink_to(sink).uid("fraud-alert-sink")
+
+    env.execute("py-fraud-detection")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Это полноценный production-style PyFlink job. Performance в process mode — ~30-50% Java equivalent. Можно дальше optimize через thread mode (PEMJA, урок 06) до ~70-90%.
+
+---
+
+## Type system: cloudpickle vs explicit types
+
+Python's dynamic typing встречает Flink's static type system. PyFlink runtime использует **cloudpickle** для serializing Python objects, который handles arbitrary classes, closures, lambdas:
+
+```python
+# Python class works через cloudpickle
+class MyDataClass:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+# Без explicit type, PyFlink использует Types.PICKLED_BYTE_ARRAY
+stream = env.from_collection([MyDataClass(1, 2)])
+# type_info default: Types.PICKLED_BYTE_ARRAY()
+```
+
+**Trade-off**:
+
+- **Plus**: works for anything (arbitrary classes, lambdas, closures).
+- **Minus**: serialization size — cloudpickle includes class definition bytes (~hundreds of bytes per record), ~10x slower than typed paths.
+
+Для production — explicit `Types.*`:
+
+```python
+from pyflink.common import Types
+
+# Explicit type info — fast path
+stream = env.from_collection(
+    [(1, "a"), (2, "b")],
+    type_info=Types.TUPLE([Types.INT(), Types.STRING()]))
+```
+
+Available types: `Types.STRING()`, `Types.INT()`, `Types.LONG()`, `Types.DOUBLE()`, `Types.BOOLEAN()`, `Types.TUPLE([t1, t2])`, `Types.LIST(t)`, `Types.MAP(k, v)`, `Types.ROW([t1, t2])`, `Types.ROW_NAMED(['a', 'b'], [t1, t2])`, `Types.PICKLED_BYTE_ARRAY()` (fallback).
+
+---
+
+## Production gotchas
+
+- **Missing `output_type`** — silent cloudpickle fallback, ~10x slower. Always explicit.
+- **Lambdas capturing globals** — closure captures big global objects (loaded models), они shipped per record. Use class-based UDF с lazy init.
+- **State serialization Python ↔ Java** — primitive types work natively, Python custom classes → cloudpickle bytes на JVM side. State size может быть гигантским. Convert в Tuple/dict с primitive types для state.
+- **Watermark assigners — Java** — `TimestampAssigner` имеет Python API, но complex assigners часто требуют Java implementation. Workaround: pre-process events в map() to set timestamp.
+- **Side outputs** — `OutputTag` работает, но requires explicit type_info на каждый side stream.
+- **Connected streams** — `connect()` available, но `CoProcessFunction` Python API limited.
+- **Broadcast state** — есть, но performance hit больше Java (Python receives broadcasted data via IPC each evaluation).
+- **`from_collection` для testing** — works locally, но serializes collection через JVM gateway — slow для large datasets. Use proper source для real testing.
+- **`execute_and_collect` returns iterator** — consume полностью или close, иначе resource leaks. Use `with ... as` если supported.
+- **Type inference для nested types** — `Types.MAP(STRING, MAP(STRING, INT))` works, но deeper nesting — verbose. Use Row types или explicit POJO classes.
+- **Watermark progress в Python operators** — Python ProcessFunction может block watermark propagation если slow. Monitor через `currentWatermark` metric.
+
+<Callout type="warning">
+Python ProcessFunction blocks watermarks if process_element is slow. В Java mailbox processor explicitly schedules watermark forwarding, в Python — sequential. Производственный pipeline с slow Python UDF может cause watermark stalls в downstream windowed operators. Monitor watermark gap метрики. Решение: pandas UDFs (vectorized, urок 07) или thread mode (PEMJA, урок 06).
+</Callout>
+
+<Callout type="tip">
+Decision rule: **сложные stateful patterns с keyed state — рассмотрите Java**. PyFlink DataStream API works, но perf gap ~50% process mode. Если ML-inference dominant в pipeline — PyFlink выигрывает (no IPC к external Python service). Если pure event processing с complex state — Java native.
+</Callout>
+
+---
+
+## When to fall back to Table API
+
+PyFlink Table API (см. урок 04) имеет **first-class parity** с Java Table API, в отличие от DataStream. Если ваш use case:
+
+- Простой filtering + aggregation + joining → Table API SQL быстрее coding.
+- Window operations → Table API имеет полный set of windowing.
+- Schema-driven processing — Table API CREATE TABLE + SQL queries.
+
+Используйте DataStream только если:
+
+- Нужен custom state с complex логикой (per-key complex bookkeeping).
+- Нужны timers + custom event-time handling.
+- Нужны low-level Process functions.
+
+В одном Python job можно конвертировать между Table и DataStream:
+
+```python
+table = t_env.from_data_stream(stream, schema)
+# Process с SQL
+result_table = t_env.sql_query("SELECT user_id, COUNT(*) FROM events GROUP BY user_id, TUMBLE(ts, INTERVAL '5' MINUTE)")
+result_stream = t_env.to_data_stream(result_table)
+# Process с DataStream
+result_stream.key_by(...).process(...)
+```
+
+---
+
+<KnowledgeCheck
+  question="Production team хочет переписать Java Flink job (fraud detection: keyed state per user, multiple ValueState fields, timers, side outputs) на PyFlink из-за shift в ML workload. Какие capabilities в DataStream Python API есть/нет, и какой production architecture вы бы предложили?"
+  answer="**Capabilities available в PyFlink DataStream 2.2**: (1) ProcessFunction, KeyedProcessFunction — first-class. (2) State primitives — ValueState, ListState, MapState — все работают с RuntimeContext. (3) Timers — event time + processing time. (4) Side outputs через OutputTag. (5) Watermark strategies. (6) Source/sink builders. (7) Async UDFs в Flink 2.2 (см. урок 08) — для ML inference external API calls. **NOT available**: (1) CEP API (Java only). (2) DataStream V2 (FLIP-409, experimental Java). (3) Complex windowing — basic windows работают, но complex assigners limited (используйте Table API). (4) AsyncDataStream wrapper (Java specific) — но Async UDFs в Flink 2.2 закрывает большинство use cases. (5) Some advanced Sink V2 builders. **Architecture proposal** для fraud detection с ML: **Option A (recommended) — hybrid**: keep core Java для performance-critical processing, ML inference в Python через external service OR PyFlink job. (a) Java job: Kafka → keyed state per user с recent transactions → timers для cleanup → output features stream к Kafka. (b) Python job: features Kafka → PyFlink с PyTorch model для inference → fraud decisions Kafka. Pros: native performance для state-heavy, Python flexibility для ML. Cons: two jobs, two deployments. **Option B — full PyFlink с thread mode (PEMJA)**: один Python job, KeyedProcessFunction с state, model loaded once per slot в open(). Performance ~70-90% Java (см. урок 06) если правильно configured. Pros: single pipeline, ML и stream processing colocated. Cons: PEMJA limits на native deps (PyTorch может работать, но carefully). **Option C — full PyFlink process mode**: standard PyFlink, простой setup. Performance ~30-50% Java. ОК если throughput не критичен (<10k events/sec). **Production architecture recommendation**: Option A для high-throughput production (10k+ events/sec, financial use case). Option B для medium throughput (1-10k events/sec) с ML-heavy logic. Pure DataStream Python для prototyping. **Implementation details**: (a) Python KeyedProcessFunction с MapState для recent transactions (sliding window), ValueState для last alert timestamp (rate limiting). (b) Explicit `output_type=Types.MAP(...)` для всех transformations — never cloudpickle fallback. (c) Timers для state cleanup (event time, register_event_time_timer). (d) Side output для anomalies. (e) Async UDF (Flink 2.2) для ML inference call к internal model server. (f) Performance monitoring: PyFlink-specific metrics (Python heap, IPC latency, bundle processing time). **Migration plan**: (1) Side-by-side run Java + PyFlink для 1 week. (2) Compare alert counts/latency. (3) If PyFlink throughput acceptable — gradual traffic shift 5% → 25% → 100%. (4) Java job remains как warm standby for rollback."
+/>

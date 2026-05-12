@@ -1,0 +1,332 @@
+---
+title: "Stateful microservice pattern — event-sourcing на Flink"
+description: "Flink как stateful backend микросервиса: ProcessFunction вместо CRUD endpoint-ов, replay capability через savepoint, command/event разделение. Сравнение с traditional REST + DB."
+order: 2
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Stateful Microservice", "Event Sourcing", "CQRS", "ProcessFunction", "Replay"]
+---
+
+# Stateful microservice pattern — event-sourcing на Flink
+
+Классический микросервис — это REST endpoint поверх database. Order service принимает POST `/orders`, валидирует, делает INSERT в Postgres, отвечает 201. State живёт в БД, бизнес-логика в коде, между ними N-tier latency и race conditions на concurrent updates.
+
+Flink предлагает другую модель: **stateful microservice как stream of commands → events**. Бизнес-логика — это KeyedProcessFunction. State (открытые order-ы, лимиты, баланс пользователя) — это ValueState/MapState внутри оператора. Database исчезает как отдельный компонент: state IS the database. Commit log Kafka заменяет write-ahead log.
+
+Этот pattern не для всех. Но для domain-ов с complex state machine (orders, payments, fraud, IoT device shadows) он drastically снижает complexity и даёт supercapacity: full audit log из коробки, replay из любой точки прошлого, exactly-once semantics без 2PC между сервисом и БД.
+
+---
+
+## Архитектурный сдвиг
+
+Сравним два подхода для одного use case — order service.
+
+<DiagramContainer title="Traditional REST + DB vs Flink stateful microservice" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Client"
+        tooltip="Mobile app, web, другие сервисы. Шлёт команду на изменение state."
+      >
+        POST /orders
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="HTTP REST" />
+    <FlowRow>
+      <DataBox
+        label="Order Service (REST)"
+        tooltip="Traditional: stateless app server, валидация в коде, persistence в БД через ORM. Каждый request — N round-trips к БД (read current state, validate, write new state). Concurrent updates требуют либо optimistic locking, либо distributed lock."
+      >
+        Validate → SQL UPDATE
+      </DataBox>
+      <DataBox
+        label="Postgres"
+        tooltip="State of truth. Row per order. Indexes на queries. Транзакции для atomicity. Replication для HA. Backup для DR. Schema migrations. Connection pool. Всё это — операционная сложность."
+      >
+        orders table
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="vs" />
+    <FlowRow>
+      <DataBox
+        label="Flink Command Topic"
+        tooltip="Kafka topic 'order-commands'. Каждая команда — event с user_id key. ОБЯЗАТЕЛЬНО key = aggregate root id (например order_id или user_id) — это даст single-writer per aggregate через keyBy."
+      >
+        Kafka: order-commands
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="keyBy(orderId)" />
+    <FlowRow>
+      <DataBox
+        label="OrderProcessor (Flink)"
+        tooltip="KeyedProcessFunction. ValueState<OrderState> хранит текущее состояние order-а. processElement применяет command, генерирует event(-ы), updates state. Single-threaded per key — concurrency не нужен. Exactly-once гарантируется ABS + 2PC sink."
+      >
+        ValueState&lt;OrderState&gt;
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="emit events" />
+    <FlowRow>
+      <DataBox
+        label="Event Topic"
+        tooltip="Kafka topic 'order-events': OrderCreated, OrderPaid, OrderShipped. Downstream consumers — analytics, notifications, search indexer, ML feature store. Это classic CQRS — write через commands, read через materialized views over events."
+      >
+        Kafka: order-events
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Command vs Event
+
+Фундаментальное разделение event-sourcing:
+
+| Aspect | Command | Event |
+|---|---|---|
+| Намерение | «Сделай X» | «Произошло Y» |
+| Может быть отвергнут | Да (валидация) | Нет (факт) |
+| Granularity | Один на user action | Может быть N на command |
+| Naming | Imperative: PlaceOrder, CancelOrder | Past tense: OrderPlaced, OrderCancelled |
+| Идемпотентность | Желательна (request_id) | Не нужна (event уже произошёл) |
+
+`PlaceOrder` (command) → валидация → `OrderPlaced` + `InventoryReserved` + `PaymentInitiated` (events).
+
+```java
+public sealed interface OrderCommand permits PlaceOrder, CancelOrder, Pay {}
+public record PlaceOrder(String orderId, String userId, List<Item> items, String requestId) implements OrderCommand {}
+public record CancelOrder(String orderId, String reason, String requestId) implements OrderCommand {}
+public record Pay(String orderId, BigDecimal amount, String paymentId, String requestId) implements OrderCommand {}
+
+public sealed interface OrderEvent permits OrderPlaced, OrderCancelled, OrderPaid, OrderRejected {}
+public record OrderPlaced(String orderId, String userId, List<Item> items, BigDecimal total, Instant ts) implements OrderEvent {}
+public record OrderCancelled(String orderId, String reason, Instant ts) implements OrderEvent {}
+public record OrderPaid(String orderId, BigDecimal amount, String paymentId, Instant ts) implements OrderEvent {}
+public record OrderRejected(String orderId, String reason, String requestId, Instant ts) implements OrderEvent {}
+```
+
+Sealed interfaces (Java 17+) дают pattern matching — exhaustive switch без default branch.
+
+---
+
+## ProcessFunction как aggregate root
+
+```java
+public class OrderProcessor extends KeyedProcessFunction<String, OrderCommand, OrderEvent> {
+
+    private transient ValueState<OrderState> state;
+    private transient MapState<String, Long> processedCommands; // idempotency
+
+    @Override
+    public void open(Configuration cfg) {
+        state = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("order-state", OrderState.class));
+
+        StateTtlConfig idempotencyTtl = StateTtlConfig
+            .newBuilder(Duration.ofHours(24))
+            .setUpdateType(UpdateType.OnCreateAndWrite)
+            .cleanupInRocksdbCompactFilter(1000)
+            .build();
+        MapStateDescriptor<String, Long> idemDesc =
+            new MapStateDescriptor<>("processed-cmds", String.class, Long.class);
+        idemDesc.enableTimeToLive(idempotencyTtl);
+        processedCommands = getRuntimeContext().getMapState(idemDesc);
+    }
+
+    @Override
+    public void processElement(OrderCommand cmd, Context ctx, Collector<OrderEvent> out)
+            throws Exception {
+
+        // Idempotency check — same request_id уже processed
+        if (processedCommands.contains(cmd.requestId())) {
+            return;
+        }
+
+        OrderState current = state.value();
+        OrderEvent event = switch (cmd) {
+            case PlaceOrder p   -> handlePlaceOrder(current, p, ctx);
+            case CancelOrder c  -> handleCancel(current, c, ctx);
+            case Pay pay        -> handlePay(current, pay, ctx);
+        };
+
+        if (event != null) {
+            OrderState next = apply(current, event);
+            state.update(next);
+            out.collect(event);
+            processedCommands.put(cmd.requestId(), ctx.timestamp());
+        }
+    }
+
+    private OrderEvent handlePlaceOrder(OrderState s, PlaceOrder cmd, Context ctx) {
+        if (s != null) {
+            return new OrderRejected(cmd.orderId(), "already exists", cmd.requestId(), Instant.now());
+        }
+        BigDecimal total = cmd.items().stream()
+            .map(Item::price)
+            .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return new OrderPlaced(cmd.orderId(), cmd.userId(), cmd.items(), total, Instant.now());
+    }
+
+    private OrderState apply(OrderState before, OrderEvent event) {
+        return switch (event) {
+            case OrderPlaced p    -> new OrderState(p.orderId(), p.userId(), p.items(), p.total(),
+                                                     Status.PLACED, p.ts());
+            case OrderPaid paid   -> before.withStatus(Status.PAID);
+            case OrderCancelled c -> before.withStatus(Status.CANCELLED);
+            case OrderRejected r  -> before; // не меняем state, только emit
+        };
+    }
+}
+```
+
+Каждый command → single-threaded apply через keyBy(orderId). Никаких race conditions, никаких optimistic locks, никаких distributed transactions. State держится в RocksDB рядом с computation.
+
+---
+
+## Replay capability — суперсила event-sourcing
+
+Самая мощная способность: **replay event log с любой точки прошлого**.
+
+```bash
+# Сохранили savepoint вчера в 14:00
+flink stop --savepointPath s3://savepoints/order-service <jobId>
+
+# Обнаружили баг в логике apply — старая версия неверно считала total
+# Fix code, deploy
+
+# Replay из savepoint, но Kafka offsets reset на 7 дней назад
+flink run \
+    -s s3://savepoints/order-service/savepoint-xxx \
+    --allowNonRestoredState \
+    order-service.jar
+```
+
+Или ещё мощнее — добавили новый downstream consumer (например, новый аналитический dashboard):
+
+```java
+KafkaSource<OrderEvent> source = KafkaSource.<OrderEvent>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("order-events")
+    .setGroupId("new-analytics-v1")
+    .setStartingOffsets(OffsetsInitializer.earliest()) // ← из самого начала
+    .build();
+```
+
+Прочитав event log с начала, новый consumer построит свою materialized view над всей историей. В традиционной архитектуре это означало бы full table scan, JOIN-ы, корреляцию по timestamps, и потеря deletions (Postgres не помнит delete). С event log это просто `setStartingOffsets(earliest)`.
+
+<Callout type="note">
+Replay работает корректно только если **events изменяются по правилам compatibility** — schema evolution через Avro/Protobuf, никаких semantic-breaking changes. Если событие OrderPlaced v1 имеет поле `total`, в v2 — `subtotal + tax + shipping`, replay over старых v1 events требует upcasting в коде consumer-а. Это серьёзный design constraint event-sourced систем.
+</Callout>
+
+---
+
+## Materialized views — CQRS read side
+
+Write side — Flink stateful service генерирует events. Read side — отдельные projection-ы, оптимизированные под queries.
+
+<DiagramContainer title="CQRS: command/event/projection разделение" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Write side"
+        tooltip="OrderProcessor (Flink stateful). State of truth. Single-threaded per aggregate root через keyBy. Гарантирует invariants (нельзя оплатить cancelled order)."
+      >
+        OrderProcessor
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="OrderEvent" />
+    <FlowRow>
+      <DataBox
+        label="Event log"
+        tooltip="Kafka topic order-events. Append-only. Source of truth для replay. Retention infinite (compacted topic с key=orderId), или long retention (90 days), или archive в S3 через MirrorMaker."
+      >
+        order-events topic
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="N consumers" />
+    <FlowRow>
+      <DataBox
+        label="OLTP projection"
+        tooltip="Materialized Table в Flink → Postgres. Latest state per order для admin UI queries. Идемпотентный UPSERT через primary key."
+      >
+        Postgres view
+      </DataBox>
+      <DataBox
+        label="Analytics projection"
+        tooltip="Aggregated metrics → ClickHouse. Daily/hourly aggregates. Real-time через Flink window + INSERT INTO ClickHouse."
+      >
+        ClickHouse view
+      </DataBox>
+      <DataBox
+        label="Search projection"
+        tooltip="Denormalized документы для search → Elasticsearch. Join order с customer/product. Flink stream-stream join + ES sink."
+      >
+        ES view
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Каждая projection independent. Можно добавить новую (replay из earliest), пересоздать (drop view + reset consumer group → earliest), или удалить — write side не меняется.
+
+---
+
+## Когда этот pattern оправдан
+
+| Use case | Stateful Flink | Traditional REST + DB |
+|---|---|---|
+| Complex state machine (order, fraud, IoT shadow) | ✓ | Сложно |
+| High concurrent writes per aggregate | ✓ (no locks) | Optimistic locks/retries |
+| Audit log + replay capability | ✓ (нативно) | Отдельная event store |
+| Sub-millisecond write latency | ✓ | Зависит от БД |
+| Простой CRUD без бизнес-логики | Overkill | ✓ |
+| Ad-hoc SQL queries по state | Limited (Materialized Tables) | ✓ |
+| Strong consistency для multi-aggregate transactions | Hard (saga pattern) | ✓ (если single DB) |
+| Microservice team размер 1-2 человека | Overkill | ✓ |
+
+<Callout type="warning">
+Этот pattern — large architectural decision. Он требует команду, которая понимает event-sourcing, CQRS, schema evolution, distributed systems. Если домен простой (CRUD над сущностями без сложной логики) — traditional REST + Postgres. Stateful Flink уместен для core domain critical state machines, не для каждой таблицы.
+</Callout>
+
+---
+
+## Synchronous query? Нет, не из Flink
+
+Самый частый вопрос: «А как HTTP-клиенту узнать результат своей PlaceOrder команды?». Прямо синхронно из Flink — нельзя (Queryable State был deprecated). Варианты:
+
+1. **Polling projection** — клиент шлёт command в Kafka через API gateway, получает request_id, опрашивает Postgres projection «есть ли order с этим request_id».
+2. **WebSocket / SSE** — gateway держит connection, подписан на Kafka event topic, push-ит event клиенту при появлении.
+3. **Hybrid** — для critical-path (фронт ждёт response) — synchronous validation в gateway + async финализация в Flink. Gateway шлёт `OrderValidated` ack сразу, Flink финализирует.
+
+В практике large e-commerce systems используют 1+2: API gateway publish-ит command, держит WebSocket, push-ит OrderPlaced event клиенту. UX почти такой же, как synchronous, но архитектура async.
+
+---
+
+## Production gotchas
+
+- **Key choice критический** — keyBy(aggregateId), не keyBy(userId) если у user несколько orders. Иначе все orders user-а serialize-ятся через один subtask. Бутылочное горлышко.
+- **State size unbounded без TTL** — completed orders накапливаются вечно. Solutions: (1) TTL на state с длинным сроком (90 дней), после — archive event log; (2) explicit `state.clear()` после терминального event (OrderCompleted/OrderCancelled); (3) routing — completed orders в отдельную compacted Kafka topic, hot state только для in-flight.
+- **Idempotency обязательна** — production гарантия at-least-once delivery от client до Kafka означает duplicate commands. processedCommands MapState отсеивает дубли. Без этого retry клиента → 2 заказа.
+- **Schema evolution events** — events живут вечно в Kafka. Используйте Avro/Protobuf с registered schemas. Никогда не break-ьте semantic — новые поля optional, default values, no field reuse.
+- **Multi-aggregate transactions** — нельзя сделать «atomically списать с баланса + создать order» в одном Flink job если они разные aggregate roots. Решение: saga pattern с compensating commands (если order failed — отмени списание).
+- **Cold start latency** — первая команда для нового orderId создаёт state. На RocksDB первый write в new key — это L0 write, fast. Но если state backend ForSt с S3, есть network round-trip. Использовать `cleanupInRocksdbCompactFilter` чтобы не накапливать garbage из old keys.
+- **Operator UID обязателен** — `processFunction.uid("order-processor")`. Без UID savepoint restore сломается при добавлении/удалении операторов. Это правило для всего pipeline.
+
+```java
+stream
+    .keyBy(OrderCommand::orderId)
+    .process(new OrderProcessor())
+    .uid("order-processor")          // ← stable identity
+    .name("Order Processor");
+```
+
+<Callout type="warning">
+Если бизнес-логика часто меняется (новые статусы, новые валидации, новые fields), event-sourcing требует careful migration plan для каждого release. Pre-deploy: тестируйте, что новая логика корректно reconstruct-ит state из existing events. Это не batch SQL миграция за 5 минут — это design discipline.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: order service на Flink stateful pattern, 50k commands/sec, 500M historical orders в Kafka log. Discovered баг — handlePlaceOrder неверно считает total при наличии promotion code (последние 30 дней). Как исправить production без data loss и с минимальным downtime?"
+  answer="Это classic event-sourcing replay scenario. План: (1) Сохранить текущий savepoint командой `flink stop --savepointPath s3://... <jobId>` — захватит state для отката если что; (2) Deploy fix code; (3) Стартовать новую job из earliest offsets за last 30 days (`OffsetsInitializer.timestamp(now - 30days)`) с **новой** Kafka transactional.id prefix и **новой** consumer group — это создаст параллельный pipeline; (4) Direct downstream consumers на новый event topic (или на новую compacted version order-events-v2) atomically через feature flag; (5) После catch-up старая job stopped, savepoint archived. Critical: events в Kafka не меняются (immutability), но state в Flink **пересчитан** correctly с новой логикой. Downtime — только короткий cutover (секунды-минуты). Если БЫ это была traditional REST+DB архитектура: пришлось бы (a) написать batch script для recalc total для всех affected orders, (b) рисковать race conditions с live traffic, (c) не иметь способа replay для тестирования. Event-sourcing делает такие фиксы routine operation, не emergency."
+/>

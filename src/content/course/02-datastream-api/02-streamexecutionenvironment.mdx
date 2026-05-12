@@ -1,0 +1,365 @@
+---
+title: "StreamExecutionEnvironment: sources, sinks, transformations"
+description: "Точка входа DataStream API. fromSource (FLIP-27), sinkTo (FLIP-191 SinkV2), transformations (map, flatMap, filter, keyBy). Boundedness.CONTINUOUS_UNBOUNDED vs BOUNDED."
+order: 2
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["StreamExecutionEnvironment", "FLIP-27", "FLIP-191", "SinkV2", "Boundedness"]
+---
+
+# StreamExecutionEnvironment: sources, sinks, transformations
+
+`StreamExecutionEnvironment` — точка входа в DataStream API. Через него вы создаёте sources, applying transformations, attaching sinks, и в конце вызываете `execute()`. На первый взгляд тривиально, но за каждым методом стоят важные архитектурные решения: FLIP-27 Source API (унифицированный для bounded/unbounded), FLIP-191 SinkV2 (replacing legacy SinkFunction), boundedness concept делающий batch и streaming unified.
+
+В этом уроке разберём StreamExecutionEnvironment как фасад, FLIP-27 source architecture (SplitEnumerator + SourceReader), FLIP-191 sink topology, ключевые transformations, и почему все legacy `SourceFunction`/`SinkFunction` removed в 2.0.
+
+---
+
+## Базовая структура job
+
+Каждый Flink job имеет одинаковую структуру:
+
+```java
+public class MyJob {
+    public static void main(String[] args) throws Exception {
+        // 1. Получить environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // 2. Конфигурация runtime
+        env.enableCheckpointing(60_000);
+        env.setParallelism(8);
+
+        // 3. Source — fromSource (FLIP-27 API)
+        DataStream<Transaction> txs = env.fromSource(
+            KafkaSource.<Transaction>builder()
+                .setBootstrapServers("kafka:9092")
+                .setTopics("transactions")
+                .setGroupId("my-job")
+                .setStartingOffsets(OffsetsInitializer.latest())
+                .setValueOnlyDeserializer(new TransactionDeserializer())
+                .build(),
+            WatermarkStrategy.<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+                .withTimestampAssigner((tx, ts) -> tx.getEventTime()),
+            "kafka-source");
+
+        // 4. Transformations
+        DataStream<Alert> alerts = txs
+            .filter(tx -> tx.getAmount() > 1000)
+            .keyBy(Transaction::getUserId)
+            .process(new FraudDetector())
+            .uid("fraud-detector");
+
+        // 5. Sink — sinkTo (FLIP-191 SinkV2)
+        alerts.sinkTo(KafkaSink.<Alert>builder()
+            .setBootstrapServers("kafka:9092")
+            .setRecordSerializer(new AlertSerializer())
+            .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+            .setTransactionalIdPrefix("alerts-tx")
+            .build());
+
+        // 6. Execute
+        env.execute("Fraud Detection");
+    }
+}
+```
+
+Эта структура — каноническая. На клиенте main() выстраивает StreamGraph, `env.execute()` отдаёт его в кластер (см. урок 04 модуля 01).
+
+---
+
+## FLIP-27 Source API
+
+В Flink 2.0 удалены **все legacy source APIs** — `SourceFunction`, `RichSourceFunction`, `ParallelSourceFunction`. Остался единый **Source interface (FLIP-27)**, который unified для bounded (batch) и unbounded (streaming) sources.
+
+<DiagramContainer title="FLIP-27 Source архитектура" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="SplitEnumerator"
+        tooltip="Один на job, живёт в JobMaster. Обнаруживает doступные splits (Kafka partitions, files, S3 objects), распределяет их между SourceReader-ами. При rebalance/scaling может reassign splits."
+      >
+        single instance, в JobMaster
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="assign splits через RPC" />
+    <FlowRow>
+      <DataBox
+        label="SourceReader (parallel)"
+        tooltip="N instances в TaskManager-ах (по parallelism source-а). Каждый получает свои splits и fetch-ит данные. Создаёт SourceOutput с emit(record, timestamp). Independent от других reader-ов."
+      >
+        N readers, по parallelism
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="emit records" />
+    <FlowRow>
+      <DataBox
+        label="DataStream"
+        tooltip="Output источника. Записи здесь имеют timestamp (если assigned) и flow через downstream operators. WatermarkStrategy генерирует watermarks из этих records."
+      >
+        flow в downstream
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Boundedness
+
+Каждый source объявляет boundedness:
+
+| Boundedness | Когда | Поведение |
+|---|---|---|
+| **`CONTINUOUS_UNBOUNDED`** | Kafka topic с latest offset | Streaming. Источник работает forever. Watermarks из timestamps. |
+| **`BOUNDED`** | Kafka topic от/до offsets, S3 file set, JDBC SELECT | Batch-style. Источник завершается после обработки всех splits. |
+
+```java
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("events")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setBounded(OffsetsInitializer.timestamp(System.currentTimeMillis()))  // BOUNDED!
+    .setValueOnlyDeserializer(new SimpleStringSchema())
+    .build();
+```
+
+Boundedness влияет на:
+- **Checkpointing**: BOUNDED не нужны continuous checkpoints (но всё ещё могут happen).
+- **Schedule mode**: BOUNDED может использовать Batch scheduler с post-completion optimizations.
+- **Watermarks**: после processing всех splits source emit `Watermark.MAX_WATERMARK`.
+
+### Hybrid Sources (FLIP-150)
+
+Очень мощная фича — комбинирование bounded backfill + unbounded live:
+
+```java
+HybridSource<Event> source = HybridSource.builder(fileSource)   // BOUNDED, читает S3 файлы
+    .addSource(kafkaSource)                                     // UNBOUNDED, читает Kafka с latest
+    .build();
+```
+
+Pipeline сначала processит файлы (например, исторические данные за месяц), затем seamless переключается на live Kafka stream. Без HybridSource эти данные нужно было бы object отдельно. Активно используется в lakehouse архитектурах.
+
+---
+
+## Available sources в 2.x
+
+| Source | Use case | Boundedness |
+|---|---|---|
+| **KafkaSource** | Apache Kafka topic | Configurable (default unbounded) |
+| **PulsarSource** | Apache Pulsar | Configurable |
+| **FileSource** | S3/HDFS/local files | Bounded (default) |
+| **JdbcSource** | RDBMS SELECT | Bounded |
+| **HybridSource** | Combination | Mixed |
+| **DataGeneratorSource** | Test data generation | Configurable |
+
+```java
+// FileSource bounded
+FileSource<String> fileSource = FileSource
+    .forRecordStreamFormat(new TextLineInputFormat(), Path.fromLocalFile("/data/*.csv"))
+    .build();
+
+DataStream<String> lines = env.fromSource(fileSource,
+    WatermarkStrategy.noWatermarks(), "files");
+```
+
+---
+
+## FLIP-191 SinkV2 API
+
+Параллельно с FLIP-27 в 2.0 deprecated и removed `SinkFunction` / `RichSinkFunction` / `SinkV1`. Остался **SinkV2 (FLIP-191)** — unified sink API.
+
+```java
+KafkaSink<Alert> sink = KafkaSink.<Alert>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(KafkaRecordSerializationSchema.<Alert>builder()
+        .setTopic("alerts")
+        .setValueSerializationSchema(new AlertSerializer())
+        .build())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("alerts-tx")
+    .setProperty("transaction.timeout.ms", "900000")
+    .build();
+
+stream.sinkTo(sink).uid("kafka-sink");
+```
+
+SinkV2 поддерживает **многоступенчатые topologies**:
+
+| Component | Назначение | Часто живёт |
+|---|---|---|
+| **SinkWriter** | Получает records, буферизует | На каждом subtask |
+| **PreCommitTopology** (optional) | Перед commit (например, compaction) | Promille-level operations |
+| **Committer** | Применяет commits на checkpoint | После checkpoint complete |
+| **PostCommitTopology** (optional) | После commit (publish manifests для Iceberg) | Global per job |
+
+Это позволяет sinks типа Iceberg / Paimon / Hudi реализовать честные commits с pre/post hooks (модуль 07, 10).
+
+### DeliveryGuarantee
+
+```java
+DeliveryGuarantee.NONE              // best-effort
+DeliveryGuarantee.AT_LEAST_ONCE     // retries, duplicates possible
+DeliveryGuarantee.EXACTLY_ONCE      // Two-Phase Commit (Kafka, Iceberg)
+```
+
+См. модуль 07 для deep-dive в Two-Phase Commit и exactly-once.
+
+---
+
+## Available sinks в 2.x
+
+| Sink | Use case | EOS supported? |
+|---|---|---|
+| **KafkaSink** | Apache Kafka | Yes (Kafka transactions) |
+| **FileSink** | S3/HDFS файлы | Yes (committed/pending renames) |
+| **JdbcSink** | RDBMS | Yes (через PreparedStatement transactions) |
+| **IcebergSink** | Apache Iceberg | Yes (manifest commits) |
+| **PaimonSink** | Apache Paimon | Yes |
+| **PrintSink** | Debug stdout | No |
+
+---
+
+## Core Transformations
+
+DataStream API предоставляет functional operators:
+
+### Stateless
+
+```java
+// map: 1 in → 1 out
+DataStream<String> uppercased = stream.map(s -> s.toUpperCase());
+
+// flatMap: 1 in → 0..N out
+DataStream<String> words = stream.flatMap((String line, Collector<String> out) -> {
+    for (String word : line.split(" ")) out.collect(word);
+}).returns(String.class);
+
+// filter: 1 in → 0 or 1 out
+DataStream<Tx> bigTxs = txs.filter(tx -> tx.amount > 1000);
+```
+
+### Stateful (требует keyBy)
+
+```java
+KeyedStream<Tx, Long> keyed = txs.keyBy(Tx::getUserId);
+
+// reduce: incremental aggregation
+keyed.reduce((a, b) -> a.amount > b.amount ? a : b);
+
+// process: custom logic с state + timers (см. урок 03)
+keyed.process(new FraudDetector());
+
+// window: time-based aggregation
+keyed.window(TumblingEventTimeWindows.of(Time.minutes(5)))
+     .aggregate(new SumAggregator());
+```
+
+### Partitioning
+
+```java
+stream.keyBy(...)        // hash partitioning
+stream.rebalance()        // round-robin (для load balancing)
+stream.rescale()          // round-robin внутри local subtasks
+stream.broadcast()        // каждая запись во все downstream
+stream.shuffle()          // random
+stream.global()           // всё в одну downstream subtask
+stream.forward()          // default 1-к-1 (chain-friendly)
+```
+
+---
+
+## Type information
+
+Flink требует TypeInformation для каждой DataStream — для сериализации. Java generics после erasure теряются, поэтому часто нужен явный type hint:
+
+```java
+// Bad: TypeInformation = GenericType<...> → Kryo fallback, 50% perf hit
+DataStream<Tuple2<String, Integer>> bad = lines
+    .map(l -> new Tuple2<>(l, 1));
+
+// Good: явный returns()
+DataStream<Tuple2<String, Integer>> good = lines
+    .map(l -> new Tuple2<>(l, 1))
+    .returns(Types.TUPLE(Types.STRING, Types.INT));
+
+// Best: POJO class с no-arg ctor + public fields/getters
+DataStream<MyEvent> events = stream.map(...);  // TypeInformation automatic
+```
+
+POJO requirements:
+- Класс public
+- No-arg constructor
+- Public fields ИЛИ public getters/setters
+- Не nested generics (плохо)
+
+Без POJO → Kryo serialization → 50% perf hit. Production tip: `pipeline.generic-types: false` для fail-fast.
+
+<Callout type="warning">
+Самая частая prod issue — lambda + generic types. `.map(s -> Tuple2.of(s, 1))` теряет type info после Java erasure. Flink falls back на Kryo (медленно) или fail-fast если configured. Всегда `.returns(...)` после lambda с generics.
+</Callout>
+
+---
+
+## UID — для savepoint совместимости
+
+Каждый stateful operator ОБЯЗАН иметь `.uid("...")`:
+
+```java
+stream.keyBy(...).process(new FraudDetector()).uid("fraud-detector-v1");
+```
+
+UID — стабильный identifier между deploys. Flink matches state в savepoint с operator по UID. Без UID Flink генерирует hash от topology — любое изменение pipeline ломает state restoration.
+
+См. модуль 14 (State Evolution) для подробностей.
+
+---
+
+## env.execute() vs env.executeAsync()
+
+```java
+// Blocking — клиент ждёт завершения job
+env.execute("My Job");
+
+// Non-blocking — submit и сразу возврат
+JobClient client = env.executeAsync("My Job");
+// client.getJobID(), client.getJobStatus(), client.cancel()
+```
+
+Для streaming jobs обычно `executeAsync()` или Application mode (где main() в JM, async natively).
+
+---
+
+## Production gotchas
+
+- **Не используйте legacy `addSource()` / `addSink()`** — это указывает на устаревший SourceFunction / SinkFunction API. В Flink 2.x они removed. Используйте `fromSource()` / `sinkTo()`.
+- **Boundedness wrong** — если KafkaSource bounded (для backfill), но `enableCheckpointing` true, checkpoints всё ещё триггерятся. Это OK, но иногда вызывает confusion при debugging.
+- **DataGeneratorSource для testing** — production-grade test source с rate limiting. Лучше, чем `env.fromElements()` для нагрузочного теста.
+- **Не забывайте `.uid()`** на каждом stateful operator. Без него savepoint compatibility break при любом topology change.
+- **`returns()` после lambda** с generics — иначе Kryo fallback.
+- **Sink committer timing** — для EOS sinks committer запускается ПОСЛЕ checkpoint complete (notifyCheckpointComplete callback). Latency end-to-end = checkpoint interval. Нельзя сделать "true millisecond EOS".
+- **Hybrid Sources для bootstrapping** — pattern: backfill из S3 + live Kafka. Без него часто пишут отдельные backfill jobs, что усложняет ops.
+
+<Callout type="tip">
+Для интерактивного debugging используйте `DataStreamUtils.collect()` (Flink 1.13+) — собирает finite results в Java collection. Не для production, но удобно для unit testing и dev.
+</Callout>
+
+---
+
+## Comparison vs legacy API
+
+| Legacy (Flink 1.x, removed 2.0) | Modern (FLIP-27, FLIP-191) |
+|---|---|
+| `env.addSource(new MyKafkaSource())` | `env.fromSource(kafkaSource, watermarkStrategy, name)` |
+| `RichSourceFunction.run(SourceContext)` | `SplitEnumerator` + `SourceReader` |
+| `stream.addSink(new SinkFunction())` | `stream.sinkTo(sink)` |
+| `RichSinkFunction.invoke(value, context)` | `SinkWriter.write(value, context)` |
+| `TwoPhaseCommitSinkFunction` | `SinkV2 Committer` API |
+| Boundedness — implicit | `Boundedness.CONTINUOUS_UNBOUNDED` / `BOUNDED` |
+
+Все legacy API removed в 2.0. Если видите туториалы pre-2024 с `addSource()` / `addSink()` — это legacy, не используйте.
+
+---
+
+<KnowledgeCheck
+  question="Объясните FLIP-27 Source API: какие два главных компонента, где они живут физически, и как scaling работает при изменении parallelism Kafka source-а от 4 до 8?"
+  answer="FLIP-27 разделяет source на два компонента: (1) **SplitEnumerator** — единственный instance, живёт в JobMaster. Отвечает за discovery splits (Kafka partitions, S3 files), их распределение между SourceReader-ами, и rebalance при scaling. Имеет state (assigned splits per reader). (2) **SourceReader** — N instances по parallelism source-а, живут на TaskManager-ах. Каждый получает свои splits через RPC от SplitEnumerator-а и fetch-ит данные из Kafka/S3. Создаёт SourceOutput с emit(record, timestamp). При scaling 4 → 8 SourceReader-ов: (a) JobMaster получает rescaling сигнал (через Adaptive Scheduler или manual savepoint+restart); (b) SplitEnumerator детектит новые reader-ы (8 вместо 4); (c) rebalances splits — например, было 16 Kafka partitions × 4 readers = 4 splits per reader, становится 16/8 = 2 split per reader; (d) SplitEnumerator посылает SplitsAssignment messages новым reader-ам, может revoke splits у старых через addSplitsBack(). State каждого reader-а (positions in splits) восстанавливается из last checkpoint. Это разделение enumerator/reader даёт несколько benefits: (1) discovery logic централизована — нет race conditions; (2) rescaling без потери offset-ов; (3) custom split assignment strategies (locality-aware); (4) unified API для bounded (files) и unbounded (Kafka) — один и тот же интерфейс. Legacy SourceFunction не имел такого разделения и не поддерживал proper rescaling — это было fundamental ограничение, fixed FLIP-27."
+/>

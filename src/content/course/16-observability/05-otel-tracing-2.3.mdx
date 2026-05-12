@@ -1,0 +1,512 @@
+---
+title: "OpenTelemetry tracing в Flink: spans, OTel gRPC export (2.3)"
+description: "OpenTelemetry в Flink (1.20+ для checkpoints), OTel gRPC export (2.3). Spans: DagRun → task → DB query. Integration Jaeger/Tempo. Debug slow checkpoints"
+order: 5
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["OpenTelemetry", "Distributed Tracing", "OTel", "Jaeger", "Tempo", "Checkpoint Tracing"]
+---
+
+# OpenTelemetry tracing в Flink
+
+Metrics показывают «что» — distributed tracing показывает «почему». Когда checkpoint duration spike до 5 минут, metrics показывают факт. Traces покажут: barrier injected at T0, propagated к subtask 15 at T0+10s, alignment finished at T+4min — теперь видно что 4 минуты заняла alignment в subtask 15.
+
+OpenTelemetry (OTel) — emerging стандарт для unified observability: metrics + traces + logs в одном экосистемном слое. В Flink **1.20+** появилась integration для checkpoint tracing. В **Flink 2.3** GA пришёл **OTel gRPC export** — efficient binary protocol.
+
+В этом уроке препарируем OTel integration: что трассируется, как настроить экспорт, integration с Jaeger/Tempo backends, и production debugging slow checkpoints.
+
+---
+
+## OTel в Flink: что трассируется
+
+Currently (1.20-2.3) OTel в Flink покрывает:
+
+| Trace | Что показывает |
+|---|---|
+| **Checkpoint lifecycle** | barrier inject → propagate → ack → commit |
+| **Job submission** | submit → schedule → deploy → running |
+| **Task lifecycle** | deploy → init → running → finished |
+| **Async I/O** (1.20+) | external call latency, retries |
+
+В roadmap (2.3+ и 2.4):
+- Per-record tracing (sampled) — для latency investigation.
+- State access spans.
+- Source/sink internal spans.
+
+---
+
+## Anatomy: checkpoint trace
+
+Checkpoint trace выглядит так:
+
+```
+Span: checkpoint-123 (5.2 sec)
+  ├─ Span: barrier-injection (10ms)
+  │   ├─ Source subtask 0 inject
+  │   ├─ Source subtask 1 inject
+  │   └─ ...
+  ├─ Span: barrier-propagation (3s)
+  │   ├─ Map operator receive barrier (200ms after source)
+  │   ├─ KeyedProcess receive barrier (2.5s after source) ← STUCK
+  │   │   └─ Span: alignment-wait (2.3s)
+  │   └─ Sink receive barrier (3s after source)
+  ├─ Span: async-snapshot (2s)
+  │   ├─ Subtask 0 snapshot (1.5s)
+  │   ├─ Subtask 1 snapshot (1.8s)
+  │   └─ Subtask 15 snapshot (1.9s)
+  ├─ Span: dfs-upload (1.5s)
+  │   └─ S3 upload spans per subtask
+  └─ Span: notify-complete (200ms)
+      └─ 2PC commit callbacks к sinks
+```
+
+Видим: checkpoint занял 5.2s, причём 2.3s — alignment в KeyedProcess. Это immediately actionable insight.
+
+<DiagramContainer title="OpenTelemetry trace hierarchy для checkpoint" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Root span: Checkpoint N"
+        tooltip="Trace root, спан всего lifecycle checkpoint. Duration = trigger-time до final acknowledgment. Все downstream spans — children."
+      >
+        Checkpoint 123 (5.2s)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Barrier injection"
+        tooltip="JobManager инжектит barrier во все source subtasks. Span короткий (~10ms), но фиксирует точку синхронизации. Tags: checkpoint_id, source_count."
+      >
+        Barrier inject (10ms)
+      </DataBox>
+      <DataBox
+        label="Barrier propagation"
+        tooltip="Каждый operator получает barrier по input channels. Spans per-operator, parent = barrier-propagation. Alignment time visible как pre-snapshot wait."
+      >
+        Barrier propagation (3s)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Async snapshot"
+        tooltip="Background thread writes state к durable storage. Spans per subtask. Tags: state_size, backend_type, async_phase_duration. Visible: который subtask тратит больше всех."
+      >
+        Async snapshot (2s)
+      </DataBox>
+      <DataBox
+        label="DFS upload"
+        tooltip="State files uploaded to S3/HDFS. Spans per upload (incremental → multiple per checkpoint). Tags: file_size, upload_duration, throughput."
+      >
+        DFS upload (1.5s)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Acknowledgement"
+        tooltip="Subtasks ack JobManager. Когда all ack — checkpoint complete. notifyCheckpointComplete callbacks trigger 2PC commits в transactional sinks."
+      >
+        Ack + notify complete (200ms)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Configuration: OTel reporter
+
+### С 1.20+ (HTTP)
+
+```yaml
+# Metric reporter (если comining metrics + traces):
+metrics.reporters: otel
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OtelReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector:4318
+metrics.reporter.otel.protocol: http/protobuf
+metrics.reporter.otel.interval: 30s
+
+# Trace reporter:
+traces.reporters: otel
+traces.reporter.otel.factory.class: org.apache.flink.traces.otel.OtelTraceReporterFactory
+traces.reporter.otel.endpoint: http://otel-collector:4318
+traces.reporter.otel.protocol: http/protobuf
+
+# Resource attributes:
+traces.reporter.otel.resource-attributes: "service.name=flink-job-1,deployment.environment=production"
+```
+
+### С Flink 2.3 (gRPC, GA)
+
+gRPC GA в 2.3 — лучшая опция:
+
+```yaml
+metrics.reporter.otel.endpoint: http://otel-collector:4317
+metrics.reporter.otel.protocol: grpc
+
+traces.reporter.otel.endpoint: http://otel-collector:4317
+traces.reporter.otel.protocol: grpc
+```
+
+gRPC vs HTTP:
+- gRPC: binary protobuf, persistent connection, ~30% less overhead.
+- HTTP/protobuf: chunked HTTP, easier debugging.
+
+Production — gRPC.
+
+### Sampling
+
+Trace на каждый event — не реалистично (data volume). OTel sampling:
+
+```yaml
+# Probability-based (e.g., 1% traces):
+traces.reporter.otel.sampler: parentbased_traceidratio
+traces.reporter.otel.sampler.arg: 0.01
+
+# Always-on (development):
+traces.reporter.otel.sampler: always_on
+```
+
+Default для production — `parentbased_traceidratio` с 0.01 (1%). Достаточно для distribution analysis.
+
+Для checkpoint tracing — **always sample** (checkpoints rare events, не fluffy):
+
+```yaml
+traces.reporter.otel.checkpoint.sampler: always_on
+```
+
+---
+
+## OTel Collector pipeline
+
+OTel Collector — middle-tier между Flink и backend storage (Jaeger, Tempo, etc.).
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+  attributes:
+    actions:
+      - key: env
+        value: production
+        action: insert
+
+  # Sampling в Collector (если не в Flink):
+  probabilistic_sampler:
+    sampling_percentage: 5
+
+exporters:
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      insecure: true
+
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, attributes, probabilistic_sampler]
+      exporters: [jaeger]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch, attributes]
+      exporters: [prometheusremotewrite]
+```
+
+Collector centralizes routing. Можно swap backend storage без re-configuration в каждом Flink job.
+
+---
+
+## Backend storage: Jaeger vs Tempo
+
+### Jaeger
+
+- Mature (Uber). UI focused на trace exploration.
+- Local storage Cassandra, Elasticsearch.
+- Best для standalone, moderate scale.
+
+### Grafana Tempo
+
+- Newer (Grafana Labs). Object storage (S3) → cheap long retention.
+- Integration с Grafana metrics → click trace from metric.
+- Best для cloud-native, large scale.
+
+### Production выбор
+
+С Grafana stack (Prometheus + Grafana) — **Tempo** для consistency. Иначе — **Jaeger**.
+
+---
+
+## Production walkthrough: debug slow checkpoint
+
+**Симптом**: P95 checkpoint duration jumped с 5s до 60s после deploy.
+
+### Step 1: Open trace explorer (Jaeger/Tempo)
+
+Filter: `service.name=my-flink-job AND span.name=checkpoint`. Time range: last 1 hour.
+
+### Step 2: Identify slow trace
+
+Sort by duration. Pick recent trace at P95 (60s).
+
+### Step 3: Drill into span hierarchy
+
+```
+Checkpoint 9981 (60s)
+  ├─ barrier-inject (10ms)
+  ├─ barrier-propagation (55s)            ← ALL TIME HERE
+  │   ├─ Map (200ms)
+  │   ├─ KeyedProcess (8s)                ← stuck wait
+  │   │   └─ alignment-wait (7.8s)
+  │   └─ Sink (55s)                       ← biggest stuck
+  │       └─ alignment-wait (54s)
+  ├─ async-snapshot (3s)
+  ├─ dfs-upload (1.5s)
+  └─ notify-complete (200ms)
+```
+
+Alignment в Sink — 54s. Это означает: barriers на Sink subtasks dropped 54s due to backpressure от Sink's input.
+
+### Step 4: Cross-reference с metrics
+
+Metrics: `backPressuredTimeMsPerSecond` на Sink — 900 sustained ~1min before checkpoint, drops to 0 after.
+
+Confirmed: backpressure burst блокировал alignment.
+
+### Step 5: Root cause Sink slow
+
+Trace child span: `async-sink-batch-flush (50s)`. Внутри `kafka-producer-flush.txn-init (45s)`.
+
+Kafka transaction.init slow → broker overload? Investigate broker.
+
+### Step 6: Fix
+
+- Short term: enable unaligned checkpoints (`aligned-checkpoint-timeout: 30s`).
+- Mid term: investigate Kafka broker — broker upgrade, partitions rebalance.
+- Long term: Kafka tuning, larger producer buffer.
+
+**Total debug time с tracing**: 15 минут.
+**Without tracing**: hours of theorizing.
+
+---
+
+## Per-record tracing (sampled)
+
+Каждая запись через DAG может быть traced (sampled). Это даёт end-to-end latency view:
+
+```
+Record-456 (700ms end-to-end)
+  ├─ Source.read (5ms)
+  ├─ Map.process (10ms)
+  ├─ KeyedProcess.process (200ms)
+  │   └─ state-access (180ms)             ← slow state get!
+  └─ Sink.write (485ms)
+      └─ external-api.call (480ms)        ← external slow
+```
+
+Identifies latency hotspots без deploying profiler — sampled traces show real production behavior.
+
+User code propagation:
+
+```java
+public class TracedMapper extends RichMapFunction<Event, Result> {
+    private static final Tracer TRACER = ...;
+
+    @Override
+    public Result map(Event e) {
+        Span span = TRACER.spanBuilder("my-business-logic")
+            .setAttribute("user_id", e.getUserId())
+            .startSpan();
+        try (Scope scope = span.makeCurrent()) {
+            return doProcess(e);
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+Spans context propagates automatically через Flink runtime (Flink 2.3+ instrumentation).
+
+---
+
+## Context propagation между jobs
+
+Если у вас upstream service (e.g., микросервис) publish-ит в Kafka, и Flink consume-ит — trace continues:
+
+```
+Service A (HTTP request)
+  └─ Service A produce Kafka
+      └─ Flink consume + process
+          └─ Flink produce downstream Kafka
+              └─ Service B consume
+```
+
+Требуется:
+1. Service A sends OTel context в Kafka headers.
+2. Flink Kafka source enriches с context.
+3. Spans correlated через trace_id.
+
+```java
+KafkaSource<Event> source = KafkaSource.<Event>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("events")
+    .setValueOnlyDeserializer(
+        new TracingKafkaDeserializer<>(new EventDeserializer()))
+    .build();
+```
+
+`TracingKafkaDeserializer` extracts OTel context из Kafka record headers.
+
+End-to-end trace показывает full request lifecycle через сервисы.
+
+---
+
+## Production gotchas
+
+### Gotcha 1: OTel в Flink 1.x — limited coverage
+
+Flink 1.20 had initial OTel — только checkpoints. Метрики через separate path. Real coverage в 2.0+, GA gRPC в 2.3.
+
+Если на Flink 1.x — be aware of limitations. Better — upgrade.
+
+### Gotcha 2: Trace sampling rate matters
+
+```yaml
+traces.reporter.otel.sampler.arg: 1.0   # 100% sampling
+```
+
+100% trace = огромный data volume. На high-throughput job (1M records/sec) = 1M spans/sec → Collector overload → backend storage explosion.
+
+**Fix**: 0.01-0.05 (1-5%). Production sweet spot.
+
+Checkpoints — exception, always sample (rare events).
+
+### Gotcha 3: Span attributes size
+
+```java
+span.setAttribute("event_payload", event.toString());   // ANTI-PATTERN
+```
+
+Полный event payload в attribute → MB per span → storage explosion.
+
+**Fix**: only structural attributes (user_id, event_type, duration). Не payload.
+
+### Gotcha 4: Trace ID propagation broken
+
+Custom deserializers/serializers не пропускают OTel headers → traces fragment-ируются в Kafka boundary.
+
+**Fix**: use TracingDeserializer wrappers OR custom code что explicitly propagates `traceparent` header.
+
+### Gotcha 5: OTel Collector single point
+
+Single Collector → bottleneck. Один down → all traces lost.
+
+**Fix**: Collector replicas с load balancer. Cluster pattern.
+
+### Gotcha 6: HTTP vs gRPC мelange
+
+```yaml
+metrics.reporter.otel.protocol: grpc
+traces.reporter.otel.protocol: http/protobuf   # inconsistent
+```
+
+Mix создаёт complexity. gRPC более efficient — используйте consistent.
+
+### Gotcha 7: Sampling в job vs Collector
+
+Можно sample на двух levels: Flink side OR Collector side. Both = double sampling.
+
+**Fix**: sample в одном месте, обычно Flink side (раньше в pipeline, меньше network traffic).
+
+---
+
+## Configuration baseline (production, 2.3+)
+
+```yaml
+# Metrics (если унифицированный stack):
+metrics.reporters: otel
+metrics.reporter.otel.factory.class: org.apache.flink.metrics.otel.OtelReporterFactory
+metrics.reporter.otel.endpoint: http://otel-collector:4317
+metrics.reporter.otel.protocol: grpc
+metrics.reporter.otel.interval: 30s
+
+# Traces:
+traces.reporters: otel
+traces.reporter.otel.factory.class: org.apache.flink.traces.otel.OtelTraceReporterFactory
+traces.reporter.otel.endpoint: http://otel-collector:4317
+traces.reporter.otel.protocol: grpc
+
+# Sampling:
+traces.reporter.otel.sampler: parentbased_traceidratio
+traces.reporter.otel.sampler.arg: 0.05   # 5% sampling
+
+# Checkpoint traces — always:
+traces.reporter.otel.checkpoint.sampler: always_on
+
+# Resource attributes:
+traces.reporter.otel.resource-attributes: >
+  service.name=${JOB_NAME},
+  deployment.environment=production,
+  service.version=${VERSION}
+
+# Logs export (если используется):
+log4j.appender.otel.endpoint: http://otel-collector:4317
+log4j.appender.otel.protocol: grpc
+```
+
+---
+
+## Compared to alternatives
+
+| Tool | Use case | Strengths |
+|---|---|---|
+| **Prometheus** | Metrics only | Time-series, alerting |
+| **OpenTelemetry** | Metrics + traces + logs | Unified, vendor-neutral |
+| **Datadog APM** | All-in-one paid SaaS | UI, AI insights |
+| **Jaeger** | Traces standalone | Mature, simple |
+| **Zipkin** | Traces (legacy) | Simple, older |
+| **Lightstep** | Traces SaaS | Distributed analytics |
+
+OTel — emerging standard, vendor-neutral, future-proof. Production recommendation 2026+.
+
+---
+
+<Callout type="note">
+OpenTelemetry в Flink 2.3 с gRPC export — это game changer для production debugging. До этого slow checkpoint debugging был археологией; теперь это 15-minute trace exploration. Включите OTel как baseline для всех новых production deployments.
+</Callout>
+
+---
+
+<Callout type="warning">
+Sampling rate критически важен. 100% sampling на high-throughput job = data explosion → backend storage стоит больше чем job сам. 1-5% sampling для regular spans, always-on для checkpoint spans (rare events). Tune sampling rate based на data volume и storage budget.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink 2.3 на K8s, использует OTel для metrics + traces. Backend: OTel Collector → Grafana Tempo (traces) + VictoriaMetrics (metrics). Сценарий: пользователи жалуются, что end-to-end latency для одного типа event (поверх 99 percentile) — 2-3 секунды (target 200ms). Throughput stable, backpressure нет в metrics. Как использовать OTel для root cause analysis? Опишите debugging flow и какие attributes/spans добавить."
+  answer="Plan для diagnosis с OTel: (1) Setup per-record tracing для slow event type. Add user code instrumentation чтобы выделить slow events. В user code: Span recordSpan = tracer.spanBuilder('record-processing').setAttribute('event_type', e.getType()).setAttribute('user_id', e.getUserId()).startSpan(); try (Scope s = recordSpan.makeCurrent()) { processEvent(e); } finally { recordSpan.end(); }. Sampling: 100% для slow types (rare), 1% для остальных. Trace propagation через Kafka headers — verify TracingKafkaDeserializer enabled. (2) Open Tempo в Grafana. Filter: service.name=my-flink-job AND attribute.event_type=slow_type. Sort by duration descending. Look at P99 traces (2-3 second ones). (3) Drill into one slow trace. Expected structure: Span: record-processing (2.5s). Внутри child spans для каждого operator: Source.read, Map.process, KeyedProcess.process, Sink.write. Identify span(s) с aномально длинной duration. (4) Common patterns from trace analysis: Pattern A — state-access slow: span 'state.value()' takes 1.5s. Causes: hot key (large state value), RocksDB compaction concurrent, slow disk. Cross-reference с RocksDB metrics. Pattern B — async I/O slow: span 'AsyncDataStream.dbLookup' takes 2s. Causes: DB query slow, connection pool exhausted, timeout retries. Pattern C — sink slow: span 'KafkaSink.write' takes 2s. Causes: Kafka broker overload, transaction timeout, broker rebalance. Pattern D — serialization slow: span 'KryoSerializer' takes 500ms. Causes: large objects, complex schema. Pattern E — chained operator blocked: один operator in chain имеет long span, остальные idle. (5) Add custom attributes для context. Span attributes: state_size_bytes, db_query_count, kafka_partition, serialized_size. С этими attributes можно filter в Tempo: 'show me slow events where state_size > 1MB'. (6) Cross-reference с metrics. Open Grafana metrics panel для same time range. Look для: GC pauses coincide с slow events? Network spike? RocksDB compaction? Click 'View related trace' — Tempo's integration с metrics. (7) Specific instrumentation hypothesis A — slow state-heavy events. Add state size measurement в KeyedProcess: long stateSize = ((BackingStorageState) state).estimateSizeBytes(); span.setAttribute('state_size_bytes', stateSize). Re-deploy, check traces — high correlation between state_size > X и duration > Y? Then hot keys identified. (8) Hypothesis B — external dependency variance. Add explicit span для DB call: dbSpan.setAttribute('db_query_type', queryType).setAttribute('db_endpoint', endpoint). Identify какой DB endpoint slow, какой query type. Может быть один endpoint slow (capacity), один query type expensive (missing index). (9) Hypothesis C — Kafka commit during transaction. Sink transaction.commit на checkpoint boundary — если event landed в checkpoint window, commit latency added to perceived latency. Trace span 'kafka.producer.commit' will show. (10) Action based на root cause: hot keys → salt key + two-stage aggregation. DB endpoint slow → escalate to external team, add caching layer. Kafka commit slow → bigger broker, more partitions. (11) Production setup для ongoing: Enable always-on sampling для tail latency events (sampler: parentbased_traceidratio_tailbased — sample IF duration > 500ms). Alert: traces P99 > target — auto-trigger detail trace dump. Lesson: metrics tell that latency is bad. Traces tell why latency is bad. OTel pinpoints offending span в seconds vs hours of theorizing. Critical: structured attributes (event_type, state_size, etc.) enable filtering — без них traces — bag of unstructured spans."
+/>

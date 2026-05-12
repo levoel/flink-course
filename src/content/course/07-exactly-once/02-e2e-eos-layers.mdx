@@ -1,0 +1,381 @@
+---
+title: "End-to-end exactly-once: три слоя гарантии"
+description: "Replayable source + internal EOS через ABS + transactional sink. Если любой слой at-least-once — итог at-least-once"
+order: 2
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Exactly-Once", "ABS", "Replayable Source", "Transactional Sink", "EOS Composition"]
+---
+
+# End-to-end exactly-once: три слоя гарантии
+
+В обиходе «Flink даёт exactly-once» — это упрощение. Flink сам по себе гарантирует exactly-once только для внутреннего state через Asynchronous Barrier Snapshotting (ABS). Чтобы гарантия была **end-to-end** — от источника до приёмника — должны выполняться три независимых условия одновременно. Этот урок разбирает каждый слой, показывает что бывает при их нарушении и какие комбинации технологий реально дают EOS.
+
+End-to-end EOS — это **композиция**: если хотя бы один слой at-least-once, итог at-least-once. Если хотя бы один at-most-once, итог at-most-once. Формула строгая: weakest link wins.
+
+---
+
+## Три слоя гарантии
+
+<DiagramContainer title="Анатомия end-to-end exactly-once" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Layer 1 — Replayable Source"
+        tooltip="Source должен уметь читать с произвольной позиции по запросу. Kafka offsets, S3 file path + byte offset, JDBC primary key range. Если source не replayable (например, plain TCP socket) — записи теряются после восстановления."
+      >
+        Kafka offsets / file paths
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="emit records" />
+    <FlowRow>
+      <DataBox
+        label="Layer 2 — Internal EOS через ABS"
+        tooltip="Chandy-Lamport-like алгоритм barrier snapshots: JobManager injects barriers в source, они propagate через граф, каждый оператор делает snapshot state когда barrier приходит на ВСЕ входы. Восстановление: rollback state + replay source с saved offset."
+      >
+        Internal state via barriers
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="committed state" />
+    <FlowRow>
+      <DataBox
+        label="Layer 3 — Transactional Sink"
+        tooltip="Sink должен буферизовать output между checkpoint и атомарно commit когда checkpoint завершён глобально. Two-Phase Commit: preCommit (flush, txn в state) → commit (после notifyCheckpointComplete). Альтернатива — idempotent sink (UPSERT по PK)."
+      >
+        2PC commit / idempotent
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Сильное упрощение: **flat-rolling pipeline** не даёт EOS просто потому что job назван «exactly-once». Гарантия — emergent property всех трёх слоёв.
+
+---
+
+## Layer 1 — Replayable source
+
+Source должен поддерживать `Boundedness` + детерминированный «position» state. Когда checkpoint barrier дойдёт до source, координат записывается в snapshot. После сбоя Flink восстанавливает state и просит source resume с saved позиции — записи между saved и failure повторно эмитятся в pipeline.
+
+### Что есть replayable
+
+| Source | Replay state | Replayable |
+|---|---|---|
+| Kafka (KafkaSource FLIP-27) | offsets per partition | ✅ |
+| Kinesis | shard iterator + sequence number | ✅ |
+| Pulsar | message ID per topic-partition | ✅ |
+| FileSource (S3/HDFS) | file path + byte offset | ✅ |
+| Flink CDC (Postgres logical, MySQL binlog) | LSN / GTID | ✅ |
+| RabbitMQ classic queue | ❌ (no replay protocol) | ❌ |
+| Plain TCP socket | nothing to replay | ❌ |
+| HTTP webhook receiver | ❌ | ❌ |
+| Custom in-memory (`fromCollection`) | ✅ если bounded | only batch |
+
+### Как Kafka source хранит replay state
+
+```java
+public class KafkaSourceReader implements SourceReader<RecordWithPartition, KafkaPartitionSplit> {
+    // На snapshotState() Flink снимок:
+    @Override
+    public List<KafkaPartitionSplit> snapshotState(long checkpointId) {
+        // splits = [TopicPartition + currentOffset + stoppingOffset]
+        return assignedSplits;
+    }
+
+    // На initializeState() — restore:
+    @Override
+    public void addSplits(List<KafkaPartitionSplit> splits) {
+        // Resume Kafka consumer с saved offsets
+        consumer.seek(split.getTopicPartition(), split.getStartingOffset());
+    }
+}
+```
+
+Это и есть «replayability»: source делает `seek(offset)` после восстановления и снова поставляет те же записи, что были после последнего успешного checkpoint.
+
+<Callout type="warning">
+Если у вас плохая практика commit Kafka offsets через `enable.auto.commit=true` в Flink — это **anti-pattern**. Offsets должны жить в Flink state, не в Kafka `__consumer_offsets`. Иначе после restart Kafka может вернуть offsets, не согласованные со state.
+</Callout>
+
+---
+
+## Layer 2 — Internal EOS через ABS
+
+Алгоритм Asynchronous Barrier Snapshotting (Carbone et al., VLDB 2017) гарантирует, что внутренний state каждого оператора отражает обработку **ровно того же набора входных записей** до некоторого consistent point.
+
+### Барьеры и alignment
+
+```
+Source → [...] → KeyedProcess → Window → Sink
+
+JobManager injects barrier(N) в source.
+Barrier(N) propagates downstream вместе с records.
+
+На каждом оператор:
+  barrier arrived на input I_1 → block I_1 (aligned mode)
+  ждать barriers на остальных inputs
+  когда все barriers пришли → asyncSnapshot(state) → emit barrier downstream
+```
+
+Unaligned checkpoints (Flink 1.11+) убирают `block` и пишут «in-flight buffers» в snapshot. Это быстрее, но больше state.
+
+### Что гарантирует ABS
+
+- **Снимок consistent** — state каждого оператора отражает обработку всех записей **до** barrier и **никаких после**.
+- **Распределённая атомарность** — либо все операторы записали snapshot для checkpoint N (success), либо ни один (abort, retry).
+- **Replay-friendly** — после rollback можно перечитать source с offsets из snapshot и состояние операторов будет таким же, как было.
+
+### Что НЕ гарантирует ABS
+
+- **EOS sink** — ABS не диктует sink behavior. Sink сам должен либо буферизовать (2PC), либо быть idempotent.
+- **Replay source** — ABS делает snapshot offsets, но если source не умеет seek, восстановления нет.
+
+---
+
+## Layer 3 — Transactional sink
+
+Самый сложный слой. Sink должен обеспечить, что записи между checkpoint N и checkpoint N+1 либо **все** видны downstream, либо **ни одна**.
+
+Два пути:
+
+### Путь A — 2PC (Two-Phase Commit)
+
+Sink буферизует output в **открытую транзакцию** внешней системы. На barrier(N):
+1. `preCommit()` — flush данных, но не commit (хранит txnId в Flink state)
+2. После `notifyCheckpointComplete(N)` — `commit(txnId)` — атомарно делает данные видимыми.
+
+Если crash между preCommit и commit — после recovery Flink читает pending txnId из state и вызывает `recoverAndCommit()`.
+
+Пример: KafkaSink с `transactional.id` — использует Kafka transactional protocol.
+
+### Путь B — Idempotent sink
+
+Записи имеют уникальный PK или deterministic key. Sink делает UPSERT (PostgreSQL `ON CONFLICT DO UPDATE`, Cassandra LWT, Iceberg upsert mode). Дубликаты после replay перезаписывают одно и то же значение — итог идемпотентен.
+
+Это **проще** чем 2PC, но требует уникальности PK и UPSERT-семантики во внешней системе.
+
+### Что НЕ даёт EOS
+
+| Sink | Гарантия |
+|---|---|
+| Plain JDBC INSERT без PK | at-least-once (после replay дубликаты) |
+| Plain KafkaSink с `DeliveryGuarantee.AT_LEAST_ONCE` | at-least-once |
+| HTTP POST | at-least-once в лучшем случае |
+| `print()` | at-least-once (для дебага) |
+| File append без 2PC | дубликаты при replay |
+| FileSink с rolling policy + 2PC | exactly-once ✅ |
+| KafkaSink с `DeliveryGuarantee.EXACTLY_ONCE` | exactly-once ✅ |
+| Iceberg sink с SinkV2 committer | exactly-once ✅ |
+
+---
+
+## Композиция: weakest link wins
+
+<DiagramContainer title="Композиция гарантий — weakest link" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Scenario A"
+        tooltip="Kafka source (replayable) + ABS (internal EOS) + KafkaSink EOS. Все три слоя exactly-once. End-to-end: exactly-once. Это canonical Flink production setup."
+      >
+        Kafka → ABS → KafkaSink EOS
+      </DataBox>
+      <DataBox
+        label="= EOS ✅"
+        tooltip="Все три слоя дают exactly-once гарантию. Результирующая семантика — exactly-once end-to-end."
+      >
+        Exactly-once
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Scenario B"
+        tooltip="Kafka source + ABS + plain JDBC INSERT (без PK uniqueness). Layer 3 at-least-once: после replay дубликаты в БД. Итог: at-least-once."
+      >
+        Kafka → ABS → JDBC INSERT
+      </DataBox>
+      <DataBox
+        label="= at-least-once"
+        tooltip="Sink at-least-once делает весь pipeline at-least-once. Layer 1+2 не спасают от дубликатов в sink."
+      >
+        At-least-once
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Scenario C"
+        tooltip="Не-replayable source (RabbitMQ classic queue) + ABS + KafkaSink EOS. После replay часть записей не вернётся — Layer 1 at-most-once. Итог: at-most-once."
+      >
+        RabbitMQ → ABS → KafkaSink EOS
+      </DataBox>
+      <DataBox
+        label="= at-most-once"
+        tooltip="Non-replayable source может терять записи при replay. Это at-most-once семантика. Layer 3 EOS не спасает от потерь в layer 1."
+      >
+        At-most-once
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Scenario D"
+        tooltip="Kafka source + ABS + idempotent UPSERT в Postgres по PK. Layer 3 idempotent: повторные записи переписывают значение, no duplicates. Итог: effectively exactly-once."
+      >
+        Kafka → ABS → Postgres UPSERT
+      </DataBox>
+      <DataBox
+        label="= EOS (idempotent) ✅"
+        tooltip="Idempotent sink даёт effectively exactly-once: повторные записи в Postgres ON CONFLICT DO UPDATE не создают дубликатов. Это проще чем 2PC."
+      >
+        Exactly-once
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Канонический Flink job с EOS
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// Layer 2: ABS — exactly-once mode
+env.enableCheckpointing(60_000);
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+env.getCheckpointConfig().setCheckpointTimeout(600_000); // 10 min
+
+// Layer 1: replayable Kafka source
+KafkaSource<Transaction> source = KafkaSource.<Transaction>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("transactions")
+    .setGroupId("fraud-pipeline")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setValueOnlyDeserializer(new TransactionDeserializer())
+    // ВАЖНО: offsets хранятся в Flink state, не в Kafka __consumer_offsets
+    .setProperty("commit.offsets.on.checkpoint", "false")
+    .build();
+
+DataStream<Transaction> stream = env.fromSource(
+    source,
+    WatermarkStrategy.<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+        .withTimestampAssigner((tx, ts) -> tx.getEventTime()),
+    "kafka-source");
+
+// Layer 3: transactional KafkaSink
+KafkaSink<Alert> sink = KafkaSink.<Alert>builder()
+    .setBootstrapServers("kafka:9092")
+    .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+        .setTopic("fraud-alerts")
+        .setValueSerializationSchema(new AlertSerializer())
+        .build())
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("fraud-pipeline-v1")
+    .setProperty("transaction.timeout.ms", "3600000") // 1 hour
+    .build();
+
+stream
+    .keyBy(Transaction::getUserId)
+    .process(new FraudDetector())
+    .sinkTo(sink);
+
+env.execute("Fraud Detection EOS");
+```
+
+Три слоя выделены явно: KafkaSource (replayable), `EXACTLY_ONCE` checkpointing (ABS), `KafkaSink + EXACTLY_ONCE` (2PC).
+
+---
+
+## Connector readiness chart
+
+Не все connector-ы готовы для EOS. Текущее состояние (Flink 2.2):
+
+| Connector | EOS support | Mechanism |
+|---|---|---|
+| KafkaSink | ✅ | 2PC (transactional producer) |
+| FileSink | ✅ | Pending → committed via 2PC |
+| Iceberg Sink | ✅ | SinkV2 with pre-/post-commit topology |
+| Paimon Sink | ✅ | SinkV2 with snapshot commit |
+| JDBC Sink | ✅ XA / ⚠️ upsert | XA-2PC (DB должен support) или idempotent UPSERT |
+| Elasticsearch | ⚠️ idempotent | UPSERT by document ID |
+| Cassandra | ⚠️ idempotent | UPSERT, нет 2PC |
+| HBase | ⚠️ idempotent | PUT с rowkey идемпотентен |
+| RabbitMQ | ❌ | classic queue не транзакционный |
+| HTTP sink | ❌ | best-effort |
+
+<Callout type="note">
+JDBC XA-2PC требует support от database. PostgreSQL, MySQL поддерживают XA, но performance penalty ~30-50%. Часто проще использовать idempotent UPSERT по PK — это даёт effective EOS без XA overhead.
+</Callout>
+
+---
+
+## Production gotchas
+
+### 1. Source без `commit.offsets.on.checkpoint` нарушает EOS
+
+По умолчанию KafkaSource НЕ коммитит offsets в Kafka. Это правильно: offsets в Flink state — single source of truth. Но если кто-то включил `enable.auto.commit=true`, после restart Kafka выдаст offsets из своего `__consumer_offsets`, которые могут разойтись со state. Дубликаты или потери — оба возможны.
+
+**Fix**: оставить default behavior. Если нужна visibility в Kafka UI — установить `commit.offsets.on.checkpoint=true` (не disable EOS, просто side effect).
+
+### 2. Checkpointing AT_LEAST_ONCE случайно
+
+```java
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.AT_LEAST_ONCE); // ❌
+```
+
+При этом mode ABS не aligns barriers — multiple operator inputs могут видеть разные batches между checkpoints. Результат: state inconsistent → дубликаты на replay даже с EOS sink.
+
+**Fix**: всегда `EXACTLY_ONCE` для production EOS. `AT_LEAST_ONCE` только для latency-critical use cases без EOS требования.
+
+### 3. Sink в режиме AT_LEAST_ONCE
+
+```java
+KafkaSink.<Alert>builder()
+    .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE) // ❌ если нужна EOS
+    .build();
+```
+
+`AT_LEAST_ONCE` использует idempotent producer (Kafka producer config `enable.idempotence=true`), но без транзакций. Дубликаты на checkpoint replay возможны.
+
+**Fix**: `EXACTLY_ONCE` если нужно. Учесть: 2PC даёт latency penalty (commit после notifyCheckpointComplete).
+
+### 4. Non-replayable source с EOS sink
+
+Пример: HTTP webhook receiver + KafkaSink EOS. Webhook не replayable — после restart часть событий теряется. Кажется, что EOS работает (sink не дублирует), но **факт пропущенных записей** делает overall pipeline at-most-once.
+
+**Fix**: либо использовать буфер (Kafka между webhook и Flink), либо принять at-most-once семантику.
+
+### 5. EXACTLY_ONCE с side effects в UDF
+
+```java
+.map(tx -> {
+    httpClient.post("/audit", tx); // ❌ side effect вне sink
+    return tx;
+})
+```
+
+ABS гарантирует EOS только для state и sink output. Side effects в UDF (HTTP calls, file writes) выполняются на каждый replay → at-least-once в внешнюю систему.
+
+**Fix**: side effects через AsyncFunction с idempotency, или вообще не делать их в pipeline.
+
+---
+
+## Cheat sheet
+
+```
+end-to-end EOS = AND(
+    replayable_source,        # Kafka offsets / file paths / CDC LSN
+    internal_eos_via_ABS,     # EXACTLY_ONCE checkpointing mode
+    transactional_sink        # 2PC OR idempotent UPSERT
+)
+
+Weakest link wins:
+    any(at-most-once)  → overall at-most-once
+    any(at-least-once) → overall at-least-once
+    all(EOS)           → overall EOS
+```
+
+---
+
+<KnowledgeCheck
+  question="Production setup: Kafka source с `enable.auto.commit=true`, env.enableCheckpointing() в EXACTLY_ONCE mode, KafkaSink с DeliveryGuarantee.EXACTLY_ONCE. Команда тестирует EOS через chaos engineering — обнаруживают дубликаты в downstream Kafka topic после kill TaskManager. Где ошибка и как fix?"
+  answer="Ошибка в Layer 1 — Kafka source конфликтует с Flink state по offsets. С `enable.auto.commit=true` Kafka commit-ит offsets в `__consumer_offsets` независимо от Flink checkpoint. После kill TaskManager Flink restore-ит state с saved offsets, но Kafka может вернуть offsets из своего `__consumer_offsets`, которые advanced дальше (autocommit interval независим от checkpoint). Возможны два scenario: (a) Kafka offset > Flink offset → потеря записей; (b) Kafka offset < Flink offset → дубликаты (Flink перечитывает события, sink commit их во вторую транзакцию). Fix: убрать `enable.auto.commit` (default false в KafkaSource). Offsets — в Flink state, single source of truth. Если нужна visibility в Kafka UI, использовать `commit.offsets.on.checkpoint=true` (commits ПОСЛЕ успешного checkpoint, side effect, не нарушает EOS). Дополнительно: в KafkaSink убедиться что `transactionalIdPrefix` уникален per pipeline version (иначе старые pending txns могут conflict). Это классический пример где Layer 1 нарушен и Layer 2+3 EOS не спасают."
+/>

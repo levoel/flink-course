@@ -1,0 +1,401 @@
+---
+title: "Key Groups математика и rescaling механика"
+description: "hash(key) % maxParallelism → key group → owning subtask. maxParallelism immutable. Rescaling 4→8 на уровне key groups, default 128, max 32768"
+order: 4
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Key Groups", "maxParallelism", "Rescaling", "Hash partitioning", "State Redistribution"]
+---
+
+# Key Groups математика и rescaling механика
+
+`maxParallelism` — самая важная конфигурация Flink job. Её непонимание — причина #1 production-проблем при scaling. В этом уроке мы препарируем механизм key groups до точных формул и шагов rescaling.
+
+Если после этого урока вы знаете только одно — **выставляйте `setMaxParallelism(N)` явно при первом запуске** — это уже окупит время.
+
+---
+
+## Проблема: как routing работает по key?
+
+После `keyBy(Tx::getUserId)` записи должны попадать на subtasks **детерминированно**: запись с userId=42 всегда должна идти на тот же subtask, иначе:
+- State per user будет split между subtask-ами — нарушение per-key isolation
+- Аггрегаты будут неверными
+- При restart state не resolved корректно
+
+Простое решение — `hash(userId) % parallelism`. Но это ломается при rescaling: если parallelism меняется, formula возвращает другой subtask → state «потерян» (физически он в чужом subtask).
+
+Flink решает это через **key groups**: промежуточный уровень между ключом и subtask.
+
+---
+
+## Двухуровневая модель: ключ → key group → subtask
+
+<DiagramContainer title="hash(key) → key group → subtask" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="key = 'user-42'"
+        tooltip="Любой пользовательский ключ. Может быть Long, String, POJO — что угодно. hashCode/MurmurHash на serialized байтах."
+      >
+        Application key
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="hash(key) % maxParallelism" />
+    <FlowRow>
+      <DataBox
+        label="key group = 17"
+        tooltip="Внутреннее partitioning unit Flink. Total key groups = maxParallelism. Это immutable число — не меняется при rescaling. Default 128, max 32768."
+      >
+        Key group ID ∈ [0, maxParallelism)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="key group / (maxParallelism / parallelism)" />
+    <FlowRow>
+      <DataBox
+        label="subtask = 1"
+        tooltip="Owning subtask вычисляется по диапазону key groups. При parallelism=4 каждый subtask владеет maxParallelism/4 = 32 key groups. Subtask 1 владеет key groups [32, 63]."
+      >
+        Subtask ∈ [0, parallelism)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Точные формулы из Flink исходников
+
+```java
+// KeyGroupRangeAssignment.assignToKeyGroup
+public static int assignToKeyGroup(Object key, int maxParallelism) {
+    return MathUtils.murmurHash(key.hashCode()) % maxParallelism;
+}
+
+// Range key groups для subtask:
+public static KeyGroupRange computeKeyGroupRangeForOperatorIndex(
+        int maxParallelism, int parallelism, int operatorIndex) {
+    int start = ((operatorIndex * maxParallelism + parallelism - 1) / parallelism);
+    int end = ((operatorIndex + 1) * maxParallelism - 1) / parallelism;
+    return new KeyGroupRange(start, end);
+}
+
+// Subtask, владеющий key group:
+public static int computeOperatorIndexForKeyGroup(
+        int maxParallelism, int parallelism, int keyGroupId) {
+    return keyGroupId * parallelism / maxParallelism;
+}
+```
+
+`MathUtils.murmurHash` смазывает результат `key.hashCode()` (который может быть плохо распределён для некоторых типов), потом modulo maxParallelism.
+
+---
+
+## Worked example: maxParallelism=128, parallelism=4
+
+128 key groups, разделённых на 4 subtask. Каждый subtask владеет 32 key groups:
+
+| Subtask | Key group range | Items |
+|---|---|---|
+| 0 | [0, 31] | 32 |
+| 1 | [32, 63] | 32 |
+| 2 | [64, 95] | 32 |
+| 3 | [96, 127] | 32 |
+
+Для key `userId=42`:
+- `hash(42) % 128 = ?` Допустим, MurmurHash даёт 17
+- `17 / (128 / 4) = 17 / 32 = 0`
+- Запись идёт в subtask **0**.
+
+Для другого key `userId=99`:
+- `hash(99) % 128 = ?` Допустим, 75
+- `75 / (128 / 4) = 75 / 32 = 2`
+- Запись идёт в subtask **2**.
+
+---
+
+## Rescaling 4 → 8: что физически происходит
+
+Теперь scale up в 2 раза. **maxParallelism остаётся 128** — это её ключевое свойство. Меняется только parallelism: 4 → 8.
+
+Новое распределение key groups:
+
+| Subtask | Old range (P=4) | New range (P=8) | Items |
+|---|---|---|---|
+| 0 | [0, 31] | [0, 15] | 16 |
+| 1 | [32, 63] | [16, 31] | 16 |
+| 2 | [64, 95] | [32, 47] | 16 |
+| 3 | [96, 127] | [48, 63] | 16 |
+| 4 | — | [64, 79] | 16 |
+| 5 | — | [80, 95] | 16 |
+| 6 | — | [96, 111] | 16 |
+| 7 | — | [112, 127] | 16 |
+
+**Каждый из новых 8 subtask получает 16 key groups** (вместо 32). Old subtask 0's key groups [0-31] разделяются между new subtask 0 и new subtask 1.
+
+<DiagramContainer title="Key groups при rescaling 4→8" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Old subtask 0"
+        tooltip="Old subtask 0 владел key groups 0-31. State backend имел все state для этих ключей. При rescaling этот subtask 'разбирается': new subtask 0 берёт kg 0-15, new subtask 1 берёт kg 16-31."
+      >
+        kg [0..31]
+      </DataBox>
+      <DataBox
+        label="Old subtask 1"
+        tooltip="Old subtask 1 владел [32..63]. После rescaling: new subtask 2 берёт [32..47], new subtask 3 берёт [48..63]."
+      >
+        kg [32..63]
+      </DataBox>
+      <DataBox
+        label="Old subtask 2"
+        tooltip="Old subtask 2 владел [64..95]. После rescaling: new subtask 4 [64..79], new subtask 5 [80..95]."
+      >
+        kg [64..95]
+      </DataBox>
+      <DataBox
+        label="Old subtask 3"
+        tooltip="Old subtask 3 владел [96..127]. После rescaling: new subtask 6 [96..111], new subtask 7 [112..127]."
+      >
+        kg [96..127]
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rescaling: same key groups, разные owners" />
+    <FlowRow>
+      <DataBox
+        label="New subtask 0"
+        tooltip="Берёт половину старого subtask 0: kg [0..15]. State backend reload-ит только этот subset SST файлов из checkpoint."
+      >
+        kg [0..15]
+      </DataBox>
+      <DataBox
+        label="New subtask 1"
+        tooltip="Берёт другую половину: kg [16..31]. SST файлы старого subtask 0 теперь shared между new 0 и new 1."
+      >
+        kg [16..31]
+      </DataBox>
+      <DataBox
+        label="..."
+        tooltip="Аналогично для остальных. Total: 128 key groups, теперь по 16 на каждый из 8 subtask."
+      >
+        ...
+      </DataBox>
+      <DataBox
+        label="New subtask 7"
+        tooltip="Последняя половина старого subtask 3: kg [112..127]."
+      >
+        kg [112..127]
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Ключевое: **сам ключ userId=42 → key group 17 всегда**. Меняется только owner. Запись после rescaling всё равно попадает в правильный subtask, потому что hash function deterministic.
+
+### Что делает physical state backend
+
+Checkpoint на rescaling содержит SST файлы, organized **per key group**. Когда new subtask 1 запускается с key group range [16..31], state backend подгружает только SST с данными для этих key groups. Остальные ignore.
+
+Это работает потому что Flink при snapshot **записывает state per key group sub-range**. SST файлы шарят SharedStateRegistry (детали — урок 04.07 incremental checkpointing).
+
+---
+
+## Critical fact: maxParallelism IMMUTABLE
+
+После запуска job-а maxParallelism зафиксирован. Изменить можно только через savepoint + restart с State Processor API rebootstrapping.
+
+### Почему immutable?
+
+Потому что key group id = `hash(key) % maxParallelism`. Если поменять maxParallelism со 128 на 256, то ключ userId=42, который раньше был в key group 17, теперь окажется в key group `hash(42) % 256` = совершенно другое число. State, сохранённый для key group 17, не найдёт нового владельца.
+
+### Default maxParallelism
+
+```java
+// Flink computes default:
+public static int computeDefaultMaxParallelism(int parallelism) {
+    int max = Math.max(
+        128,                        // floor 128
+        nextPowerOf2((int)(parallelism * 1.5))
+    );
+    return Math.min(max, 32768);    // cap 32768
+}
+```
+
+| Initial parallelism | Default maxParallelism |
+|---|---|
+| 1–85 | 128 |
+| 86–170 | 256 |
+| 171–341 | 512 |
+| 342–682 | 1024 |
+| 683–1365 | 2048 |
+| ... | round up power of 2 |
+
+<Callout type="warning">
+**Никогда не полагайтесь на default.** Default 128 значит, что job не сможет scale до >128 subtask без rebootstrapping state. Это типичная ловушка для production-системы, которая стартует с parallelism=8, через год нагрузка растёт до 200 — обнаруживается, что maxParallelism=128, и scale выше невозможен.
+</Callout>
+
+### Рекомендация: setMaxParallelism щедро
+
+```java
+env.setMaxParallelism(1024);  // или 4096
+```
+
+Cost: больше key groups → чуть больше overhead на small parallelism. Но это micro-overhead (single digit % maybe), несравним с риском неспособности scale-up.
+
+Аргументы за высокий maxParallelism:
+- 1024 даёт room для scale-up до parallelism=1024
+- Key groups в snapshot — несколько байт metadata per key group, не overhead
+- Single-key throughput не страдает
+
+Аргументы против:
+- Slight overhead на small parallelism (более fine-grained snapshot)
+- Memory metadata в JobManager scales linearly с maxParallelism
+
+В большинстве production cases — `setMaxParallelism(1024)` золотая середина.
+
+---
+
+## Скрытая зависимость: maxParallelism от input format
+
+Default maxParallelism считается **на запуск job-а**. Если первая версия job имеет parallelism=4, то default = 128. Если позже scale до 200, то maxParallelism всё равно 128 — scale upper bound!
+
+Это значит: даже если кажется «мы потом увеличим», физически нельзя увеличить без rebootstrap.
+
+```java
+// ❌ Risky:
+env.execute("Job");  // default maxParallelism
+
+// ✅ Safe:
+env.setMaxParallelism(1024);
+env.execute("Job");
+```
+
+---
+
+## Skew problem: что если ключи распределены не равномерно?
+
+`hash % maxParallelism` гарантирует **равномерное** распределение по key groups, **только если hash хорошо рандомизирован**. Если ключ имеет плохой hashCode (например, custom POJO с broken hashCode), MurmurHash смазывает только частично.
+
+### Hot keys problem
+
+Если один ключ имеет 1M событий, а остальные — 100 — этот один ключ в одном key group → один subtask. Скос (skew) не лечится maxParallelism.
+
+Решения:
+- **Two-stage aggregation**: добавить random salt к key для intermediate aggregation, затем убрать для final
+- **Local aggregation в pre-aggregation operator** перед keyBy
+
+```java
+// Two-stage anti-skew:
+stream
+    .map(e -> new KV(e.userId + "-" + ThreadLocalRandom.current().nextInt(10), e))
+    .keyBy(KV::getKey)
+    .reduce(localReducer)  // local на 10x parallelism
+    .map(kv -> new KV(kv.getKey().split("-")[0], kv))
+    .keyBy(KV::getKey)
+    .reduce(finalReducer);
+```
+
+---
+
+## Production gotchas
+
+### 1. maxParallelism mismatch при savepoint restore
+
+```bash
+flink stop --savepointPath ... <jobid>
+# Меняем код: env.setMaxParallelism(2048);  // было 128
+flink run -s <savepoint> jar.jar
+# ❌ ERROR: maxParallelism mismatch
+```
+
+Savepoint содержит maxParallelism = 128. Job code пытается 2048. Conflict. Flink отказывает в restore.
+
+**Решение**: только через State Processor API можно «перепаковать» state в новый maxParallelism. Это offline-batch операция: read savepoint → re-bootstrap с новым maxParallelism → write new savepoint.
+
+### 2. Plate maxParallelism после deploy
+
+Если в первом deploy запустили без явного setMaxParallelism, default зафиксирован — никак не поменять без rebootstrap.
+
+**Checklist**: всегда set maxParallelism явно в первом коммите.
+
+### 3. setParallelism > setMaxParallelism — error
+
+```java
+env.setMaxParallelism(128);
+env.setParallelism(256);  // ❌ ERROR
+```
+
+Parallelism не может быть больше maxParallelism (нет смысла — пустые subtasks).
+
+### 4. Per-operator maxParallelism
+
+```java
+stream.process(new Func()).setMaxParallelism(256);  // override для оператора
+```
+
+Но это рискованно: разные операторы с разными maxParallelism могут конфликтовать при rescaling. Лучше глобальный.
+
+### 5. Custom hashCode broken state distribution
+
+```java
+class MyKey {
+    String a, b;
+    @Override
+    public int hashCode() { return a.hashCode(); }  // ❌ ignore b
+}
+```
+
+Если две MyKey с одинаковым `a` но разным `b` дают тот же hashCode — они идут в тот же key group → один subtask → state collision logically, но Flink-wise OK (он использует equals для disambiguation внутри RocksDB). Performance страдает: hot subtask.
+
+**Solution**: правильный hashCode на ALL поля через Objects.hash(a, b).
+
+### 6. String keys: be aware of MurmurHash behaviour
+
+```java
+keyBy(e -> e.userId.toString())  // String keys
+```
+
+MurmurHash на String hashCode даёт хорошее распределение. Не было проблем production.
+
+```java
+keyBy(e -> e.userId % 1000)  // ❌ всё в 1000 key groups
+```
+
+Modulo-based keys ограничивают распределение. Если key cardinality < maxParallelism, не все key groups будут utilised.
+
+---
+
+## Adaptive Scheduler и rescaling
+
+Flink 2.x по умолчанию использует **Adaptive Scheduler** (FLIP-291: in-place rescaling). Это позволяет менять parallelism job-а без full restart — внутри Flink перераспределяет key groups между subtasks без unload state на checkpoint.
+
+```yaml
+jobmanager.scheduler: adaptive
+jobmanager.adaptive-scheduler.resource-wait-timeout: 5min
+```
+
+С Adaptive Scheduler rescaling 4→8 происходит обычно за seconds, без полного restart job-а. Состояние тех subtask-ов, которые «остаются», не перезагружается из remote storage — только новые subtask делают partial state load.
+
+---
+
+<Callout type="tip">
+Простое правило: **maxParallelism = ваш absolute upper bound for parallelism + 4x headroom**. Если думаете scale до 64 — поставьте 256. Если до 256 — поставьте 1024. Если до 1000 — поставьте 4096. Это free insurance против rebootstrap pain.
+</Callout>
+
+---
+
+## Math cheat sheet
+
+```
+key group(key, mp)        = MurmurHash(key.hashCode()) mod mp
+subtask(kg, mp, p)        = kg * p / mp
+range(p, mp, i)           = [(i*mp + p-1) / p, (i+1)*mp - 1) / p]
+items per subtask         = mp / p (если mp делится на p — иначе ±1)
+```
+
+Где: `mp` = maxParallelism, `p` = parallelism, `i` = subtask index, `kg` = key group ID.
+
+---
+
+<KnowledgeCheck
+  question="Job стартовал с parallelism=4, maxParallelism default. Через год нагрузка выросла, нужен scale до parallelism=256. Что произойдёт при `setParallelism(256)` и restart с last savepoint? Как решить проблему?"
+  answer="При restart Flink увидит, что savepoint содержит maxParallelism = 128 (default, потому что не был явно установлен), и откажет в restore — нельзя parallelism > maxParallelism. Это classic 'maxParallelism trap'. Решения по эскалации: (1) ОТЛОЖЕННАЯ ПРАВКА — нельзя просто увеличить maxParallelism через config; (2) Использовать State Processor API: offline batch job читает savepoint → создаёт new bootstrap данных → пишет new savepoint с increased maxParallelism. Это требует rewrite всех state в новые SST файлы, может занять часы для TB state; (3) Альтернатива — accept upper bound 128, не scale выше. Production lesson: ВСЕГДА setMaxParallelism(1024+) при первом deploy. Cost микро-overhead, gain — гибкость scaling на годы вперёд. Это одна из главных production lessons Flink — нельзя 'отложить'."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/08-flink-cdc-3-pipeline",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-08",
+    "description": "Quiz для Flink CDC 3.x pipeline"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-08-q1",
+      "type": "multiple-choice",
+      "question": "Преимущества Flink CDC 3.x над Debezium + Kafka Connect для Postgres → lakehouse pipeline?",
+      "options": [
+        { "id": "a", "text": "Flink CDC только для batch jobs" },
+        { "id": "b", "text": "Single deployment (1 Flink job vs 4 systems: Debezium+KC+Kafka+downstream), declarative YAML (no Java code), schema evolution auto-propagation (DDL flows DB→sink, sink applies ALTER TABLE), native exactly-once к lakehouse direct (no Kafka hop), built-in AI integration (3.3+: OPENAI_EMBEDDING/CHAT в transform), lower latency, operational simplicity. Choose Debezium для Kafka-centric heterogeneous downstream" },
+        { "id": "c", "text": "Flink CDC не поддерживает Postgres" },
+        { "id": "d", "text": "Никаких преимуществ" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink CDC 3.x replacement для Debezium-based lakehouse ingestion. Key advantages: (1) Single deployment vs Debezium+KafkaConnect+Kafka+downstream. (2) Declarative YAML — entire pipeline в файле, no Java code. (3) Schema evolution auto-propagation — ALTER TABLE в Postgres flows через pipeline, Paimon applies ALTER TABLE автоматически; в Debezium downstream coordinates manually. (4) Native exactly-once к lakehouse — direct, no Kafka intermediate. (5) AI integration built-in (3.3+) — OPENAI_EMBEDDING/CHAT/SENTIMENT inline. (6) Lower latency, simpler ops. Use Debezium для: Kafka-centric architectures с many heterogeneous consumers (microservices, ML, analytics).",
+      "studyHint": "Повторите урок — секция Flink CDC vs Debezium",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-08-q2",
+      "type": "multiple-choice",
+      "question": "Production: Flink CDC Postgres pipeline crashed и не restarted на 24 часа. Postgres disk filled — WAL не освобождается. Что причина и как fix?",
+      "options": [
+        { "id": "a", "text": "Postgres bug — обратиться в support" },
+        { "id": "b", "text": "Flink CDC создаёт Postgres replication slot per pipeline. Slot holds WAL retention — WAL не recycled пока slot active (independent of pipeline running). Crashed pipeline = slot persists, WAL accumulates indefinitely. Fix: (1) Restart pipeline ASAP — consumed WAL released. (2) Если pipeline navсегда disabled — manually drop slot: SELECT pg_drop_replication_slot('flink_cdc_slot'). (3) Production: monitor pg_replication_slots — alert если confirmed_flush_lsn не advancing > threshold. Иначе disk fills" },
+        { "id": "c", "text": "Это limitation Postgres" },
+        { "id": "d", "text": "Уменьшить max_wal_size" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical Postgres CDC operational gotcha. Replication slots — durable state в Postgres что remembers что данный consumer должен see (last consumed LSN). WAL не recycled пока всех slots не прошли это (oldest confirmed_flush_lsn). Если pipeline crash и не restart — slot remains, WAL grows unbounded, disk fills. Real production incidents tooks down whole DBs. Mitigations: (1) Monitor pg_replication_slots view actively (Datadog/Prometheus). (2) Alert if slot active=false longer than threshold. (3) Auto-drop slots для retired pipelines. (4) Set wal_keep_size cap. Critical: на permanent pipeline removal, manually drop slot.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-08-q3",
+      "type": "multiple-choice",
+      "question": "Что обеспечивает schema evolution propagation в Flink CDC?",
+      "options": [
+        { "id": "a", "text": "Manual sync через external scripts" },
+        { "id": "b", "text": "Pipeline emits SchemaChangeEvent при DDL detection в WAL → propagates через transform/route stages → sink applies к target table (Paimon ALTER TABLE etc). Supported DDL: ADD COLUMN (auto-add к sink), DROP COLUMN (configurable behaviour), RENAME COLUMN, CHANGE COLUMN TYPE (compatible widening). Configurable через schema-change.behavior: try-evolve, evolve, lenient, exception. No manual sync, no pipeline restart — automatic propagation" },
+        { "id": "c", "text": "Schema evolution не supported" },
+        { "id": "d", "text": "Только batch reload" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Killer feature Flink CDC 3.x. Pipeline streams two types events: DataChangeEvent (regular INSERT/UPDATE/DELETE rows) и SchemaChangeEvent (DDL like ALTER TABLE). При DDL в Postgres WAL — Flink CDC source emits SchemaChangeEvent. Это propagates через transform stages (могут adapt — e.g., add new column к projection), routes к sink. Sink (Paimon, Iceberg, etc.) applies к target table — ALTER TABLE ADD COLUMN automatically. No restart, no manual coordination. Configurable behavior (schema-change.behavior YAML option): try-evolve (apply if compatible), exception (fail на incompatible change), lenient (skip incompatible), evolve (force apply). Strict improvement over Debezium where downstream needs manual sync.",
+      "studyHint": "Повторите урок — секция Schema evolution propagation",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m10-08-q4",
+      "type": "true-false",
+      "question": "Flink CDC 3.3+ AI Model Integration позволяет вызывать OpenAI embedding/chat functions прямо в transform expressions без необходимости отдельного AsyncFunction или external service call.",
+      "correctAnswer": true,
+      "explanation": "Правда. Flink CDC 3.3+ added native AI integration. Transform expressions support functions like OPENAI_EMBEDDING(text), OPENAI_CHAT(prompt, model='gpt-4'), OPENAI_SENTIMENT(text). Configured через options (api-key, model, timeout-ms). Internally handles async I/O wrapping — calls API non-blockingly. Use cases: real-time vector ingestion в vector DB (Pinecone, Milvus), automated classification (sentiment, category) при ingestion, PII detection via LLM, translation/summarization. Caveats: cost explosion (API calls per row × CDC rate × time), API rate limits, latency 100-500ms per call. Mitigations: compute on INSERT only (filter via __data_event_type__), hash-cache deterministic embeddings, use cheaper models. Это disrupts pattern external Async I/O lookup к ML service.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

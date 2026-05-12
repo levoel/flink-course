@@ -1,0 +1,139 @@
+{
+  "moduleId": "15-performance-tuning",
+  "title": "Module 15 Exam — Performance Tuning",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m15-exam",
+    "description": "Integrated exam for Module 15"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-exam-q1",
+      "type": "multiple-choice",
+      "question": "Полная декомпозиция TaskManager Total Process Memory по FLIP-49 (Flink 2.x):",
+      "options": [
+        { "id": "a", "text": "Heap + Off-Heap" },
+        { "id": "b", "text": "Total Process = Total Flink Memory (JVM Heap [Framework + Task] + Off-Heap [Framework + Task + Network + Managed]) + JVM Metaspace + JVM Overhead" },
+        { "id": "c", "text": "Heap + Managed + Network" },
+        { "id": "d", "text": "Process = Heap + Direct Memory" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-49 — единственная корректная модель Flink 2.x. Total Process Memory (= K8s pod limit с headroom) → JVM Metaspace (256MB default) + JVM Overhead (clamped 192MB-1GB, 10% default) + Total Flink Memory. Внутри Flink Memory: JVM Heap (Framework 128MB + Task computed) + Off-Heap (Framework 128MB + Task 0 default + Network 10% + Managed 40%). Без понимания decomposition tuning RocksDB/GC/network — слепое.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m15-exam-q2",
+      "type": "multiple-choice",
+      "question": "Три метрики (FLIP-179, Flink 1.13+) для backpressure диагностики и их семантика:",
+      "options": [
+        { "id": "a", "text": "isBackPressured boolean only" },
+        { "id": "b", "text": "busyTimeMsPerSecond (полезная работа, включает state I/O wait), idleTimeMsPerSecond (нет данных upstream), backPressuredTimeMsPerSecond (downstream не принимает). Сумма ≈ 1000ms/sec. Web UI colors: красный busy>90%, синий idle>50%, чёрный backpressured>50%" },
+        { "id": "c", "text": "throughput / latency / utilization" },
+        { "id": "d", "text": "CPU / memory / disk" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Тройка превратила диагностику из шаманства в детерминированный flow. Diagnosis: red operator = bottleneck CPU/state, black backpressured = bottleneck downstream от него. busy включает state I/O wait — это важно: subtask может быть busy при low CPU, реально I/O bound. Cross-check с iostat. Web UI 1.13+ показывает реальные numbers, не выводы из stack samples.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m15-exam-q3",
+      "type": "multiple-choice",
+      "question": "Custom RocksDBOptionsFactory ОБЯЗАТЕЛЬНО должна:",
+      "options": [
+        { "id": "a", "text": "Implement RocksDBOptionsFactory interface напрямую" },
+        { "id": "b", "text": "Extend DefaultConfigurableOptionsFactory И вызывать super.createDBOptions(opts, handles) первым — иначе WriteBufferManager + Block Cache не injected → OOM через несколько часов. Симптом: Status.JVM.Memory.Direct.MemoryUsed линейный рост, K8s OOMKill" },
+        { "id": "c", "text": "Использовать только setMaxOpenFiles" },
+        { "id": "d", "text": "Не модифицировать DBOptions" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Most common production OOM cause. Антипаттерн: return new DBOptions().setMaxBackgroundJobs(8) — fresh options, WBM/BC потеряны. Math: 10 CF × 4 slots × (64MB MemTable + 8MB BC) = 2.88GB unbounded native. Right pattern: opts = super.createDBOptions(opts, handles) preserves injection, then opts.setMaxBackgroundJobs(8) overrides on top. Без super() даже простой override breaks memory management. CI rule: lint custom factories на subclassing.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-exam-q4",
+      "type": "multiple-choice",
+      "question": "Buffer Debloating (FLIP-183, 1.14+):",
+      "options": [
+        { "id": "a", "text": "Уменьшает default segment-size" },
+        { "id": "b", "text": "Dynamic buffer sizing based на throughput. Под backpressure buffers shrink → меньше in-flight data → checkpoint alignment ускоряется 2-5x. taskmanager.network.memory.buffer-debloat.enabled: true, target: 1s. Default disabled из conservatism, но de-facto mandatory для EXACTLY_ONCE с variable throughput" },
+        { "id": "c", "text": "Compression механизм" },
+        { "id": "d", "text": "Удаление unused buffers" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Каждые 200ms re-evaluate optimal buffer size. При backpressure (slow downstream) buffer-ы shrink → in-flight data может упасть с 100MB до 10MB → barrier alignment в разы быстрее. Production: для EOS workloads single config change даёт 2-5x speedup checkpoint duration. Не помогает stable throughput jobs (no backpressure), там pure overhead. Pair с unaligned checkpoints (aligned-timeout: 30s) — fallback к unaligned после 30s alignment.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-exam-q5",
+      "type": "multiple-choice",
+      "question": "Generational ZGC (Java 21+) recommendation для Flink 2.x — когда использовать?",
+      "options": [
+        { "id": "a", "text": "Never — G1 always default" },
+        { "id": "b", "text": "Для heap > 8GB latency-critical workloads. -XX:+UseZGC -XX:+ZGenerational -XX:MaxGCPauseMillis=10 -XX:+AlwaysPreTouch -Xms == -Xmx. Pauses < 1ms даже на TB heap, generational efficiency сравнима с G1. Cost ~5-10% throughput compensated latency выигрышем. Recommended default для всех новых production deployments на Java 21" },
+        { "id": "c", "text": "Только для batch" },
+        { "id": "d", "text": "Только для < 4GB heap" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Java 21 LTS + generational ZGC GA — game changer. Старая мудрость 'G1 default OK для всего' устарела. Для streaming с large heap (HashMap state, ML inference) или low-latency требованиями (P99 < 50ms) — ZGC превосходит G1. На small heap < 4GB ZGC overhead (3% memory, 5-15% throughput) не worth — G1 OK. AlwaysPreTouch обязательно — touch pages upfront, eliminates page fault spikes. Fixed heap (-Xms == -Xmx) — ZGC любит stable.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-exam-q6",
+      "type": "multiple-choice",
+      "question": "Production: subtask 12 из 32 busy=100%, остальные idle. numRecordsInPerSecond skew 25× (subtask 12 = 50k/sec, остальные 2k). TaskManager регулярно OOM. Root cause + fix priority?",
+      "options": [
+        { "id": "a", "text": "Restart job" },
+        { "id": "b", "text": "Data skew: hot key (whale user / bot) mapped в один key group. Fixes priority: (1) Two-stage aggregation с salting — keyBy(userId + '_' + hash%32) → reduce → keyBy(userId) → reduce. 32× spread hot key. (2) State TTL для защиты от OOM. (3) Top-K hot user detection + special handling (side output, broadcast). (4) Long-term: business logic review (bot detection?). Critical: increasing parallelism НЕ решает skew" },
+        { "id": "c", "text": "Increase parallelism до 64" },
+        { "id": "d", "text": "Switch к HashMap backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Severe data skew. keyBy partitioning use hash → если cardinality неравномерна (один hot key), один subtask overwhelmed. Diagnose: coefficient of variation numRecordsInPerSecond > 0.5 = severe. Hot user patterns: whale account, bot synthetic traffic. Critical insight: parallelism 32→64 НЕ помогает — hot key всё равно в одном subtask из 64. Только salting splits load. Cost salting: extra shuffle stage, но evens load. Long-term: business logic — bot detection, special handling.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-exam-q7",
+      "type": "true-false",
+      "question": "max-concurrent-checkpoints: 2+ безопасно для всех state backends — увеличивает effective throughput через parallel checkpoint progress.",
+      "correctAnswer": false,
+      "explanation": "False. С 2+ parallel checkpoints RocksDB не может evict immutable MemTables (referenced both active checkpoints) → MemTable accumulation → write stall. Production rule: max-concurrent: 1 для RocksDB. 2+ только для HashMap state (no concurrent reference issue). Если нужна faster checkpoint visibility: incremental checkpoints + Changelog backend (FLIP-158, sub-second consistent) — proper solution. Concurrent checkpoints — anti-pattern для RocksDB jobs, может привести к degraded performance вместо ожидаемого ускорения.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-exam-q8",
+      "type": "multiple-choice",
+      "question": "Changelog state backend (GIC, FLIP-158) — когда правильное решение?",
+      "options": [
+        { "id": "a", "text": "Никогда — это experimental" },
+        { "id": "b", "text": "Когда checkpoint duration variable (sawtooth pattern из-за compaction spikes), нужна sub-second predictable duration, EXACTLY_ONCE с downstream latency requirement (transactional sink commit latency = checkpoint visibility). State backend changelog uncoupled от compaction — каждая mutation в log на DFS. Trade-offs: higher DFS throughput, slower recovery (log replay), 2-3× storage" },
+        { "id": "c", "text": "Для всех jobs автоматически" },
+        { "id": "d", "text": "Только для batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-158 (1.15 experimental, 1.16 stable). НЕ silver bullet. Решает specifically variability проблему. Когда RocksDB incremental sufficient — не нужен. Когда checkpoint size sawtooth (50GB после L0→L1 compaction) → downstream latency spikes → Changelog даёт constant small deltas. Configuration: state.backend.changelog.enabled: true, periodic-materialize.interval: 10min (balance recovery vs DFS overhead). Production rule: enable когда конкретная проблема со spikes, не profilactically.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-exam-q9",
+      "type": "multiple-choice",
+      "question": "Chained pipeline busy 95%, throughput plateau. Sync DB lookup в одном из chained Map. План?",
+      "options": [
+        { "id": "a", "text": "Restart, parallelism +" },
+        { "id": "b", "text": "(1) Temporary disable chaining → confirm sync lookup busy 90%+ (blocking mailbox thread). (2) Real fix: AsyncDataStream.unorderedWait — capacity=100 in-flight, не блокирует thread, throughput x10-x50 если DB latency=50ms. (3) Re-enable chaining (default). Alternative: cache enrichment с TTL, broadcast small dataset, или specific business logic decisions" },
+        { "id": "c", "text": "Switch к hash join" },
+        { "id": "d", "text": "Migration к batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sync I/O в chained task = thread blocked → все chain elements idle. Diagnose flow: temporary disableChaining для per-op metrics, identify blocking operator, real fix via async. AsyncDataStream.unorderedWait — proper Flink way. Capacity controls in-flight requests. После async fix chain не блокирует — re-enable chaining (don't leave disabled, performance loss). Production lesson: chaining hides bottlenecks. Add temporary disable to diagnostic playbook, restore после fix.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-exam-q10",
+      "type": "true-false",
+      "question": "K8s pod memory limit должен ровно совпадать с taskmanager.memory.process.size — Flink calculates точно.",
+      "correctAnswer": false,
+      "explanation": "False. OS-level overhead (cgroup memory accounting, page cache для mmap'нутых RocksDB SST files, socket buffers, /tmp tmpfs если local dir там) добавляет 1-2GB поверх Flink budget. JVM не видит OS overhead. Result: cgroup memory.usage exceeds pod limit → K8s OOMKill (exit 137). JVM heap/direct memory выглядят OK. Production rule: pod.limit = process.size × 1.15 минимум (15% headroom). Например process.size=14g на pod.limit=16Gi. Также verify state.backend.rocksdb.localdir НЕ на tmpfs — иначе RocksDB пишет в memory.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

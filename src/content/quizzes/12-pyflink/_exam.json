@@ -1,0 +1,117 @@
+{
+  "moduleId": "12-pyflink",
+  "title": "Module 12 Exam — PyFlink",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m12-exam",
+    "description": "8-question integrated exam for Module 12"
+  },
+  "questions": [
+    {
+      "id": "flink-m12-exam-q1",
+      "type": "multiple-choice",
+      "question": "Python version support и production deployment для PyFlink 2.2.x — какие critical settings?",
+      "options": [
+        { "id": "a", "text": "Любая Python version работает identically" },
+        { "id": "b", "text": "Python 3.11 production default для Flink 2.2.x (3.7/3.8 dropped). Single Docker image для CI/dev/staging/prod — guarantees IDENTICAL Python version client↔cluster (pickle protocol, cloudpickle, native ABI зависят). pyArchives через conda-pack (preferred для ML с numpy/pandas/torch) uploaded к S3, referenced в FlinkDeployment CRD args. Identical pinned versions всех deps в requirements.txt/environment.yml. Off-heap memory configured для embedded Python. Connectors как JAR в classpath" },
+        { "id": "c", "text": "Use Python 2.7 для compatibility" },
+        { "id": "d", "text": "Production не recommended" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production PyFlink на Kubernetes requires careful coordination across multiple layers. **Python version 3.11**: latest officially supported для Flink 2.2.x. Python 3.7 dropped Flink 1.19, 3.8 dropped 2.2. Reasons для 3.11: 25% faster execution vs 3.10, PEP 657 fine errors, ExceptionGroup для async code, PEMJA built против 3.11 ABI. **Single Docker image for всё** — critical для consistency. FROM flink:2.2.0-java17 + install python3.11.7 (pinned patch) + system libs. Used для CI tests, local dev (docker-compose), staging, production. Eliminates Python version mismatch issues. **pyArchives packaging**: conda-pack создаёт portable archive без conda runtime — `tar.gz` containing complete Python venv. Upload S3 (separate bucket для artifacts). FlinkDeployment CRD references via args: `-pyarch s3://artifacts/env.tar.gz#env -pyexec env/bin/python`. **Pinned deps**: requirements.txt or environment.yml с exact versions для всех libs. CI verifies installed versions match expected. **Off-heap memory**: `taskmanager.memory.task.off-heap.size: 512m+` для embedded Python (thread mode) или Python process memory (process mode с ML libs). **Connectors**: JAR files в /opt/flink/lib/ image или mounted volume. Available для PyFlink Table API automatically through DDL.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-exam-q2",
+      "type": "multiple-choice",
+      "question": "PyFlink Table API vs DataStream API — почему такая разница в performance characteristics?",
+      "options": [
+        { "id": "a", "text": "Они одинаковые" },
+        { "id": "b", "text": "Table API: SQL parsing/optimization/code generation всё JVM-side (Calcite). Python — thin wrapper через Py4J, submits SQL strings. Runtime processing — JVM bytecode, ~100% Java baseline. DataStream API: each Python transformation has callback в Python. Process mode IPC overhead 30-50% baseline, thread mode (PEMJA) 70-90%, Pandas UDF (vectorized via Arrow) 90-95%, Async UDF depends external. Result: Table API recommended для most production cases; DataStream только когда нужны low-level features (custom state machines, timers) не expressible в SQL" },
+        { "id": "c", "text": "DataStream быстрее" },
+        { "id": "d", "text": "Table API только для small data" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Architectural difference explains performance gap. **Table API execution**: SQL string → Apache Calcite parser (Java) → logical plan → optimizer (predicate pushdown, projection pruning, join reordering) → physical plan → code generation produces Java bytecode → DataStream graph submitted к execution. ВСЕ steps JVM. PyFlink TableEnvironment — Py4J wrapper. Python только submits SQL, retrieves results. **No Python в data path** unless Python UDF invoked. Performance equivalent Java Table API (~100% baseline для 250k+ rec/sec/subtask). **DataStream API execution**: each `.map()/.filter()/.process()` has Python callable executed per record. Process mode: separate Python OS process per slot, IPC over gRPC (~50μs roundtrip). Bundle batching amortizes (1000 records per call), но caps at ~30-50% Java baseline due IPC + Python interpretation. Thread mode (PEMJA, урок 06): embedded CPython в JVM, JNI calls ~1μs, ~70-90% Java baseline, but GIL contention limits slot count. Pandas UDF (урок 07): Arrow zero-copy + vectorization, ~90-95% Java baseline, best для batch numeric operations. Async UDF (урок 08, Flink 2.2): asyncio + concurrent in-flight requests, throughput depends external system, killer для LLM/API workloads. **Production guidance**: prefer Table API для ETL declarative workloads (CDC, aggregations, joins, simple transformations). DataStream API для (a) custom keyed state с complex logic не expressible в SQL, (b) custom timers с specific scheduling, (c) side outputs с custom routing. Choose execution mode based on UDF characteristics.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m12-exam-q3",
+      "type": "multiple-choice",
+      "question": "Process mode vs thread mode (PEMJA) — fundamental architectural difference?",
+      "options": [
+        { "id": "a", "text": "Одинаковые с разными именами" },
+        { "id": "b", "text": "Process mode: separate Python OS process per slot via Apache Beam Portability framework. gRPC IPC (Unix socket, protobuf). Bundle processing для amortization (~50μs IPC overhead/call). ~30-50% Java baseline. STRONG isolation — Python crash → restart Python subprocess, JVM unaffected. Thread mode (PEMJA, 1.15+): embedded CPython в JVM через JNI. ~1μs per call. No serialization. ~70-90% Java baseline. WEAK isolation — Python crash → JVM crash. Single GIL across all slots per TM → contention. Trade-off: performance vs isolation" },
+        { "id": "c", "text": "Process mode deprecated" },
+        { "id": "d", "text": "Thread mode только для tests" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Two fundamentally different execution models. **Process mode** (default, default Apache Beam Portability framework): separate OS process per slot. Components: TaskManager JVM + Beam Portability harness (manages Python process lifecycle) + Python interpreter process + gRPC services (Control, Data, State, Logging). Communication через Unix domain sockets (faster than TCP), records serialized к Beam Portable protobuf format. IPC roundtrip ~50μs — requires bundle batching (1000 records/bundle default) для amortization. Performance: ~30-50% Java baseline. **Isolation strong**: Python crashes (segfault от C extension, OOM, SIGABRT) → Python process dies → Flink restarts Python subprocess → JVM unaffected. Other slots unaffected. Critical for untrusted dependencies. **Thread mode (PEMJA)** (Flink 1.15+): CPython embedded в JVM via JNI bridge using stable CPython ABI. Python код executes в JVM thread context. No process boundary, no IPC, no serialization. JNI call ~1μs. Performance: ~70-90% Java baseline. **Isolation weak**: Python error → JVM error. Segfault в native extension → entire JVM crash → TaskManager restart (affects all slots in that TM). **GIL contention**: all slots в TM share single embedded CPython interpreter → single GIL → concurrent slot execution serializes. Production: numberOfTaskSlots: 1-2 per TM, compensate via more TMs. **Decision factors**: process mode default safe choice, especially for untrusted deps, GPU code, heavy native extensions. Thread mode для performance gain when (a) UDFs use mature stable deps (numpy/pandas/sklearn), (b) team has tested extensively, (c) acceptable blast radius (TM-level crashes manageable).",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m12-exam-q4",
+      "type": "multiple-choice",
+      "question": "Pandas UDFs дают 10-50x speedup — какая technology behind?",
+      "options": [
+        { "id": "a", "text": "Просто Python rewritten в C" },
+        { "id": "b", "text": "Apache Arrow zero-copy memory format + vectorization. Flink batches records в Arrow RecordBatch (columnar memory: each column = contiguous buffer). Pandas DataFrame constructed from Arrow columns без copying — same memory addresses. UDF получает pd.Series/DataFrame, applies vectorized numpy/pandas ops (SIMD-aware, cache-friendly). Returns batch result. Bulk transfer + batch execution = 10-50x faster than per-record IPC + per-record Python execution. ~90-95% Java baseline для numerical operations" },
+        { "id": "c", "text": "Pandas UDFs используют GPU" },
+        { "id": "d", "text": "Они slower than row-wise UDFs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Two-pronged speedup mechanism. **Apache Arrow** — cross-language columnar memory format designed для zero-copy data sharing. Key features: (1) **Columnar layout** — each column contiguous memory buffer optimized для cache-friendly sequential access, SIMD vectorization. (2) **Shared memory** — JVM and Python see same memory addresses. (3) **Standard format** — pandas, numpy, polars, R consume directly. **Flink Pandas UDF flow**: (1) Flink batches N records (default arrow.batch.size=10000) в Arrow RecordBatch on JVM. (2) Memory passed Python — pandas DataFrame constructed from Arrow columns без copy (pyarrow.Table.to_pandas() zero-copy для compatible types). (3) UDF receives pd.Series/DataFrame, applies vectorized ops (numpy operations across array, pandas methods on Series). (4) Result Series converted back через Arrow к JVM RowData. **Vectorization speedup**: per-record UDF — 10M records × (50μs IPC + 10μs Python) = 600 sec. Pandas UDF — 1000 batches × 1ms = 1 sec. **600x theoretical**, realistic 10-50x speedup. **Real workloads**: simple numeric op ~94% Java baseline (235k vs 250k rec/sec). sklearn predict_proba 10k records — milliseconds (naturally batched). NLP regex via pd.Series.str — C-level optimized. **Limitations**: works для vectorizable operations (numpy/pandas batch ops). Non-vectorizable (per-record conditionals, sequential dependencies) — vectorization не помогает. Use row-wise UDF instead. **Migration easy**: existing row-wise UDF often vectorizes по simple decorator change `func_type='pandas'` plus signature update (pd.Series instead of scalar). Same syntax for many ops (v * 2 works element-wise on Series).",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m12-exam-q5",
+      "type": "multiple-choice",
+      "question": "Async UDFs в Flink 2.2 — что они закрыли и какие production patterns critical?",
+      "options": [
+        { "id": "a", "text": "Async UDFs только для GPU" },
+        { "id": "b", "text": "Closed критический gap PyFlink — no async I/O equivalent Java's AsyncDataStream. Sync UDF с external API call blocking Python interpreter (LLM 1-3s → 0.3 rec/sec/subtask). Async UDF: @async_udf decorator + async def coroutine + asyncio event loop per slot. Concurrent in-flight requests up to capacity. 500x throughput. Critical patterns: (1) connection pooling в open(), (2) rate limiting (aiolimiter), (3) error handling с fallback (no exception bubble), (4) idempotency keys для at-least-once safety, (5) pre-filtering в SQL для cost control, (6) caching common results, (7) UNORDERED ordering default" },
+        { "id": "c", "text": "Async UDFs deprecated" },
+        { "id": "d", "text": "Не отличаются от sync UDFs" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Gap closed**: Pre-2.2 PyFlink couldn't do non-blocking external calls. Synchronous external API call в UDF blocked Python interpreter — каждый record waits 1-3s для LLM response → throughput 0.3-1 rec/sec/subtask. Catastrophic для real-time. Java имел `AsyncDataStream.unorderedWait`. Python не имел equivalent. **Flink 2.2 solution**: `@async_udf` decorator on `async def` coroutine. Per-slot asyncio event loop. Concurrent in-flight requests up to capacity setting. Records await without blocking — other coroutines progress. Throughput = capacity / latency. **500x improvement** typical для LLM workloads. **Production patterns critical**: (1) **Connection pooling**: single `aiohttp.ClientSession` в `async def open()`, reused в `eval()`. Pool size via `TCPConnector(limit=2000)` для high capacity. Without — connection exhaustion. (2) **Rate limiting**: client-side via `aiolimiter` для respect external API TPM/RPM. Without — 429 errors flood, cascade failures. (3) **Error handling**: wrap external call try/except, return fallback ('uncertain'). NEVER let exception bubble — would fail operator → cascade restart → state replay → re-fail. (4) **Idempotency keys**: include `x-idempotency-key: {record_id}` header. Flink at-least-once semantics — on recovery in-flight requests re-issued, duplicates possible. External service deduplicates by key. (5) **Pre-filtering в SQL**: `WHERE priority='HIGH' OR contains_urgent_keywords(text)` — don't call expensive LLM unless necessary. Saves 80%+ API costs. (6) **Caching**: separate Redis cache для repeated queries (hash query → response, 1h TTL). Hit rate >70% common. (7) **UNORDERED ordering**: default. ORDERED has head-of-line blocking — slow record holds capacity, throughput collapses.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-exam-q6",
+      "type": "multiple-choice",
+      "question": "Production PyFlink job в process mode throughput 30k events/sec, target 200k. UDF — pure Python с numpy. Какой optimization plan?",
+      "options": [
+        { "id": "a", "text": "Increase parallelism only" },
+        { "id": "b", "text": "Multi-phase optimization: (1) Bundle tuning bundle.size=5000, bundle.time=2000ms — better amortization. Expected 30k → 80k. (2) Switch к thread mode (PEMJA) — `python.fn-execution.framework: THREAD`. Eliminates IPC overhead. Expected 80k → 150k. Reduce slots/TM к 2 для GIL contention mitigation. (3) Vectorize numpy ops to Pandas UDF — `func_type='pandas'`. Arrow zero-copy + batch execution. Expected 150k → 200k+. (4) If still insufficient — re-evaluate if Java rewrite warranted. Throughout: profile UDF (cProfile), monitor processBundleMs, watch GIL contention" },
+        { "id": "c", "text": "Switch на Java" },
+        { "id": "d", "text": "Buy more hardware" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Systematic optimization phases. **Phase 1 — Bundle tuning** (cheapest): increase `python.fn-execution.bundle.size: 5000` (default 1000), `python.fn-execution.bundle.time: 2000` (default 1000ms). Larger bundles amortize IPC overhead better. Trade-off: latency may grow к 2 sec worst case. Expected throughput: 30k → 80-100k. **Phase 2 — Profile Python UDF**: cProfile attached к Python process. Common findings: (a) heavy imports в eval() — lift к open(). (b) Inefficient ops — pandas.read_csv per record! Cache result. (c) Redundant work — same computation repeated. Fix obvious wins. **Phase 3 — Thread mode (PEMJA)**: `python.fn-execution.framework: THREAD`. Eliminates IPC overhead (~50μs/record gone). UDF compatibility check first: numpy/pandas — usually OK с stable CPython ABI. Reduce numberOfTaskSlots: 8 → 2 для GIL contention (single embedded interpreter, all slots share GIL). Compensate via more TaskManagers (2 TM × 8 slots → 8 TM × 2 slots). Expected: 80k → 150-180k. **Phase 4 — Pandas UDF**: convert numpy operations to vectorized. Add `func_type='pandas'`, signature pd.Series instead of scalar. Same numpy/pandas syntax (`v * 2` works on Series). Arrow zero-copy batch transfer. Expected: 150k → 200k+. **Phase 5 — Async UDF**: if UDF has external API call (not given here, but valuable consideration), async UDF for concurrent in-flight. **Phase 6 — Java rewrite**: last resort if performance still insufficient. Indicators: throughput <50% target after all optimizations, latency requirements <50ms p99, throughput >500k/sec/subtask. **Monitoring during transitions**: throughput per subtask, processBundleMs histogram (should drop в Pandas mode), Python heap memory, JVM heap+off-heap (thread mode), restart count. **Production rollout**: each phase staging test 1 week, canary 5% → 100% over 2 weeks. Keep rollback config ready.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-exam-q7",
+      "type": "multiple-choice",
+      "question": "PyFlink RAG (Retrieval-Augmented Generation) pipeline в Flink 2.2 — какая architecture?",
+      "options": [
+        { "id": "a", "text": "RAG impossible в PyFlink" },
+        { "id": "b", "text": "Full pipeline в pure PyFlink Table API + SQL: (1) Kafka source customer queries. (2) Async UDF get_embedding(text) → OpenAI embeddings API (300+ concurrent). (3) VECTOR_SEARCH(knowledge_base, embedding, 5) — FLIP-540 built-in 2.2. (4) Async UDF generate_response(query, context) → LLM (Claude/GPT) с retrieved context (200+ concurrent). (5) Async UDF post_response(customer_id, response) → webhook. Each step async с capacity tuning. Pipeline expressed as SQL с composed UDFs. Throughput 100+ msgs/sec end-to-end" },
+        { "id": "c", "text": "Только batch mode" },
+        { "id": "d", "text": "Требует internal microservices" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Modern AI/ML production pipeline на PyFlink 2.2. **Architecture**: Kafka customer messages → embedding UDF → vector search → LLM generation → webhook delivery. All в single PyFlink Table API job. **Implementation**: (1) **Source**: CREATE TABLE customer_queries WITH (connector='kafka', format='json'). (2) **Embedding UDF** (async): ```python\\n@async_udf(input_types=[STRING()], result_type=ARRAY(FLOAT()),\\n           capacity=300, timeout=2000)\\nasync def embed(text):\\n    async with session.post('openai.com/embeddings', json={'input':text}) as r:\\n        return (await r.json())['data'][0]['embedding']```. Capacity 300 (OpenAI p99=300ms → 1000/sec/subtask). (3) **Vector search**: VECTOR_SEARCH built-in 2.2 (FLIP-540) — `VECTOR_SEARCH(knowledge_base, embedding, 5)` returns top-5 similar docs from pre-loaded knowledge_base. Embedded vector store или external Pinecone. (4) **LLM UDF** (async): ```python\\n@async_udf(..., capacity=200, timeout=8000)\\nasync def generate(query, context):\\n    prompt = f'Customer: {query}\\\\nContext: {context}'\\n    response = await anthropic.messages.create(...)\\n    return response.content[0].text```. Capacity 200 (Claude p99=2s → 100/sec/subtask). (5) **Webhook UDF** (async): post response к customer-facing API. **SQL composing**: ```sql\\nINSERT INTO webhook_log\\nSELECT customer_id, post_response(customer_id, response_text)\\nFROM (SELECT customer_id, generate(query, VECTOR_SEARCH(kb, embed(query), 5)) AS response_text\\n      FROM customer_queries)```. **Throughput math**: bottleneck LLM (slowest). 4 TM × 1 slot (GIL для async UDFs) = 4 parallel. Per subtask 100/sec (LLM capacity 200, p99 2s) → total 400/sec. Easily handles target 100/sec. **Production safeguards**: rate limiting (OpenAI/Anthropic TPM), pre-filtering высокоприоритетных messages, Redis caching для common queries, idempotency keys на webhook, cost monitoring (track API calls daily). **Critical Flink 2.2 features used**: async UDFs (этот урок), VECTOR_SEARCH (FLIP-540), ML_PREDICT optional (FLIP-526) для embedded models.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m12-exam-q8",
+      "type": "true-false",
+      "question": "PyFlink Table API имеет first-class parity с Java Table API — same SQL dialect, same connectors (через JAR в classpath, не Python wrapper), same code generation на JVM. Python — thin Py4J wrapper, runtime processing на JVM с native performance (~100% Java baseline). DataStream API имеет gaps. Recommendation для most use cases: Table API.",
+      "correctAnswer": true,
+      "explanation": "Critical architectural insight для practical PyFlink usage. **Table API parity**: SQL string parsed Apache Calcite (Java), optimized в logical plan, code generated к Java bytecode на runtime, executed как DataStream graph. Python TableEnvironment — Py4J wrapper calls equivalent Java APIs. `t_env.execute_sql('INSERT INTO ...')` — Python passes string к JVM, JVM handles parsing/optimization/execution. **No Python в data path** unless Python UDF invoked. Performance equivalent Java Table API (~100% baseline). **Connectors via JAR**: каждый connector (kafka, jdbc, iceberg, paimon, cdc) — Java JAR registered through SPI (Service Provider Interface). PyFlink uses same JARs through CREATE TABLE DDL — no Python wrapper needed. Full enterprise ecosystem available. **DataStream API gaps**: features НЕ в PyFlink — FlinkCEP (Java only), DataStream V2 FLIP-409 (Java only experimental), some advanced window assigners, custom partitioners limited. Each Python transformation has callback executed в Python — performance gap based on mode (process 30-50%, thread 70-90%, pandas 90-95%, async depends external). **Practical guidance**: для production ETL — Table API. Schema-driven (CREATE TABLE + INSERT INTO SELECT), declarative, easier to maintain, full performance. DataStream API только когда нужны low-level features (custom keyed state с complex logic, custom timers, side outputs) не expressible в SQL. **Hybrid**: можно mix в одном job — `t_env.from_data_stream(stream)` и `t_env.to_data_stream(table)` для conversion. Use DataStream для custom processing steps, Table API для declarative ETL stages.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

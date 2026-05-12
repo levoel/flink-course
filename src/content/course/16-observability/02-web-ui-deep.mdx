@@ -1,0 +1,452 @@
+---
+title: "Flink Web UI deep: backpressure, watermarks, checkpoint history"
+description: "Flink Web UI: backpressure visualization (color coding), watermarks per operator, checkpoint history (duration, size, ack), task subtasks metrics. Real debugging walkthrough"
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["Web UI", "Backpressure", "Watermarks", "Checkpoint History", "Diagnostics"]
+---
+
+# Flink Web UI deep
+
+Flink Web UI — один из самых underrated production tools. Если знать его до автоматизма, 80% production проблем диагностируются за первые 60 секунд. Если не знать — production debugging превращается в blind shotgun.
+
+В этом уроке препарируем реальные секции Web UI: DAG view с color coding, watermarks per operator, checkpoint history, subtask metrics — с примерами реальных debugging walkthrough.
+
+---
+
+## Layout Web UI: пять ключевых tabs
+
+Web UI находится на JobManager: `http://jobmanager:8081`.
+
+| Tab | Что показывает | Когда смотреть |
+|---|---|---|
+| **Overview** | Cluster summary, running jobs, TaskManager-ы | Health check |
+| **Jobs → Running** | Active jobs, DAG, performance | Live debugging |
+| **Jobs → Completed** | History (5min default) | Post-mortem analysis |
+| **Task Managers** | Per-TM logs, metrics, threads | Specific TM diagnosis |
+| **Configuration** | Effective config | Verify deployment |
+
+Основная debugging работа в **Jobs → Running → <Job ID>**.
+
+---
+
+## Job page: DAG view
+
+DAG view — главная диагностическая поверхность. Каждый operator (или chained task) — это коробка, окрашенная по health metric:
+
+<DiagramContainer title="DAG view color coding и hover details" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Green box"
+        tooltip="busyTimeMsPerSecond < 50%. Operator имеет capacity reserve. Healthy для большинства pipelines."
+      >
+        busy < 50% (healthy)
+      </DataBox>
+      <DataBox
+        label="Yellow box"
+        tooltip="busyTimeMsPerSecond 50-90%. Operator активно работает, но мало reserve. OK для steady-state."
+      >
+        busy 50-90% (working)
+      </DataBox>
+      <DataBox
+        label="Red box"
+        tooltip="busyTimeMsPerSecond > 90%. Operator не имеет idle time. Bottleneck здесь. Increase parallelism, optimize hot path."
+      >
+        busy > 90% (CPU bottleneck)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="alternative state" />
+    <FlowRow>
+      <DataBox
+        label="Blue box"
+        tooltip="idleTimeMsPerSecond > 50%. Нет данных из upstream. Проблема выше по DAG. Move к source."
+      >
+        idle > 50% (waiting upstream)
+      </DataBox>
+      <DataBox
+        label="Black / dark"
+        tooltip="backPressuredTimeMsPerSecond > 50%. Downstream не принимает. Проблема ниже по DAG. Move к sink."
+      >
+        backpressured > 50%
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Hover на box — детали: busy/idle/backpressured % breakdown, records in/out, parallelism.
+
+---
+
+## Operator drill-down
+
+Click on operator box → **Operator detail page**. Содержит:
+
+### 1. Overview tab
+- Records sent/received
+- Bytes in/out
+- Parallelism
+- Subtask status overview
+
+### 2. Watermarks tab
+Watermark progression per subtask:
+
+```
+Subtask 0: Current Input Watermark: 2026-01-15 14:23:12
+Subtask 1: Current Input Watermark: 2026-01-15 14:23:11
+Subtask 2: Current Input Watermark: 2026-01-15 14:18:45  ← STUCK!
+```
+
+Subtask 2 watermark значительно отстаёт → один из source channels feeding subtask 2 — idle Kafka partition или stuck.
+
+### 3. Checkpoints tab (per operator)
+Checkpoint metrics для этого operator:
+- Last checkpoint duration
+- State size  
+- Async / sync phase breakdown
+
+### 4. Backpressure tab
+Per-subtask backpressure status:
+```
+Subtask 0: OK
+Subtask 1: HIGH (backpressured 95%)
+Subtask 2: OK
+```
+
+### 5. Metrics tab
+Custom user metrics + built-in metrics. Можно plot real-time chart.
+
+### 6. Flame Graph tab (1.13+, FLIP-165)
+Sampling stack traces для CPU profiling. Critical для understanding CPU-bound operators.
+
+---
+
+## Watermarks visualization
+
+Watermarks — это «event-time progress» сигнал. Если watermark stuck, всё event-time downstream — windows, timers, joins — не emit-ит результаты.
+
+**Где смотреть**:
+1. Click на source operator → Watermarks tab.
+2. Сравнить current input watermark с current event time:
+   - Если разница < 1min → healthy.
+   - Если разница > 10min → stuck.
+   - Если разница > 1hour → severe issue.
+
+**Distinct issues**:
+
+| Симптом | Причина |
+|---|---|
+| One subtask watermark stuck | Idle Kafka partition (no events for that partition) |
+| All subtasks watermark stuck | Source idle, late events, broken event time extractor |
+| Watermark fast forward спорадически | `withIdleness` triggered, idle partitions excluded |
+| Watermark slowest = whole pipeline stuck | Watermark Alignment (FLIP-217) issue |
+
+**Fix idle partition**: `WatermarkStrategy.<T>forBoundedOutOfOrderness(Duration.ofSeconds(20)).withIdleness(Duration.ofMinutes(1))` — после 1min idle partition выбывает из watermark calculation.
+
+---
+
+## Checkpoint history walkthrough
+
+Job page → **Checkpoints tab** → таблица checkpoint history.
+
+Колонки:
+
+```
+ID | Status   | Trigger Time | Latest Ack | End-to-End | Sync | Async | Alignment | State Size | Failure
+12 | COMPLETE | 14:23:00     | 14:23:08   | 8s         | 50ms | 7.5s  | 0.5s      | 12 GB      | -
+13 | FAILED   | 14:24:00     | 14:32:00   | 8min       | -    | -     | -         | -          | Timeout
+14 | COMPLETE | 14:25:00     | 14:25:09   | 9s         | 60ms | 8.2s  | 0.7s      | 12 GB      | -
+```
+
+**Sync phase**: должна быть < 100ms. Если выше — issue в state backend init.
+
+**Async phase**: main contributor к total duration. Зависит от:
+- State size
+- DFS upload throughput
+- Incremental delta size
+
+**Alignment time**: время от barrier inject до start processing. Если > seconds:
+- Aligned checkpoints под backpressure
+- Fix: unaligned checkpoints или smaller buffers
+
+**Subtask details**: click checkpoint ID → per-subtask breakdown. Helps identify slow subtask (data skew → больше state → slower async).
+
+---
+
+## Subtask metrics
+
+В operator detail → **Subtasks tab**:
+
+```
+Subtask | Records In | Records Out | Bytes In | Backpressure | Status
+0       | 1,234,567  | 1,234,567   | 256 MB   | OK           | RUNNING
+1       | 1,234,500  | 1,234,500   | 257 MB   | OK           | RUNNING
+2       | 5,892,123  | 5,892,123   | 1.2 GB   | HIGH         | RUNNING   ← SKEW
+3       | 1,233,890  | 1,233,890   | 256 MB   | OK           | RUNNING
+```
+
+Subtask 2 имеет 4× больше records — data skew. См. урок про parallelism strategy.
+
+---
+
+## Real debugging walkthrough: «job медленный»
+
+**Симптом**: throughput 50% от ожидаемого, customer complaints о latency.
+
+### Шаг 1: Overview tab
+Открыть job. Total parallelism 32 — OK. Status RUNNING — OK. Last checkpoint 5min ago — slow!
+
+### Шаг 2: DAG view
+
+```
+[Kafka Source ●green] → [Map ●green] → [KeyedProcess ●yellow] → [Sink ●red]
+```
+
+Sink red (busy 95%). Bottleneck downstream.
+
+### Шаг 3: Click Sink → Backpressure tab
+
+```
+All subtasks: backpressured 0%
+busyTimeMsPerSecond: 950
+```
+
+Sink CPU-bound, не backpressured (downstream — Kafka — fast). Нужно scale sink или optimize.
+
+### Шаг 4: Flame Graph sink
+
+```
+80% time in: KafkaProducer.send → batchAccumulator → compress
+```
+
+Compression (gzip default) dominant. Switch к lz4 или snappy.
+
+### Шаг 5: Test fix
+
+```java
+.setProperty(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4")
+```
+
+Re-deploy. Throughput recovers.
+
+**Total debug time**: 5 minutes от open Web UI к identified fix. Без Web UI это был бы час+ blind tuning.
+
+---
+
+## Real debugging walkthrough: «checkpoint failed timeout»
+
+**Симптом**: alert `numberOfFailedCheckpoints > 0`.
+
+### Шаг 1: Checkpoint history
+- Last 10 checkpoints all timed out (10min timeout).
+- Sync phase OK (50ms).
+- Async phase: progress показывает per-subtask, некоторые stuck.
+
+### Шаг 2: Per-subtask alignment
+
+```
+Subtask | Alignment time | Async time
+0       | 50ms            | 2s
+1       | 50ms            | 2s
+...
+15      | 9min            | -        ← stuck в alignment
+```
+
+Subtask 15 stuck in alignment 9 minutes.
+
+### Шаг 3: Subtask 15 → backpressure
+Subtask 15 backpressured 95%. Downstream slow.
+
+### Шаг 4: Downstream operator (sink)
+
+Sink subtask 15 busy 100%. Hot key (data skew к subtask 15).
+
+### Шаг 5: Fix
+Enable unaligned checkpoints:
+
+```yaml
+execution.checkpointing.unaligned: true
+execution.checkpointing.aligned-checkpoint-timeout: 30s
+```
+
+Mid-term: salt hot key для skew. Long-term: identify hot user, special handling.
+
+---
+
+## TaskManager page
+
+Tab Task Managers → click TM ID → per-TM details:
+
+### Memory tab
+- Heap usage chart
+- Direct memory chart
+- Managed memory chart
+
+### Threads tab
+- Active threads count
+- Thread states distribution
+
+### Stack Trace tab
+- On-demand stack dump каждого thread
+- Useful для blocking issues
+
+### Logs tab
+- Live tail of TM logs
+
+### Metrics tab
+- TM-level metrics (process CPU, disk I/O)
+
+---
+
+## Filtering и time ranges
+
+Production tip: **completed jobs disappear через 5 minutes by default**. После сбоя у вас 5 минут чтобы открыть Web UI и сделать post-mortem.
+
+Increase retention:
+
+```yaml
+jobmanager.archive.fs.dir: s3://bucket/flink/archive
+historyserver.archive.fs.dir: s3://bucket/flink/archive
+historyserver.archive.fs.refresh-interval: 10000
+```
+
+С `flink-history-server` (отдельный process) — все completed jobs sleep индефинитно (limited by S3 retention). Critical для post-mortem analysis.
+
+---
+
+## REST API behind Web UI
+
+Web UI use REST API. Можно скриптить:
+
+```bash
+# All running jobs:
+curl http://jobmanager:8081/jobs/overview | jq
+
+# Job DAG:
+curl http://jobmanager:8081/jobs/<id> | jq
+
+# Subtask metrics:
+curl http://jobmanager:8081/jobs/<id>/vertices/<vid>/subtasks/metrics | jq
+
+# Checkpoint statistics:
+curl http://jobmanager:8081/jobs/<id>/checkpoints | jq
+
+# Backpressure (heavy operation — samples):
+curl http://jobmanager:8081/jobs/<id>/vertices/<vid>/backpressure | jq
+```
+
+Useful для CI/CD smoke tests, automated health checks.
+
+---
+
+## Production gotchas
+
+### Gotcha 1: Web UI hidden за load balancer
+
+Default HA — JobManager rotates leader. Web UI работает только на current leader. Load balancer должен:
+- HTTP health check на `/config` (returns 200 если leader)
+- Route к active leader
+
+Иначе пользователи попадают на standby и видят «No such job».
+
+### Gotcha 2: Web UI access in production
+
+Default open access. Для production:
+
+```yaml
+rest.bind-address: 0.0.0.0
+rest.port: 8081
+security.ssl.rest.enabled: true
+security.ssl.rest.keystore: /path/keystore.jks
+```
+
+Plus reverse proxy with auth (nginx, OAuth2 proxy).
+
+### Gotcha 3: Backpressure tab triggers sampling
+
+Click на Backpressure → Flink samples stack traces 100 раз. На huge cluster это load на JobManager. Не open постоянно без надобности.
+
+С 1.13+ (FLIP-179) основные backpressure metrics встроенные, не требуют sampling. Но Backpressure tab всё ещё use sampling.
+
+### Gotcha 4: Completed job log retention
+
+```yaml
+jobmanager.archive.fs.dir: s3://archive
+```
+
+Без archive completed jobs disappear через `jobmanager.execution.failover-strategy` retention (default 5min). Set archive для history server!
+
+### Gotcha 5: Flame Graph cost
+
+Flame graph samples ~100 stack traces. На high-throughput TM минимальный overhead, но **продолжающийся** sampling может cumulate. Default sampling on demand — OK. Не enable continuous.
+
+### Gotcha 6: Web UI metrics lag
+
+Web UI metrics refresh каждые ~3 seconds. Если ищете spike pattern — это slow. Для real-time use Prometheus/Grafana.
+
+### Gotcha 7: Subtask names truncated
+
+В DAG view long subtask names truncated «...». Hover показывает full, но в complex DAG это annoying.
+
+**Fix**: shorter operator names:
+
+```java
+.uid("kafka-source")        // short identifier
+.name("Kafka source")        // short display name
+```
+
+---
+
+## Diagnostic checklist для Web UI
+
+When job slow / failing:
+
+1. **Overview**: status, parallelism, last checkpoint?
+2. **DAG colors**: red operator? black backpressured?
+3. **Click problematic operator**: subtask skew? watermark stuck?
+4. **Flame Graph**: CPU hotspot?
+5. **Checkpoint history**: durations stable? failures?
+6. **TaskManager memory**: stable? linear growth (leak)?
+7. **Logs**: errors в hot path?
+
+Sequential через эти steps → 80% issues identified в 5 минут.
+
+---
+
+## Web UI alternatives и complements
+
+Web UI хорош для:
+- Live diagnosis
+- DAG visualization
+- Backpressure analysis
+- Flame graph
+
+Web UI не достаточен для:
+- Historical trends → Prometheus + Grafana
+- Distributed tracing → OpenTelemetry
+- Log search → Elasticsearch / Loki
+
+Production setup использует все три в комбинации:
+- Web UI для immediate diagnosis (открыть когда alert).
+- Grafana dashboards для historical trends, capacity planning.
+- Tracing / logs для root cause analysis после initial diagnosis.
+
+---
+
+<Callout type="note">
+Web UI и Grafana дополняют друг друга. Web UI = live, ad-hoc, deep drill into specific operator. Grafana = historical trends, alerting, multi-job overview. Не выбирайте one over the other — production needs both.
+</Callout>
+
+---
+
+<Callout type="warning">
+Production rule: установите Flink history server и archive. Без них post-mortem проваленного job невозможен — completed jobs disappear через 5 минут default retention. История без archive — это null history.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Alert: 'Flink job XYZ checkpoint failed (timeout). Last completed checkpoint 30 минут назад'. Откройте Flink Web UI, опишите шаги диагностики в правильной последовательности. Какие data points нужны для root cause?"
+  answer="Step-by-step diagnostic flow: (1) Job overview page. Verify status=RUNNING (not in restart loop), parallelism соответствует deployment, last successful checkpoint timestamp. Если в restart loop — separate issue (см. logs). (2) Checkpoints tab → история. Identify failure pattern: все checkpoints fail consistent? Specific subtask consistently slow? Failure mode = Timeout (alignment не finished) или Aborted (subtask failed)? Last 5 attempts проверить — pattern same or different? (3) Last failed checkpoint → click → per-subtask breakdown. Identify subtask(s) stuck в alignment (alignment time >> async time) или stuck в async (async incomplete by timeout). Patterns: (a) Один subtask в alignment — backpressure на downstream от него. (b) Multiple subtasks в async — slow DFS / large state. (c) All subtasks stuck — global issue (DFS unavailable, network partition). (4) DAG view главного job. Color coding: ищите red operator или black backpressured. Если black backpressure от source → к sink, downstream — bottleneck. Click bottleneck operator. (5) Backpressure tab problematic operator. Identify specific subtask(s) с HIGH backpressure status. (6) Корреляция с checkpoint subtask: если subtask 5 в Backpressure HIGH AND subtask 5 stuck в alignment → confirmed: alignment slow because downstream slow accepting data. (7) Identify downstream bottleneck. Click downstream operator (or sink). Check Flame Graph для CPU hotspot. Check Subtask metrics для data skew (один subtask 10× больше records?). (8) TaskManager memory tab. Check direct memory, managed memory trends. Если линейный рост — RocksDB tuning issue (custom factory без super), но обычно не coincides с checkpoint timeout. (9) Data points для root cause: (a) Failure type (timeout vs abort), (b) Slow subtask IDs, (c) Alignment time vs async time breakdown per subtask, (d) Backpressure pattern на slow subtask's downstream, (e) Data skew metrics (numRecordsIn variance across subtasks), (f) Recent deployment changes (correlated with onset?), (g) Cluster metrics (CPU/memory headroom). (10) Common root causes ranked: (a) Data skew → одна subtask overloaded → alignment timeout. Fix: salt hot key, две-stage aggregation. (b) Backpressure от slow sink → enable unaligned checkpoints (aligned-checkpoint-timeout: 30s) как immediate fix; long-term scale sink или async wrapper. (c) Large state + slow S3 → incremental checkpoints должны быть enabled, verify, consider Changelog backend для smoother size. (d) DFS issue → check S3 throughput metrics outside Flink. (11) Post-mortem records. Document в incident report: timeline, identified bottleneck, fix applied, verification (subsequent checkpoints OK?). Without Web UI этот flow занимает часы blind tuning. С Web UI — 10-15 minutes structured diagnosis."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/09-production-readiness",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-09",
+    "description": "Quiz for capstone production readiness checklist"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-09-q1",
+      "type": "multiple-choice",
+      "question": "Production readiness checklist категории — что minimum must-have перед launch?",
+      "options": [
+        { "id": "a", "text": "Только code review" },
+        { "id": "b", "text": "Multi-dimensional: (1) Code quality — UIDs, watermarks, idempotency, error handling; (2) State management — TTL, sizing, backend choice; (3) EOS verification — sink configs, reconciliation; (4) Deployment — K8s, HA, autoscaling; (5) Observability — metrics, alerts, runbooks; (6) Performance — load tested к peak × 1.5; (7) Security — secrets, TLS, RBAC; (8) DR — runbooks, recovery testing; (9) Operational readiness — on-call, escalation" },
+        { "id": "c", "text": "Только performance benchmarks" },
+        { "id": "d", "text": "Это subjective list" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Comprehensive checklist covers all production concerns. Missing any creates risk. Code quality — bugs в production cost 10-100x more than bugs caught earlier. State management — anti-patterns surface при scale. EOS — silent data loss possible без verification. Deployment — config issues common source incidents. Observability — без её troubleshooting impossible. Performance — capacity surprises = outages. Security — breaches catastrophic. DR — untested DR = false confidence. Op readiness — без on-call даже good pipeline fails. Checklist exists potому что mental coverage impossible.",
+      "studyHint": "Повторите урок 09 — все категории",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m18-09-q2",
+      "type": "multiple-choice",
+      "question": "Production scenario: stakeholders push к launch через week. Checklist review shows: (1) chaos testing 3/8 scenarios; (2) DR runbook written не tested; (3) state growth 5%/week; (4) late events archive no retention policy. Какие BLOCK launch?",
+      "options": [
+        { "id": "a", "text": "Все можно launch — fix post-launch" },
+        { "id": "b", "text": "BLOCK: chaos testing incomplete — 5 unknown failure modes, production risk too high. Complete remaining scenarios этой week. ACCEPTABLE с monitoring: state growth 5% (extrapolate capacity OK для 3 months, root cause investigation in 2-4 weeks). Day-1 fix: archive retention policy. Plan post-launch: DR runbook game day exercise в 2 weeks (if internal SLA) or block if regulator-required" },
+        { "id": "c", "text": "Все BLOCK launch" },
+        { "id": "d", "text": "Random skip checklist items" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Risk-based prioritization. Chaos testing 5/8 missing = 5 unknown failure modes = blind launch risk. Production-impactful. State growth 5% — concerning но не immediate blocker if capacity OK для 3 months. Archive retention — quick Day-1 fix, не launch blocker. DR runbook — false confidence без testing, but acceptable to launch если SLA не regulator-required. Stakeholder communication: 'Launch blocked: completing chaos test scenarios. ETA 4-7 days. Trade-off: complete launch readiness vs production risk. Recommend complete.' Concrete data overcomes vague pressure. Process > vibes.",
+      "studyHint": "Повторите урок 09 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-09-q3",
+      "type": "multiple-choice",
+      "question": "Post-launch monitoring (first 2 weeks) — какие practices critical?",
+      "options": [
+        { "id": "a", "text": "Standard monitoring достаточно" },
+        { "id": "b", "text": "Tight period: daily standup для review metrics + anomalies; war room для launch day (full team available); temporarily lower alert thresholds (увеличить sensitivity); manual reconciliation runs (verify EOS в production reality); performance baseline collection для future anomaly detection. После 2 weeks без major incidents — transition к regular cadence" },
+        { "id": "c", "text": "Только wait и watch" },
+        { "id": "d", "text": "Disable monitoring чтобы avoid alert fatigue" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Launch period requires increased vigilance. First 2 weeks — when issues most likely emerge (production traffic patterns, edge cases not seen in staging). Daily standup ensures team awareness. War room — coordinated response if issue появится. Lower thresholds — catch warnings before becoming incidents. Manual reconciliation — verify EOS реально works в production conditions (chaos testing in staging проверял, но production = different). Performance baseline — establish 'normal' для future anomaly detection. После 2 weeks stable — regular cadence. Без этого launch period = silent issues becoming major.",
+      "studyHint": "Повторите урок 09 — раздел 'Post-launch monitoring'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-09-q4",
+      "type": "true-false",
+      "question": "Production readiness checklist — это one-time milestone. После initial launch passed, не нужно revisit.",
+      "correctAnswer": false,
+      "explanation": "Production readiness — continuous responsibility, не one-time. Codebases change (new features, refactors), infrastructure changes (K8s upgrades, dependency updates), team changes (new on-call members, mentoring needed), scale changes (capacity revisits), failure modes discovered (chaos testing additions). Practices to maintain readiness: (1) checklist revisited перед major changes (re-launch criteria); (2) quarterly review of all categories; (3) post-incident additions к checklist; (4) onboarding new team members через checklist; (5) yearly comprehensive audit. 'Checked the boxes once' = false security as system evolves.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

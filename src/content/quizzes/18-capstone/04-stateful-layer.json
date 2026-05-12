@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/04-stateful-layer",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-04",
+    "description": "Quiz for capstone stateful layer"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-04-q1",
+      "type": "multiple-choice",
+      "question": "UserAggregator проектируется с ValueState<UserSummary> + MapState<Long, WindowCounter> + ValueState<Long> lastOrderTime. Почему такая структура, не один большой ValueState<UserState>?",
+      "options": [
+        { "id": "a", "text": "Random choice" },
+        { "id": "b", "text": "Different access patterns + TTL: UserSummary долгоживущий (90 days TTL для GDPR), WindowCounter короткоживущий (1 day TTL — windows старше не нужны), lastOrderTime — separate для clean velocity tracking. Один big ValueState означал бы либо short TTL (losing summary history) либо long TTL (огромный state). Decomposition позволяет per-component lifecycle" },
+        { "id": "c", "text": "Только для performance benchmarks" },
+        { "id": "d", "text": "Это deprecated API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "State decomposition by lifecycle critical. Single big ValueState combining all data has worst-of-all-worlds TTL — choose long TTL (large state) или short TTL (lose persistent info). Decomposition: (1) UserSummary 90d TTL — cumulative metrics что нужно years; (2) MapState<window_start, WindowCounter> 1d TTL — windows старше day useless для real-time; (3) lastOrderTime separate ValueState — clean atomic update без serializing full summary. Per-state TTL = right size для each purpose. Pattern recommends для production stateful operators.",
+      "studyHint": "Повторите урок 04 — раздел 'UserAggregator'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m18-04-q2",
+      "type": "multiple-choice",
+      "question": "Watermark alignment между Postgres CDC source и Kafka external source — зачем и как configure?",
+      "options": [
+        { "id": "a", "text": "Не нужно — Flink auto-aligns" },
+        { "id": "b", "text": "Без alignment fast source может убежать по event time, watermark всего pipeline застрянет на slow source. Configure: withWatermarkAlignment('main-pipeline-group', Duration.ofMinutes(2), Duration.ofSeconds(5)) на обоих sources с тем же group name. Max drift 2 min — fast source paused если разница больше" },
+        { "id": "c", "text": "Только для batch jobs" },
+        { "id": "d", "text": "Это deprecated feature" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Watermark alignment (FLIP-217) critical для multi-source pipelines. Problem: Kafka source может быть behind by minutes (consumer lag) while Postgres CDC source up-to-date. Без alignment: watermark = min(source watermarks) — stuck на Kafka. Temporal joins с future events from Postgres но stale dims from Kafka — incorrect. With alignment: same group + max-drift = fast sources paused if разница больше — все sources move together. Capstone: пауза Postgres CDC если Kafka lag > 2 min.",
+      "studyHint": "Повторите урок 04 — раздел 'Watermark alignment'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-04-q3",
+      "type": "multiple-choice",
+      "question": "Side outputs для fraud alerts vs anomaly events vs late events — почему separate тagger?",
+      "options": [
+        { "id": "a", "text": "Просто для clarity" },
+        { "id": "b", "text": "Different consumers + retention: fraud alerts → on-call Kafka topic с PagerDuty integration (critical, low volume); anomalies → separate alert topic (warnings); late events → archive topic for investigation (high volume, long retention для analysis). Mixing — pollutes consumers, hard to set per-stream retention/throughput" },
+        { "id": "c", "text": "Только для тестирования" },
+        { "id": "d", "text": "Side outputs не support multiple types" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Separation of concerns. Fraud alerts: high-priority, low-volume, immediate response required. Anomalies: medium-priority warnings. Late events archive: high-volume diagnostic data для investigation. Different Kafka topics:различные retention (alerts 30d vs archive 7d), throughput (10/sec vs 1000/sec), consumers (alerting service vs analyst tool), security (alerts restricted, archive analyst-accessible). Без separation everything goes to same place — noisy, hard to scale specific stream, security overlap. Pattern: один OutputTag = одна downstream concern.",
+      "studyHint": "Повторите урок 04 — раздел 'UserAggregator implementation'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-04-q4",
+      "type": "true-false",
+      "question": "Fraud detection logic с complex ML inference в primary processElement — это правильный design для production fraud detection pipeline.",
+      "correctAnswer": false,
+      "explanation": "Anti-pattern. Complex/slow fraud logic (ML inference, external API calls) в primary processElement blocks main pipeline throughput. Backpressure cascades, latency spikes для все events не just fraud-triggering. Production pattern: keep main path simple (basic rules: amount thresholds, velocity, fraud_score = quick computation), emit raw events на separate fraud pipeline (другой Flink job с ML_PREDICT inline). Fraud decisions returned through Kafka topic. Main pipeline остаётся fast, fraud pipeline can be scaled/upgraded independently. Это separation of concerns в architecture.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

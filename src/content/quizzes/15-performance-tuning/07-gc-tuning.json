@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "15-performance-tuning/07-gc-tuning",
+  "moduleId": "15-performance-tuning",
+  "_meta": {
+    "idPrefix": "flink-m15-07",
+    "description": "Quiz for GC tuning lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m15-07-q1",
+      "type": "multiple-choice",
+      "question": "Какой GC рекомендуется для production Flink 2.x на Java 21 с heap > 8GB и низкими latency требованиями?",
+      "options": [
+        { "id": "a", "text": "G1 — default" },
+        { "id": "b", "text": "Generational ZGC: -XX:+UseZGC -XX:+ZGenerational -XX:MaxGCPauseMillis=10 -XX:+AlwaysPreTouch. Pauses < 1ms даже на TB heap, generational в Java 21 — efficiency сравнима с G1 для большинства workloads. Production default для всех новых deployments" },
+        { "id": "c", "text": "Parallel GC" },
+        { "id": "d", "text": "Shenandoah для всех cases" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Java 21 LTS + generational ZGC GA — это game changer для streaming. До этого ZGC был flat (не generational), efficiency для streaming ниже G1. Generational ZGC = young gen optimization + concurrent everything. Pauses sub-millisecond даже на large heap, не degrades с heap size. Cost ~5-10% throughput (compensated по latency). Use cases: large heap (8GB+), low-latency требование (P99 < 50ms), HashMapStateBackend workload. -XX:+AlwaysPreTouch обязательно — touch all pages upfront, eliminates page fault spikes. -Xms == -Xmx fixed heap (ZGC любит stable).",
+      "studyHint": "Повторите урок — ZGC + Production tuning patterns",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m15-07-q2",
+      "type": "multiple-choice",
+      "question": "Зачем нужен -XX:+AlwaysPreTouch и какие последствия его отсутствия?",
+      "options": [
+        { "id": "a", "text": "Ускоряет startup TaskManager" },
+        { "id": "b", "text": "JVM аллоцирует virtual memory upfront, но physical pages только по requested. Без AlwaysPreTouch на burst (e.g., GC) — page faults → latency spikes 10-100ms. С AlwaysPreTouch JVM touch'ит все pages на старте, повышает startup time на секунды, но eliminates runtime spikes. Critical для low-latency workloads, особенно ZGC (любит stable heap)" },
+        { "id": "c", "text": "Уменьшает heap usage" },
+        { "id": "d", "text": "Это optional оптимизация" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Default behavior: virtual memory allocated, physical pages on-demand. Это lazy allocation. Под GC pressure JVM хочет new pages → page fault → kernel allocates → 1-10ms latency. На burst много page faults → latency spike. AlwaysPreTouch — touch each page at startup (write zeros), commits RSS upfront. Startup time увеличивается (секунды-десятки секунд для large heap), но steady-state predictable. Plus: K8s pod memory usage stable plateau (предсказуемо), не растёт первые минуты после startup. Production critical с large heap + low-latency. Don't disable — minor startup overhead для major runtime stability.",
+      "studyHint": "Повторите урок — ZGC tuning",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m15-07-q3",
+      "type": "multiple-choice",
+      "question": "Job Java 21, HashMapStateBackend (state на heap), 24GB process.size, managed.fraction=0.1. P99 = 800ms (target 50ms), throughput 50%. GC: G1 Young Gen time 8000ms/min (default G1), Heap volatile 70-90%. Какой план?",
+      "options": [
+        { "id": "a", "text": "Уменьшить heap" },
+        { "id": "b", "text": "Switch к generational ZGC: -XX:+UseZGC -XX:+ZGenerational -XX:MaxGCPauseMillis=10 -XX:+AlwaysPreTouch -Xms20g -Xmx20g. Это single biggest win — pauses < 1ms vs десятки мс G1, P99 падает 5-10×. Verify Java 21 runtime. JFR recording для allocation hotspots. Долгосрочно: migration к RocksDB state backend (state в managed off-heap, GC pressure исчезает) — root cause fix" },
+        { "id": "c", "text": "Увеличить parallelism" },
+        { "id": "d", "text": "Отключить GC logging" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Heavy heap allocation + G1 Young Gen занимает 13% времени. HashMapStateBackend = state живёт в JVM heap → large young+old gen pressure. ZGC switch — biggest win. Generational ZGC eliminates GC stop-the-world. Heap sizing: 24GB process - 2GB JVM overhead - 256MB metaspace - 128MB framework heap = ~21GB available; -Xmx20g leaves headroom. AlwaysPreTouch obligatory. Allocation reduction: primitive collections (Long2LongHashMap fastutil), String deduplication (+UseStringDeduplication), object reuse в RichFunction. Long-term: HashMap → RocksDB state — fundamentally lower GC pressure. Critical insight: GC tuning маскирует symptoms, root cause architectural (HashMap для heavy state).",
+      "studyHint": "Повторите урок — Production tuning patterns + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m15-07-q4",
+      "type": "true-false",
+      "question": "ZGC overhead ~3% memory и 5-10% throughput — поэтому для small heap (<4GB) ZGC не worth, лучше G1.",
+      "correctAnswer": true,
+      "explanation": "True. ZGC требует metadata для colored pointers (3% memory overhead). Throughput cost 5-15% vs G1. На large heap (>8GB) это compensated латencу выигрышем — pauses < 1ms vs десятки мс. На small heap (<4GB): (1) Pauses G1 уже acceptable (~50ms typical); (2) ZGC overhead значителен в proportion; (3) Generational gains меньше (small young gen). Decision tree: <4GB → G1, 4-32GB latency-critical → ZGC, >32GB → ZGC obligatory. Shenandoah — backup plan для Java 17 (где generational ZGC недоступен).",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

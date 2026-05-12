@@ -1,0 +1,478 @@
+---
+title: "Savepoints: canonical vs native, lifecycle, backend switch"
+description: "Savepoints vs Checkpoints: trigger (manual/auto), format (native vs canonical 1.15+), ownership, lifecycle. Backend switch RocksDB → ForSt через canonical."
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Savepoints", "Canonical Format", "Native Format", "Backend Switch", "Job Upgrade"]
+---
+
+# Savepoints: manual snapshots для planned upgrades
+
+Checkpoints — для fault tolerance: автоматические, owned by Flink, deleted after expiration. **Savepoints** — для **planned operations**: manual, owned by user, persist forever. Code upgrade, schema migration, backend switch, A/B testing — все используют savepoints.
+
+В Flink 1.15+ introduced **canonical format** — portable между versions и state backends. Это разрешает game-changing operation: RocksDB → ForSt switch без полной перестройки state.
+
+Этот урок: savepoint mechanics, canonical vs native format, lifecycle management, и production patterns для job upgrade.
+
+---
+
+## Checkpoint vs Savepoint
+
+| Aspect | Checkpoint | Savepoint |
+|---|---|---|
+| Trigger | Automatic (interval) | Manual (CLI/API) |
+| Purpose | Fault tolerance | Planned upgrade |
+| Format | Native | Canonical (portable) OR Native |
+| Ownership | Flink (auto-delete) | User (manual delete) |
+| Performance | Optimized (incremental, GIC) | Full snapshot |
+| Lifecycle | Tied к job lifecycle | Independent |
+| Backend switch | ❌ Not supported | ✅ Yes (canonical) |
+| Version migration | ❌ Same Flink version only | ✅ Yes (canonical) |
+
+---
+
+## Savepoint trigger
+
+### CLI
+
+```bash
+# Trigger savepoint (job continues)
+flink savepoint <jobid> s3://bucket/savepoints/
+
+# Stop with savepoint (graceful shutdown)
+flink stop --savepointPath s3://bucket/savepoints/ <jobid>
+
+# Stop with savepoint в canonical format
+flink stop --savepoint-format canonical \
+          --savepointPath s3://bucket/savepoints/ <jobid>
+
+# Stop with savepoint в native format (faster, but tied к current backend)
+flink stop --savepoint-format native \
+          --savepointPath s3://bucket/savepoints/ <jobid>
+```
+
+### REST API
+
+```bash
+# Trigger savepoint
+POST /jobs/<jobid>/savepoints
+{
+  "target-directory": "s3://bucket/savepoints/",
+  "cancel-job": false,
+  "format-type": "CANONICAL"
+}
+
+# Returns request-id, poll для completion
+GET /jobs/<jobid>/savepoints/<request-id>
+```
+
+### Programmatic
+
+```java
+JobClient client = env.executeAsync();
+CompletableFuture<String> savepointPath = client.triggerSavepoint(
+    "s3://bucket/savepoints/",
+    SavepointFormatType.CANONICAL
+);
+```
+
+---
+
+## Canonical format vs Native
+
+### Native format
+
+Native — same format как checkpoints: RocksDB SST files (или ForSt), operator state в native serialization. **Fast** — same path как checkpoint.
+
+```
+s3://bucket/savepoints/savepoint-abc-001/
+├── _metadata
+└── operator-001/
+    ├── shared/SST_001.sst
+    ├── exclusive/_op_state
+    └── ...
+```
+
+**Restrictions**:
+- Только same Flink version
+- Только same state backend (RocksDB or ForSt — нельзя switch)
+- Tied к internal RocksDB schema
+
+### Canonical format
+
+Canonical — **portable**, format-independent. Backend-agnostic serialization (Flink internal):
+
+```
+s3://bucket/savepoints/savepoint-abc-001/
+├── _metadata-canonical          ← portable metadata
+└── operator-001/
+    ├── keyed-state/
+    │   ├── valuestate-lastTime.canonical
+    │   └── mapstate-orderHistory.canonical
+    └── operator-state.canonical
+```
+
+**Benefits**:
+- Backend switch — RocksDB → ForSt (или vice versa) на restore
+- Version migration — savepoint от Flink 1.18 можно restore в 2.2
+- Schema evolution friendly
+
+**Cost**: создание/restore медленнее (serialization/deserialization), file size больше.
+
+### Format choice по use case
+
+| Use case | Format |
+|---|---|
+| Normal job upgrade (same backend, same version) | Native (fast) |
+| Backend switch (RocksDB → ForSt) | Canonical |
+| Flink version upgrade (1.18 → 2.x) | Canonical |
+| Long-term backup (год storage) | Canonical (future-proof) |
+| Daily operational savepoint | Native |
+| Disaster recovery | Both — native primary, canonical backup |
+
+---
+
+## Restore: flink run -s
+
+```bash
+# Restore from savepoint
+flink run -s s3://bucket/savepoints/savepoint-abc-001/ job.jar
+
+# Allow non-restored state (если topology поменялась, новые operators OK)
+flink run -s s3://bucket/savepoints/savepoint-abc-001/ \
+          --allowNonRestoredState job.jar
+
+# Specify run mode
+flink run -s s3://... --runMode application job.jar
+```
+
+### Что значит --allowNonRestoredState
+
+При changes к topology (added/removed operators), savepoint contains state для operators которых сейчас нет:
+
+```java
+// v1 (savepoint created):
+stream.keyBy(...).process(new MyFunc()).uid("my-func").sink(...)
+
+// v2 (новая job):
+stream.keyBy(...).process(new MyFunc()).uid("my-func")
+      .keyBy(...).process(new NewFunc()).uid("new-func")  // ← new operator
+      .sink(...)
+```
+
+Без `--allowNonRestoredState`: error если state не restored для each operator UID в savepoint.
+
+С флагом: skip missing, log warning. New operators получают empty state.
+
+**Critical**: всегда устанавливайте `.uid("descriptive-id")` на stateful operators. Без uid Flink auto-generates UID на основе topology — на минимальные changes UID меняется → state не restored.
+
+```java
+stream
+    .keyBy(Tx::getUserId).uid("keyby-user-id")
+    .process(new FraudDetector()).uid("fraud-detector")
+    .sinkTo(kafkaSink).uid("kafka-sink");
+```
+
+---
+
+## Backend switch: RocksDB → ForSt
+
+В Flink 2.x ForSt (FLIP-427) — disaggregated state backend (state на S3). Migration от RocksDB:
+
+### Step 1: Stop with canonical savepoint
+
+```bash
+flink stop --savepoint-format canonical \
+          --savepointPath s3://bucket/migration/savepoints/ \
+          <jobid>
+# Saves: s3://bucket/migration/savepoints/savepoint-rocksdb-abc/
+```
+
+### Step 2: Update job config
+
+```yaml
+# OLD config
+state.backend.type: rocksdb
+state.backend.incremental: true
+
+# NEW config
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://bucket/forst-state
+state.backend.forst.local-dir: /tmp/forst-cache
+state.backend.changelog.enabled: true
+dstl.dfs.base-path: s3://bucket/dstl
+# ForSt requires Async State API V2!
+```
+
+### Step 3: Restore from canonical savepoint
+
+```bash
+flink run -s s3://bucket/migration/savepoints/savepoint-rocksdb-abc/ \
+          --runMode application \
+          forst-version-of-job.jar
+```
+
+Flink reads canonical savepoint, creates ForSt-native state из portable format. **State migration** happens на restore. После первого checkpoint job is fully ForSt-based.
+
+### Important notes
+
+- Canonical savepoint **3-10x slower** to create than native (full serialization)
+- Restore time также slower (deserialization)
+- Use only когда нужен backend switch — не для daily operations
+- Migration one-way obvious — после ForSt switch, going back требует another canonical savepoint
+
+---
+
+## Lifecycle management
+
+### Retention
+
+Savepoints persist forever пока user не delete. Они **независимы** от job lifecycle:
+
+```bash
+# Cancel job — checkpoint deleted, savepoint untouched
+flink cancel <jobid>
+
+# Job died — savepoint still available
+# Use для restart: flink run -s s3://bucket/savepoint-... job.jar
+```
+
+### Cleanup
+
+Manual cleanup нужен:
+
+```bash
+# Manual delete
+aws s3 rm --recursive s3://bucket/savepoints/savepoint-abc-001/
+
+# Через Flink REST (1.17+)
+DELETE /savepoints/<savepoint-path>
+```
+
+### Best practices
+
+1. **Tagging strategy**: include version, timestamp в path
+   ```
+   s3://bucket/savepoints/job-fraud/v2.1.5/2024-11-01_14-00/
+   ```
+
+2. **Retention policy**: keep last 3 deploys, plus weekly snapshots для год
+   ```
+   keep:
+     - latest 3 deploys (rollback target)
+     - weekly последние 4 weeks
+     - monthly последние 12 months
+   ```
+
+3. **Automation**: CD pipeline script
+   ```bash
+   # Pre-deploy: snapshot current
+   SAVEPOINT=$(flink stop --savepoint-format canonical \
+                          --savepointPath s3://.../v$VERSION/ $JOBID \
+                          | extract_path)
+
+   # Tag for rollback
+   aws s3 cp $SAVEPOINT s3://.../latest-stable/
+
+   # Deploy new
+   flink run -s $SAVEPOINT new-job.jar
+   ```
+
+---
+
+## Production patterns
+
+### Pattern 1: Zero-downtime upgrade
+
+```bash
+# 1. Snapshot current job
+flink stop --savepoint-format native \
+          --savepointPath s3://bucket/savepoints/v1.5/ \
+          <old-jobid>
+
+# 2. Deploy v2 from same savepoint
+flink run -s s3://bucket/savepoints/v1.5/savepoint-... \
+          --runMode application v2-job.jar
+
+# 3. Verify metrics
+# 4. If problems → rollback
+flink stop --savepointPath s3://bucket/savepoints/v2.0-issues/ <v2-jobid>
+flink run -s s3://bucket/savepoints/v1.5/savepoint-... v1-job.jar
+```
+
+Downtime: ~few seconds (stop + start).
+
+### Pattern 2: State Processor API bootstrap
+
+State Processor API позволяет создать savepoint **offline** from batch job:
+
+```java
+// Generate savepoint из external data
+SavepointMetadata savepoint = SavepointMetadata.forNewBatchEnvironment(env)
+    .withConfiguration(...);
+
+ExistingSavepoint existing = Savepoint.load(env, savepoint, savepointPath);
+
+DataSet<Account> accounts = env.fromCollection(loadAccountsFromDB());
+existing.writeKeyedState("account-state", accounts, ...);
+
+Savepoint.write(savepoint, "s3://bucket/bootstrap-savepoint/");
+
+// Затем restore нормально:
+// flink run -s s3://bucket/bootstrap-savepoint/ stream-job.jar
+```
+
+Use case: bootstrap stateful streaming job from existing batch data, не replay через source с empty state.
+
+### Pattern 3: A/B testing through savepoints
+
+```bash
+# Production v1 running
+# Create savepoint
+flink savepoint $V1_JOB s3://bucket/savepoints/ab-test/
+
+# Start v2 from same savepoint (parallel execution)
+flink run -s s3://bucket/savepoints/ab-test/savepoint-... \
+          v2-job.jar
+
+# v1 и v2 process same input от savepoint moment
+# Compare outputs, pick better
+# Stop loser, keep winner
+```
+
+---
+
+## Production gotchas
+
+### 1. Уидs must be persistent
+
+```java
+// ❌ Implicit UIDs — change with topology
+stream.keyBy(...).process(new MyFunc()).sink(...)
+
+// ✅ Explicit UIDs — survive topology changes
+stream.keyBy(...).uid("kb-user").process(new MyFunc()).uid("my-func").sinkTo(s).uid("sink")
+```
+
+Without explicit `.uid()` — auto-generated based на operator position. Adding/removing operators changes UIDs of everything downstream. Savepoint restore fails.
+
+**Production rule**: every stateful operator MUST have explicit `.uid()`. CI check для this.
+
+### 2. Schema evolution + savepoints
+
+When State Schema changes (например added field):
+
+```java
+// v1
+public class UserState {
+    long lastLogin;
+}
+
+// v2
+public class UserState {
+    long lastLogin;
+    String displayName;   // ← new field
+}
+```
+
+Если используется Avro/Protobuf — schema evolution works automatically. С POJO/Kryo — needs explicit migration. State Processor API может помочь bulk migrate state.
+
+### 3. Canonical savepoint size
+
+Canonical обычно 2-5x bigger than native — full serialization не использует RocksDB SST sharing. На TB state — 5TB canonical savepoint. Make sure DFS storage и transfer time accommodate.
+
+### 4. Stop-with-savepoint timeout
+
+```bash
+flink stop --savepointPath ... --savepoint-timeout 30min <jobid>
+```
+
+Default timeout = `execution.checkpointing.timeout`. На large state canonical может занимать час. Increase timeout.
+
+### 5. Savepoint partial completion
+
+Сценарий: 99% operators acked savepoint, 1% died. State partial. Cleanup нужен manual.
+
+```bash
+# Cleanup partial savepoint
+aws s3 rm --recursive s3://bucket/savepoints/savepoint-incomplete/
+```
+
+### 6. allowNonRestoredState — dangerous flag
+
+```bash
+flink run -s ... --allowNonRestoredState job.jar
+```
+
+Skips operators без matching UID. Если accidentally rename uid — silently loses state (job starts with empty state for that operator). Always **review** what state is being skipped (warning logs).
+
+### 7. Cross-region savepoint restore
+
+S3 multi-region: savepoint в us-east-1, restore в eu-west-1. Слово medium-difficulty:
+- Download all bytes к новому region
+- Long download time
+- S3 egress cost
+
+**Mitigation**: replicate savepoint к target region before deploy (`aws s3 sync`).
+
+### 8. Savepoint vs retained checkpoint
+
+```yaml
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+```
+
+Retained checkpoints survive cancel — can be used like savepoints для restart. **Differences**:
+- Checkpoints в native format only (no canonical)
+- Incremental — depend on previous checkpoints
+- Не self-contained — нельзя move прежде самого старого retained
+
+Savepoints — self-contained, portable. Use checkpoints для quick restart, savepoints для planned operations.
+
+### 9. Savepoint format mismatch
+
+Trying restore canonical savepoint with native flag (или vice versa) → error. Format detected automatically from `_metadata` file. Если manually moved files — may break.
+
+### 10. Operator order matters для restore
+
+Order operators в DAG matters для some scenarios. Savepoint stores state per operator UID. Если order меняется (например `map.filter` → `filter.map`), Flink может match by UID — works.
+
+---
+
+## Cheat sheet
+
+```bash
+# CREATE savepoint
+flink stop --savepoint-format canonical \
+          --savepointPath s3://bucket/savepoints/v$VERSION/ \
+          <jobid>
+
+# RESTORE from savepoint
+flink run -s s3://bucket/savepoints/v$VERSION/savepoint-... \
+          job.jar
+
+# WITH allowed missing state
+flink run -s ... --allowNonRestoredState job.jar
+
+# BACKEND SWITCH (RocksDB → ForSt)
+flink stop --savepoint-format canonical --savepointPath ... <jobid>
+# Update config: state.backend.type: forst
+flink run -s ... forst-job.jar
+
+# CLEANUP old savepoints
+aws s3 rm --recursive s3://bucket/savepoints/old-version/
+```
+
+```java
+// In code: ALWAYS set explicit UIDs
+stream.keyBy(...).uid("kb-user")
+      .process(new FraudDetector()).uid("fraud-detector-v3")
+      .sinkTo(...).uid("kafka-sink-v3");
+```
+
+---
+
+<KnowledgeCheck
+  question="Production: migration plan для job — switch с RocksDB на ForSt (disaggregated state на S3) без downtime, plus upgrade Flink 1.18 → 2.2. State 5TB. Спроектируйте complete migration procedure."
+  answer="Multi-step migration с минимальной downtime. (1) Pre-migration prep: (a) Verify все stateful operators имеют explicit .uid() — критично для restore. CI check добавить, если нет. (b) Update job code для compatibility с Flink 2.2 (DataStream V2 API changes, deprecated SourceFunction уже removed); (c) Add Async State API V2 calls — ForSt requires async API (state.asyncValue() вместо state.value()), синхронные calls degraded к sync DFS calls; (d) Update tests, benchmark на staging cluster с 100GB-1TB state. (2) Snapshot current production job (Flink 1.18, RocksDB): использовать canonical format — required для cross-backend AND cross-version. ```flink stop --savepoint-format canonical --savepoint-timeout 4h --savepointPath s3://bucket/migrations/flink-2.2-forst/ <jobid>``` Это полный canonical serialization 5TB state — ожидаемо 1-3 часа upload. (3) Verify savepoint completeness: (a) Check size на S3 — 10-25TB (canonical 2-5x bigger than native), confirm no truncation; (b) Verify _metadata-canonical exists; (c) Test restore на small staging cluster (с 10% data sample). (4) Deploy Flink 2.2 cluster: (a) New Flink 2.2 cluster (parallel к 1.18) — Kubernetes Operator FLIP-271 recommended для elastic; (b) Configure ForSt: state.backend.type: forst, primary-dir: s3://bucket/forst-state, local-dir: /tmp/forst-cache, async-io: enabled; (c) Configure GIC: state.backend.changelog.enabled: true, dstl.dfs.base-path: s3://bucket/dstl (recommended для stable EOS); (d) Verify ForSt operator code paths using async state API. (5) Restore on new cluster: ```flink run -s s3://bucket/migrations/flink-2.2-forst/savepoint-... --runMode application updated-job.jar``` Restore time — также hours для 5TB canonical (deserialization). Job starts processing. Initial checkpoint после restore — full ForSt materialization, может be slow первый раз. (6) Validation period (24-72 hours): (a) Run обе clusters in parallel — old reads same Kafka offset (separate consumer group), produces к shadow Kafka topic; (b) Compare outputs (sample percentage); (c) Monitor metrics: latency, throughput, state size; (d) Confirm checkpoint stability under load. (7) Cutover: (a) Switch downstream consumers к new cluster output topic; (b) Stop old cluster gracefully; (c) Retain old savepoint forever (rollback option for first month). (8) Cleanup: (a) После 30 days stability — old savepoint can be deleted (или archive); (b) ForSt local cache cleanup configured (TTL); (c) Verify S3 lifecycle policies для DSTL и checkpoints (cleanup beyond retention). Risk mitigations: (a) Rollback plan: keep canonical savepoint, can restore к 1.18 + RocksDB anytime first month; (b) Phased rollout — start с lower-criticality jobs first, learn lessons; (c) Cost estimate — canonical savepoint S3 storage + transfer 50-200$ для one-time 25TB upload; ForSt operational S3 storage similar к incremental RocksDB. Production timing: prep 2 weeks, migration 1 day (mostly waiting на savepoint create/restore), validation 1 week. Total ~3 weeks safely. Without canonical format this migration would be impossible — would require state rebuilding from source (replay 30+ days Kafka — weeks of catch-up)."
+/>

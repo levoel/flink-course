@@ -1,0 +1,310 @@
+---
+title: "NFA implementation: как Flink матчит patterns эффективно"
+description: "High-level NFA (Non-deterministic Finite Automaton) implementation в Flink CEP: state construction from pattern, partial matches storage, key groups distribution. Почему сложные patterns expensive"
+order: 5
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["NFA", "Pattern Matching", "Partial Matches", "Computation State", "Shared Buffer", "Key Groups"]
+---
+
+# NFA — engine, который матчит patterns
+
+И Pattern API, и `MATCH_RECOGNIZE` компилируются в одну и ту же runtime структуру — **NFA (Non-deterministic Finite Automaton)**. Понимание этой engine критично для two reasons: (1) tuning performance (почему один pattern быстрый, другой медленный), (2) интерпретация state size и memory footprint в production.
+
+Этот урок разбирает internals: как pattern компилируется в NFA, как partial matches хранятся в Shared Buffer, как распределяются по key groups, и почему certain patterns стоят O(N²) или O(2^N) state space.
+
+---
+
+## NFA vs DFA — почему non-deterministic
+
+Regex теоретически compile-ится либо в DFA (Deterministic Finite Automaton), либо в NFA. DFA имеет ровно один active state в любой момент — fast но exponentially explodes в number of states (subset construction). NFA имеет multiple active states одновременно — slower per event, но polynomial size.
+
+Flink CEP использует **NFA** потому что:
+
+1. **Pattern variables не fixed-set**: `oneOrMore()` или `B+` создаёт unbounded length sequences. DFA construction не закрывается finite-stateю.
+2. **IterativeCondition** требует access к previously matched events — это not regular language, нужно non-determinism plus stack-like state.
+3. **AFTER MATCH SKIP variants** натурально expressible как multiple active computation states.
+
+Высокоуровневая структура:
+
+<DiagramContainer title="NFA components в Flink CEP runtime" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Pattern definition"
+        tooltip="Java DSL или SQL MATCH_RECOGNIZE. Парсится в pattern tree: states (named) + transitions (with predicates) + quantifier modifiers + contiguity modes."
+      >
+        Pattern Java DSL / SQL
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="NFACompiler: pattern → NFA states + transitions" />
+    <FlowRow>
+      <DataBox
+        label="NFA structure"
+        tooltip="Compiled NFA: set of named states (Initial, Final, intermediate), set of transitions с predicate functions, set of stop states, contiguity-encoded edges (TAKE/IGNORE/PROCEED). Immutable — same NFA shared across all keys."
+      >
+        NFA: states + transitions
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="per-key runtime state" />
+    <FlowRow>
+      <DataBox
+        label="Computation States"
+        tooltip="Per-key active partial matches. Каждый ComputationState — это (current NFA state, pointer to event buffer, version). Может быть много одновременно — это и есть 'non-determinism'. Хранятся в Flink ValueState/MapState."
+      >
+        Set&lt;ComputationState&gt; per key
+      </DataBox>
+      <DataBox
+        label="Shared Buffer"
+        tooltip="Storage matched events. Использует версионирование (Lazy Forward DAG) — multiple computation states шарят events efficiently. Хранится в Flink MapState. Это где живёт основная масса CEP state."
+      >
+        Shared Buffer (versioned events)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="на каждый input event NFA processes" />
+    <FlowRow>
+      <DataBox
+        label="processEvent"
+        tooltip="Для каждого event NFA: (1) для каждого active ComputationState — пробует TAKE/IGNORE/PROCEED transitions; (2) обновляет Shared Buffer; (3) detect-ит full matches; (4) prunes timed-out partial matches."
+      >
+        TAKE / IGNORE / PROCEED transitions
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Transition types: TAKE, IGNORE, PROCEED
+
+Pattern compile-ится в NFA где из каждого state есть три типа transitions:
+
+### TAKE — match и продвинуться
+
+```java
+.where(predicate).next("nextState")
+```
+
+Если event matches predicate — consume event, transition в "nextState", добавить event в Shared Buffer.
+
+### IGNORE — пропустить event
+
+```java
+.followedBy("next")
+```
+
+Между предыдущим и текущим state мы допускаем other events. IGNORE transition позволяет остаться в текущем state не consuming event.
+
+### PROCEED — epsilon transition (no event consumed)
+
+```java
+.optional()
+```
+
+Optional state может «proceed» к next state без матчинга event-а — это epsilon transition. NFA сразу создаёт две computation states: одна осталась waiting for optional event, другая уже proceeded.
+
+<Callout type="note">
+Combinatorics transitions объясняет почему `oneOrMore` + IterativeCondition expensive: каждый event создаёт новые TAKE transitions, каждая порождает new ComputationState. Активных ComputationStates растёт линейно с number of matched events. Это quadratic growth для length-N partial matches.
+</Callout>
+
+---
+
+## ComputationState и Shared Buffer
+
+Каждая active partial match — это `ComputationState`:
+
+```
+ComputationState {
+    state: NFAState                    // current state in NFA
+    eventPointer: BufferEventReference // pointer в Shared Buffer
+    version: DeweyVersion              // versioning для shared events
+    startTimestamp: Long               // when partial match started (для within())
+}
+```
+
+**DeweyVersion** — это hierarchical version (dot-separated path like `1.1.2`). Используется чтобы distinguish branches, которые шарят events до некоторой точки и потом diverge. Это **key innovation** для efficient storage.
+
+### Shared Buffer
+
+Naive approach — каждая ComputationState хранит свою copy событий. Для wide patterns с `followedByAny` это O(N×M) duplication.
+
+Shared Buffer — **DAG-style storage** с versioning:
+
+```
+Events:        e1 → e2 → e3 → e4
+                         ↓
+Computation A: v1.1 ────────→ pointer
+Computation B: v1.2 ─────────→ pointer (shares e1, e2)
+Computation C: v1.2.1 ───────→ pointer (extends B)
+```
+
+Версии — strictly hierarchical: `v1.2.1` is descendant of `v1.2`. Когда computation state expires (timeout, terminal), Flink prunes events которые not reachable from any active version.
+
+Это reduces storage от O(N×M) к O(distinct_event_path_lengths) — обычно O(N).
+
+---
+
+## State construction example: `(A B+ C)`
+
+Рассмотрим как pattern `A B+ C` (с DEFINE A any, B price down, C price up) компилируется:
+
+```
+NFA states:
+  s0: Initial         (no events matched)
+  s1: A_matched       (just matched A)
+  s2: B_matched       (one or more B matched)
+  s3: C_matched       (matched C — terminal)
+
+Transitions:
+  s0 ─TAKE(any)→ s1               (A matches)
+  s1 ─TAKE(price<PREV)→ s2        (first B)
+  s2 ─TAKE(price<PREV)→ s2        (more B — self-loop)
+  s2 ─IGNORE→ s2                  (relaxed contiguity B+: skip other events)
+  s2 ─TAKE(price>LAST(B))→ s3    (C — terminal)
+```
+
+На каждый event:
+- В state s2: пробует `TAKE` (если matches B predicate) И `IGNORE` (если другое event); параллельно пробует `TAKE` для C → если matches, branches на s3.
+- **Branching**: один event может trigger несколько transitions → создаёт multiple ComputationStates.
+
+---
+
+## Why complex patterns expensive
+
+### O(N²) для followedBy с oneOrMore
+
+```java
+Pattern.<Event>begin("a").where(p1)
+    .followedBy("b").where(p2).oneOrMore()
+    .followedBy("c").where(p3)
+```
+
+Для каждого matching `b` event создаётся continuation, которая waits for `c`. Если в window 100 matching `b`-events, до first `c` мы имеем 100 parallel partial matches. Каждый `c` triggers cartesian product → 100 matches.
+
+Storage: O(N) ComputationStates × O(N) shared events = O(N²) worst case.
+
+### Exponential для followedByAny
+
+```java
+.followedByAny("b").where(...).oneOrMore().allowCombinations()
+```
+
+`allowCombinations` enumerates все subsets — 2^N. Для N=20 = 1M partial matches. **На production это безусловный no-go** без strict bounds.
+
+### IterativeCondition penalty
+
+Каждый event для transition triggers `IterativeCondition.filter()`. Если condition iterates через все matched events в partial match (O(N)), и есть M parallel partial matches, total cost = O(N×M) per event. Для 1000 events/sec × 100 matched per partial × 50 partial → 5M iterations/sec **только для condition checks**.
+
+---
+
+## Key groups и parallelism
+
+Flink CEP runs as **KeyedProcessFunction**. State partitioned by **key groups** (default `maxParallelism=128`):
+
+```
+Job parallelism: 8
+maxParallelism: 128
+Key groups: 0-127, distributed:
+  TaskManager 1, subtask 0: key groups 0-15
+  TaskManager 1, subtask 1: key groups 16-31
+  ...
+  TaskManager 4, subtask 7: key groups 112-127
+```
+
+Каждый key matches на key group через `hash(key) % maxParallelism`. Per-key state (NFA's per-key ComputationStates + Shared Buffer) живёт в Flink state backend (RocksDB / ForSt / heap).
+
+### Implications:
+
+1. **Hot keys ⇒ skewed state**. Один user с миллионом events → один subtask имеет 99% load. Flink не auto-redistributes по hot-spot. Mitigation: pre-aggregation upstream или key salting (если semantics позволяет).
+
+2. **Rescaling**: при добавлении TaskManager-а key groups redistribute. State per key group migrates via checkpoint mechanism. На-практике fast.
+
+3. **Memory**: NFA state per key хранится в state backend. С RocksDB — большая часть на диске, hot в Block Cache. С ForSt — primary на S3, cache на NVMe.
+
+---
+
+## Сравнительная таблица: complexity по pattern shape
+
+| Pattern shape | Worst-case ComputationStates | Shared Buffer growth | Production-safe? |
+|---|---|---|---|
+| `A B C` (single match per state, strict) | O(1) | O(3) | Trivial |
+| `A B+ C` (oneOrMore) | O(W) where W = events в within | O(W) | OK с within |
+| `A B* C` (zeroOrMore) | O(W) | O(W) | OK |
+| `A.followedByAny(B)+ C` (non-det) | O(W) parallel | O(W²) | Risky |
+| `A B+.allowCombinations() C` | O(2^N) | O(2^N) | **Never на production** без tight bounds |
+| `IterativeCondition` per event | × O(N) check cost | — | Profile! |
+
+---
+
+## Visualizing pattern execution
+
+Рассмотрим execution `A B+ C` (relaxed, default) на sequence: `[A1, X, B1, B2, X, C1]`:
+
+```
+event=A1: s0 ─TAKE→ s1     →  ComputationState{s1, [A1]}
+event=X:  s1 ─IGNORE→ s1   →  ComputationState{s1, [A1]} (no change)
+                              s1 ─PROCEED→ s2 (B is oneOrMore: zero events ok? нет, oneOrMore — нет PROCEED initially)
+event=B1: s1 ─TAKE(B)→ s2  →  ComputationState{s2, [A1, B1]}
+event=B2: s2 ─TAKE(B)→ s2  →  ComputationState{s2, [A1, B1, B2]}
+          s2 ─IGNORE→ s2   →  (если C не matched, остаёмся ждать)
+event=X:  s2 ─IGNORE→ s2   →  (no change)
+          s2 ─TAKE(C)? — нет, X не matches C predicate
+event=C1: s2 ─TAKE(C)→ s3  →  ComputationState{s3, [A1, B1, B2, C1]}  ← FULL MATCH
+```
+
+Output: match {A: A1, B: [B1, B2], C: C1}.
+
+Если `AFTER MATCH SKIP PAST LAST ROW` (default) — после match-а computation states purged, NFA restarts с следующего event.
+
+---
+
+## Production gotchas
+
+### 1. State size — главный constraint
+
+Большинство production CEP issues — это **state size**, не CPU. Pattern с `oneOrMore` + wide `within` накапливает огромные Shared Buffers. Симптом: checkpoint duration растёт, RocksDB compactions stall.
+
+Mitigation:
+- Tight `within()` — минимально нужное окно
+- Avoid `oneOrMore` без upper bound, prefer `times(min, max)`
+- Per-key keyBy так чтобы events of unrelated users не накапливались в одной partial match
+
+### 2. Watermark progress — late emission
+
+Match emit-ся только когда watermark проходит `within()` границу matched first event. Если watermark stalled (idle source) — matches stuck в state даже если "completed".
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withIdleness(Duration.ofMinutes(1))   // ← important
+    .withTimestampAssigner(...)
+```
+
+### 3. NFA serialization changes — savepoint incompatibility
+
+Изменение pattern (добавление state, изменение predicates) изменяет NFA structure. На савепойнт restart Flink **не сможет deserialize** old NFA state. Требуется savepoint stop + start с new pattern и **clean state** (или explicit state migration).
+
+Production practice: treat CEP pattern changes как breaking deployment — drain существующие patterns, deploy new.
+
+### 4. Hot key + heavy IterativeCondition = backpressure
+
+Один busy key + `IterativeCondition` с O(N) checks может saturate один subtask. Other subtasks idle. Network buffer queue grows → backpressure propagates upstream.
+
+Detect через Flink Web UI: per-subtask records-in metrics + busyMsPerSecond. Hot subtask будет 100% busy.
+
+---
+
+## Key takeaways
+
+- **NFA**, не DFA — non-determinism нужен для `oneOrMore`, `IterativeCondition`, multiple active partial matches.
+- **TAKE / IGNORE / PROCEED** — три типа transitions, encode contiguity и quantifiers.
+- **Shared Buffer + DeweyVersion** — efficient storage shared events между partial matches.
+- **State size** — главный production constraint, не CPU. Tight `within()` обязателен.
+- **Key groups distribute по hash**, hot keys — главный source of skew.
+- **NFA serialization changes** — pattern change = breaking deployment, нужен clean savepoint.
+
+---
+
+<KnowledgeCheck
+  question="Объясните, почему pattern с followedByAny + oneOrMore + allowCombinations имеет экспоненциальную state complexity. Какой production-safe alternative?"
+  answer="followedByAny создаёт non-deterministic relaxed contiguity — каждый matching event генерирует new ComputationState. oneOrMore допускает variable-length sequences — partial matches growing per event. allowCombinations enumerates ВСЕ subsets matching events — 2^N ComputationStates для N matching events. Combined: для wide within() с N=20 это 1M parallel partial matches, каждый с pointer в shared events. Memory blow-up, checkpoint stall, eventually JVM OOM. Production-safe alternative: (1) использовать followedBy (single match per A) или default contiguity без allowCombinations; (2) bound через times(min, max) вместо oneOrMore; (3) если нужны overlapping matches — migrate к MATCH_RECOGNIZE с explicit AFTER MATCH SKIP TO NEXT ROW и tight WITHIN; (4) для extreme cases — custom KeyedProcessFunction со state machine, где можно явно ограничивать active matches per key."
+/>

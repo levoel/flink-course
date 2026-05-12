@@ -1,0 +1,89 @@
+{
+  "moduleId": "10-connectors-cdc",
+  "title": "Module 10 Exam — Connectors и Flink CDC",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m10-exam",
+    "description": "Integrated exam для Module 10: FLIP-27 Source, Kafka, File, Hybrid, Lakehouse, JDBC/Async, Flink CDC, Custom"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-exam-q1",
+      "type": "multiple-choice",
+      "question": "Объясните полную FLIP-27 Source API architecture: что runs на JobManager, что на TaskManager?",
+      "options": [
+        { "id": "a", "text": "Все runs на TaskManager — простая модель" },
+        { "id": "b", "text": "Source — factory, сериализуется и shipped к JM и всем TM (no runtime state). На JobManager: SourceCoordinator hosts SplitEnumerator (один per source per job) — split discovery, assignment к readers, recovery coordination, watermark alignment (FLIP-217). На TaskManager (per parallel subtask): SourceOperator wraps SourceReader — owns assigned splits, fetches data via SplitReader threads, emits records + per-split watermarks, snapshots own state. Communication между JM↔TM через OperatorEventDispatcher (gRPC)" },
+        { "id": "c", "text": "Все runs на JobManager — coordination" },
+        { "id": "d", "text": "Это deprecated API" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-27 — separation of concerns architecture. Source (factory class, no state) shipped to all nodes. SplitEnumerator runs sequentially в SourceCoordinator thread pool на JobManager — handles split discovery (periodic для unbounded sources), assignment к readers, recovery (addSplitsBack on subtask failure), watermark alignment coordination. SourceReader (per parallel subtask) on TaskManager — actual data fetching через SplitReader fetcher threads, emits records и per-split watermarks к downstream operators, snapshots List<SplitT> с current positions. OperatorEventDispatcher (gRPC) — communication channel JM↔TM. Clean recovery model — both snapshotState calls на checkpoint, restored на recovery.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m10-exam-q2",
+      "type": "multiple-choice",
+      "question": "Build production pipeline: Postgres OLTP (10M users, 1M tx/sec peak) → Paimon lakehouse, с schema evolution и embedding generation для search. Архитектура?",
+      "options": [
+        { "id": "a", "text": "Spark batch hourly + Flink streaming + manual schema sync" },
+        { "id": "b", "text": "Flink CDC 3.x pipeline (YAML declarative): source = postgres с slot, scan.incremental.snapshot.enabled (parallel chunked initial snapshot), schema-change.behavior = try-evolve. Transform: OPENAI_EMBEDDING(name || description) AS embedding на products table. Sink = paimon с bucket count tuned (1 bucket per ~1GB), changelog-producer = lookup, file.format = parquet с zstd compression. Pipeline parallelism = 16 для 1M tx/sec. Monitor pg_replication_slots actively — alert на slot inactive. Use Kubernetes operator для deploy, set transaction.timeout.ms > checkpoint interval" },
+        { "id": "c", "text": "Debezium + Kafka Connect + Spark" },
+        { "id": "d", "text": "Использовать только JDBC source" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Idiomatic Flink CDC 3.x production deployment. Postgres source с logical replication slot, incremental snapshot для no-lock initial load. Transforms inline: OPENAI_EMBEDDING для real-time vector ingestion (cache by content hash для cost control). Schema evolution auto-propagate через try-evolve. Paimon sink streaming-first format с native upsert, automatic compaction, native CDC integration. Tune bucket count (~1GB/bucket), parallelism для throughput. Critical operational concerns: monitor replication slot actively (slot persists per pipeline, WAL не освобождается без active consumption — disk fills if pipeline down), tune Kafka-like timeouts. Это modern lakehouse architecture replacing Lambda (Spark+Flink+manual).",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-exam-q3",
+      "type": "multiple-choice",
+      "question": "Production: KafkaSink с EXACTLY_ONCE, checkpoint interval 10 min, transaction.timeout.ms по умолчанию. Periodic data loss. Что fix?",
+      "options": [
+        { "id": "a", "text": "Disable EXACTLY_ONCE" },
+        { "id": "b", "text": "Default Kafka transaction.timeout.ms = 60s, but checkpoint = 10 min. When checkpoint takes longer than 60s — Kafka coordinator aborts transaction → Flink thinks it's still alive (pre-committed) → commit phase fails или recovery commits старые transactions → data inconsistency. Fix: setProperty('transaction.timeout.ms', '1800000') — 30 min (= 3× checkpoint_interval). Also verify Kafka broker transaction.max.timeout.ms allows (broker default 15 min — может cap). Production rule: transaction.timeout.ms = max(2 × checkpoint_interval, 900_000), broker config supports" },
+        { "id": "c", "text": "Использовать AT_LEAST_ONCE — duplicates лучше чем loss" },
+        { "id": "d", "text": "Reduce checkpoint interval к 30s" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "#1 production gotcha для KafkaSink EOS. Kafka coordinates transactions independently от Flink — transaction.timeout.ms = max время transaction может быть open. Default 60s designed для quick OLTP. Streaming jobs с checkpoint intervals 5-10 min не fit default. Mismatch → coordinator aborts transactions → either records committed но Flink не знает → 'duplicates' OR aborted but Flink думает committed → 'lost'. Subtle bug — appears periodic. Fix: explicit setProperty('transaction.timeout.ms', '1800000'). Verify broker.config transaction.max.timeout.ms permits (server-side cap). Production rule: 3× checkpoint_interval, 30 min typical, broker max set 30+ min.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-exam-q4",
+      "type": "multiple-choice",
+      "question": "Use case: real-time fraud detection нуждается в last 6 months user transaction history для per-user baseline. Архитектура?",
+      "options": [
+        { "id": "a", "text": "Spark batch для history + отдельный Flink job для live" },
+        { "id": "b", "text": "HybridSource (FLIP-150): combine bounded FileSource (S3 historical Parquet) + unbounded KafkaSource (live transactions). Dynamic switch factory с access к prev source state — Kafka starts at last_historical_timestamp + 1ms (no gap/overlap). State per user baseline accumulates через historical phase, продолжает через live. Same pipeline, same operator state, exactly-once preserved. State checkpointed — restart resumes без re-processing history. Production tuning: больше parallelism + larger Block Cache во время historical phase" },
+        { "id": "c", "text": "Streaming-only от Kafka beginning" },
+        { "id": "d", "text": "Custom Source с manual switching" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic Hybrid Source use case — replaces Lambda architecture. FileSource (BOUNDED) реrads S3 Parquet history, KafkaSource (CONTINUOUS_UNBOUNDED) reads live. Hybrid Source switches при FileSource exhaustion. Dynamic factory с switchContext.getPreviousEnumeratorState() extracts last_historical_timestamp — Kafka starts там → no gap, no overlap. Critical: state per user (ValueState<UserBaseline>) populated during historical phase (computes mean transaction amount, frequency, locations) — продолжает comparison через live phase. Same operator state spans switch — exactly-once preserved automatically. Tuning: historical phase = high throughput, scale up RocksDB Block Cache и parallelism; live phase = standard. Это modern Kappa architecture в Flink.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-exam-q5",
+      "type": "multiple-choice",
+      "question": "100k events/sec lookup user info из Postgres dim table — production architecture?",
+      "options": [
+        { "id": "a", "text": "Synchronous JDBC lookup, parallelism 100" },
+        { "id": "b", "text": "Multi-layer: (1) AsyncDataStream.orderedWait или unorderedWait с RichAsyncFunction (HikariCP pool 20 connections per subtask, capacity 100 in-flight, timeout 1s). (2) Lookup cache PARTIAL LRU 100k rows + TTL 15min — 80-95% hit rate (<1ms) reduces actual DB queries 10-20x. (3) Connection pooling — total parallelism × 20, нужно DB max_connections = 500+ или PgBouncer multiplexer. (4) Parallelism scale linear ~5k/sec per subtask с cache — 20 subtasks для 100k. (5) For ultra-hot users: stream user updates через Flink CDC, broadcast к keyed stream, maintain ValueState — eliminates JDBC lookups для cached users entirely" },
+        { "id": "c", "text": "Использовать Iceberg как lookup table" },
+        { "id": "d", "text": "Increase Postgres CPU" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production-grade high-throughput enrichment. Sync JDBC = 50/sec per subtask = need 2000 parallelism = unrealistic. Multi-layer optimization: Async I/O (pipelined concurrent queries, capacity-bounded with aggressive timeout, ordered vs unordered choose based downstream) — 5000/sec без cache. Plus PARTIAL LRU cache (Pareto distribution active users → 80-95% hit rate, <1ms) — multiplies к 50k+/sec. Connection pooling HikariCP, DB-side max_connections or PgBouncer middleware. Architectural option: if updates frequent или cache invalidation too coarse — Flink CDC stream user changes, broadcast к main stream, maintain в keyed state — eliminates JDBC entirely. Standard architecture для personalization, fraud detection, recommendation systems.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-exam-q6",
+      "type": "true-false",
+      "question": "Все modern Flink connectors (Kafka, File, JDBC, Iceberg, Paimon, Flink CDC) implement FLIP-27 Source API и/или FLIP-191 SinkV2 — legacy SourceFunction и SinkFunction removed в Flink 2.0.",
+      "correctAnswer": true,
+      "explanation": "Правда. Flink 2.0 (March 2025) removed legacy API: SourceFunction (replaced by FLIP-27 Source), SinkFunction (replaced by FLIP-191 SinkV2), DataSet API (replaced by unified DataStream + Boundedness), Scala API (Java-first philosophy). All modern connectors implement new API: KafkaSource (FLIP-27) + KafkaSink (SinkV2), FileSource + FileSink, JdbcSource + JdbcSink, Iceberg FlinkSink, Paimon FlinkSinkBuilder, Hudi HoodieFlinkSink, Delta DeltaSink, MyQueueSource (custom). FLIP-27 advantages: unified batch/streaming через Boundedness, clean recovery model (SplitEnumerator + SourceReader snapshots), watermark alignment (FLIP-217). SinkV2 advantages: clear writer/committer separation, pre-commit и post-commit topologies для compaction и metastore sync. Это standardised foundation modern Flink ecosystem.",
+      "bloomLevel": "conceptual"
+    }
+  ]
+}

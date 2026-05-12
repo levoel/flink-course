@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "11-formats-serialization/08-schema-evolution",
+  "moduleId": "11-formats-serialization",
+  "_meta": {
+    "idPrefix": "flink-m11-08",
+    "description": "TypeSerializerSnapshot, state migration, State Processor API"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-08-q1",
+      "type": "multiple-choice",
+      "question": "TypeSerializerSchemaCompatibility возвращает четыре возможных результата. Какие и что они означают?",
+      "options": [
+        { "id": "a", "text": "Только compatible и incompatible" },
+        { "id": "b", "text": "(1) compatibleAsIs() — new serializer совпадает с old, никаких изменений в state. (2) compatibleWithReconfiguredSerializer() — minor reconfiguration (например fields reordered), но всё совместимо. (3) compatibleAfterMigration() — нужна full state migration на recovery (Flink reads с old, пишет с new). (4) incompatible() — schemas несовместимы, job НЕ стартует" },
+        { "id": "c", "text": "Только три: compatible, migrate, fail" },
+        { "id": "d", "text": "Восемь возможных результатов" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Четыре outcomes detailed: (1) **compatibleAsIs()** — самый частый случай, minor code change без schema impact (например, добавили log statement). State binary совместим. Zero migration cost. (2) **compatibleWithReconfiguredSerializer()** — нужна minor reconfiguration serializer на recovery. Например, field order в POJO changed — Flink использует old field order для compat reading, но logically совместимо. (3) **compatibleAfterMigration()** — нужна полная state migration: Flink читает с old serializer, пишет с new. Происходит на recovery, может занять long time для большого state (10+ min для 100GB). Example: добавлено nullable field в POJO. (4) **incompatible()** — schemas несовместимы (rename field без alias, type change, required removed). Job throws на recovery, восстановление невозможно без manual migration (State Processor API). resolveSchemaCompatibility() выбирает один из этих outcomes на основе serializer-specific logic.",
+      "studyHint": "Повторите урок 08 — секцию 'TypeSerializerSnapshot — общая модель'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-08-q2",
+      "type": "multiple-choice",
+      "question": "PojoSerializer schema evolution: rename field `customer → clientName` без aliases. Что произойдёт на recovery?",
+      "options": [
+        { "id": "a", "text": "Flink автоматически распознаёт rename и сохраняет данные" },
+        { "id": "b", "text": "PojoSerializerSnapshot сравнивает field names byte-by-byte: customer ≠ clientName. Видит one field removed (customer), one added (clientName). compatibleAfterMigration() с loss data — customer data lost, clientName всегда null after migration. Flink не может отличить rename от drop+add без explicit hints. Workarounds: Avro aliases, custom PojoSerializer, State Processor API для proper rename" },
+        { "id": "c", "text": "Recovery fails с IncompatibleException" },
+        { "id": "d", "text": "Flink использует Levenshtein distance для match" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "PojoSerializerSnapshot хранит field names + types в snapshot. На recovery сравнивает field-by-field: для каждого field в old snapshot ищет matching field by NAME в new schema. Match by name + compatible type → mapped. No match by name → removed (data lost). New field в snapshot без match в old → added with null/default. Rename = drop old name + add new name without intent indication. Flink trustees field names as authoritative — рассматривает их как stable identifiers. **Avro alternative**: `{name: 'clientName', aliases: ['customer'], type: 'string'}` — Avro reader проверяет aliases, выполняет proper rename. **Custom PojoSerializer**: переопределить resolveSchemaCompatibility() добавив explicit rename detection logic. **State Processor API**: batch job читает old state с customer field, пишет new с clientName — full control. Production rule: либо использовать Avro для evolution-heavy state, либо documenting rename intent через explicit migration steps.",
+      "studyHint": "Повторите урок 08 — секцию 'PojoSerializer schema evolution: example rename'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-08-q3",
+      "type": "multiple-choice",
+      "question": "State Processor API — когда использовать и как работает?",
+      "options": [
+        { "id": "a", "text": "Когда built-in PojoSerializer/AvroSerializer evolution недостаточно — для невозможных через snapshot transformations (complex restructuring, rename без aliases, splits, merges). Batch Flink job (отдельный от streaming) reads old savepoint, transforms state в новую структуру, пишет new savepoint. Streaming job restartится с new savepoint" },
+        { "id": "b", "text": "Только для test environments, не production" },
+        { "id": "c", "text": "Для realtime state querying" },
+        { "id": "d", "text": "State Processor API deprecated в Flink 2.x" }
+      ],
+      "correctAnswer": "a",
+      "explanation": "State Processor API (flink-state-processor-api) — escape hatch для невозможных schema migrations. Use cases: (1) Rename field properly (avoiding aliases workaround). (2) Split field: `signupDate: Instant → signupYear: int + signupMonth: int`. (3) Merge fields. (4) Restructure: ValueState<List<Item>> → MapState<ItemKey, Item>. (5) Filter state: keep только entries matching criteria. (6) Convert serializer type: Kryo → POJO. **How it works**: standalone batch Flink job. (1) `Savepoint.load(env, path, backend)` — read existing savepoint. (2) `existing.readKeyedState('operator-uid', readerFn)` — get DataStream<KeyedState> of old format. (3) Transform via map() в new format. (4) `NewSavepoint.create(backend, maxPar).withKeyedState('operator-uid', bootstrapFn, newStream)` — write new savepoint. (5) `newSavepoint.write('new-path')`. Streaming job restarts с new savepoint. **Production workflow**: stop streaming with savepoint → run migration batch job → start streaming with new savepoint. Was experimental до 1.15, stable 1.16+. Critical для long-lived stateful jobs with breaking schema changes.",
+      "studyHint": "Повторите урок 08 — секцию 'State Processor API — escape hatch'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m11-08-q4",
+      "type": "true-false",
+      "question": "Explicit `@uid('operator-name')` для всех stateful operators обязателен в production. Без UID Flink назначает auto-UID на основе operator position в graph, и любой code change (даже adding log statement в map() выше) ломает state mapping — savepoint становится unrelatable к new operators.",
+      "correctAnswer": true,
+      "explanation": "Auto-UID generation: Flink JobGraph builder назначает UIDs на основе operator position (chain ID + position в chain). Любое изменение upstream operators (add/remove map, change parallelism, alter chain breaks) → repositioning → different auto-UIDs для downstream stateful operators. Savepoint мапит state by UID → recovery finds 'no state for new UID' → state lost silently (operator restartится с empty state). Worst case: business logic critical state (user profiles, fraud history) evaporates на deploy. **Explicit @uid pattern**: `stream.keyBy(...).process(new MyFn()).uid('my-fn-state').name('My processing')`. UID — stable identifier для state, не зависит от graph topology. Name — display only. **Production checklist**: каждый stateful operator (KeyedProcessFunction, Window, AsyncFunction с state, etc.) имеет explicit `.uid()`. CI lint: scan code для `.process(.*)` без следующего `.uid(`. Naming convention: `<module>-<purpose>-state` (например `fraud-detection-user-history`). Не reuse UID между different state types. **State Migration safety**: with explicit UIDs, можно safely refactor pipeline structure (rearrange map/filter, add new stages) — stateful operators preserve their state через UID consistency.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

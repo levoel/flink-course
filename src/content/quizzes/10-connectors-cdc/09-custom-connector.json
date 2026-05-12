@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/09-custom-connector",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-09",
+    "description": "Quiz для custom connector"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-09-q1",
+      "type": "multiple-choice",
+      "question": "Какие компоненты обязательны для implementation custom FLIP-27 Source?",
+      "options": [
+        { "id": "a", "text": "Только Source class" },
+        { "id": "b", "text": "Source factory (implements Source<T, SplitT, EnumChkT>) — createEnumerator, createReader, restoreEnumerator, getSplitSerializer, getEnumeratorCheckpointSerializer + SourceSplit type + SplitEnumerator (split discovery/assignment, on JM) + SourceReader (data fetching, per subtask on TM) + SimpleVersionedSerializers для SplitT и EnumChkT. Best practice: extend SourceReaderBase или SingleThreadMultiplexSourceReaderBase для proper threading" },
+        { "id": "c", "text": "JSON config файл" },
+        { "id": "d", "text": "REST endpoint" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-27 contract: (1) Source — factory с createEnumerator (JM), createReader (TM), restoreEnumerator (recovery), serializers. (2) SourceSplit class — unit of work (e.g., Kafka partition + offset, file path + position, DB partition range). (3) SplitEnumerator — runs in SourceCoordinator on JM, discovers и assigns splits, recovery (addSplitsBack), snapshotState. (4) SourceReader — per parallel subtask, fetches и emits. Best practice extend SourceReaderBase (handles single-thread mailbox + multi-thread fetcher threading correctly) или SingleThreadMultiplexSourceReaderBase. Plus SimpleVersionedSerializer для splits + enumerator state — version field critical для savepoint upgrade compatibility.",
+      "studyHint": "Повторите урок — секция Custom Source implementation",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m10-09-q2",
+      "type": "multiple-choice",
+      "question": "Почему Committer в custom SinkV2 должен быть idempotent? Какой failure scenario это решает?",
+      "options": [
+        { "id": "a", "text": "Idempotent не required — Flink handles it" },
+        { "id": "b", "text": "На recovery (TM failure, JM failover) Flink restores Committables и calls Committer.commit() для них снова — possibly уже committed transactions. Non-idempotent throws AlreadyCommittedException → CommitRequest fails → Flink retries → infinite loop или corruption. Idempotent implementation: catch AlreadyCommittedException и treat success, или unique transaction IDs safely re-submittable. Production scenario: Flink crashes after Committer.commit() succeeded but before JM ack — on restart re-submits Committable — without idempotence: spurious failure" },
+        { "id": "c", "text": "Только для idempotent sinks (Kafka)" },
+        { "id": "d", "text": "Для logging" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "#1 source of production bugs в custom connectors. Flink at-least-once delivers commits — может call Committer.commit() для same Committable multiple times (recovery scenarios). Non-idempotent throws → retry storm → infinite loop. Idempotent contract: either catch already-committed exceptions и treat as success, или design unique transaction IDs that can be safely re-submitted. Same pattern в KafkaSink (Kafka transactional commit idempotent), FileSink (rename .pending → final, if already renamed: OK). Custom committers must explicitly implement. Production scenario: TM killed после Committer.commit() succeeds но перед persisting state — recovery re-submits — без idempotence first commit succeeds, second 'fails' → spurious error → manual intervention.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-09-q3",
+      "type": "multiple-choice",
+      "question": "Когда выбирать custom connector vs standard? И какие практические caveats?",
+      "options": [
+        { "id": "a", "text": "Custom всегда — больше control" },
+        { "id": "b", "text": "Custom нужен для: proprietary message bus (internal corporate queue), specialized hardware/protocols (Modbus, OPC-UA), internal API/microservice integration (REST/gRPC), legacy mainframe (IMS, AS/400), custom DB без JDBC. НЕ нужен для standard DB (JDBC покрывает даже non-standard SQL), Kafka-compatible MQ (KafkaSource с config tweaks), file-based (FileSource).  Caveats: long-term maintenance burden, savepoint compatibility (version field critical), extensive recovery testing required, idempotent committer obligatory" },
+        { "id": "c", "text": "Custom только для batch sources" },
+        { "id": "d", "text": "Standard всегда лучше — never custom" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Decision criteria: Custom когда standard не покрывает proprietary/specialized systems. Не custom для slightly-different version of standard (JDBC handles unusual SQL dialects, Kafka connector handles Kafka-compatible MQs через config). Custom = long-term commitment: maintain через Flink upgrades, savepoint backward compatibility (serializer versions), extensive recovery testing (TM kill, JM failover, network partition), idempotent committer obligation. Production approach: prefer standard wherever possible, custom only if business-critical proprietary integration. Investment: 3-6 months developer time for production-grade custom connector + ongoing maintenance. Worth для unique systems, not для convenience.",
+      "studyHint": "Повторите урок — секция Когда custom connector",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-09-q4",
+      "type": "true-false",
+      "question": "Best practice — extend SourceReaderBase или SingleThreadMultiplexSourceReaderBase вместо implementing SourceReader from scratch, потому что handles threading model (single-thread mailbox + fetcher threads) корректно.",
+      "correctAnswer": true,
+      "explanation": "Правда. SourceReader threading model nuanced: main mailbox thread (handles checkpoint barriers, watermarks, control events) + multiple fetcher threads (do actual I/O к external system). Custom threading легко вызывает deadlocks — mailbox blocked waiting for fetcher result, fetcher blocked waiting for mailbox capacity. SourceReaderBase encapsulates correct pattern: SplitFetcherManager manages fetcher threads, RecordEmitter emits в mailbox thread, isAvailable() future coordinates. SingleThreadMultiplexSourceReaderBase further simplifies — one fetcher thread serves multiple splits, simpler model. Use whenever possible. Custom from scratch only if you have very unusual concurrency requirements (например one thread per split required by protocol). Это standard practice во всех modern Flink connectors (Kafka, File, JDBC).",
+      "bloomLevel": "applied"
+    }
+  ]
+}

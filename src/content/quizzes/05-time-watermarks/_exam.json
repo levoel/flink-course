@@ -1,0 +1,89 @@
+{
+  "moduleId": "05-time-watermarks",
+  "title": "Module 05 Exam — Time, Watermarks, Windows",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m05-exam",
+    "description": "6-question integrated exam for Module 05"
+  },
+  "questions": [
+    {
+      "id": "flink-m05-exam-q1",
+      "type": "multiple-choice",
+      "question": "Команда мигрирует fraud detection с processing time на event time, чтобы поддержать reprocessing 30-дневной истории. После replay — окна не fire, aggregations пустые. Какие три проблемы наиболее вероятны?",
+      "options": [
+        { "id": "a", "text": "Flink не поддерживает replay" },
+        { "id": "b", "text": "(1) Idle Kafka partitions без withIdleness — MIN propagation tank-ит WM до Long.MIN_VALUE; (2) outOfOrderness слишком большой для replay (например 1h) — WM ползёт; (3) TimestampAssigner возвращает Long.MIN_VALUE на bad records или забыли .window(TumblingEventTimeWindows...) vs ProcessingTimeWindows" },
+        { "id": "c", "text": "Нужен другой state backend" },
+        { "id": "d", "text": "Replay невозможен с event time" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Три самые частые причины stuck watermark после миграции на event time: (1) Idle partitions: на replay часть partitions ещё пустые → их WatermarkGenerator state = Long.MIN_VALUE → MIN propagation tanks pipeline. Fix: .withIdleness(Duration.ofMinutes(1)). (2) outOfOrderness слишком большой: например 1h — WM ползёт медленно, окна 5-min закроются только через 1h after maxObservedTs. Fix: уменьшить до sensible value (20-30s). (3) TimestampAssigner возвращает Long.MIN_VALUE на null timestamps или legacy code использует TumblingProcessingTimeWindows (просто копипаст). Fix: validate в assigner, проверить window class. Дополнительно: multi-source с разной скоростью замены → нужно watermark alignment FLIP-217.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-exam-q2",
+      "type": "multiple-choice",
+      "question": "Design choice: real-time analytics pipeline объединяет три Kafka topics (orders 100K/s, payments 30K/s, clickstream 1M/s). Backfill 30 дней истории. Что обязательно для production?",
+      "options": [
+        { "id": "a", "text": "Использовать только processing time для simplicity" },
+        { "id": "b", "text": "(1) Event time с per-source WatermarkStrategy; (2) .withIdleness на каждой source; (3) .withWatermarkAlignment с одной группой 'pipeline-1' и maxDrift=60s — иначе fast clickstream накопит state TB-scale; (4) .allowedLateness + .sideOutputLateData для late events capture; (5) ForSt state backend на S3 для disaggregated state; (6) GIC checkpoints для stable latency" },
+        { "id": "c", "text": "Сделать всё через Table API" },
+        { "id": "d", "text": "Использовать только in-memory state backend" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production-grade multi-source pipeline требует: (1) event time для correct semantics на replay; (2) per-source WatermarkStrategy с withIdleness (1min sensible) — защита от idle partitions; (3) FLIP-217 alignment с одной группой — иначе clickstream (1M/s) убежит, накопит state до OOM (без alignment 30 дней backfill = TB state); (4) allowedLateness 2-5x outOfOrderness + sideOutputLateData для capture late events (production must); (5) ForSt state backend — disaggregated state на S3, не зависит от local disk; (6) state.backend.changelog.enabled (GIC/DSTL) — stable checkpoint time независимо от state size, критично для EOS sinks. Without всего этого — OOM, data loss, или extremely slow recovery.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-exam-q3",
+      "type": "multiple-choice",
+      "question": "Sliding window 24h с slide 1 min на ProcessWindowFunction — почему это anti-pattern и как переписать?",
+      "options": [
+        { "id": "a", "text": "Это нормальный pattern" },
+        { "id": "b", "text": "Overlap = 1440 (каждое событие в 1440 окон), ProcessWindowFunction хранит raw events per window → unbounded state growth. Fixes: (a) AggregateFunction вместо ProcessWindowFunction — running aggregate (1 double per window); (b) Table API CUMULATE — 1 window per key, не 1440, built-in rolling semantic; (c) Custom KeyedProcessFunction с MapState<windowStart, agg>, manual emit timers и cleanup" },
+        { "id": "c", "text": "Просто disable allowedLateness" },
+        { "id": "d", "text": "Increase parallelism" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical state explosion: size/slide = 1440 overlap multiplier. Каждое событие на 1440 windows. ProcessWindowFunction store raw events — state grows linearly с throughput. На 100K events/sec × 86400 sec/day × 3 days × 1440 = exponential. RocksDB OOM. Fixes: (1) AggregateFunction — running sum per window per key (1 double × 1440 windows × keys), state stable; (2) Table API CUMULATE(step=1min, maxSize=24h) — 1 window state, reset каждые 24h, 1440x state reduction; (3) Custom KeyedProcessFunction с MapState<windowStart, RunningAgg>, manual emit/cleanup — fully controlled но complex. CUMULATE — usually best choice для 'last 24h running update' pattern.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-exam-q4",
+      "type": "multiple-choice",
+      "question": "Late events handling: команда жалуется на 10-20% missing data в dashboards относительно batch reconciliation. Implementation: TumblingEventTimeWindows.of(5min) без allowedLateness, без side output, outOfOrderness=30s. Root cause и production fix?",
+      "options": [
+        { "id": "a", "text": "Flink bug — нужен upgrade" },
+        { "id": "b", "text": "Late events silently dropped — outOfOrderness=30s covers only 80-90% events. Production fix: (1) .allowedLateness(Duration.ofMinutes(5)) — 2-10x outOfOrderness; (2) .sideOutputLateData(lateTag) — capture для DLQ; (3) downstream idempotent (compacted Kafka topic, OLAP upsert) для re-fires; (4) monitor numLateRecordsDropped — должно быть = 0; (5) diagnose upstream причину lateness (retry storms, multi-region jitter, idle resurrection)" },
+        { "id": "c", "text": "Increase parallelism" },
+        { "id": "d", "text": "Switch на batch processing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Classic silent data loss из-за отсутствия allowedLateness и side output. outOfOrderness=30s означает: события > 30s late от max observed → late → dropped without trace. 10-20% events late > 30s — нормально для production (network jitter, retries, slow consumers). Fix layers: (1) allowedLateness 5min — window state удерживается, re-fire на late events, downstream видит updates; (2) sideOutputLateData — capture beyond lateness для DLQ или recovery pipeline; (3) Downstream idempotency — compacted topic key=(window, entity_id), ReplacingMergeTree в ClickHouse, ON CONFLICT в Postgres — без этого re-fires создают duplicates; (4) Metric monitoring numLateRecordsDropped + alert > 0; (5) Root cause analysis — почему лагают > 30s? Upstream retries, idle partitions resurrection, multi-source drift. Production rule: every windowed pipeline MUST have allowedLateness + sideOutputLateData.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-exam-q5",
+      "type": "multiple-choice",
+      "question": "Compare DataStream window API и TVF Windows в Table API/SQL. Когда что выбрать?",
+      "options": [
+        { "id": "a", "text": "DataStream быстрее" },
+        { "id": "b", "text": "TVF Windows: declarative analytics в SQL, простые aggregations + window joins + window TopN, CUMULATE built-in (вместо 1440x state HOP), composable. DataStream window API: custom triggers/evictors, complex state per window, custom logic, fine-grained allowed lateness + side output (TVF limited). Выбор: SQL/analytics → TVF, custom stateful logic → DataStream" },
+        { "id": "c", "text": "Они идентичны" },
+        { "id": "d", "text": "TVF only для batch" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "TVF Windows strengths: (1) Declarative SQL — easy для analytics teams; (2) Composable — window join по (window_start, window_end), window TopN через ROW_NUMBER OVER PARTITION BY window_start; (3) CUMULATE built-in — answer to 'sliding 24h slide 1min' anti-pattern; (4) Optimizer improvements; (5) SESSION TVF с 1.19. DataStream window API strengths: (1) Custom Triggers (early firing, count-based, custom on event); (2) Evictors (filtering pre-aggregation); (3) Fine-grained allowedLateness + sideOutputLateData; (4) Custom state per window (windowState()); (5) Complex stateful logic в KeyedProcessFunction. Choice: SQL analytics + simple aggregations + window joins → TVF; custom stateful logic + custom triggers → DataStream. Mix в одном job возможен через DataStream<-> Table conversion.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m05-exam-q6",
+      "type": "true-false",
+      "question": "В production multi-source pipeline всегда нужен .withIdleness() + .withWatermarkAlignment() + .allowedLateness() + .sideOutputLateData() — это required, не optional configuration для critical jobs.",
+      "correctAnswer": true,
+      "explanation": "True. Это production must-have layered protection: (1) withIdleness — защита от stuck watermark от idle partitions/sources. Без этого один idle Kafka partition останавливает весь pipeline через MIN propagation. (2) withWatermarkAlignment (FLIP-217) — защита от fast source overruns slow source. Без этого на backfill state grows TBs → OOM. (3) allowedLateness — защита от silent data loss late events. Без этого все events past WM dropped silently. (4) sideOutputLateData — capture для DLQ / recovery / monitoring. Без этого нет visibility сколько events lost. Each protect от specific failure mode, all четыре together — production-grade pipeline. Если хоть одного нет — есть scenario когда теряешь данные или job dies. Это правило проверено сотнями production incidents — это required configuration baseline.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

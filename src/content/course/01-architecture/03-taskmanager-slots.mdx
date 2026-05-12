@@ -1,0 +1,248 @@
+---
+title: "TaskManager и слоты: memory model FLIP-49"
+description: "TaskManager — JVM с N task slots. Slot — единица планирования. Memory model: framework/task heap/managed/network/metaspace, что куда тратится."
+order: 3
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["TaskManager", "Task Slots", "Memory Model", "FLIP-49", "Managed Memory"]
+---
+
+# TaskManager и слоты: memory model FLIP-49
+
+TaskManager — worker-процесс Flink, JVM с N task slots. Slot — единица планирования: каждый subtask занимает один slot. Это звучит просто, но за фразой «slot — единица планирования» скрывается тонкая модель: что именно изолируется между slots, что — нет, как делится память, что произойдёт, если поставить `numberOfTaskSlots=8` на TM с 2 ГБ heap.
+
+В этом уроке препарируем TaskManager на компоненты, разберём memory model FLIP-49 (active since Flink 1.10), и поймём, как RocksDB-state, network buffers и user heap делят process memory.
+
+---
+
+## TaskManager как JVM-контейнер
+
+TaskManager — это **одна JVM**, которая хостит N subtasks разных jobs (в Session mode) или N subtasks одной job (в Application mode). Каждый subtask — это не отдельный поток в чистом виде, а целая «mailbox» с одним worker-thread и набором ресурсов.
+
+<DiagramContainer title="TaskManager изнутри" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="TaskManager JVM"
+        tooltip="Один процесс, обычно 2-16 GB process memory. Запускается через bin/taskmanager.sh или K8s pod. Регистрируется у ResourceManager при старте, посылает heartbeat каждые heartbeat.interval (default 10s)."
+      >
+        taskmanager.numberOfTaskSlots = 4
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Slot 0"
+        tooltip="Один subtask = один slot. По умолчанию slot sharing group 'default' позволяет всем операторам одной job делить один slot — N параллельных копий полного pipeline-а в N slots. Memory budget per slot = total managed / numberOfTaskSlots."
+      >
+        subtask A0 + B0
+      </DataBox>
+      <DataBox
+        label="Slot 1"
+        tooltip="Полностью независимый subtask от slot 0. Может принадлежать другой job (Session mode) или другому экземпляру pipeline-а той же job (Application mode). Memory изолируется через managed memory budget, CPU — нет (soft isolation)."
+      >
+        subtask A1 + B1
+      </DataBox>
+      <DataBox label="Slot 2" tooltip="То же самое, что slot 1.">subtask A2 + B2</DataBox>
+      <DataBox label="Slot 3" tooltip="То же самое, что slot 1.">subtask A3 + B3</DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="Shared resources"
+        tooltip="Network buffers, RocksDB block cache, JVM metaspace, framework code — общие для всех slots. CPU времени тоже общий (OS scheduler). Это «soft isolation» — heavy slot может голодать соседей по CPU."
+      >
+        network / RocksDB shared cache / CPU
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+**Ключевая идея**: slot — это не CPU core и не отдельный thread pool. Slot — это **memory budget + identifier для slot-aware scheduling**. CPU делится OS-планировщиком между всеми потоками JVM, network buffers общие, RocksDB block cache общий через WriteBufferManager (FLIP-49).
+
+---
+
+## Memory model FLIP-49
+
+Память TaskManager-а разделена на 7 областей. Это введено в Flink 1.10 (FLIP-49) и стабилизировано в 2.x.
+
+<DiagramContainer title="Process memory структура" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="taskmanager.memory.process.size"
+        tooltip="Total memory, который занимает TaskManager process. Включает всё: JVM heap, off-heap, metaspace, overhead. Это значение видит K8s через container.resources.limits.memory. Должно ≥ суммы всех компонентов ниже."
+      >
+        Total process memory (например 4 GB)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="split into 7 sections" />
+    <FlowRow>
+      <DataBox
+        label="Framework Heap"
+        tooltip="JVM heap для Flink framework code (mailbox processor, RPC actors, internal state coordination). Default 128 MB. taskmanager.memory.framework.heap.size. Не используется user code."
+      >
+        128 MB framework
+      </DataBox>
+      <DataBox
+        label="Framework Off-Heap"
+        tooltip="Direct memory для Flink framework (Netty buffers, RPC serialization). Default 128 MB. taskmanager.memory.framework.off-heap.size."
+      >
+        128 MB framework off-heap
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Task Heap"
+        tooltip="JVM heap для user-кода (ProcessFunction, map, reduce). Здесь живут ваши POJO, временные коллекции внутри processElement. Размер вычисляется как остаток: process.size - все остальные. Контролируется через taskmanager.memory.task.heap.size."
+      >
+        Task heap (user code)
+      </DataBox>
+      <DataBox
+        label="Task Off-Heap"
+        tooltip="Direct memory для user-кода. Если у вас Netty buffers, off-heap arrays, FFI — выделяйте через taskmanager.memory.task.off-heap.size. Default 0!"
+      >
+        Task off-heap
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Managed Memory"
+        tooltip="Off-heap, управляемый Flink. Используется для: RocksDB block cache + write buffers, sort buffers (batch), Python worker memory (PyFlink). taskmanager.memory.managed.fraction default 0.4 (40% от process после framework). Это main budget для state."
+      >
+        Managed (RocksDB / sort / Python)
+      </DataBox>
+      <DataBox
+        label="Network"
+        tooltip="Off-heap, для exchange buffers между tasks. taskmanager.memory.network.fraction default 0.1. Числовой fraction × process size, clamped [min, max]. Если 'Insufficient network buffers' — увеличивайте fraction."
+      >
+        Network buffers
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="JVM Metaspace"
+        tooltip="Class metadata (загруженные классы). Default 256 MB. Если у вас много dynamic class loading (Session mode с многими jobs) — увеличивайте taskmanager.memory.jvm-metaspace.size."
+      >
+        256 MB metaspace
+      </DataBox>
+      <DataBox
+        label="JVM Overhead"
+        tooltip="Code cache, GC structures, thread stacks. taskmanager.memory.jvm-overhead.fraction default 0.1, clamped [192MB, 1GB]. Не путать с overhead OS — это всё ещё внутри process memory."
+      >
+        JVM overhead
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Пример распределения 4 ГБ
+
+```yaml
+taskmanager.memory.process.size: 4096m       # 4 GB total
+taskmanager.memory.framework.heap.size: 128m  # 128 MB
+taskmanager.memory.framework.off-heap.size: 128m  # 128 MB
+taskmanager.memory.jvm-metaspace.size: 256m   # 256 MB
+taskmanager.memory.jvm-overhead.fraction: 0.1  # 409 MB (clamped to range)
+taskmanager.memory.network.fraction: 0.1       # 409 MB
+taskmanager.memory.managed.fraction: 0.4       # 1638 MB (RocksDB!)
+# Task heap = 4096 - 128 - 128 - 256 - 409 - 409 - 1638 = 1128 MB
+```
+
+То есть из 4 ГБ только ~1.1 ГБ доступно user heap. Если у вас `numberOfTaskSlots: 4`, на slot приходится ~280 MB heap. Это часто меньше, чем ожидают разработчики.
+
+<Callout type="warning">
+Самая частая ошибка — поднять `numberOfTaskSlots` без увеличения `process.size` и удивиться OOM. Каждый slot уменьшает heap budget per subtask. На 4 GB TM с 8 slots на subtask приходится <150 MB — нереалистично для большинства workloads.
+</Callout>
+
+---
+
+## Что shared между slots, что — нет
+
+| Ресурс | Изоляция между slots | Комментарий |
+|---|---|---|
+| **Task Heap** | Soft (общий JVM heap, но логически делится) | GC видит весь heap как один. OOM в одном slot убьёт всю TM. |
+| **Managed Memory** | Hard (через MemoryManager) | RocksDB через WriteBufferManager делит block cache. Каждый slot получает managed/N байт квоту. |
+| **Network Buffers** | Hard (через NetworkBufferPool) | Каждый channel получает свой набор buffers. |
+| **CPU** | None (soft isolation) | OS-планировщик распределяет потоки. Heavy CPU job голодает соседей. Для hard CPU isolation — отдельные TM-ы. |
+| **RocksDB block cache** | Hard (shared cache through MemoryManager) | Включена по умолчанию (state.backend.rocksdb.memory.managed: true) — все instances одного TM делят cache. |
+| **JVM Metaspace** | None (общий JVM) | Загруженные классы разделяются между slots. |
+| **Threads** | Logical (mailbox thread per subtask) | Каждый subtask имеет ровно один worker thread (mailbox processor). |
+
+Это значит: **slot изолирует state, не CPU**. Если на одном TM два slot-а, один из которых делает heavy CPU computation, второй замедлится. Для строгой CPU isolation — поднимайте больше TM-ов с одним slot каждый (на K8s — pod-per-slot).
+
+---
+
+## Mailbox processor — модель потоков
+
+Каждый subtask имеет ровно один поток — **mailbox thread**. Это не thread pool, не reactor — это classic single-threaded event loop:
+
+```
+loop {
+  if (timer expired) onTimer();
+  else if (input available) processElement();
+  else if (mail available) processMail();   // checkpoints, watermarks, control
+  else park();
+}
+```
+
+Это устраняет race conditions внутри subtask. State доступ без локов, timers выполняются sequentially с processElement, checkpoints (barriers) обрабатываются как специальные «mail» сообщения.
+
+**Side effect**: блокирующая операция в `processElement` (synchronous DB call, slow disk read) останавливает весь mailbox — checkpoints не успевают, watermarks не propagate. Поэтому для external lookups обязателен Async I/O (модуль 02 урок 06).
+
+---
+
+## Сколько slots ставить
+
+Эвристика для production:
+
+```
+desired_total_slots = sum of parallelism всех jobs
+slots_per_tm = numberOfTaskSlots
+total_tms = desired_total_slots / slots_per_tm
+process.size_per_tm = N * memory_per_slot + framework_overhead
+```
+
+Типичные настройки:
+
+| Workload | Slots per TM | Process size per TM | Комментарий |
+|---|---|---|---|
+| **Stateless transforms** | 4-8 | 2-4 GB | Heap-heavy, не нужен большой managed budget. |
+| **Heavy state (RocksDB)** | 1-2 | 8-16 GB | Managed memory нужно ≥ 4 GB для приличного block cache. |
+| **CPU-intensive (parsing, ML inference)** | 1 | 4-8 GB | Hard CPU isolation через separate pods. |
+| **Mixed workload** | 2-4 | 4-8 GB | Компромисс. |
+
+---
+
+## Comparison vs Spark / Kafka Streams
+
+| Аспект | Flink TaskManager | Spark Executor | Kafka Streams |
+|---|---|---|---|
+| Process model | Standalone JVM, registered с RM | Standalone JVM, registered с driver | Embedded в application JVM |
+| Unit of scheduling | Slot | Core (cores per executor) | Stream thread |
+| Memory isolation | Hard via MemoryManager (managed/network) | Heap + off-heap, не isolated per task | Shared с application |
+| CPU isolation | Soft (OS scheduler) | Soft (OS scheduler) | Soft |
+| State storage | RocksDB / ForSt managed memory | In RDD between batches | RocksDB embedded |
+| Multiple jobs per worker | Yes (Session mode) | No (executor per app) | Multiple apps possible но independent |
+
+---
+
+## Production gotchas
+
+- **`numberOfTaskSlots: 1` + много TM-ов** — даёт hard CPU isolation, но увеличивает network overhead (больше shuffle между процессами). Хороший выбор для state-heavy / CPU-heavy workloads.
+- **`numberOfTaskSlots: N` + один TM** — экономит память (один framework heap, одна Java metaspace), но soft isolation. Хорошо для stateless transforms.
+- **OOM-Killed pod** — почти всегда означает, что native memory (RocksDB / Netty direct) превысила процесс лимит. Включайте managed RocksDB (`state.backend.rocksdb.memory.managed: true` — default в 2.x), проверяйте, что custom OptionsFactory не отключает WriteBufferManager.
+- **Heap dump показывает много `byte[]` без owner** — это network buffers + RocksDB. Не паника, это by design.
+- **Long GC pauses (>5s)** — обычно managed/heap соотношение неверное. Увеличьте managed (там RocksDB) и уменьшайте heap. На больших heap (>16 GB) переходите на G1 или ZGC.
+- **`jvm-overhead` clamp** — fraction 0.1 при 4 GB process даёт 409 MB, но при 200 GB даёт 20 GB, что perekruchivaet min/max (default min 192MB max 1GB). Проверяйте actual через TM metrics.
+
+<Callout type="tip">
+Web UI → TaskManager → Memory tab показывает realtime распределение. Если managed используется ~90%+ — добавьте `managed.fraction` или поднимите `process.size`. Если task heap close to max — у вас leak в user code или slishком много slots.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="У вас Flink job с RocksDB state backend и parallelism=8. Вы выбираете между: (А) 8 TaskManager-ов по 1 slot, process.size 4 GB каждый, или (Б) 2 TaskManager-а по 4 slots, process.size 16 GB каждый. Оба варианта дают 8 slots total и 32 GB total memory. В чём различия и какой когда?"
+  answer="Total compute и memory одинаковы, но distribution radikalно разный. Вариант (А) — 8×1: каждый slot — свой JVM с ~1.6 GB managed memory (40% от 4 GB), hard CPU isolation (OS isolation между процессами), но 8 framework heap (8×128MB=1GB wasted), 8 metaspace (8×256MB=2GB wasted), и 8 RocksDB instances с separate block caches (хуже для cache hit rate). При сбое одного TM — теряется 1 slot из 8 (parallelism падает до 7, region failover restartит только affected). Network shuffle между slots — TCP-only (cross-process), без локальной оптимизации. Вариант (Б) — 2×4: каждый TM имеет ~6.4 GB managed memory, делимая между 4 slots — RocksDB shared cache в 4 раза эффективнее (один большой WriteBufferManager + block cache), framework/metaspace overhead amortized по slots, network shuffle между slots внутри одного TM — через local memory (без TCP). Soft CPU isolation: один heavy slot замедлит соседей. При сбое одного TM — теряется 4 slots, нужно ждать TM restart (image pull, JVM startup, state restore). Использовать (А) для: CPU-bound workloads (ML inference, heavy parsing), critical latency requirements где slot не должен голодать, scenarios где failure isolation важнее efficiency. Использовать (Б) для: state-heavy workloads (большой RocksDB cache outweighs CPU isolation), tight memory budget (amortized overhead), workloads с heavy shuffle (local network gain), Application mode на K8s где меньше pod-ов означает меньше cold start time."
+/>

@@ -1,0 +1,425 @@
+---
+title: "JDBC source/sink, lookup joins (sync vs async), Async I/O"
+description: "JDBC source/sink в Flink: connection pooling, batch insert tuning, lookup joins (synchronous vs async via Async I/O), exactly-once для JDBC sink через XA"
+order: 7
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["JDBC", "Lookup Joins", "Async I/O", "Connection Pooling", "XA Transactions", "Sink Batching"]
+---
+
+# JDBC и lookup joins — bridge к relational worlds
+
+JDBC source/sink — bridge между Flink streaming pipelines и relational databases (Postgres, MySQL, MSSQL, Oracle). Critical для use cases: dim table joins (lookup), sink streaming results в OLTP/OLAP DB, simple batch ingestion. Этот урок разбирает: JDBC connector mechanics, lookup joins (sync vs async), Async I/O API, connection pooling, batch insert tuning, XA для exactly-once.
+
+---
+
+## JDBC source — bounded
+
+JDBC source в Flink — **BOUNDED only**. Используется для batch reads — например initial backfill, или batch backfill в Hybrid Source.
+
+### Table API
+
+```sql
+CREATE TABLE users_dim (
+    user_id BIGINT PRIMARY KEY NOT ENFORCED,
+    name STRING,
+    segment STRING,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://db:5432/production',
+    'username' = 'reader',
+    'password' = 'secret',
+    'table-name' = 'users',
+    'scan.fetch-size' = '1000',
+    'scan.auto-commit' = 'false'
+);
+
+SELECT * FROM users_dim WHERE segment = 'premium';
+```
+
+Под the hood:
+- **JdbcSource** (FLIP-27 implementation, BOUNDED).
+- Splits = partitioned scans по primary key range (если configured) или whole table в single split.
+- Reader = JDBC connection с server-side cursor.
+
+### Partitioned scan для parallelism
+
+```sql
+WITH (
+    'scan.partition.column' = 'user_id',
+    'scan.partition.num' = '8',                   -- 8 parallel readers
+    'scan.partition.lower-bound' = '0',
+    'scan.partition.upper-bound' = '10000000'
+)
+```
+
+JDBC source splits range [0, 10M] в 8 sub-ranges, каждый reader fetches own range через `SELECT ... WHERE user_id BETWEEN ? AND ?`. Parallelism scales с number of partitions.
+
+### Not для streaming change detection
+
+JDBC source — query-and-finish. Не tail-ит changes. Для real-time DB replication используйте **Flink CDC** (урок 08).
+
+---
+
+## JDBC sink — streaming inserts
+
+```java
+SinkFunction<Order> jdbcSink = JdbcSink.sink(
+    "INSERT INTO orders_history (order_id, user_id, amount, ts) VALUES (?, ?, ?, ?)",
+    (statement, order) -> {
+        statement.setLong(1, order.getId());
+        statement.setLong(2, order.getUserId());
+        statement.setBigDecimal(3, order.getAmount());
+        statement.setTimestamp(4, new Timestamp(order.getEventTime()));
+    },
+    JdbcExecutionOptions.builder()
+        .withBatchSize(5000)
+        .withBatchIntervalMs(200)
+        .withMaxRetries(5)
+        .build(),
+    new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+        .withUrl("jdbc:postgresql://db:5432/production")
+        .withDriverName("org.postgresql.Driver")
+        .withUsername("writer")
+        .withPassword("secret")
+        .build()
+);
+
+stream.addSink(jdbcSink);
+```
+
+### Batching critical для throughput
+
+JDBC sink **batches** records:
+- `withBatchSize(5000)` — flush после 5000 records
+- `withBatchIntervalMs(200)` — flush после 200ms если меньше batch size
+
+Без batching: каждое event = 1 INSERT + commit. С PostgreSQL это ~1000 inserts/sec. С batching 5000: ~50_000 inserts/sec. **50x improvement**.
+
+### Upsert sink
+
+```sql
+CREATE TABLE orders_sink (
+    order_id BIGINT,
+    status STRING,
+    amount DECIMAL,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'jdbc',
+    'url' = 'jdbc:postgresql://db:5432/production',
+    'table-name' = 'orders'
+);
+
+INSERT INTO orders_sink SELECT * FROM stream_with_updates;
+```
+
+С PRIMARY KEY defined Flink использует UPSERT semantics — `INSERT ... ON CONFLICT DO UPDATE`. Updates per-key, last-write-wins.
+
+### Exactly-once via XA (optional)
+
+```java
+JdbcSink.exactlyOnceSink(
+    "INSERT INTO ...",
+    (stmt, r) -> {...},
+    JdbcExecutionOptions.defaults(),
+    JdbcExactlyOnceOptions.builder()
+        .withTransactionPerConnection(true)
+        .build(),
+    () -> {
+        XADataSource ds = new PGXADataSource();
+        ds.setURL("...");
+        return ds;
+    }
+);
+```
+
+Uses XA (eXtended Architecture) transactions — 2PC через XA protocol. Database support required (Postgres yes, MySQL yes, SQLite no). Trade-off: significantly higher overhead (XA protocol round-trips), reduced throughput.
+
+**Production:** prefer idempotent UPSERT (PRIMARY KEY) при possible — XA только для true append-only scenarios.
+
+---
+
+## Lookup joins — enrichment pattern
+
+Common pattern: streaming events + lookup в dimensional table (user info, product catalog, GeoIP):
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL,
+    order_time TIMESTAMP_LTZ,
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND,
+    proctime AS PROCTIME()
+) WITH ('connector' = 'kafka', ...);
+
+CREATE TABLE users_dim (
+    user_id BIGINT PRIMARY KEY NOT ENFORCED,
+    segment STRING,
+    region STRING
+) WITH ('connector' = 'jdbc', ...);
+
+-- Lookup join: enrich orders with user info
+INSERT INTO enriched_orders
+SELECT 
+    o.order_id, o.amount, u.segment, u.region
+FROM orders o
+LEFT JOIN users_dim FOR SYSTEM_TIME AS OF o.proctime AS u
+    ON o.user_id = u.user_id;
+```
+
+`FOR SYSTEM_TIME AS OF` clause — temporal join, lookup version at given time. Typically `o.proctime` (current processing time — latest user info).
+
+---
+
+## Sync vs async lookup
+
+### Synchronous lookup (default)
+
+```java
+// Под the hood в Flink lookup join — sync mode default
+// processElement(Order o):
+//     User u = jdbc.query("SELECT * FROM users WHERE user_id = ?", o.getUserId());
+//     emit new EnrichedOrder(o, u);
+//     ↑ blocks для duration query (10-100ms typical)
+```
+
+Each event blocks operator thread на duration JDBC query. Если query 20ms — max throughput per subtask = 50 events/sec. Unacceptable для production.
+
+### Async lookup via Async I/O
+
+<DiagramContainer title="Async I/O: pipeline lookups concurrently" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Sync lookup"
+        tooltip="Каждое event — query → wait → emit. Throughput limited 1/latency. 20ms query = 50 events/sec per subtask."
+      >
+        event → JDBC query (20ms blocking) → emit. NEXT event waits.
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="vs" />
+    <FlowRow>
+      <DataBox
+        label="Async lookup"
+        tooltip="Event triggers async query, operator продолжает. Multiple queries in-flight concurrently. Results assembled в order (ordered) или as completed (unordered). Throughput = capacity / latency. 100 in-flight × 20ms = 5000 events/sec."
+      >
+        event → submit async query → CONTINUE → result callback → emit
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="capacity controls в-flight" />
+    <FlowRow>
+      <DataBox
+        label="AsyncDataStream operator"
+        tooltip="Manages async lookups: capacity (max in-flight queries), timeout (drop slow queries), output mode (ordered preserves stream order, unordered emits as-completed). Backpressure via capacity."
+      >
+        capacity=100, timeout=1s, ordered/unordered
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Async I/O API
+
+```java
+public class AsyncJdbcLookup extends RichAsyncFunction<Order, EnrichedOrder> {
+    
+    private transient HikariDataSource pool;
+    private transient ExecutorService executor;
+    
+    @Override
+    public void open(OpenContext ctx) {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:postgresql://db:5432/production");
+        config.setMaximumPoolSize(20);
+        pool = new HikariDataSource(config);
+        executor = Executors.newFixedThreadPool(20);
+    }
+    
+    @Override
+    public void asyncInvoke(Order order, ResultFuture<EnrichedOrder> resultFuture) {
+        CompletableFuture.supplyAsync(() -> {
+            try (Connection conn = pool.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT segment, region FROM users WHERE user_id = ?")) {
+                stmt.setLong(1, order.getUserId());
+                ResultSet rs = stmt.executeQuery();
+                if (rs.next()) {
+                    return new EnrichedOrder(order, rs.getString("segment"), rs.getString("region"));
+                }
+                return new EnrichedOrder(order, null, null);
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }, executor).whenComplete((result, error) -> {
+            if (error != null) resultFuture.completeExceptionally(error);
+            else resultFuture.complete(Collections.singletonList(result));
+        });
+    }
+    
+    @Override
+    public void timeout(Order order, ResultFuture<EnrichedOrder> resultFuture) {
+        resultFuture.complete(Collections.singletonList(new EnrichedOrder(order, null, null)));
+    }
+}
+
+// Use:
+DataStream<EnrichedOrder> enriched = AsyncDataStream.orderedWait(
+    orders,
+    new AsyncJdbcLookup(),
+    1000,                          // timeout 1000ms
+    TimeUnit.MILLISECONDS,
+    100                            // capacity = 100 concurrent
+);
+```
+
+### Ordered vs unordered
+
+```java
+AsyncDataStream.orderedWait(...)      // preserves event order in stream
+AsyncDataStream.unorderedWait(...)    // emits as completed — higher throughput
+```
+
+Ordered: preserves order между events. If lookup для event 2 completes before event 1 — buffered until 1 done. Slight latency overhead.
+
+Unordered: emits as completed. Higher throughput. Use when downstream не cares об order (например aggregations).
+
+---
+
+## Lookup cache
+
+Repeating lookups для same key — opportunity for caching. Table API supports:
+
+```sql
+WITH (
+    'connector' = 'jdbc',
+    'lookup.cache' = 'PARTIAL',                  -- LRU cache
+    'lookup.partial-cache.max-rows' = '100000',
+    'lookup.partial-cache.expire-after-write' = '1h',
+    'lookup.partial-cache.expire-after-access' = '15min'
+)
+```
+
+`PARTIAL` cache — LRU + TTL. Per-subtask cache (no cross-subtask sharing).
+
+`FULL` cache — loads entire dim table at startup, refreshes periodically. Для small dim tables (<1M rows).
+
+```sql
+'lookup.cache' = 'FULL',
+'lookup.full-cache.reload-strategy' = 'PERIODIC',
+'lookup.full-cache.periodic-reload.interval' = '10min'
+```
+
+---
+
+## Connection pooling — critical
+
+JDBC connections expensive (TCP + auth handshake ~100ms). Pool обязателен.
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl(...);
+config.setMaximumPoolSize(20);          // per-subtask pool
+config.setMinimumIdle(5);
+config.setConnectionTimeout(5000);
+config.setIdleTimeout(600_000);
+config.setMaxLifetime(1_800_000);
+HikariDataSource pool = new HikariDataSource(config);
+```
+
+Total connections = parallelism × maxPoolSize. С parallelism=8 × pool=20 = 160 connections. **PostgreSQL default max_connections = 100** — must adjust DB-side, иначе connection exhaustion.
+
+```sql
+-- PostgreSQL
+ALTER SYSTEM SET max_connections = 500;
+SELECT pg_reload_conf();
+```
+
+Or use PgBouncer (connection pool middleware) — 1 PgBouncer connection serves many client connections.
+
+---
+
+## Сравнительная таблица: lookup approaches
+
+| Approach | Latency | Throughput | Complexity | Use case |
+|---|---|---|---|---|
+| Sync JDBC lookup | 10-100ms blocking | ~50/sec per subtask | Low | Низкий throughput, simple |
+| Async I/O JDBC | 10-100ms async | ~5000/sec per subtask | Medium | High throughput, fresh data |
+| Async I/O + Partial cache | <1ms cache hit, 10-100ms miss | ~50000/sec при high hit rate | Medium-high | Most production |
+| Full cache (reload periodic) | <1ms все | Unlimited per subtask | Low | Small dim table (<1M rows) |
+| Broadcast state (load once) | <1ms | Unlimited | Medium | Static dim with rare updates |
+| External low-latency cache (Redis) | 1-5ms | ~1000/sec sync, 10000/sec async | High | Need ultra-low latency, distributed dim |
+
+---
+
+## Production gotchas
+
+### 1. Connection exhaustion при rescaling
+
+Adding parallelism scales up total connections. JM doesn't validate DB connection limit.
+
+**Symptom:** на rescale jobs fail с «too many connections».
+
+**Fix:** size DB connection limit conservatively, use PgBouncer.
+
+### 2. Sync lookup pinning operator thread
+
+Operator main thread blocked во время sync JDBC query. Не processes other events, не handles checkpoint barrier. Checkpoint blocked → timeout → job restart.
+
+**Fix:** **always** use Async I/O для lookups. Sync только для trivial bounded jobs.
+
+### 3. Async lookup без timeout → backpressure cascade
+
+```java
+AsyncDataStream.orderedWait(stream, fn, /* timeout */ 60_000, ...)
+                                              ↑ TOO LARGE
+```
+
+Stuck queries hold capacity slots. New events backpressure-ed. Если 100 slots stuck — pipeline halted.
+
+**Fix:** aggressive timeout (1-5 секунд typical), implement `timeout` callback с graceful fallback.
+
+### 4. Lookup cache invalidation
+
+`PARTIAL` cache TTL — stale data возможна. Если user segment changed в DB, Flink cache return старое значение до TTL expiration.
+
+**Mitigation:**
+- Short TTL (1-15 min) — trade-off с cache hit rate
+- For real-time accuracy — Flink CDC stream changes к users table, broadcast updates к Flink CEP/joins
+- Or invalidate via external signal
+
+### 5. JDBC sink — batch size + commit semantics
+
+```java
+JdbcExecutionOptions.builder()
+    .withBatchSize(5000)
+    .withBatchIntervalMs(200)
+```
+
+Records buffered до flush. Если crash before flush — events lost (если AT_LEAST_ONCE) или depend on next checkpoint.
+
+**Exactly-once** через XA — overhead 5-10x latency. Most use cases — UPSERT with PRIMARY KEY (idempotent), не XA.
+
+### 6. SQLite + parallel writers = lock contention
+
+SQLite locks DB на write. Multiple Flink writers serialize. **Avoid SQLite** для production sinks (Postgres/MySQL только).
+
+---
+
+## Key takeaways
+
+- **JDBC source — BOUNDED only**, partitioned scan для parallelism.
+- **JDBC sink — batching critical** (5000 records / 200ms typical), UPSERT через PRIMARY KEY для idempotence.
+- **Sync lookup = pinning operator thread**, ~50/sec per subtask — **don't use на production**.
+- **Async I/O** — pipelined lookups, 5000-50000/sec per subtask, требует aggressive timeout.
+- **Lookup cache** (PARTIAL LRU+TTL или FULL periodic reload) — major throughput multiplier.
+- **Connection pooling** обязателен — HikariCP, total = parallelism × pool size — adjust DB limit.
+- **Exactly-once JDBC** через XA — overhead, prefer idempotent UPSERT.
+
+---
+
+<KnowledgeCheck
+  question="У вас Flink job делает lookup users dim table в Postgres для каждого order event (100k events/sec). Какая архитектура?"
+  answer="Single sync lookup даст 50 events/sec per subtask — нужно 2000 parallelism для 100k events/sec, что unfeasible. Production architecture: (1) Async I/O — RichAsyncFunction с HikariCP pool (20 connections per subtask). Capacity 100 in-flight, timeout 1s, ordered output (или unordered если downstream tolerant). (2) Lookup cache — PARTIAL LRU с max 100k rows, TTL 15min. Hit rate обычно 80-95% (Pareto distribution активных users) — большинство queries hit cache (<1ms), miss queries параллельно к Postgres. (3) Connection pooling — Hikari на 20 connections × parallelism. С parallelism 8 = 160 connections. Postgres max_connections=500 или PgBouncer middleware. (4) Throughput estimate: 8 subtasks × ~5k events/sec (с cache) = 40k events/sec. Если нужно больше — увеличить parallelism (linear scaling до DB bottleneck). (5) Если DB latency too high or update-аctually часто: rate change events streamed via Flink CDC, broadcast к stream, обновления applied к keyed state (eliminate JDBC lookups completely для hot users). Это classic architecture для high-throughput enrichment."
+/>

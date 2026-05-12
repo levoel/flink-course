@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "14-state-evolution/06-job-upgrade-strategy",
+  "moduleId": "14-state-evolution",
+  "_meta": {
+    "idPrefix": "flink-m14-06",
+    "description": "Quiz for Job upgrade strategy lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m14-06-q1",
+      "type": "multiple-choice",
+      "question": "Почему UID на stateful operators MANDATORY для production?",
+      "options": [
+        { "id": "a", "text": "Для readability в Web UI" },
+        { "id": "b", "text": "Flink maps savepoint state к operators по UID (если set) или auto-generated ID (hash от position в graph). Auto-generated ID меняется при ЛЮБОМ topology change — добавили upstream map = все downstream IDs changed = state не маппится → state lost. UID stable" },
+        { "id": "c", "text": "Это требование Kubernetes" },
+        { "id": "d", "text": "Только для logging" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "UID — fundament state continuity через topology changes. Auto-generated IDs hash от operator position в JobGraph — meнятся при insert/remove/reorder operators. State в savepoint identified by ID — auto-generated change = state не маппится → either restore fails или silent state loss (worst). Explicit UID `.uid('fraud-detector')` — stable identifier. Even при upstream changes, FraudDetector state continues mapping correctly. Enforce: `pipeline.auto-generate-uids: false` → job submission fails если stateful operator без UID. Production discipline non-negotiable.",
+      "studyHint": "Повторите урок — UID: фундамент state continuity + Mandatory UIDs enforcement",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m14-06-q2",
+      "type": "multiple-choice",
+      "question": "Удаляете оператор 'legacy-counter' из топологии. Какой подход?",
+      "options": [
+        { "id": "a", "text": "Просто удалить из кода и redeploy" },
+        { "id": "b", "text": "Best: State Processor API one-time cleanup — fromExistingSavepoint().removeOperator('legacy-counter').write(cleanedPath). Затем restore from cleaned. Quick alternative: --allowNonRestoredState flag, но state остаётся orphan в savepoint forever (storage cost, future confusion)" },
+        { "id": "c", "text": "Никак — нельзя remove operator" },
+        { "id": "d", "text": "Сначала set state TTL=0 на operator" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Two approaches. Best (cleanest): State Processor API migration removeOperator → new savepoint without orphan state → restore. Quick (messy): --allowNonRestoredState flag — Flink ignores state for missing operator. BUT state остаётся в savepoint forever — S3 storage cost growing, confusion будущим devs. --allowNonRestoredState appropriate для одноразовых случаев when you're sure cleanup planned later. For ongoing operations — always State Processor API cleanup. Removing without either method = restore fails с 'state for operator UID X exists but no matching operator'.",
+      "studyHint": "Повторите урок — allowNonRestoredState + Scenario 2: Remove stateful operator",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m14-06-q3",
+      "type": "multiple-choice",
+      "question": "PR: (a) adds new MapState в existing FraudDetector ('fraud-detector' UID); (b) removes 'legacy-counter'; (c) renames 'enrichment' UID к 'enrichment-v2' (no logic change). Concerns?",
+      "options": [
+        { "id": "a", "text": "Всё OK" },
+        { "id": "b", "text": "(a) OK with proper StateDescriptor, MapState begins empty correctly; (b) Orphan state — нужен State Processor API cleanup pre-deploy; (c) DANGEROUS — UID rename = state не маппится. 'enrichment' state lost при restore as 'enrichment-v2'. Нужен State Processor API migration (read old UID, write new UID) ИЛИ explicit acknowledgement of state loss" },
+        { "id": "c", "text": "Только (a) проблема" },
+        { "id": "d", "text": "Reject entire PR" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Detail review: (a) Add new MapState — OK, new state begins empty, existing 'fraud-detector' state untouched, POJO/Avro evolution для outer class needs separate review. (b) Remove 'legacy-counter' — leaves orphan state. State Processor API one-time cleanup before deploy = cleanest. --allowNonRestoredState — quick but state forever. (c) UID rename — even 'no logic change' = state continuity broken. 'enrichment' state в savepoint не маппится к 'enrichment-v2'. State loss = behavior change despite claim 'no logic change'. Options: State Processor API migration preserves state, or explicit state loss acceptance (only if operator stateless or state loss acceptable).",
+      "studyHint": "Повторите урок — Runbook: типичные upgrade scenarios + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m14-06-q4",
+      "type": "true-false",
+      "question": "Каждый production upgrade с state changes должен быть tested на staging с realistic production savepoint (или sampled production state) перед production deploy.",
+      "correctAnswer": true,
+      "explanation": "True. Staging должен mirror production: state schema, code dependencies, infrastructure config. Synthetic test data misses state edge cases от prod (extreme key distributions, unicode edge cases, NULL handling, large maps в state). Best practice — sampled production savepoint (10% sample) restored в staging — realistic state diversity, manageable scale. Run 24-48h verify: no errors, correct outputs, normal state size growth. Skipping staging = production-as-staging = customers as test subjects. Schema breaking changes especially critical — test before exposing production state.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

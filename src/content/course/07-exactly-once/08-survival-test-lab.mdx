@@ -1,0 +1,491 @@
+---
+title: "EOS Survival Test — chaos lab с docker kill"
+description: "docker-compose с Flink+Kafka, downstream consumer counting duplicates. Chaos: kill во время commit, между preCommit/commit, во время barrier"
+order: 8
+difficulty: "advanced"
+estimatedTime: 32
+topics: ["Chaos Engineering", "EOS Test", "Docker", "Failure Injection", "Duplicate Detection"]
+---
+
+# EOS Survival Test — chaos lab с docker kill
+
+Теоретическое понимание 2PC недостаточно для confidence в production EOS. Этот lab — практический chaos test: запустить pipeline с KafkaSink EOS, injected chaos в разные моменты transaction lifecycle, и **verify** что downstream Kafka topic содержит ровно те записи, что были произведены — без дубликатов, без потерь. Этот lab — finale модуля Exactly-Once и его pre-requisite для запуска EOS на production.
+
+Chaos scenarios:
+1. Kill TaskManager во время normal writes.
+2. Kill TaskManager между prepareCommit и notifyCheckpointComplete.
+3. Kill TaskManager после notifyCheckpointComplete но до commit.
+4. Kill TaskManager во время barrier alignment.
+5. Network partition между JobManager и TaskManager.
+6. Slow `transaction.timeout.ms` — induce data loss intentionally.
+
+---
+
+## docker-compose stack
+
+```yaml
+# flink-eos-lab/docker-compose.yml
+services:
+  jobmanager:
+    image: flink:2.2.0-java17
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend.type: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.timeout: 60s
+        taskmanager.numberOfTaskSlots: 4
+
+  taskmanager:
+    image: flink:2.2.0-java17
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 2
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+
+  kafka:
+    image: apache/kafka:3.7.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_MAX_TIMEOUT_MS: 3600000  # 1 hour
+```
+
+Setup: 1 JobManager, 2 TaskManager, 1 Kafka в KRaft mode с 1-hour max transaction timeout.
+
+---
+
+## Test pipeline — deterministic producer + dedup consumer
+
+### Producer — sequential integers
+
+```java
+public class DeterministicProducer {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, LongSerializer.class);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+
+        KafkaProducer<Integer, Long> producer = new KafkaProducer<>(props);
+        long n = 1_000_000;  // 1M messages
+        for (long i = 0; i < n; i++) {
+            producer.send(new ProducerRecord<>("input", (int)(i % 16), i));
+            if (i % 1000 == 0) producer.flush();
+        }
+        producer.close();
+        System.out.println("Produced " + n + " messages");
+    }
+}
+```
+
+Records: keys 0-15, values 0-999999 (sequential). Это deterministic — мы знаем что ровно эти числа должны выйти из pipeline.
+
+### Flink pipeline — identity with state
+
+```java
+public class IdentityPipelineEos {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(10_000);
+        env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+        env.getCheckpointConfig().setCheckpointTimeout(60_000);
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(5, 5_000));
+
+        KafkaSource<Long> source = KafkaSource.<Long>builder()
+            .setBootstrapServers("kafka:9092")
+            .setTopics("input")
+            .setGroupId("eos-test")
+            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setValueOnlyDeserializer(new LongDeserializationSchema())
+            .build();
+
+        DataStream<Long> stream = env.fromSource(source,
+            WatermarkStrategy.noWatermarks(), "input-source");
+
+        // KeyBy для stateful — usually есть какой-то stateful operator
+        DataStream<Long> processed = stream
+            .keyBy(v -> v % 16)
+            .process(new IdentityWithState());
+
+        KafkaSink<Long> sink = KafkaSink.<Long>builder()
+            .setBootstrapServers("kafka:9092")
+            .setRecordSerializer(KafkaRecordSerializationSchema.<Long>builder()
+                .setTopic("output")
+                .setValueSerializationSchema(new LongSerializationSchema())
+                .build())
+            .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+            .setTransactionalIdPrefix("eos-test-v1")
+            .setProperty("transaction.timeout.ms", "3600000")
+            .build();
+
+        processed.sinkTo(sink);
+
+        env.execute("EOS Survival Test");
+    }
+
+    static class IdentityWithState extends KeyedProcessFunction<Long, Long, Long> {
+        ValueState<Long> lastSeen;
+
+        @Override
+        public void open(OpenContext ctx) {
+            lastSeen = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("lastSeen", Long.class));
+        }
+
+        @Override
+        public void processElement(Long value, Context ctx, Collector<Long> out) throws Exception {
+            lastSeen.update(value);
+            out.collect(value);
+        }
+    }
+}
+```
+
+Identity pipeline (input == output), но содержит stateful operator чтобы ABS реально работал.
+
+### Verifier — count and detect duplicates
+
+```java
+public class DuplicateVerifier {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "verifier");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");  // КРИТИЧНО!
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, IntegerDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, LongDeserializer.class);
+
+        KafkaConsumer<Integer, Long> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(List.of("output"));
+
+        Set<Long> seen = new HashSet<>();
+        long duplicates = 0;
+        long missing;
+        long total = 0;
+        long expectedTotal = 1_000_000;
+
+        long deadline = System.currentTimeMillis() + 60_000;  // 1 min silence
+        while (System.currentTimeMillis() < deadline) {
+            ConsumerRecords<Integer, Long> records = consumer.poll(Duration.ofSeconds(1));
+            if (!records.isEmpty()) {
+                deadline = System.currentTimeMillis() + 60_000;
+                for (ConsumerRecord<Integer, Long> r : records) {
+                    total++;
+                    if (!seen.add(r.value())) {
+                        duplicates++;
+                        System.err.println("DUPLICATE: " + r.value());
+                    }
+                }
+            }
+        }
+        missing = expectedTotal - seen.size();
+        System.out.printf("Total seen: %d, unique: %d, duplicates: %d, missing: %d%n",
+            total, seen.size(), duplicates, missing);
+
+        if (duplicates == 0 && missing == 0) {
+            System.out.println("✓ EOS verified");
+            System.exit(0);
+        } else {
+            System.out.println("✗ EOS violated");
+            System.exit(1);
+        }
+    }
+}
+```
+
+**Critical**: `isolation.level=read_committed`. Без этого consumer видит aborted transactions — невозможно отделить EOS violation от транзитного состояния.
+
+---
+
+## Chaos test runner
+
+```bash
+#!/bin/bash
+# chaos-test.sh — run pipeline + inject chaos + verify
+
+set -e
+
+echo "1. Start cluster..."
+docker compose up -d
+sleep 30
+
+echo "2. Create topics..."
+docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 \
+    --create --topic input --partitions 16 --replication-factor 1
+docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 \
+    --create --topic output --partitions 16 --replication-factor 1
+
+echo "3. Submit Flink job..."
+docker compose exec jobmanager flink run -d /opt/flink/eos-pipeline.jar
+
+echo "4. Start producer in background..."
+java -jar producer.jar &
+PRODUCER_PID=$!
+
+echo "5. Wait 30s for steady state..."
+sleep 30
+
+echo "6. Inject chaos: kill TM during run..."
+docker compose kill -s SIGKILL flink-eos-lab-taskmanager-1
+sleep 60  # give recovery time
+
+echo "7. Inject more chaos: kill again during commit cycle..."
+sleep 5  # try to land kill mid-commit
+docker compose kill -s SIGKILL flink-eos-lab-taskmanager-2
+sleep 60
+
+echo "8. Restart killed TMs..."
+docker compose up -d taskmanager
+sleep 30
+
+echo "9. Wait for producer to finish..."
+wait $PRODUCER_PID
+
+echo "10. Wait for pipeline to drain..."
+sleep 60
+
+echo "11. Run verifier..."
+java -jar verifier.jar
+```
+
+---
+
+## Chaos scenarios — детально
+
+<DiagramContainer title="Chaos scenarios — where to inject failures" color="amber">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="A — Normal write phase"
+        tooltip="Между checkpoint barriers. Записи пишутся в open transaction. Kill TM здесь — самый легкий case. Recovery from previous checkpoint + replay from saved offsets. Pipeline pause ~30-60s."
+      >
+        Kill между barrier(N-1) и barrier(N)
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="B — Mid-barrier alignment"
+        tooltip="Barrier(N) arrived на некоторые inputs, другие waiting. State не сейчас snapshot-ed. Kill во время align. Checkpoint aborts, restart from N-1. Может induce backpressure после recovery (TM down → fewer slots)."
+      >
+        Kill во время alignment
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="C — Between preCommit and notify"
+        tooltip="prepareCommit() flushed Kafka prepared txns, но JM ещё не broadcasted notifyCheckpointComplete. Kill TM. Checkpoint(N) aborts. Restart from N-1. Prepared txns remain в Kafka до timeout. После timeout (1h) auto-aborted by broker. New writes re-do данные."
+      >
+        Kill после preCommit, до notify
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="D — After notify, before commit"
+        tooltip="JM broadcasted notifyCheckpointComplete(N), но sink не успел вызвать commit() на producer. Kill TM. Checkpoint(N) marked completed. Restart from N. Committer на recovery вызывает recoverAndCommit — для prepared txn finalize. EOS preserved."
+      >
+        Kill после notify, до commit
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="E — During commit itself"
+        tooltip="commit() in flight. Kafka broker может уже принял commit (но Flink не получил ack). Kill TM. Recovery вызывает recoverAndCommit — Kafka returns success (idempotent) или not_exists если completed. Both treated как success. EOS preserved."
+      >
+        Kill mid-commit
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="F — transaction.timeout race"
+        tooltip="Intentionally set timeout=30s. Recovery занимает 60s. После timeout broker aborts prepared txn. Recovery commit fails. Data loss observable. Это negative test — verify gotcha."
+      >
+        Slow timeout → data loss
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Каждый scenario A-E должен показать **zero duplicates, zero missing**. Scenario F — intentionally **demonstrate failure** (missing data) для education.
+
+---
+
+## Running individual scenarios
+
+### Scenario A — normal kill
+
+```bash
+# Run producer producing 100k msgs
+# Mid-flight kill one TM
+docker compose kill -s SIGKILL flink-eos-lab-taskmanager-1
+sleep 60
+docker compose up -d taskmanager
+# Wait для recovery, drain, verify
+```
+
+Expected: count == 100000, duplicates == 0.
+
+### Scenario C — precise kill после preCommit
+
+Это сложнее timing. Подход:
+1. Set `execution.checkpointing.interval: 60s` — long interval.
+2. В Flink Web UI watch checkpoint history.
+3. Когда checkpoint(N) триггерится и acks accumulating → kill TM в ~3-5 секундный window между preCommit и notify.
+
+Реализация через scripted timing:
+
+```bash
+# Watch JobManager logs для checkpoint events
+docker compose logs -f jobmanager | grep -E "Triggering checkpoint|Completed checkpoint" &
+LOGS_PID=$!
+
+# Kill timing: после "Triggering checkpoint" + ~3s (preCommit done) перед "Completed checkpoint"
+sleep 33  # adjust experimentally
+docker compose kill -s SIGKILL flink-eos-lab-taskmanager-1
+```
+
+Realistic: 50% chance hit precise window. Repeat experiment N times.
+
+### Scenario F — induce data loss
+
+Intentional bad config:
+```java
+.setProperty("transaction.timeout.ms", "30000")  // 30s — too small
+```
+
+Steps:
+1. Start pipeline с small timeout.
+2. Run normal producer.
+3. Kill TM — recovery from K8s pod restart takes 90s easily.
+4. After 30s broker auto-aborts prepared transactions.
+5. After 90s Flink recovers, calls commit on aborted txnIds → fails.
+6. Verifier shows missing data.
+
+Это **must-not-have** в production. Lab demonstrates **why** timeout setting matters.
+
+---
+
+## Observability — что мониторить
+
+В Web UI / JMX:
+
+| Metric | Norm | Alert |
+|---|---|---|
+| `lastCheckpointDuration` | < 5s | > checkpointTimeout |
+| `lastCheckpointSize` | stable | growing |
+| `numRestarts` | 0-1 за час | > 5 за час |
+| `kafka.producer.transaction-coordinator.PendingTransactions` | low | > 100 |
+| `kafka.broker.LastStableOffsetLag` | < 1000 | > 100000 |
+| `lastCheckpointFailureTimestamp` | none | recent |
+
+Backpressure metrics после chaos kill часто spike — это normal recovery, должно вернуться в норму за минуты.
+
+---
+
+## Comparison: AT_LEAST_ONCE vs EXACTLY_ONCE under chaos
+
+Запустить lab с обоими modes, сравнить:
+
+| Mode | Duplicates | Missing | Throughput | Latency |
+|---|---|---|---|---|
+| EXACTLY_ONCE | 0 | 0 | baseline | +commit lag (1-5s) |
+| AT_LEAST_ONCE | hundreds | 0 | +15% | immediate |
+| At-least-once (idempotent producer) | tens | 0 | +10% | immediate |
+| At-most-once | 0 | hundreds | +20% | immediate |
+
+EOS — only mode с zero duplicates AND zero missing.
+
+---
+
+## Production gotchas (lab learnings)
+
+### 1. Consumer без read_committed → false positive duplicates
+
+Если verifier пропустил `ISOLATION_LEVEL_CONFIG=read_committed`, он видит aborted transactions как regular records. Result: hundreds of «duplicates» которые на самом деле aborted txns invisible для real consumers.
+
+**Fix**: всегда set `isolation.level=read_committed` для верификации EOS.
+
+### 2. Kill только TaskManager — not JobManager
+
+Killing JM может вызвать другой failure mode — entire cluster down, recovery from CompletedCheckpointStore (ZooKeeper/K8s ConfigMap). Это more disruptive scenario, testing HA не EOS.
+
+**Fix**: для EOS test — kill только TM. Для HA test — kill JM.
+
+### 3. Kafka cluster size — single broker для lab
+
+Single broker простой setup, но `transaction.state.log.replication.factor=1` — single point of failure. Не representative для production multi-broker.
+
+**Fix**: для production-realistic test — 3 brokers с replication 3, ISR 2, и kill один broker mid-flight.
+
+### 4. Producer overrun checkpoint interval
+
+Если producer rate > pipeline throughput, backlog grows. Каждый checkpoint больше предыдущего, time grows. Eventually checkpoint timeout.
+
+**Fix**: для lab — bounded producer (1M records). Для real-world test — throttle producer match downstream throughput.
+
+### 5. Verifier early exit
+
+Если verifier `poll` timeout пока pipeline still in recovery, может exit prematurely с false «missing». 
+
+**Fix**: long enough silence timeout (60s+), or wait для kafka log consumer-offsets advance to producer offset.
+
+### 6. State backend — RocksDB vs HashMap
+
+RocksDB checkpoints (incremental) recover быстрее на large state. HashMap (heap) faster на small state. Lab с large state требует RocksDB; small state OK с HashMap.
+
+---
+
+## Cheat sheet
+
+```
+EOS Survival Test minimal kit:
+    1. Deterministic producer (sequential IDs)
+    2. Identity pipeline with stateful operator
+    3. KafkaSink с EXACTLY_ONCE + correct timeouts
+    4. Verifier с isolation.level=read_committed
+    5. Chaos injector (docker kill TM)
+
+Chaos scenarios:
+    A) Normal write phase     — easy case
+    B) Mid-barrier alignment  — medium
+    C) After preCommit        — hardest, EOS-preserved
+    D) After notify           — recoverAndCommit
+    E) Mid-commit             — idempotent
+    F) Slow timeout           — INDUCED data loss
+
+Production confidence:
+    Repeat each scenario 100×, expect 0 duplicates 0 missing in A-E
+```
+
+---
+
+<KnowledgeCheck
+  question="Production team запускает EOS Survival Test. Scenario A (kill TM during normal writes) — passes (0 duplicates). Scenario C (kill после preCommit) — passes 95 раз из 100, 5 раз shows '23 duplicates'. Что они делают неправильно и как investigate?"
+  answer="**Investigation approach**: 5/100 failure rate в scenario C — intermittent, not deterministic. Most likely root cause — verifier configuration issue, not real EOS violation. **Top hypothesis: verifier missing read_committed**. Verify: check verifier consumer properties — должно быть `isolation.level=read_committed`. Без этого consumer видит **aborted** transactions как regular records. В scenario C прерванный checkpoint aborts prepared transactions — их records 'появляются' в log с aborted markers. Read_committed consumer skips them; read_uncommitted (default!) показывает их. Если verifier правильно configured но still failing — escalate: **(a)** Check Kafka broker logs для transaction state. После failed scenario, посмотреть `kafka.coordinator.transaction.TransactionStateManager` logs — verify transactions transitioned PrepareCommit → CompleteCommit или aborted. **(b)** Check Flink JM logs для checkpoint state. Если checkpoint(N) был completed (notifyCheckpointComplete broadcasted) но crash случился до commit, recovery должен recoverAndCommit. Look for `recoverAndCommit` или `commitTransaction` calls в TM logs after recovery. **(c)** Verify `transactional.id` consistency. Если в Flink state stored transactionalId 'fraud-v1-3-15', и после recovery sink creates producer с тем же ID + calls commitTransaction — это must succeed (idempotent). Если ID changed между prepare и commit — это bug в KafkaSink state management. **(d)** Verify `transaction.timeout.ms` ≥ recovery time. 5 failures могут correspond к slower recoveries (TM image download slow, slow disk). If recovery 45s но timeout 60s — close call, occasional aborts. Fix: set timeout 1 hour. **(e)** Test scenario D more rigorously — между notify и commit. Если duplicates **только** в scenario D (not C), это означает recoverAndCommit полностью commit-ит pre-existing prepared txn AND new replay txn commits same data → real duplicates. Это bug если так. Should not happen с correct Flink implementation. **Most likely culprit**: verifier missing read_committed (90% probability), либо too-small transaction.timeout.ms (10%). Action plan: (1) fix verifier config; (2) re-run 1000 iterations; (3) если still failing — Wireshark Kafka protocol to verify actual commit sequence; (4) если real bug confirmed, file Flink JIRA с reproduction."
+/>

@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "10-connectors-cdc/02-flip27-source-api",
+  "moduleId": "10-connectors-cdc",
+  "_meta": {
+    "idPrefix": "flink-m10-02",
+    "description": "Quiz для FLIP-27 Source API"
+  },
+  "questions": [
+    {
+      "id": "flink-m10-02-q1",
+      "type": "multiple-choice",
+      "question": "Какие компоненты FLIP-27 Source API и где они выполняются?",
+      "options": [
+        { "id": "a", "text": "Только Source class на JobManager" },
+        { "id": "b", "text": "Source factory (сериализуется и shipped); SplitEnumerator runs на JobManager (внутри SourceCoordinator) — discovers splits, assigns к readers; SourceReader runs per parallel subtask на TaskManager — fetches data, emits records, snapshots own state" },
+        { "id": "c", "text": "Только SourceReader on все TaskManagers равноправно" },
+        { "id": "d", "text": "SplitEnumerator + SourceReader оба на каждом TaskManager" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "FLIP-27 — separation of concerns: Source (factory, no runtime state — shipped к JM и всем TM) + SplitEnumerator (один per source per job, runs внутри SourceCoordinator на JobManager — split discovery, assignment, recovery coordination) + SourceReader (один per parallel subtask на TaskManager — actual data fetching, emit, per-split state). Communication между JM↔TM через OperatorEventDispatcher (gRPC). Это replacement для legacy SourceFunction который был single class на TaskManager без proper coordination.",
+      "studyHint": "Повторите урок — секция Three core components",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m10-02-q2",
+      "type": "multiple-choice",
+      "question": "Что значит Boundedness в FLIP-27 и как это enables unified batch/streaming?",
+      "options": [
+        { "id": "a", "text": "Boundedness только для legacy batch DataSet API" },
+        { "id": "b", "text": "Boundedness — runtime property Source (BOUNDED vs CONTINUOUS_UNBOUNDED). Same Source implementation может both modes через configuration. BOUNDED — SplitEnumerator emits notifyNoMoreSplits после exhaustion → SourceReader returns END_OF_INPUT → batch finalization. CONTINUOUS_UNBOUNDED — keeps discovering forever. Это foundation unified DataStream batch/streaming в Flink" },
+        { "id": "c", "text": "Boundedness deprecated в Flink 2.x" },
+        { "id": "d", "text": "Это enum для определения types of records" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Boundedness enum — fundamental enabler unified batch/streaming. KafkaSource.setBounded(OffsetsInitializer.latest()) делает source BOUNDED (stops at current Kafka end), без этого CONTINUOUS_UNBOUNDED. FileSource forBulkFileFormat без monitorContinuously — BOUNDED, с monitorContinuously — CONTINUOUS_UNBOUNDED. Runtime: BOUNDED enables batch finalization (sinks finalize commits, windows эмитят final results). С env.setRuntimeMode(BATCH) Flink applies дополнительные optimizations (sort-based shuffles, blocking aggregations). Это why FLIP-27 essential — pre-FLIP-27 batch требовал DataSet API, теперь DataStream работает для both modes.",
+      "studyHint": "Повторите урок — секция Boundedness",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m10-02-q3",
+      "type": "multiple-choice",
+      "question": "Production issue: SplitEnumerator делает heavy S3 listing (10s каждый цикл), split assignment latency growing, readers idle. Что fix?",
+      "options": [
+        { "id": "a", "text": "Увеличить parallelism" },
+        { "id": "b", "text": "SplitEnumerator runs single-threaded в SourceCoordinator thread pool — heavy blocking work blocks split assignment. Fix: использовать context.callAsync() для async listing работы; cache discovery results; use S3 prefix-based listing efficiently; для очень больших prefixes — partition по date prefix или manifest-based listing (Iceberg approach)" },
+        { "id": "c", "text": "Переключить на legacy SourceFunction" },
+        { "id": "d", "text": "Отключить watermark alignment" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SplitEnumerator runs sequentially в SourceCoordinator. Heavy blocking ops (S3 listing 10M files) блокируют processing split requests от readers → idle readers waiting for work. SplitEnumeratorContext.callAsync(supplier, handler) provides async work mechanism — supplier runs в separate thread, handler called в coordinator thread when done. Plus best practices: limit S3 listing scope через prefix-based partitioning (year/month/day), cache results, use Iceberg/Paimon manifest для O(1) listing вместо O(N) listing. Это common production issue с custom FileSource over massive directories.",
+      "studyHint": "Повторите урок — Production gotcha #1",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m10-02-q4",
+      "type": "true-false",
+      "question": "Watermark Alignment (FLIP-217) работает на уровне SourceCoordinator (JobManager) и может pause faster sources чтобы синхронизировать с slower в alignment group.",
+      "correctAnswer": true,
+      "explanation": "Правда. FLIP-217 Watermark Alignment coordinated через SourceCoordinator на JM. WatermarkStrategy.withWatermarkAlignment('group', maxDrift, updateInterval) declares group. SourceCoordinator collects watermarks from все sources в group, computes max allowed watermark = min(group_watermarks) + maxDrift. Sources advancing past этого pause-яются (SourceReader._suspended_) пока slow source не догонит. Это predicate для multi-source CEP/joins — без alignment fast source overflow state buffers waiting for slow source's events. Trade-off: fast source paused = effective backpressure через watermark mechanism.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

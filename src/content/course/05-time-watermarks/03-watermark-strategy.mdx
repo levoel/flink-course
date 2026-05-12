@@ -1,0 +1,458 @@
+---
+title: "WatermarkStrategy: forBoundedOutOfOrderness, withIdleness, custom generator"
+description: "WatermarkStrategy API в деталях. Bounded out-of-orderness, monotonous, withIdleness для idle partitions, custom WatermarkGenerator (punctuated vs periodic), TimestampAssigner."
+order: 3
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["WatermarkStrategy", "WatermarkGenerator", "TimestampAssigner", "withIdleness", "Punctuated Watermarks"]
+---
+
+# WatermarkStrategy: deep dive
+
+`WatermarkStrategy` — главный API для работы со временем в Flink. Это builder, который объединяет три вещи: **TimestampAssigner** (извлечение event time из record), **WatermarkGenerator** (определение прогресса времени в потоке) и **idleness detection** (что делать с пустыми partition-ами). От правильного выбора стратегии зависит latency окон, корректность late events, выживаемость pipeline под backpressure.
+
+Этот урок — препарирование `WatermarkStrategy` до уровня, на котором вы понимаете, какой watermark пойдёт по DAG-у для каждой вашей конфигурации.
+
+---
+
+## Анатомия WatermarkStrategy
+
+<DiagramContainer title="Компоненты WatermarkStrategy" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="WatermarkStrategy<T>"
+        tooltip="Главный builder. Возвращается из статических factory методов forBoundedOutOfOrderness, forMonotonousTimestamps, forGenerator, noWatermarks. Применяется через .assignTimestampsAndWatermarks(strategy) или внутри fromSource()."
+      >
+        Builder
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="composition" />
+    <FlowRow>
+      <DataBox
+        label="TimestampAssigner<T>"
+        tooltip="Извлекает long timestamp (millis) из record. Сигнатура: long extractTimestamp(T element, long recordTimestamp). Второй аргумент — Kafka record timestamp (если есть)."
+      >
+        T → long ts
+      </DataBox>
+      <DataBox
+        label="WatermarkGenerator<T>"
+        tooltip="Стратегия emission watermark. Two methods: onEvent (вызывается per-record) и onPeriodicEmit (вызывается каждые autoWatermarkInterval, default 200ms). Решает, какой watermark пойдёт downstream."
+      >
+        Emit Watermarks
+      </DataBox>
+      <DataBox
+        label="WatermarkAlignment (FLIP-217)"
+        tooltip="Опциональная координация watermark между sources. Группа + maxAllowedDrift + updateInterval. SourceCoordinator паузит fast splits. Детали в уроке 05."
+      >
+        Coord between sources
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="WatermarkOutput"
+        tooltip="Внутренний интерфейс — куда emit'ить watermarks. Может маркировать output как idle (если withIdleness активирован). Downstream operator-ы получают watermark в onProcessingTime / onEventTime / processWatermark колбеках."
+      >
+        emitWatermark() / markIdle()
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Минимальный пример
+
+```java
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((event, recordTs) -> event.getEventTime())
+    .withIdleness(Duration.ofMinutes(1));
+
+KafkaSource<Event> source = KafkaSource.<Event>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("events")
+    .setValueOnlyDeserializer(new EventDeserializer())
+    .build();
+
+env.fromSource(source, strategy, "kafka-source")
+   .keyBy(Event::getUserId)
+   .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+   .process(...);
+```
+
+---
+
+## Built-in стратегии
+
+### 1. forBoundedOutOfOrderness(Duration)
+
+Самая частая стратегия. Watermark = `maxObservedTimestamp - outOfOrderness`. Конфигурирует, как далеко в прошлом могут быть out-of-order события.
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20));
+```
+
+**Семантика**: «события могут опаздывать максимум на 20 секунд от события с самым свежим timestamp».
+
+**Tradeoff**:
+- Маленький bound (1 сек) → быстрый watermark → быстрые окна, но больше late events
+- Большой bound (5 мин) → медленный watermark → больше latency окон, но меньше late events
+
+**Внутреннее устройство** (`BoundedOutOfOrdernessWatermarks`):
+
+```java
+public class BoundedOutOfOrdernessWatermarks<T> implements WatermarkGenerator<T> {
+    private long maxTimestamp = Long.MIN_VALUE + outOfOrdernessMillis + 1;
+
+    public void onEvent(T event, long eventTimestamp, WatermarkOutput output) {
+        maxTimestamp = Math.max(maxTimestamp, eventTimestamp);
+    }
+
+    public void onPeriodicEmit(WatermarkOutput output) {
+        output.emitWatermark(new Watermark(maxTimestamp - outOfOrdernessMillis - 1));
+    }
+}
+```
+
+Это **periodic** generator — watermark emit-ится каждые `autoWatermarkInterval` (default 200ms), не на каждый event.
+
+### 2. forMonotonousTimestamps()
+
+«Timestamps монотонно растут». Watermark = `lastSeenTimestamp - 1`.
+
+```java
+WatermarkStrategy.<Event>forMonotonousTimestamps()
+    .withTimestampAssigner((e, ts) -> e.getEventTime());
+```
+
+**Когда использовать**:
+- Source гарантирует ordered delivery (один Kafka partition + single producer)
+- Внутри key (после keyBy), если события одного key всегда in-order
+
+**Внутреннее устройство** (`AscendingTimestampsWatermarks`):
+
+```java
+public void onEvent(T event, long eventTimestamp, WatermarkOutput output) {
+    maxTimestamp = Math.max(maxTimestamp, eventTimestamp);
+}
+
+public void onPeriodicEmit(WatermarkOutput output) {
+    output.emitWatermark(new Watermark(maxTimestamp - 1));   // -1, не -outOfOrderness!
+}
+```
+
+Latency окон **минимальная**, но если хоть один event прилетел out-of-order — он будет late.
+
+### 3. forGenerator(WatermarkGeneratorSupplier)
+
+Custom generator. Используется когда built-in не подходит.
+
+```java
+WatermarkStrategy.<Event>forGenerator(ctx -> new MyWatermarkGenerator());
+```
+
+### 4. noWatermarks()
+
+«Не emit'ить watermarks». Полезно для:
+- Pure processing time pipelines
+- Batch mode (Flink сам управляет watermark = MAX_WATERMARK на конец bounded stream)
+- Тестов без windowing
+
+```java
+WatermarkStrategy.<Event>noWatermarks();
+```
+
+---
+
+## TimestampAssigner — извлечение event time
+
+`TimestampAssigner<T>` — `long extractTimestamp(T element, long recordTimestamp)`. Второй аргумент — Kafka record timestamp (LogAppendTime или CreateTime, зависит от topic config).
+
+### Шаблоны
+
+```java
+// 1. Прямо из поля
+.withTimestampAssigner((event, ts) -> event.getEventTime())
+
+// 2. Парсинг ISO 8601 строки
+.withTimestampAssigner((event, ts) ->
+    Instant.parse(event.getTimeStr()).toEpochMilli())
+
+// 3. Fallback на Kafka timestamp
+.withTimestampAssigner((event, ts) -> {
+    if (event.getEventTime() > 0) return event.getEventTime();
+    return ts;   // recordTimestamp = Kafka log timestamp
+})
+
+// 4. С коррекцией timezone
+.withTimestampAssigner((event, ts) ->
+    event.getLocalTime().atZone(ZoneId.of("UTC")).toInstant().toEpochMilli())
+```
+
+### Anti-pattern: возврат wall clock
+
+```java
+// ❌ Это превращает event time в ingestion time
+.withTimestampAssigner((event, ts) -> System.currentTimeMillis())
+```
+
+Если случилось это в коде — vous теряете преимущества event time, но получаете все недостатки watermarks (latency, complexity).
+
+---
+
+## withIdleness — критично для multi-partition Kafka
+
+**Проблема**: Kafka topic с 12 partitions, 8 из них активные, 4 idle (no traffic). Flink читает с parallelism=4 — каждый SourceReader читает 3 partitions. Если 1 SourceReader не получает данные ни с одной из своих 3 partitions, его watermark **не движется**. Downstream MIN(watermarks) tanks весь pipeline.
+
+```java
+WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((e, ts) -> e.getEventTime())
+    .withIdleness(Duration.ofMinutes(1));    // ← critical
+```
+
+**Семантика**: если в `WatermarkGenerator.onEvent()` не было вызовов 60 секунд → output помечается как idle через `output.markIdle()`. Downstream MIN propagation **игнорирует idle channels**.
+
+### Side effect: «воскрешение» idle source
+
+Когда idle source снова получает событие, его watermark может быть в **прошлом** относительно текущего watermark pipeline. Flink не «откатывает» окна — события идут как late.
+
+```
+Time:        T1     T2     T3     T4
+WM (idle):  100    100    100    100  (markIdle at T2)
+WM (live):  100    150    200    250
+WM down:    100    150    200    250  (idle excluded from MIN)
+Event(ts=180) arrives на idle source at T4
+  → late event (WM down = 250 > 180)
+```
+
+### Configuration
+
+```yaml
+# Global default для всех WatermarkStrategy без explicit withIdleness:
+pipeline.auto-watermark-interval: 200ms   # как часто periodic emit
+```
+
+---
+
+## Custom WatermarkGenerator: punctuated vs periodic
+
+`WatermarkGenerator<T>` — интерфейс с двумя методами:
+
+```java
+public interface WatermarkGenerator<T> {
+    void onEvent(T event, long eventTimestamp, WatermarkOutput output);
+    void onPeriodicEmit(WatermarkOutput output);
+}
+```
+
+### Periodic — стандартный подход
+
+`onEvent()` обновляет внутреннее state, `onPeriodicEmit()` (каждые 200ms) emit-ит watermark. Так работают built-in стратегии.
+
+```java
+public class PercentileBasedWatermark implements WatermarkGenerator<Event> {
+    private final TreeMap<Long, Integer> recentTimestamps = new TreeMap<>();
+    private final int windowSize = 1000;
+    private final double percentile = 0.05;   // 5th percentile
+
+    public void onEvent(Event event, long ts, WatermarkOutput output) {
+        recentTimestamps.merge(ts, 1, Integer::sum);
+        if (recentTimestamps.size() > windowSize) {
+            recentTimestamps.pollFirstEntry();
+        }
+    }
+
+    public void onPeriodicEmit(WatermarkOutput output) {
+        if (recentTimestamps.isEmpty()) return;
+        // 5th percentile timestamp — большинство событий выше этого
+        long pct = computePercentile(recentTimestamps, percentile);
+        output.emitWatermark(new Watermark(pct - 1));
+    }
+}
+```
+
+Использование:
+
+```java
+WatermarkStrategy.forGenerator(ctx -> new PercentileBasedWatermark())
+    .withTimestampAssigner((e, ts) -> e.getEventTime());
+```
+
+### Punctuated — emit на конкретные события
+
+Watermark emit-ится **только** в `onEvent()` (не периодически). Полезно когда события содержат explicit «watermark marker»:
+
+```java
+public class PunctuatedWatermarkGenerator implements WatermarkGenerator<Event> {
+    public void onEvent(Event event, long ts, WatermarkOutput output) {
+        if (event.isWatermarkEvent()) {
+            // Producer явно отправил marker — все события до этого ts уже sent
+            output.emitWatermark(new Watermark(ts));
+        }
+    }
+
+    public void onPeriodicEmit(WatermarkOutput output) {
+        // ничего не делаем — emit только на specific events
+    }
+}
+```
+
+**Когда уместно**:
+- Source умеет отправлять «end of window» маркеры (custom CDC, IoT с heartbeat)
+- Реактивная семантика — emit watermark в момент известного события
+
+### Periodic vs Punctuated — сравнение
+
+| Aspect | Periodic | Punctuated |
+|---|---|---|
+| Когда emit | Каждые `autoWatermarkInterval` (200ms) | На specific events |
+| Latency watermark | Bounded by interval | Bounded by event frequency |
+| Overhead | Low (1 emit per 200ms) | Может быть много (per-event) |
+| Use case | 99% случаев | Source с marker events |
+
+---
+
+## TimestampsAndWatermarksOperator: internals
+
+Когда вы вызываете `.assignTimestampsAndWatermarks(strategy)`, Flink инжектит `TimestampsAndWatermarksOperator`. Он:
+
+1. **Per-record**: вызывает `TimestampAssigner.extractTimestamp(event, recordTs)` → пишет timestamp в StreamRecord
+2. **Per-record**: вызывает `WatermarkGenerator.onEvent(event, ts, output)`
+3. **Periodic** (200ms timer): вызывает `WatermarkGenerator.onPeriodicEmit(output)`
+4. **Watermark propagation**: emit-ит watermark downstream
+
+```
+StreamRecord<T> входит {value: event, timestamp: -1}
+     ↓
+TimestampsAndWatermarksOperator:
+  StreamRecord<T> {value: event, timestamp: ts_from_assigner}
+     ↓ downstream
+  Watermark{ts} (periodic, отдельно от data)
+```
+
+**Расположение в DAG**:
+- Внутри Source (через `fromSource(source, watermarkStrategy)`) — самый правильный, watermark emit на partition level
+- Сразу после Source (через `.assignTimestampsAndWatermarks(strategy)`) — chained с source operator-ом
+- После filter/map — если timestamp надо извлекать после трансформации
+
+```java
+// ✅ Правильно — внутри Source
+env.fromSource(source, strategy, "kafka")
+
+// ⚠️ Менее точно — после source, теряет per-partition watermarks
+env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka")
+   .assignTimestampsAndWatermarks(strategy)
+```
+
+---
+
+## Per-partition watermarks (Kafka)
+
+Когда WatermarkStrategy передан в `fromSource()`, **каждая Kafka partition** имеет свой WatermarkGenerator. Это критично:
+
+<DiagramContainer title="Per-partition watermarks через Kafka source" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Kafka topic (4 partitions)"
+        tooltip="Каждая partition — независимый log. События в одной partition могут быть in-order (single producer), но между partitions нет ordering."
+      >
+        p0, p1, p2, p3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="SourceReader (TaskManager)"
+        tooltip="Один SourceReader на subtask. Может owners одну или несколько partition (если parallelism < partitions). Per-partition WatermarkGenerator state."
+      >
+        Reads p0, p2
+      </DataBox>
+      <DataBox
+        label="SourceReader (другой subtask)"
+        tooltip="Параллельный SourceReader. Изолированный state per-partition."
+      >
+        Reads p1, p3
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="per-partition watermark emission" />
+    <FlowRow>
+      <DataBox
+        label="WM emit per partition"
+        tooltip="Каждая partition emit-ит свой watermark отдельно. На subtask level — MIN(per-partition WM). На downstream — MIN(per-subtask WM)."
+      >
+        WM(p0), WM(p1), WM(p2), WM(p3)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Без per-partition watermarks (например, если timestamp-assigner после .union()) — watermark считается global per subtask, и одна fast partition «убивает» watermark, делая всё late.
+
+---
+
+## Production gotchas
+
+### 1. `setAutoWatermarkInterval` — критично для latency
+
+```yaml
+pipeline.auto-watermark-interval: 200ms   # default
+```
+
+Watermark двигается **дискретно** каждые 200ms. Если у вас 1-секундные окна с миллисекундной latency требованием — это слишком много. Уменьшить до 50ms ускорит emission, но увеличит overhead (больше watermark records).
+
+### 2. Out-of-orderness > checkpoint interval = late events на recovery
+
+После restart Flink восстанавливает watermark из checkpoint. Если outOfOrderness = 10 мин, а events после checkpoint восстановления приходят с timestamp до WM — late events. Производственное правило: `outOfOrderness < checkpoint_interval`.
+
+### 3. withIdleness без markIdle propagation
+
+Старые connectors могут не propagate idle status downstream. Проверить можно через Web UI → operator → currentInputWatermark — если он не двигается, а соседи двигаются, какой-то upstream operator не propagate idle.
+
+### 4. TimestampAssigner возвращает negative timestamp
+
+```java
+.withTimestampAssigner((e, ts) -> e.getEventTime())   // может вернуть 0 или negative
+```
+
+Watermark на основе negative timestamp → effectively `Long.MIN_VALUE` → окна никогда не закрываются. Validate в TimestampAssigner.
+
+### 5. Punctuated watermarks без onPeriodicEmit fallback
+
+Если punctuated marker события приходят редко, periodic emit не работает (вы его явно не реализовали), watermark надолго замораживается. Combine punctuated + periodic как fallback.
+
+### 6. Slot sharing между operator-ами с разными WatermarkStrategy
+
+Два source-а в одном slot share group, каждый со своим WatermarkStrategy — независимые watermarks. После `.union()` они merge в MIN. Это OK, но если один из них noWatermarks() — другая стратегия игнорируется (Watermark всегда `Long.MIN_VALUE` от noWatermarks → MIN tanks).
+
+---
+
+## Configuration cheat sheet
+
+```yaml
+# Periodic emission interval
+pipeline.auto-watermark-interval: 200ms
+
+# Whether to drop late events globally (default false — нужен side output для capture)
+# table.exec.emit.late-fire.enabled: false
+
+# Per-source idleness default (deprecated — use withIdleness in code)
+# pipeline.source.idleness-timeout: 0ms
+```
+
+```java
+// Самый частый production pattern
+WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
+    .withTimestampAssigner((event, recordTs) -> event.getEventTime())
+    .withIdleness(Duration.ofMinutes(1))
+    .withWatermarkAlignment("group-1",
+        Duration.ofSeconds(20), Duration.ofSeconds(1));   // FLIP-217 (урок 05)
+```
+
+---
+
+<KnowledgeCheck
+  question="Production scenario: Flink job читает Kafka topic с 24 partitions, parallelism source-а = 6 (каждый subtask читает 4 partition). 18 партиций активные, 6 — idle (часть бизнес-логики ушла). WatermarkStrategy = forBoundedOutOfOrderness(20s) без withIdleness. Result: windows не fire, currentOutputWatermark застрял. Что произошло и как fix?"
+  answer="Проблема: per-partition watermarks. Каждая partition имеет свой WatermarkGenerator state. Idle partition не получает events → её onEvent() не вызывается → maxTimestamp = Long.MIN_VALUE + outOfOrderness + 1 → emit watermark = Long.MIN_VALUE. На subtask level MIN(per-partition WM) = Long.MIN_VALUE. На downstream MIN(per-subtask WM) = Long.MIN_VALUE. Окна никогда не закрываются. Fix: добавить .withIdleness(Duration.ofMinutes(1)) — после 60 секунд без events на partition она помечается idle через output.markIdle(), и MIN propagation исключает её. После этого активные 18 partitions определяют watermark. Side effect: если idle partition 'просыпается' через 2 часа с событием timestamp = T_old, это событие будет late (WM уже двигается на основе других partitions, T_old < currentWM). Нужен .allowedLateness() + .sideOutputLateData() для capture. Alternative подходы: (1) уменьшить parallelism source до 4, чтобы idle partitions распределились по более активным subtasks (но всё равно нужен withIdleness, тк partition-level state); (2) использовать FLIP-217 watermark alignment между partitions того же source (если drift известен); (3) на бизнес-стороне — закрыть idle partitions через Kafka topic redesign. На production setup .withIdleness — must-have, не optional."
+/>

@@ -1,0 +1,117 @@
+{
+  "moduleId": "17-patterns-architecture",
+  "title": "Module 17 Exam — Patterns и архитектура",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m17-exam",
+    "description": "8-question integrated exam for Module 17"
+  },
+  "questions": [
+    {
+      "id": "flink-m17-exam-q1",
+      "type": "multiple-choice",
+      "question": "Stateful microservice pattern (event-sourcing на Flink) — когда оправдан и в чём core advantage над traditional REST + DB?",
+      "options": [
+        { "id": "a", "text": "Всегда лучше REST + DB" },
+        { "id": "b", "text": "Оправдан для core domain critical state machines (orders, payments, fraud, IoT shadows). Advantages: state IS the database (single-writer per aggregate root через keyBy — no races), full audit log из коробки (Kafka event log), replay capability из любой точки, EOS без 2PC между app и DB. Требует команду familiar с event-sourcing/CQRS/schema evolution discipline. Простой CRUD — overkill" },
+        { "id": "c", "text": "Только для Java applications" },
+        { "id": "d", "text": "Только для low-traffic services" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Event-sourcing + CQRS реализованные через Flink streaming engine. ProcessFunction = aggregate root с ValueState/MapState внутри. keyBy(aggregateId) — single-threaded per key, no concurrency issues. Replay — savepoint + earliest offsets для bug fixes / new projections. Schema evolution discipline критична (events живут вечно). Anti-pattern: simple CRUD без сложной business logic — REST + Postgres сheaper и проще.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m17-exam-q2",
+      "type": "multiple-choice",
+      "question": "Three patterns для dim joins (broadcast / lookup / temporal) — когда каждый применять?",
+      "options": [
+        { "id": "a", "text": "Broadcast — всегда самый быстрый" },
+        { "id": "b", "text": "Broadcast: dim ≤ 100-500MB, rare updates (countries, feature flags, small catalog) — replicate full copy в BroadcastState HEAP per subtask. Lookup (Async I/O): big dim (GBs), current value достаточно (user profiles) — external Redis/Cassandra с Caffeine L1 cache. Temporal (FOR SYSTEM_TIME AS OF): historical correctness нужна для replay (currency rates, prices в billing) — versioned table с rowtime, FOR SYSTEM_TIME AS OF event_time" },
+        { "id": "c", "text": "Все три equivalent" },
+        { "id": "d", "text": "Lookup для всех cases — flexible" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Three patterns для different dim profiles. Broadcast cost = N parallelism × dim_size в heap — fast lookup (микросекунды) но bounded by memory. Lookup — unbounded dim size, async I/O capacity tuning critical, eventual consistency (cache TTL = stale window). Temporal — point-in-time correctness, deterministic replay, but state holds versions (TTL обязателен для cleanup). Production pipelines often combine: countries broadcast + users lookup + prices temporal.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-exam-q3",
+      "type": "multiple-choice",
+      "question": "Flink CDC 3.6 YAML pipeline + schema.change.behavior=evolve — что критичный risk и mitigation?",
+      "options": [
+        { "id": "a", "text": "Нет risk-ов" },
+        { "id": "b", "text": "Risk: destructive changes (DROP COLUMN, RENAME) auto-applied на live lakehouse — downstream queries сломаются, data loss возможен. Mitigation: production prod использует try-evolve (попытка с graceful fallback) + alerting на destructive operations + Postgres DDL governance с approval + lakehouse retention 30+ days для time-travel recovery + downstream queries handle missing columns gracefully (COALESCE)" },
+        { "id": "c", "text": "Только performance issues" },
+        { "id": "d", "text": "Только при кросс-DB pipelines" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Schema evolution в CDC — powerful tool с обоюдным lezzo. `evolve` mode применяет ALL changes including DROP COLUMN на live production. Audit trail incidents: developer случайно DROP COLUMN customers.email в Postgres → automatic propagation → email column dropped в Paimon → BI dashboards SELECT email сломались → analyst team panic. Production guardrails: try-evolve (alert вместо apply для destructive), Postgres DDL governance, retention recovery window. Не accident-prevention, а accident-recovery design.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m17-exam-q4",
+      "type": "multiple-choice",
+      "question": "ML_PREDICT inline в Flink 2.2 streaming SQL — production architecture для recommendation engine на 500k events/sec с budget constraints?",
+      "options": [
+        { "id": "a", "text": "Все через GPT-4-turbo" },
+        { "id": "b", "text": "Multi-tier ML: 99% ONNX embedded inference (1-5ms latency, $0 per call) для pre-ranking; 0.9% smaller LLM batched (Haiku/GPT-3.5, 50 records/batch) для finalization; 0.1% GPT-4 для most critical decisions. Plus predictions cache TTL 1min для popular pairs. ML_PREDICT inline в Flink SQL — async batched, built-in retry/timeout/circuit breaker. Combined с VECTOR_SEARCH для semantic similarity. Все ML operations в одном SQL pipeline" },
+        { "id": "c", "text": "Только pre-computed offline batch" },
+        { "id": "d", "text": "Только rule-based, без ML" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Production scale recommendation engine: 500k events/sec × premium LLM = $thousands/hour, latency 200ms — оба out of budget. Multi-tier solution: cheap ONNX для majority (99% events get pre-ranking), middle-tier (Haiku/3.5) для refinement (0.9%), premium (GPT-4) для critical (0.1%). Predictions cache massively reduces QPS на popular product-user pairs. ML_PREDICT inline снимает overhead отдельного ML microservice. VECTOR_SEARCH для embedding similarity. Все в одной job — Flink 2.2 disruption для streaming ML pipelines.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-exam-q5",
+      "type": "multiple-choice",
+      "question": "Anti-pattern 'tiny state, huge cardinality' — какие mitigations и в каком порядке?",
+      "options": [
+        { "id": "a", "text": "Только увеличить state backend size" },
+        { "id": "b", "text": "Order по impact: (1) Question if cardinality truly needed (re-architect granularity); (2) State TTL + cleanupInRocksdbCompactFilter — для bounded retention scenarios; (3) Probabilistic sketches (Bloom filter / HLL / Count-Min) для approximate accuracy OK cases; (4) Hash bucketing для unbounded cardinality с acceptable collisions; (5) External Redis с TTL для no-state-in-Flink; (6) Operator state если global, not per-key; (7) ForSt + GIC для recovery time independent от state size" },
+        { "id": "c", "text": "Только переход на heap backend" },
+        { "id": "d", "text": "Нет mitigation, accept the cost" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Anti-pattern fix involves multiple layers. Per-entry overhead 200-400 bytes в RocksDB × billions keys = TBs disk. Single magic switch обычно не работает. Decision tree: depends на (a) cardinality bound; (b) accuracy required (exact vs approximate); (c) retention requirement; (d) EOS constraint. Re-architect granularity часто overlooked но самый impactful. Probabilistic — для metrics OK с FPP 0.1%. External Redis — sacrifices EOS для constant Flink state. ForSt — recovery game-changer но не fix state size.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m17-exam-q6",
+      "type": "multiple-choice",
+      "question": "Modern Hybrid architecture (Iceberg + Flink + Spark) vs Lambda vs pure Kappa — почему Hybrid стал default в 2026?",
+      "options": [
+        { "id": "a", "text": "Это просто маркетинг" },
+        { "id": "b", "text": "Iceberg/Paimon — primary storage shared между streaming (Flink) + batch (Spark) + ad-hoc (Trino). One codebase для streaming + batch over same tables. Hybrid Source (Iceberg backfill + Kafka live) для Kappa replay. Iceberg time travel для replay. Преимущества над Lambda: no двойная codebase, no merge complexity. Преимущества над pure Kappa: ML training naturally batch over Iceberg, regulatory batch reconciliation simpler, Kafka retention не financially expensive" },
+        { "id": "c", "text": "Lambda была всегда правильной" },
+        { "id": "d", "text": "Pure Kappa без compromises" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Modern Hybrid pragmatically combines best practices. Iceberg/Paimon как lakehouse — single storage layer; streaming + batch + ad-hoc query все share same tables. Flink streaming pipeline пишет в Iceberg (EOS). Spark batch ML training reads Iceberg. Trino ad-hoc. На bug fix: Flink Hybrid Source replay (Iceberg parallel backfill + Kafka live), atomic cutover. На regulatory: nightly Spark reconciliation. Lambda пытался решить same problem но через две системы — сейчас не нужно. Pure Kappa имеет проблемы с ML training и long Kafka retention costs.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-exam-q7",
+      "type": "multiple-choice",
+      "question": "Streaming aggregation для billing (money-critical) — какой design pattern обязателен?",
+      "options": [
+        { "id": "a", "text": "Только Flink streaming с EOS — достаточно" },
+        { "id": "b", "text": "ОБЯЗАТЕЛЬНА batch reconciliation: streaming aggregate = fast estimate для dashboards, nightly Spark job re-aggregates raw events + computes corrections + overwrites authoritative reconciled table. Billing system reads ТОЛЬКО reconciled. Plus: allowedLateness 30-60min + side output для late events + alerting на drift > threshold + idempotent upsert sink. Это design discipline, не option" },
+        { "id": "c", "text": "Только manual corrections by analysts" },
+        { "id": "d", "text": "Streaming aggregations нельзя для billing вообще" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Critical mental model. Streaming aggregations имеют fundamental drift из множества источников (late events, watermark approximations, schema issues, code bugs). Для money — unacceptable без reconciliation. Architecture pattern: (1) Streaming Flink → Iceberg aggregate (real-time view); (2) Nightly Spark reconciles из raw events + compares + overwrites reconciled; (3) Billing reads ONLY reconciled; (4) Side output late events для investigation; (5) allowedLateness для reducing drift размер. Streaming = preview, batch = authoritative source of truth. Без этого даже 0.1% drift = тысячи $ ошибок на scale.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m17-exam-q8",
+      "type": "true-false",
+      "question": "Flink Agents (preview 0.2.1) — это production-ready replacement для LangChain/LangGraph для всех use cases AI agent applications.",
+      "correctAnswer": false,
+      "explanation": "Не production-ready и не replacement. (1) Preview status: 0.2.x с breaking API changes, immature observability, small community. Production critical paths не должны depend полностью. (2) Не replacement: LangChain wins на maturity, community, rapid iteration, Python ecosystem. Flink Agents wins на production infrastructure (EOS, durability, scaling). (3) Production strategy: hybrid pilot — keep mature production tools для critical workflows, parallel pilot Flink Agents на narrow scope для learning. (4) Roadmap: 1.0 GA — Q4 2026 / Q1 2027. Use both wisely.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

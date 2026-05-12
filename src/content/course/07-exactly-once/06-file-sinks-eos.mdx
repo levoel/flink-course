@@ -1,0 +1,413 @@
+---
+title: "FileSink с EOS — bucketing, rolling, lifecycle"
+description: "FileSink (modern, FLIP-191), bucketing per-time/per-key, rolling policies, in-progress → pending → finished файловый lifecycle"
+order: 6
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["FileSink", "Bucketing", "Rolling Policy", "FLIP-191", "File Lifecycle"]
+---
+
+# FileSink с EOS — bucketing, rolling, lifecycle
+
+FileSink — modern (FLIP-191) приёмник для file-based outputs: S3, HDFS, GCS, local FS. Используется для streaming ingestion в data lake, как stepping stone перед Iceberg/Paimon. Реализует exactly-once через **file lifecycle protocol**: каждый файл проходит in-progress → pending → finished, и переход pending → finished происходит атомарно с checkpoint commit. Этот урок разбирает bucketing strategy, rolling policies и подводные камни file rename atomicity на разных filesystems.
+
+В отличие от KafkaSink с native transactions, FileSink реализует EOS через **transactional rename**: pending файлы существуют физически, но для query engine «не существуют» до commit. Это похоже на pattern Iceberg/Hudi commits.
+
+---
+
+## File lifecycle — три состояния
+
+<DiagramContainer title="FileSink — lifecycle одного файла" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. In-progress"
+        tooltip="Файл активно пишется. Имя файла начинается с точки (hidden в большинстве query engines): .part-0-0.inprogress.{uuid}. Записи append-ятся как они приходят. Не виден внешним consumers."
+      >
+        .part-0-0.inprogress.{uuid}
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="rolling policy triggered (size/time)" />
+    <FlowRow>
+      <DataBox
+        label="2. Pending (uncommitted)"
+        tooltip="Rolling policy решает закрыть файл. SinkWriter renames .inprogress → .pending. Файл закрыт, но НЕ виден downstream до checkpoint commit. transaction ID хранится в Flink state."
+      >
+        .part-0-0.pending.{uuid}
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="checkpoint commit + notifyCheckpointComplete" />
+    <FlowRow>
+      <DataBox
+        label="3. Finished (committed)"
+        tooltip="Committer renames .pending → final name: part-0-0-{counter}. Это атомарный move на POSIX/HDFS. После rename файл visible для query engines (Spark, Trino, Flink batch)."
+      >
+        part-0-0-{counter}
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Ключевая инвариант: **только finished файлы видны downstream**. In-progress и pending hidden от query engines через naming convention (leading dot).
+
+---
+
+## Bucketing — куда писать файлы
+
+Каждая запись routed в **bucket** — поддиректорию. Bucket assigner — это функция:
+
+```java
+public interface BucketAssigner<IN, BucketID> {
+    BucketID getBucketId(IN element, Context context);
+    SimpleVersionedSerializer<BucketID> getSerializer();
+}
+```
+
+### Часто используемые bucket assigners
+
+**DateTimeBucketAssigner** — per-time bucketing:
+
+```java
+FileSink.<Event>forRowFormat(
+    new Path("s3://data-lake/events"),
+    new SimpleStringEncoder<>("UTF-8"))
+    .withBucketAssigner(new DateTimeBucketAssigner<>("yyyy-MM-dd/HH"))
+    .build();
+
+// Generated structure:
+// s3://data-lake/events/2026-05-12/14/part-0-0-0
+// s3://data-lake/events/2026-05-12/14/part-0-0-1
+// s3://data-lake/events/2026-05-12/15/part-0-0-0
+```
+
+Это Hive-compatible partitioning: query engines могут partition-prune по path.
+
+**Custom per-key**:
+
+```java
+.withBucketAssigner(new BucketAssigner<Event, String>() {
+    @Override
+    public String getBucketId(Event event, Context ctx) {
+        return event.getRegion() + "/" + event.getDate();
+    }
+
+    @Override
+    public SimpleVersionedSerializer<String> getSerializer() {
+        return SimpleVersionedStringSerializer.INSTANCE;
+    }
+})
+```
+
+`event.region=us-east-1`, `event.date=2026-05-12` → `s3://.../us-east-1/2026-05-12/...`.
+
+### Bucket lifecycle
+
+Каждый bucket — независимая state machine со своим pending list. Buckets создаются lazily на первой записи и могут быть **deactivated** через `BucketLifeCycleListener` — если bucket inactive по watermark, его pending файлы commit-ятся и bucket cleaned up.
+
+---
+
+## Rolling policies — когда закрывать файл
+
+Rolling policy определяет момент перехода in-progress → pending:
+
+```java
+public interface RollingPolicy<IN, BucketID> {
+    boolean shouldRollOnCheckpoint(PartFileInfo<BucketID> partFile);
+    boolean shouldRollOnEvent(PartFileInfo<BucketID> partFile, IN element);
+    boolean shouldRollOnProcessingTime(PartFileInfo<BucketID> partFile, long currentTime);
+}
+```
+
+### DefaultRollingPolicy
+
+```java
+DefaultRollingPolicy.builder()
+    .withMaxPartSize(MemorySize.ofMebiBytes(128))         // 128MB
+    .withRolloverInterval(Duration.ofMinutes(15))         // 15min after open
+    .withInactivityInterval(Duration.ofMinutes(5))        // 5min inactivity
+    .build();
+```
+
+Triggers (any one):
+- File size >= maxPartSize
+- File age (from creation) >= rolloverInterval
+- No new records за inactivityInterval
+
+### OnCheckpointRollingPolicy
+
+```java
+OnCheckpointRollingPolicy.build();
+```
+
+Простейший: roll **на каждый checkpoint**. Каждый file = exactly one checkpoint. Хорошо для small file production rate, плохо для high throughput (создаёт many small files).
+
+### Custom — например, per-hour rollover
+
+```java
+public class HourlyRollingPolicy<IN> implements RollingPolicy<IN, String> {
+
+    @Override
+    public boolean shouldRollOnEvent(PartFileInfo<String> partFile, IN element) {
+        return false;
+    }
+
+    @Override
+    public boolean shouldRollOnProcessingTime(PartFileInfo<String> partFile, long now) {
+        // Roll если файл живёт больше часа
+        return now - partFile.getCreationTime() > Duration.ofHours(1).toMillis();
+    }
+
+    @Override
+    public boolean shouldRollOnCheckpoint(PartFileInfo<String> partFile) {
+        return partFile.getSize() > 128 * 1024 * 1024; // 128MB
+    }
+}
+```
+
+---
+
+## Полный FileSink — Parquet bulk writer
+
+```java
+FileSink<Event> sink = FileSink
+    .forBulkFormat(
+        new Path("s3://data-lake/events"),
+        ParquetAvroWriters.forReflectRecord(Event.class))
+    .withBucketAssigner(new DateTimeBucketAssigner<>("yyyy-MM-dd/HH"))
+    .withRollingPolicy(
+        DefaultRollingPolicy.builder()
+            .withMaxPartSize(MemorySize.ofMebiBytes(256))
+            .withRolloverInterval(Duration.ofMinutes(30))
+            .withInactivityInterval(Duration.ofMinutes(5))
+            .build())
+    .withOutputFileConfig(
+        OutputFileConfig.builder()
+            .withPartPrefix("events")
+            .withPartSuffix(".parquet")
+            .build())
+    .build();
+
+stream.sinkTo(sink);
+```
+
+Generated files:
+```
+s3://data-lake/events/2026-05-12/14/events-0-0.parquet
+s3://data-lake/events/2026-05-12/14/events-0-1.parquet
+s3://data-lake/events/2026-05-12/14/events-1-0.parquet
+```
+
+`events-{subtaskIndex}-{partCounter}.parquet`.
+
+---
+
+## Two formats: forRowFormat vs forBulkFormat
+
+| Aspect | forRowFormat | forBulkFormat |
+|---|---|---|
+| Encoder | per-record (string, JSON line) | columnar (Parquet, ORC, Avro) |
+| Rolling | size/time/inactivity OK | **only checkpoint-based** |
+| Buffering | record-by-record | per-checkpoint batches |
+| Compression | per-record (gzip pipe) | columnar block compression |
+| Use case | logs, CSV, NDJSON | analytics-grade, query-optimized |
+
+`forBulkFormat` rolling — это **constraint**: columnar formats требуют writing entire metadata at end, нельзя «append» к существующему Parquet файлу. Каждый Parquet файл закрывается на checkpoint boundary. Из этого следует: **bulk format = OnCheckpointRollingPolicy effectively**.
+
+---
+
+## Commit mechanics с SinkV2
+
+FileSink реализован через SinkV2 с `SupportsCommitter`:
+
+```java
+public class FileSink<IN> implements
+    Sink<IN>,
+    TwoPhaseCommittingSink<IN, FileSinkCommittable>,
+    SupportsWriterState<IN, FileWriterBucketState> {
+
+    @Override
+    public PrecommittingSinkWriter<IN, FileSinkCommittable> createWriter(...) {
+        return new FileWriter<>(...);
+    }
+
+    @Override
+    public Committer<FileSinkCommittable> createCommitter(...) {
+        return new FileCommitter(...);
+    }
+}
+```
+
+### FileWriter behavior
+
+`write(record)` — append в текущий in-progress part file (per bucket).
+
+`prepareCommit()`:
+1. Для каждого bucket с in-progress file:
+   - Если `RollingPolicy.shouldRollOnCheckpoint` → close file, rename → pending. Создать committable.
+   - Если не roll — flush в-progress буффер на disk (для recovery), но **не close** файл (продолжит писать в next cycle).
+2. Return list of pending committables.
+
+### FileCommitter behavior
+
+`commit(committables)` после `notifyCheckpointComplete`:
+1. Для каждого pending file → atomic rename → final name.
+2. Если rename fails (file already exists, например после retry) → check if previously committed (idempotent).
+
+### Recovery — in-progress vs pending
+
+```
+On crash:
+  in-progress files: half-written, в Flink state — последний flushed offset
+  pending files: existed на disk, но Flink не успел commit
+
+On recovery:
+  in-progress: truncate to last flushed offset (state has it), continue writing
+  pending: re-commit (idempotent rename)
+```
+
+Это требует filesystem с **truncate** support. S3 НЕ имеет truncate — для S3 in-progress restart использует другой mechanism (rewrite via multipart upload).
+
+---
+
+## Filesystem atomicity gotchas
+
+EOS зависит от **atomic rename**. Поведение разных FS:
+
+| Filesystem | Rename atomicity | EOS support |
+|---|---|---|
+| HDFS | atomic | ✅ |
+| Linux ext4/xfs (local) | atomic on same volume | ✅ |
+| S3 (AWS) | not atomic — copy+delete | ⚠️ через multi-part |
+| S3 (S3A через S3Guard) | atomic via DynamoDB | ✅ |
+| GCS | atomic by API design | ✅ |
+| Azure Blob | atomic | ✅ |
+
+### S3 special handling
+
+S3 не имеет native rename — `rename(a, b)` = `copy(a, b)` + `delete(a)`. Это **не атомарно**: между copy и delete оба файла существуют. Для EOS критично что transient state не корректен.
+
+FileSink для S3 использует **Multipart Upload** approach:
+1. In-progress = open multipart upload, parts uploaded by event
+2. Pending = complete multipart upload в pending name
+3. Finished = copy + delete pending → final
+
+S3-aware FileSinks (Iceberg, Paimon) используют commit log в metadata layer вместо filesystem rename — это elegant escape от S3 limitations.
+
+---
+
+## Compaction — small file problem
+
+FileSink с per-checkpoint rolling может создавать many small files:
+- 60-second checkpoint interval
+- 8 sink subtasks
+- 24 buckets per hour
+- = 60 * 24 * 8 = 11,520 files per hour
+
+Query engines страдают на high file count: каждый файл = open() syscall + metadata read.
+
+### Решения
+
+**1. RollingPolicy с size/time threshold** (только для row format):
+```java
+.withMaxPartSize(MemorySize.ofMebiBytes(128))
+.withRolloverInterval(Duration.ofMinutes(30))
+```
+Reduces file count, но pending файлы существуют дольше → больше state.
+
+**2. Compaction в pre-commit topology**:
+```java
+public class FileSinkWithCompaction<T> extends FileSink<T>
+    implements SupportsPreCommitTopology<...> {
+
+    @Override
+    public DataStream<FileSinkCommittable> addPreCommitTopology(
+        DataStream<WriterResult> stream) {
+        return stream
+            .keyBy(WriterResult::getBucketPath)
+            .window(GlobalWindows.create())
+            .trigger(CountTrigger.of(10))
+            .process(new SmallFileCompactor());  // merge 10 small → 1 large
+    }
+}
+```
+
+**3. Iceberg/Paimon** — у них рassive compaction в catalog layer. Streaming sink пишет small files, асинхронные `rewrite_files` jobs compact.
+
+---
+
+## Production gotchas
+
+### 1. S3 без consistent rename → potential duplicate or missing
+
+В eventually consistent S3 (до 2020), после `copy(a, b)`; `delete(a)` consumer мог видеть оба файла временно. Современный S3 strongly consistent с 2020 — это исправлено.
+
+**Action**: использовать AWS SDK v2, ensure S3A configured с `fs.s3a.committer.name=magic` для committers, которые leverage strong consistency.
+
+### 2. Bucket inactivity — pending hold infinite
+
+Если bucket активен в hour 14, потом нет данных. Pending файлы в этом bucket **не commit-ятся** до next checkpoint cycle. Из-за inactivity rolling policy. Но на каждом checkpoint Flink commits in-progress → pending → finished только если bucket touched.
+
+**Fix**: периодически inject heartbeat events во все buckets, или явно использовать `withInactivityInterval` для force close inactive buckets.
+
+### 3. Rolling policy on bulk format ignored
+
+```java
+FileSink.forBulkFormat(...)
+    .withRollingPolicy(DefaultRollingPolicy.builder()
+        .withMaxPartSize(...)
+        .build())  // ❌ для bulk format только OnCheckpointRollingPolicy works
+```
+
+Bulk format rolls только на checkpoint. Set non-default rolling policy → ignored, default to OnCheckpointRollingPolicy.
+
+**Fix**: использовать OnCheckpointRollingPolicy explicitly или understand limitation.
+
+### 4. Many subtasks × many buckets = file count explosion
+
+Parallelism 32, bucket per hour, 24h = 32 * 24 = 768 final files per day. После недели = 5376 files. Query engine slow на large file count.
+
+**Fix**: меньше parallelism для sink (через `setParallelism()`), или Iceberg/Paimon с compaction.
+
+### 5. Long-running in-progress file + crash → data loss in some cases
+
+Если truncate не supported (S3), recovery in-progress file через rewrite. Если crash mid-rewrite → data inconsistency.
+
+**Fix**: short rolling intervals (< 1 hour), monitor pending count.
+
+### 6. Hadoop classpath conflict
+
+FileSink с S3 требует hadoop-aws и aws-sdk на classpath. Версии должны совпадать (hadoop-aws 3.3.x → aws-sdk 1.12.x, NOT mixing 2.x).
+
+**Fix**: использовать flink-s3-fs-presto или flink-s3-fs-hadoop fat JAR shaded properly.
+
+---
+
+## Cheat sheet
+
+```
+FileSink lifecycle:
+    in-progress (.inprogress.{uuid})
+    └─ rolling policy fires
+    └─ rename → pending (.pending.{uuid})
+        └─ checkpoint commits
+        └─ atomic rename → final (part-N-K)
+
+Rolling policies:
+    DefaultRollingPolicy (size + time + inactivity)  ← row format
+    OnCheckpointRollingPolicy                         ← bulk format (Parquet/ORC)
+    Custom                                            ← any condition
+
+Bucketing:
+    DateTimeBucketAssigner("yyyy-MM-dd/HH")          ← Hive partitioning
+    Custom BucketAssigner                             ← per-key, per-region
+
+EOS depends на atomic rename:
+    HDFS ✅, Linux local ✅, S3 ⚠️ (через multipart)
+```
+
+---
+
+<KnowledgeCheck
+  question="Production FileSink → S3 setup: parallelism 16, OnCheckpointRollingPolicy (Parquet bulk format), checkpoint interval 60s, 24 hourly buckets. После 30 дней query engine (Trino) timeout на scan этого dataset — analyst жалуется на 'Too many files'. Compute: сколько файлов? Какие два архитектурных решения применить?"
+  answer="**File count calculation**: 16 subtasks × 24 buckets × 60 checkpoints/hour × 24 hours × 30 days = 8,294,400 files. Каждый ~5-50MB (small) → query engine spend больше времени на metadata reads и connection overhead чем на actual data scan. Это classic small file problem. **Решение 1 — Compaction через SupportsPreCommitTopology**: модифицировать FileSink для compaction между Writer и Committer. Implementation: (a) Writer emit-ит WriterResult per closed file; (b) `addPreCommitTopology` группирует по bucket через keyBy, window 10 minutes, process function читает все small Parquet files в bucket, пишет один большой target 256MB, returns compacted committable; (c) Committer финализирует уже compacted file. Каждый bucket теперь имеет 1-3 файла per hour вместо 60. **Решение 2 — Iceberg вместо raw FileSink**: switch на Iceberg sink, который имеет: (a) встроенные snapshots с manifest layer — query planning не нужен directory listing, метаданные сразу указывают на data files; (b) асинхронный `RewriteFiles` action для compaction в background — pristine Iceberg API, не нарушает streaming write; (c) hidden partitioning + partition stats без extra config; (d) time travel и rollback. После migration query latency падает с минут до секунд. Дополнительно: (1) уменьшить sink parallelism до 4-8 для меньшего fanout per bucket; (2) увеличить checkpoint interval до 5min для меньшего file count при простом FileSink (но pending lag растёт); (3) на S3 уровне — partition prefixes для better request throughput. Для production data lake — **Iceberg всегда правильный выбор** vs raw FileSink, последний — это stepping stone."
+/>

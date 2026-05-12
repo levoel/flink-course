@@ -1,0 +1,356 @@
+---
+title: "Hybrid Source (FLIP-150): combine bounded + unbounded в одну job"
+description: "FLIP-150 Hybrid Source: combine bounded source (S3 backfill) + unbounded source (Kafka live) в одной job. Switch policy: по exhaustion, по timestamp threshold. Production patterns"
+order: 5
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Hybrid Source", "FLIP-150", "Backfill", "Bootstrap", "Switch Policy", "Kappa Architecture"]
+---
+
+# Hybrid Source — backfill + live в одной job
+
+`HybridSource` (FLIP-150) — это **killer feature** Flink 1.14+, fundamentally меняющая backfill workflow. Combine bounded source (например historical data from S3) + unbounded source (live Kafka stream) в одну DataStream pipeline. Single job processes years of history, smoothly transitions к live processing — same state, same operator graph, same checkpoint, exactly-once preserved.
+
+Этот урок — самый important в модуле для production engineers. Без Hybrid Source каждый Flink job нуждался в external orchestration backfill (Spark batch + Flink streaming + manual handoff). С Hybrid Source это **один simple pipeline**.
+
+---
+
+## Problem: backfill в pre-FLIP-150 era
+
+Classic problem: запускаете new fraud detection job. Хотите чтобы он imedately начал detecting fraud НА основе **последних 6 месяцев history** (e.g., learn user baseline behaviour). Раньше:
+
+```
+Pre-FLIP-150 approach:
+  1. Spark batch job: read S3 history, compute baselines per user, write к Cassandra.
+  2. Flink streaming job: read live Kafka, lookup Cassandra на каждое event для baseline.
+  3. Manual orchestration: when did Spark finish? When start Flink? How handle 'cutover gap'?
+```
+
+Issues:
+- Two технологии для maintain
+- State sync complexity
+- Cutover gap — events between Spark end и Flink start могут miss
+- Different exactly-once semantics
+
+`HybridSource` solves это:
+
+```java
+HybridSource<Event> source = HybridSource.<Event>builder(historicalFileSource)
+    .addSource(liveKafkaSource)
+    .build();
+
+env.fromSource(source, watermarkStrategy, "hybrid")
+   .keyBy(Event::getUserId)
+   .process(new FraudDetector())     // ← state populated через historical, продолжает через live
+   .sinkTo(kafkaAlertsSink);
+```
+
+**Один pipeline.** State (per-user baseline) populated during historical phase. Smoothly transitions к live phase когда historical exhausted. Same DataStream, same operator state, same exactly-once.
+
+---
+
+## Architecture: HybridSource как FLIP-27 Source
+
+`HybridSource` implements FLIP-27 Source. Internal architecture:
+
+<DiagramContainer title="HybridSource: switching между under-the-hood sources" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="HybridSourceSplitEnumerator (JM)"
+        tooltip="Top-level enumerator. Wraps под-the-hood enumerators sequentially. Currently delegating к active source's enumerator. Tracks position в hybrid sequence (which source is current)."
+      >
+        HybridSource SplitEnumerator (sequential controller)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="phase 1: bounded source active" />
+    <FlowRow>
+      <DataBox
+        label="Bounded source (S3 FileSource)"
+        tooltip="Boundedness.BOUNDED. Discovers historical files, assigns splits к readers. Когда все files processed, emits notifyNoMoreSplits → HybridSourceSplitEnumerator detects exhaustion."
+      >
+        FileSource — S3 historical
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="switch trigger: bounded exhausted" />
+    <FlowRow>
+      <DataBox
+        label="Switch logic"
+        tooltip="При exhaustion HybridSourceSplitEnumerator transitions к next source. Может pass state — например 'continue Kafka с timestamp = last historical event timestamp'. Использует SourceFactory с access к previous source state."
+      >
+        Source switch: bounded → unbounded
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="phase 2: unbounded source active" />
+    <FlowRow>
+      <DataBox
+        label="Unbounded source (KafkaSource)"
+        tooltip="Boundedness.CONTINUOUS_UNBOUNDED. Initialized с offset corresponding к hand-off point (например Kafka timestamp = last S3 event time). Reads live events continuously."
+      >
+        KafkaSource — live стрим
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="downstream sees uniform stream" />
+    <FlowRow>
+      <DataBox
+        label="Downstream operators"
+        tooltip="View стрима unified — keyBy, state, windowing work uniformly. Switch invisible — events from both phases имеют consistent event time."
+      >
+        Single DataStream pipeline
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Basic usage
+
+### Static switching (simplest)
+
+```java
+FileSource<Event> historicalSource = FileSource.forBulkFileFormat(
+        new ParquetBulkReaderFormat<>(Event.class),
+        new Path("s3://lakehouse/events/year=2026/"))
+    .build();
+
+KafkaSource<Event> liveSource = KafkaSource.<Event>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("events")
+    .setStartingOffsets(OffsetsInitializer.timestamp(/* hand-off timestamp */ 1735689600000L))
+    .build();
+
+HybridSource<Event> hybrid = HybridSource.<Event>builder(historicalSource)
+    .addSource(liveSource)
+    .build();
+
+DataStream<Event> stream = env.fromSource(
+    hybrid,
+    WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofMinutes(1))
+        .withTimestampAssigner((e, ts) -> e.getEventTime()),
+    "hybrid"
+);
+```
+
+`HybridSource` switches от historical к Kafka когда FileSource emits `notifyNoMoreSplits`. Kafka starts at pre-configured timestamp.
+
+### Dynamic switching с deferred source factory
+
+```java
+HybridSource<Event> hybrid = HybridSource.<Event>builder(historicalSource)
+    .addSource(
+        switchContext -> {
+            // switchContext exposes previous source state
+            HybridSourceEnumeratorState prevState = switchContext.getPreviousEnumeratorState();
+            long lastHistoricalTimestamp = extractMaxTimestamp(prevState);
+            
+            return KafkaSource.<Event>builder()
+                .setBootstrapServers("kafka:9092")
+                .setTopics("events")
+                .setStartingOffsets(OffsetsInitializer.timestamp(lastHistoricalTimestamp))
+                .build();
+        },
+        Boundedness.CONTINUOUS_UNBOUNDED
+    )
+    .build();
+```
+
+Это **production-grade**: hand-off timestamp determined dynamically from actual historical data (последний event timestamp). No risk of gap or overlap.
+
+---
+
+## Switch policies
+
+### По exhaustion (default)
+
+Bounded source emits `notifyNoMoreSplits` → switch. Most common.
+
+### По timestamp threshold
+
+Switch когда current event timestamp пересекает threshold:
+
+```java
+HybridSource<Event> hybrid = HybridSource.<Event>builder(historicalSource)
+    .setBoundedness(/* explicit bound */ ...)
+    .addSource(liveSource)
+    .build();
+```
+
+Это для use case: «process historical до 2026-01-01, потом switch к Kafka starting from same timestamp».
+
+### Multi-stage hybrid
+
+```java
+HybridSource<Event> hybrid = HybridSource.<Event>builder(s3CompactedHistory)
+    .addSource(s3RecentHistory)       // 1 month uncompacted
+    .addSource(kafkaLive)              // current live stream
+    .build();
+```
+
+Three-stage backfill: deep history (compacted), recent history (raw), live. Useful если разные storage tiers.
+
+---
+
+## Real production examples
+
+### Example 1: ML feature backfill
+
+**Use case:** real-time fraud detection нуждается в last 6 months transaction history per user для baseline.
+
+```java
+// Historical: S3 partition layout year/month/day/transactions.parquet
+FileSource<Transaction> historicalTx = FileSource.forBulkFileFormat(
+        new ParquetBulkReaderFormat<>(Transaction.class),
+        new Path("s3://lakehouse/transactions/"))
+    .build();
+
+KafkaSource<Transaction> liveTx = KafkaSource.<Transaction>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("transactions")
+    .setStartingOffsets(OffsetsInitializer.timestamp(System.currentTimeMillis() - 86_400_000L * 7))
+    // ↑ Start 7 days ago, обеспечивает overlap с historical end
+    .build();
+
+HybridSource<Transaction> hybrid = HybridSource.<Transaction>builder(historicalTx)
+    .addSource(liveTx)
+    .build();
+
+env.fromSource(hybrid, watermarkStrategy, "hybrid-transactions")
+    .keyBy(Transaction::getUserId)
+    .process(new FraudDetectorWithBaseline())   // populates baseline через history
+    .sinkTo(alertSink);
+```
+
+После historical phase каждый user имеет computed baseline в operator state. Live phase compares incoming transactions against baseline.
+
+**Bonus**: state population is **part of checkpoint** — restart resumes без re-processing history.
+
+### Example 2: Kappa architecture migration
+
+**Old: Lambda — batch для history + streaming для current.**
+
+**New:** Kappa с Hybrid Source — historical processed by Flink batch mode, live processed by Flink streaming mode, same code.
+
+```java
+env.setRuntimeMode(RuntimeExecutionMode.AUTOMATIC);
+// ↑ AUTOMATIC: Flink decides batch vs streaming per operator based on Boundedness
+
+HybridSource<Event> source = HybridSource.<Event>builder(s3History)
+    .addSource(liveKafka)
+    .build();
+
+env.fromSource(source, ws, "events")
+    .keyBy(Event::getKey)
+    .window(TumblingEventTimeWindows.of(Time.hours(1)))
+    .aggregate(new MyAggregator())
+    .sinkTo(icebergSink);
+```
+
+During historical phase: batch-style aggregation (sort-based). During live phase: incremental streaming aggregation. **One code, one deployment.**
+
+### Example 3: Disaster recovery — rebuild from log
+
+**Use case:** state corruption (например bug в operator). Need rebuild from event log.
+
+```java
+// 1. Stop current Flink job (без savepoint — state corrupted).
+// 2. Replay from Kafka beginning OR from S3 archive of Kafka.
+//    Kafka retention typically 7 days — older needs S3 archive.
+
+HybridSource<Event> replay = HybridSource.<Event>builder(s3KafkaArchive)  // older than Kafka retention
+    .addSource(kafkaSource)                                                 // current Kafka
+    .build();
+
+// 3. Same pipeline, processes from beginning, rebuilds state.
+```
+
+---
+
+## Сравнительная таблица: подходы к backfill
+
+| Approach | Tools | Complexity | Exactly-once | Code reuse |
+|---|---|---|---|---|
+| Lambda (separate batch + stream) | Spark + Flink + Kafka + DB | High | Manual coordination | None (different code) |
+| Replay-on-restart | Flink + Kafka with long retention | Medium | Built-in | Same code |
+| Hybrid Source | Flink only | Low | Built-in | Same code, single job |
+| External tool orchestration | Airflow + Flink | Medium-high | Per-tool | None |
+
+**Hybrid Source wins** для most production cases где есть external archive (S3) + live stream (Kafka). Tighter, simpler, less moving parts.
+
+---
+
+## Production gotchas
+
+### 1. Watermark gap при switch
+
+Historical events processed первыми — watermark advances quickly (all events past). Когда switch к Kafka, current Kafka event timestamps могут быть **меньше** последнего historical timestamp (если Kafka start = some time after).
+
+Watermark monotonic — не может go backwards. Result: live events с small timestamp не trigger windows.
+
+**Mitigation:**
+- Use dynamic switch factory с access к previous state. Kafka starts FROM `last_historical_timestamp + 1ms` — no gap, no overlap.
+- Carefully configure overlap window (например Kafka starts 1 hour before historical end) — Flink filters duplicates downstream если key is unique.
+
+### 2. Exactly-once preservation при switch
+
+`HybridSource` does **NOT** guarantee exactly-once across switch automatically. Если historical source already emitted event X, и Kafka source also emits X (overlap), downstream receives X twice.
+
+**Mitigation:**
+- Hand-off timestamp tight — no overlap.
+- Downstream idempotent (например state-based de-dup).
+- Source de-dup (track seen IDs в state).
+
+### 3. Watermark strategy и dynamic switch
+
+Когда source factory создаёт new KafkaSource в switch handler, WatermarkStrategy должен быть compatible с both sources. Если Kafka time semantics differ (например timestamp в Avro field), нужно unified TimestampAssigner.
+
+```java
+WatermarkStrategy<Event> unifiedWs = WatermarkStrategy
+    .<Event>forBoundedOutOfOrderness(Duration.ofMinutes(1))
+    .withTimestampAssigner((event, ts) -> event.getEventTime())
+    // event.getEventTime() — works both для historical и live
+    .withIdleness(Duration.ofMinutes(1));
+```
+
+### 4. Switch happens **after** last historical split processed
+
+Critical detail: bounded source exhausts (`notifyNoMoreSplits`) когда SplitEnumerator не имеет больше splits. Но readers могут still be processing assigned splits. Switch transitions enumerator immediately, но readers finish their work.
+
+В период overlap: enumerator switched (using Kafka splits), но some readers still processing FileSource splits. Это **fine** — readers per-split, but it means watermark behaviour can be subtle.
+
+### 5. Memory pressure during historical phase
+
+Historical processing typically much faster throughput чем live. Backpressure to downstream operators. State backend (RocksDB) hot — много writes per second. Может saturate CPU/disk.
+
+**Mitigation:**
+- Increase parallelism для historical phase
+- Tighter checkpoint interval (smaller incremental state)
+- Pre-warm Block Cache (`state.backend.rocksdb.block.cache-size` larger)
+- Or scale K8s pods for historical phase, scale down after switch
+
+### 6. Schema evolution mid-job
+
+Historical files имеют схему X, current Kafka — schema Y (например added new fields). HybridSource не handles schema evolution automatically.
+
+**Mitigation:**
+- Common Avro schema с optional fields for additions
+- Apply transformation в Source's DeserializationSchema чтобы align на unified internal POJO
+- Иначе runtime ClassCastException на switch
+
+---
+
+## Key takeaways
+
+- **HybridSource** combines bounded + unbounded sources в одну DataStream pipeline.
+- **Same operator state** populated during historical phase, продолжается через live — no external orchestration.
+- **FLIP-27 Source implementation** — Hybrid Source itself is a Source, wraps others.
+- **Dynamic switching** через factory с access к previous source state — production-grade hand-off.
+- **Same code, batch + streaming** — modern Kappa architecture.
+- **Watermark + exactly-once preservation** требуют careful hand-off timestamp configuration.
+
+---
+
+<KnowledgeCheck
+  question="У вас real-time fraud detection job. Нужно populate per-user baseline behaviour из last 6 months transaction history (S3 Parquet), потом live processing из Kafka. Как build pipeline?"
+  answer="Используйте HybridSource: HybridSource.<Transaction>builder(s3HistoricalSource).addSource(switchCtx -> dynamicKafkaSource(switchCtx)).build(). Critical components: (1) Historical = FileSource forBulkFileFormat над S3 path с Parquet reader, Boundedness.BOUNDED. (2) Switch logic = factory с access к HybridSourceEnumeratorState — extract last processed timestamp from previous state. (3) Live = KafkaSource с OffsetsInitializer.timestamp(lastHistoricalTimestamp + 1) — обеспечивает no gap. (4) Watermark strategy unified — getEventTime() works для both phases. (5) Downstream KeyedProcessFunction populates ValueState<UserBaseline> during historical phase, продолжает comparison во время live phase. State automatically checkpointed — restart resumes без re-processing history. (6) Production tuning: больше parallelism + larger Block Cache во время historical phase для throughput; tight checkpoint interval. (7) Beware watermark gap при switch — dynamic factory с last_historical_timestamp guarantees seamless transition."
+/>

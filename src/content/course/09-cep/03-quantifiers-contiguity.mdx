@@ -1,0 +1,330 @@
+---
+title: "Quantifiers и contiguity: times, oneOrMore, optional, next, followedBy, followedByAny"
+description: "Глубокое разбирательство quantifiers (times, oneOrMore, optional, timesOrMore) и contiguity modes (next strict, followedBy relaxed, followedByAny non-deterministic relaxed): semantics, trade-offs, examples"
+order: 3
+difficulty: "advanced"
+estimatedTime: 30
+topics: ["Quantifiers", "Contiguity", "next", "followedBy", "followedByAny", "oneOrMore", "optional"]
+---
+
+# Quantifiers и contiguity — управление матчингом
+
+Pattern API позволяет компактно выразить сложные sequences через **quantifiers** (сколько раз state матчится) и **contiguity** (как state связан с predecessor). Эти два concept-а ортогональны и комбинируются — `oneOrMore().consecutive()`, `times(3).allowCombinations()` и т.д.
+
+Понимание trade-offs — критично для performance и для корректности. Неправильный choice contiguity может: (a) пропустить matches, (b) вырастить state quadratically, (c) emit overlapping duplicates.
+
+---
+
+## Quantifiers: сколько раз матчить state
+
+### times(N)
+
+Ровно N occurrences:
+
+```java
+Pattern.<Event>begin("a").where(e -> e.getType().equals("X")).times(3)
+```
+
+Matches three consecutive (по contiguity) events of type X. В match-е `match.get("a")` будет `List<Event>` из 3 элементов.
+
+### times(min, max)
+
+Range:
+
+```java
+Pattern.<Event>begin("a").where(...).times(2, 5)
+```
+
+Matches от 2 до 5 occurrences. Greedy: tries maximum first, backtracking возможен в SQL `MATCH_RECOGNIZE`, но в Pattern API это greedy с emit на каждое prefix length при `allowCombinations`.
+
+### oneOrMore() / timesOrMore(N)
+
+Variable-length:
+
+```java
+.oneOrMore()        // 1+
+.timesOrMore(3)     // 3+
+```
+
+`oneOrMore` критичен для variable-length sequences типа «непрерывный downtrend от 5 до 100 событий». В match-е получите `List<Event>` всех matched events.
+
+### optional()
+
+0 или 1 раз:
+
+```java
+Pattern.<Event>begin("a").where(...).next("b").optional().next("c").where(...)
+```
+
+Это значит «A then optionally B then C». Если B не приходит, всё равно match (без B в map).
+
+### Greedy vs lazy
+
+`oneOrMore` и `timesOrMore` greedy по умолчанию — пытаются match как можно больше events. Для lazy semantics нужно ограничить через followedBy/within:
+
+```java
+// Greedy: matches as много "fail" как possible
+.oneOrMore()
+
+// Lazy: stops at первом non-matching event (через next() — strict)
+.oneOrMore().consecutive()
+```
+
+`consecutive()` modifier на quantifier — это strict contiguity внутри повторений (нет пропусков между repetitions). Без него — `followedBy`-like relaxed.
+
+---
+
+## Contiguity modes — фундаментальная классификация
+
+Между двумя states pattern-а могут быть **0 или более** other events. Сколько других events игнорировать, и **как** combining происходит при multiple candidates — это contiguity.
+
+<DiagramContainer title="Три contiguity modes на одном примере" color="violet">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Input sequence"
+        tooltip="Поток events за период времени. Будем матчить pattern 'A followed by B' разными contiguity modes."
+      >
+        A1, X, A2, X, B1, X, B2
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="три варианта pattern" />
+    <FlowRow>
+      <DataBox
+        label="A.next(B) — strict"
+        tooltip="Strict contiguity. После A1 идёт X — не B → no match с A1. После A2 идёт X — no match. Никаких matches вообще. Strict подходит только когда последовательность жёсткая (например ровно (Login, Action) consecutive)."
+      >
+        Matches: ∅
+      </DataBox>
+      <DataBox
+        label="A.followedBy(B) — relaxed"
+        tooltip="Relaxed contiguity. Other events между A и B допускаются. По умолчанию matches только до первого B per A. (A1, B1), (A2, B1)? Зависит от after match strategy — но base behaviour: A1 паттерн завершается на B1, A2 берёт следующий B (если ещё не consumed)."
+      >
+        Matches: (A1, B1)
+      </DataBox>
+      <DataBox
+        label="A.followedByAny(B) — non-det relaxed"
+        tooltip="Non-deterministic relaxed. Для каждого A эмитятся matches со ВСЕМИ subsequent B. (A1, B1), (A1, B2), (A2, B1), (A2, B2). Combinatorial explosion для wide windows."
+      >
+        Matches: 4 пары
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### next — strict contiguity
+
+```java
+.next("b").where(...)
+```
+
+Между matched A и B **не должно быть** events. Это самый restrictive mode. Используется когда:
+- Последовательность гарантирована (например операции одного transaction)
+- Нужно prevent matching через unrelated events
+
+Production gotcha: если в pipeline есть filter, который removes events не connected к pattern, strict match может работать. Но если все events идут в CEP — strict рассматривает буквально каждое следующее event и любой mismatch reseed-ит.
+
+### followedBy — relaxed contiguity
+
+```java
+.followedBy("b").where(...)
+```
+
+Между A и B могут быть другие events. Когда B найден, partial match A consumed. Если несколько candidate B-events для одного A, по умолчанию first match wins, остальные partial matches идут дальше или discarded в зависимости от After Match Skip Strategy (см. урок 06).
+
+Это **наиболее частый** mode на production — соответствует human-readable «sometime later». «3 fails within 1 minute» — followedBy.
+
+### followedByAny — non-deterministic relaxed
+
+```java
+.followedByAny("b").where(...)
+```
+
+Каждое candidate B матчится с предыдущим A → cartesian product. Полезно когда нужно **все** overlapping matches:
+
+```java
+// «Каждая пара (high amount, larger amount) within 1 hour»
+Pattern.<Tx>begin("first").where(tx -> tx.getAmount() > 1000)
+    .followedByAny("second").where(tx -> tx.getAmount() > 5000)
+    .within(Duration.ofHours(1));
+```
+
+В sequence (1500, 6000, 7000) followedByAny эмитит: (1500, 6000), (1500, 7000). followedBy эмитит только (1500, 6000) (first match).
+
+<Callout type="warning">
+`followedByAny` имеет **combinatorial complexity**. Для N matching A и M matching B emits N×M matches. С wide `within()` (часы, дни) это легко даёт миллионы matches. Profile carefully на realistic data перед production.
+</Callout>
+
+---
+
+## Contiguity внутри quantifiers
+
+`oneOrMore()` и `times(N)` повторяют один state. Между repetitions тоже есть contiguity:
+
+```java
+// Default: relaxed (followedBy-like) между repetitions
+Pattern.<Event>begin("a").where(...).oneOrMore()
+
+// Strict внутри repetitions:
+Pattern.<Event>begin("a").where(...).oneOrMore().consecutive()
+
+// Non-deterministic relaxed:
+Pattern.<Event>begin("a").where(...).oneOrMore().allowCombinations()
+```
+
+### consecutive
+
+`.consecutive()` — между repetitions нет других events. Эквивалент strict (`next`) для повторений:
+
+```java
+// «3 strict consecutive ERROR events»
+Pattern.<Log>begin("error").where(l -> "ERROR".equals(l.level)).times(3).consecutive()
+```
+
+Если в logs `ERROR, ERROR, INFO, ERROR` — это NOT match с `consecutive`, но match без него (relaxed default).
+
+### allowCombinations
+
+`.allowCombinations()` — non-deterministic relaxed для повторений. Все subsets matching events эмитятся.
+
+Если 5 matching events для `oneOrMore().allowCombinations()` — это 2^5 = 32 combinations (минус single events если требуется ≥ 1). Очень дорого.
+
+---
+
+## Сравнительная таблица semantics
+
+| Combination | Behaviour | Use case |
+|---|---|---|
+| `times(N)` (default relaxed) | N occurrences, allows gaps | «3 events somewhere в last minute» |
+| `times(N).consecutive()` | N consecutive events, no gaps | «3 strict consecutive ERRORs» |
+| `times(N).allowCombinations()` | All N-subsets of matching events | «any 3 из multiple suspect events» |
+| `oneOrMore()` | 1+ matches, greedy | «non-empty sequence X» |
+| `oneOrMore().consecutive()` | 1+ strict consecutive | «continuous streak X» |
+| `optional()` | 0 or 1 | «optional handshake» |
+| `.next(name)` | Strict between states | «ровно следующий event» |
+| `.followedBy(name)` | Relaxed, single match | «sometime later, first match» |
+| `.followedByAny(name)` | Non-det relaxed, all matches | «all overlapping pairs» |
+
+---
+
+## Examples с разными combinations
+
+### Example 1: brute-force login
+
+«3 LOGIN_FAIL within 1 minute, потом LOGIN_SUCCESS»:
+
+```java
+Pattern.<Event>begin("fails")
+    .where(e -> "LOGIN_FAIL".equals(e.getType()))
+    .times(3)                                  // 3 fails
+    .within(Duration.ofMinutes(1))
+    .followedBy("success")
+    .where(e -> "LOGIN_SUCCESS".equals(e.getType()));
+```
+
+Default contiguity между fails — relaxed: значит могут быть LOGIN_FAIL events с other types между ними. Это OK — actually correct: если между fails был LOGIN_RECOVERY, это не должно ломать pattern.
+
+### Example 2: market V-shape
+
+«Цена монотонно вниз, потом монотонно вверх»:
+
+```java
+Pattern.<Tick>begin("start")
+    .where(t -> true)               // any first event
+    .next("down")                   // strictly after — first downtick
+    .where(new IterativeCondition<Tick>() {
+        public boolean filter(Tick t, Context<Tick> ctx) {
+            // current < previous in start (single event)
+            return t.getPrice() < ctx.getEventsForPattern("start").iterator().next().getPrice();
+        }
+    })
+    .oneOrMore().consecutive()       // continuous downtrend (strict)
+    .followedBy("up")
+    .where(new IterativeCondition<Tick>() {
+        public boolean filter(Tick t, Context<Tick> ctx) {
+            // current > last "down"
+            Tick lastDown = null;
+            for (Tick d : ctx.getEventsForPattern("down")) lastDown = d;
+            return lastDown != null && t.getPrice() > lastDown.getPrice();
+        }
+    })
+    .oneOrMore().consecutive()
+    .within(Duration.ofMinutes(10));
+```
+
+`consecutive()` для downtrend критичен: если был uptick между downticks, это не continuous downtrend. Это classic case для `MATCH_RECOGNIZE` SQL — там это elegantly выглядит (см. урок 04).
+
+### Example 3: cart abandonment
+
+«Add to cart, потом любая user activity, но no checkout within 30 min»:
+
+```java
+Pattern.<Event>begin("add")
+    .where(e -> "ADD_TO_CART".equals(e.getType()))
+    .followedBy("end")
+    .where(e -> "CHECKOUT".equals(e.getType()))
+    .within(Duration.ofMinutes(30));
+```
+
+Тут нужен **timeout** — pattern не завершается = abandonment. `.process(new PatternProcessFunction { processTimedOutMatch })` эмитит timeout events.
+
+---
+
+## Production gotchas
+
+### 1. `followedByAny` — combinatorial trap
+
+Profile carefully. В sequence N matching A → M matching B = N×M matches. Реальный production incident: видеоплатформа использовала followedByAny для «watch_start + watch_end pairs» с within(1 hour). При спайке traffic N=10000, M=10000 → 100M matches → JVM OOM.
+
+**Mitigation:** prefer `followedBy` unless you genuinely need all combinations. Если нужны overlapping, добавьте extra predicates чтобы reduce candidates.
+
+### 2. `oneOrMore()` без within → unbounded state
+
+```java
+// ❌ Может консумировать unlimited memory per key
+.oneOrMore()...
+
+// ✅ Bound
+.oneOrMore()...within(Duration.ofMinutes(15))
+```
+
+Plus, `oneOrMore` стores partial match с **всеми** matched events — для длинных streaks это растёт.
+
+### 3. `consecutive()` забыли — pattern matches случайно
+
+Если pattern «3 errors подряд» написан без `.consecutive()`:
+
+```java
+.where(l -> "ERROR".equals(l.level)).times(3)    // default relaxed!
+```
+
+Это match-нет даже `ERROR, INFO, INFO, INFO, ERROR, INFO, ERROR` — три ERROR events с пропусками. Часто не то, что хотят. Production-fix: add `.consecutive()` если нужны strict consecutive.
+
+### 4. Greedy oneOrMore + within = late match
+
+`.oneOrMore()` greedy — пытается match как можно больше. Match emits только когда watermark проходит `last_match_timestamp + within`. Для long streaks это **latency-критично**:
+
+```java
+// 100 events за 5 минут + within(15min) → match emit-ся через 15 минут после первого event
+.oneOrMore()...within(Duration.ofMinutes(15))
+```
+
+Если нужна low-latency emission — рассмотрите `times(min, max)` с тighter bound, или вообще state machine (KeyedProcessFunction) с custom emit logic.
+
+---
+
+## Key takeaways
+
+- **Quantifiers** (`times`, `oneOrMore`, `optional`) describe сколько раз state встречается.
+- **Contiguity** (`next`, `followedBy`, `followedByAny`) describes как state связан с previous.
+- Внутри quantifier — `consecutive()` для strict, `allowCombinations()` для non-det relaxed.
+- **`followedByAny`** — combinatorial trap, profile carefully.
+- **`oneOrMore` greedy** — match emit-ится только когда watermark проходит границу within. Critical для latency.
+- Default contiguity между repetitions — relaxed. Часто нужен `.consecutive()`.
+
+---
+
+<KnowledgeCheck
+  question="У вас pattern '3 ERROR events подряд in logs', и production показывает false positives — pattern эмитится даже когда между ERROR были INFO. Что не так и как fix?"
+  answer="Default quantifier contiguity — relaxed (followedBy-like): times(3).where(level==ERROR) допускает между ERROR-events other events (INFO, WARN). Это даёт matches на 'ERROR, INFO, ERROR, INFO, ERROR'. Fix: добавить .consecutive() к quantifier: .where(...).times(3).consecutive(). Это переключает на strict mode — между repetitions не должно быть other events. Альтернатива — filter upstream чтобы в CEP попадали только ERROR events, но это меняет semantics (теряется information о gaps)."
+/>

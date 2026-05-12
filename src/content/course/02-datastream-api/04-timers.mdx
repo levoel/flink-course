@@ -1,0 +1,401 @@
+---
+title: "Timers: event-time vs processing-time"
+description: "registerEventTimeTimer / registerProcessingTimeTimer. onTimer callback fires когда watermark > ts. Use cases: timeout detection, periodic emissions, session window simulation."
+order: 4
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Timers", "Event Time", "Processing Time", "Watermarks", "onTimer"]
+---
+
+# Timers: event-time vs processing-time
+
+Timers — second crucial capability `KeyedProcessFunction` после state. Они позволяют запланировать callback на будущий момент времени — event-time или processing-time. На таймерах построены: window expiry, session timeouts, periodic emissions, late event handling, custom join timeouts.
+
+В этом уроке разберём механику таймеров (event-time vs processing-time), как они хранятся в state, fires by watermark, и production use cases: timeout detection, periodic flush, session window simulation.
+
+---
+
+## Два типа таймеров
+
+| Type | Trigger condition | Use case |
+|---|---|---|
+| **Event-time timer** | `watermark > registered_ts` | Logic based на event semantics (timeout по event-time, window expiry) |
+| **Processing-time timer** | `wall_clock > registered_ts` | Periodic operations, debouncing, real-time alerts |
+
+```java
+public void processElement(Tx tx, Context ctx, Collector<Alert> out) {
+    // Event-time timer: fires когда watermark пересёк tx.ts + 10 min
+    ctx.timerService().registerEventTimeTimer(tx.getEventTime() + 10 * 60 * 1000);
+
+    // Processing-time timer: fires через 30 сек wall clock
+    ctx.timerService().registerProcessingTimeTimer(
+        ctx.timerService().currentProcessingTime() + 30_000);
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Alert> out) {
+    // Узнать какой type триггера fired
+    if (ctx.timeDomain() == TimeDomain.EVENT_TIME) {
+        // event-time timer
+    } else {
+        // processing-time timer
+    }
+}
+```
+
+Important: `onTimer` вызывается для всех зарегистрированных timers независимо от type — отличайте через `ctx.timeDomain()`.
+
+---
+
+## Event-time timer: watermark-driven
+
+<DiagramContainer title="Event-time timer lifecycle" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="processElement at t=10:00"
+        tooltip="Запись приходит с event time 10:00. Внутри register-ит timer на 10:30 (через ctx.timerService().registerEventTimeTimer(10:30))."
+      >
+        register timer @ 10:30
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="watermark = 10:15" />
+    <FlowRow>
+      <DataBox
+        label="Timer ждёт"
+        tooltip="Watermark всё ещё < 10:30. Timer хранится в TimerService (по сути priority queue в state). При checkpoint persistится."
+      >
+        в queue, не fires
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="новые records, watermark → 10:25" />
+    <FlowRow>
+      <DataBox
+        label="Timer ждёт"
+        tooltip="Watermark ещё не достиг 10:30. Главное: timer fires не по event time current record, а по watermark progress."
+      >
+        в queue, не fires
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="watermark → 10:31 (>10:30)" />
+    <FlowRow>
+      <DataBox
+        label="onTimer fires"
+        tooltip="Watermark пересёк registered time. onTimer вызывается для key, который был current при register. ctx.getCurrentKey() → ваш userId. State scoped к этому key доступен в onTimer."
+      >
+        onTimer(10:30, ctx, out)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Когда event-time timer не fires
+
+- **Watermark не движется** — idle source, нет новых records. См. `WatermarkStrategy.withIdleness()` (модуль 05).
+- **MAX_WATERMARK после source completion** — для BOUNDED источников. После последней записи source emit MAX_WATERMARK → все pending timers fires.
+- **Job stuck** — checkpoints не успевают, processing задержан. Timers ждут в queue.
+
+---
+
+## Processing-time timer: wall-clock-driven
+
+```java
+// Periodic flush каждые 5 секунд
+private transient ValueState<Long> nextFlushTimer;
+
+public void processElement(Event e, Context ctx, Collector<Aggregate> out) {
+    accumulate(e);  // update state
+
+    Long pending = nextFlushTimer.value();
+    if (pending == null) {
+        long ts = ctx.timerService().currentProcessingTime() + 5_000;
+        ctx.timerService().registerProcessingTimeTimer(ts);
+        nextFlushTimer.update(ts);
+    }
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Aggregate> out) {
+    if (ctx.timeDomain() == TimeDomain.PROCESSING_TIME) {
+        out.collect(emit());  // flush accumulated
+        clearState();
+        nextFlushTimer.clear();
+    }
+}
+```
+
+Processing-time timer fires по wall clock TaskManager-а. Hazards:
+
+- **Replay** не deterministic — при reprocessing data из Kafka offset processing-time не такой, как был originally. Это нормально для real-time alerts (важна wall-clock latency), плохо для reproducibility.
+- **Skew между TaskManager-ами** — wall clock на разных TM-ах может differ (хотя обычно NTP-synced).
+- **При checkpoint восстановлении** — processing-time timers re-register-ятся с original timestamps, что может оказаться в прошлом → fire immediately.
+
+---
+
+## State и keyed scoping
+
+**Timers — keyed**. При `registerEventTimeTimer(ts)` Flink сохраняет `(key, ts)` пару во внутреннем priority queue. Когда timer fires, `ctx.getCurrentKey()` возвращает тот key, для которого был registered.
+
+```java
+public void processElement(Tx tx, Context ctx, Collector<Alert> out) {
+    // Key = userId благодаря keyBy(Transaction::getUserId)
+    // ctx.getCurrentKey() == tx.userId
+    ctx.timerService().registerEventTimeTimer(tx.eventTime + 10 * 60 * 1000);
+    // Stored: (tx.userId, tx.eventTime + 10min)
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Alert> out) {
+    // ctx.getCurrentKey() == tx.userId (тот, для которого был registered)
+    // State access scoped к этому userId
+}
+```
+
+### Deduplication
+
+Регистрация **idempotent для одного и того же (key, ts) пары**. Зарегистрировать timer @ 10:30 для user-A дважды — это один timer. При `delete` он удаляется.
+
+```java
+// Эти три вызова создадут ТОЛЬКО ОДИН timer для user-A:
+ctx.timerService().registerEventTimeTimer(10 * 60 * 1000);
+ctx.timerService().registerEventTimeTimer(10 * 60 * 1000);
+ctx.timerService().registerEventTimeTimer(10 * 60 * 1000);
+```
+
+---
+
+## Use case 1: Timeout detection
+
+Detect когда user inactive в течение N минут:
+
+```java
+public class InactivityDetector
+        extends KeyedProcessFunction<String, UserEvent, InactivityAlert> {
+
+    private transient ValueState<Long> lastTimerState;
+    private static final long TIMEOUT_MS = 30 * 60 * 1000;  // 30 min
+
+    @Override
+    public void open(Configuration p) {
+        lastTimerState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("last-timer", Long.class));
+    }
+
+    @Override
+    public void processElement(UserEvent e, Context ctx, Collector<InactivityAlert> out) {
+        // Cancel previous timer (если был)
+        Long prevTimer = lastTimerState.value();
+        if (prevTimer != null) {
+            ctx.timerService().deleteEventTimeTimer(prevTimer);
+        }
+
+        // Schedule new timer на eventTime + 30min
+        long newTimer = e.getEventTime() + TIMEOUT_MS;
+        ctx.timerService().registerEventTimeTimer(newTimer);
+        lastTimerState.update(newTimer);
+    }
+
+    @Override
+    public void onTimer(long ts, OnTimerContext ctx, Collector<InactivityAlert> out) {
+        // Если ts == lastTimerState — действительно никакой активности
+        // (timer mог быть delete-нут, но onTimer всё равно fires если ещё в queue
+        // на момент watermark advance — поэтому extra check)
+        Long currentTimer = lastTimerState.value();
+        if (currentTimer != null && currentTimer == ts) {
+            out.collect(new InactivityAlert(ctx.getCurrentKey(), ts));
+            lastTimerState.clear();
+        }
+    }
+}
+```
+
+Использование:
+
+```java
+events.keyBy(UserEvent::getUserId)
+      .process(new InactivityDetector())
+      .uid("inactivity");
+```
+
+Это implements **manual session window**. Session windows в Flink под капотом делают то же самое.
+
+---
+
+## Use case 2: Periodic emission
+
+Emit aggregated state каждые N минут:
+
+```java
+public class PeriodicEmitter
+        extends KeyedProcessFunction<String, Event, Summary> {
+
+    private transient ValueState<Long> countState;
+    private transient ValueState<Long> nextEmissionState;
+    private static final long EMISSION_INTERVAL = 5 * 60 * 1000;  // 5 min
+
+    @Override
+    public void open(Configuration p) {
+        countState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("count", Long.class));
+        nextEmissionState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("next-emit", Long.class));
+    }
+
+    @Override
+    public void processElement(Event e, Context ctx, Collector<Summary> out) {
+        Long count = countState.value();
+        count = (count == null ? 0L : count) + 1;
+        countState.update(count);
+
+        // Register emission timer (если не registered)
+        if (nextEmissionState.value() == null) {
+            long emitAt = e.getEventTime() + EMISSION_INTERVAL;
+            ctx.timerService().registerEventTimeTimer(emitAt);
+            nextEmissionState.update(emitAt);
+        }
+    }
+
+    @Override
+    public void onTimer(long ts, OnTimerContext ctx, Collector<Summary> out) {
+        Long count = countState.value();
+        if (count != null && count > 0) {
+            out.collect(new Summary(ctx.getCurrentKey(), count, ts));
+            countState.clear();
+        }
+        nextEmissionState.clear();
+        // Не reschedule — register произойдёт при следующей записи (lazy)
+    }
+}
+```
+
+Это даёт **per-key periodic emission**. Полезно для metric aggregation, dashboards.
+
+---
+
+## Use case 3: Custom join timeout
+
+Join orders + payments, timeout если payment не пришёл за 1 час (см. урок 03 CoProcessFunction):
+
+```java
+public void processElement1(Order o, Context ctx, Collector<Match> out) {
+    Payment p = paymentState.value();
+    if (p != null) {
+        out.collect(new Match(o, p));
+        clearAll();
+    } else {
+        orderState.update(o);
+        // Timer на 1 hour from order event time
+        ctx.timerService().registerEventTimeTimer(
+            o.getEventTime() + 60 * 60 * 1000);
+    }
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Match> out) {
+    Order unmatchedOrder = orderState.value();
+    if (unmatchedOrder != null) {
+        // emit к side output как unmatched
+        ctx.output(unmatchedTag, unmatchedOrder);
+        orderState.clear();
+    }
+}
+```
+
+---
+
+## Use case 4: Cooldown / debouncing
+
+Avoid sending alerts чаще раз в N секунд:
+
+```java
+public void processElement(Alert a, Context ctx, Collector<Alert> out) {
+    Long lastAlertTs = lastAlertState.value();
+    long now = ctx.timerService().currentProcessingTime();
+
+    if (lastAlertTs == null || now - lastAlertTs > 60_000) {
+        // Прошло > 1 min с последнего alert → emit
+        out.collect(a);
+        lastAlertState.update(now);
+    } else {
+        // Cooldown active → skip
+    }
+}
+```
+
+Это без таймеров, просто state check. Но если хочется auto-clear lastAlertTs через 1 min, чтобы освободить state:
+
+```java
+public void processElement(Alert a, Context ctx, Collector<Alert> out) {
+    Long lastTs = lastAlertState.value();
+    if (lastTs == null || ctx.timerService().currentProcessingTime() - lastTs > 60_000) {
+        out.collect(a);
+        long now = ctx.timerService().currentProcessingTime();
+        lastAlertState.update(now);
+        // Auto-cleanup timer через 1 min
+        ctx.timerService().registerProcessingTimeTimer(now + 60_000);
+    }
+}
+
+public void onTimer(long ts, OnTimerContext ctx, Collector<Alert> out) {
+    Long lastTs = lastAlertState.value();
+    if (lastTs != null && ts >= lastTs + 60_000) {
+        lastAlertState.clear();
+    }
+}
+```
+
+---
+
+## Timer storage: где хранится
+
+Timers — это **keyed state**. Хранятся в:
+
+- **HeapStateBackend** — in-memory priority queue.
+- **EmbeddedRocksDBStateBackend** — column family `_timer_state_*` в RocksDB.
+
+При checkpoint timers persistятся вместе с user state. При restore queue rebuilt из state. Per-subtask: каждый subtask имеет свою queue таймеров для своих keys.
+
+**Sizing**: каждый timer = (key + timestamp + metadata) ≈ 100-200 bytes. 10M active timers = ~1-2 GB state. Не страшно с RocksDB, но monitor `numRegisteredEventTimeTimers` метрику.
+
+---
+
+## Timer firing order
+
+Все taymery в queue ordered по timestamp. Когда watermark advance:
+
+1. Pull all timers с `timer.ts <= new_watermark` из queue.
+2. Sort by timestamp.
+3. For each timer call `onTimer(ts, ctx, out)` sequentially **в mailbox thread**.
+
+```
+Watermark advance: 10:00 → 10:30
+Timers в queue с ts ≤ 10:30:
+  - (userA, 10:15), (userB, 10:20), (userA, 10:28)
+onTimer вызывается 3 раза, sequentially, в mailbox thread
+ctx.getCurrentKey() меняется между вызовами
+```
+
+Если в `onTimer` происходит heavy work — все остальные timers и processElement waiting. Это backpressure через timer flood.
+
+<Callout type="warning">
+**Timer flood** — частый production issue. Если за период watermark advance scheduled много timers (10k+ за раз), их sequential firing может занять секунды → checkpoints stuck. Решение: spread timer registrations по времени (например, jitter on registration time) или batch state cleanup в один timer per N records.
+</Callout>
+
+---
+
+## Production gotchas
+
+- **Watermark не движется → таймеры не fire** — самый частый bug. Idle source (no incoming data) → watermark stuck → event-time timers stuck. Используйте `withIdleness(Duration.ofMinutes(1))` в WatermarkStrategy. См. модуль 05.
+- **Processing-time timer при replay** — wall clock сейчас, не original. Для reproducible logic используйте event-time.
+- **Forgotten timer deletion** — register timer → key больше не active → timer всё равно fires (key стейт может быть пустой). Always check state в onTimer.
+- **Timer per element** — 1 timer per record × 100k records/sec = 100k new timers/sec. State быстро растёт. Использовать lazy registration (один timer per period).
+- **Не выполняйте heavy work в onTimer** — это блокирует mailbox. Если нужно много work, schedule it на следующий processElement.
+- **Timer cleanup при cancel** — таймеры в state cleanly cancelled при job cancel/finish. Но pending timers не fires.
+- **MapState vs ValueState для timer tracking** — если у вас много timers per key, используйте MapState\<Long, Object\> с timestamp как key, а не ValueState\<Set\<Long\>\> (которое сериализуется целиком при каждом обновлении).
+
+<Callout type="tip">
+Метрика `numEventTimeTimers` / `numProcessingTimeTimers` в Web UI помогает detect leak. Если monotonically растёт без bound — у вас leak (forgotten delete). Прокси для healthy job: timer count stable или растёт пропорционально active keys.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job детектирует inactive users через event-time timer на 30 минут. Watermark stuck из-за того, что один из Kafka partitions idle (нет новых событий). Что происходит с pending timers, и как fix it?"
+  answer="Проблема: event-time timers fires только когда watermark advance. Если хотя бы один партиция Kafka source-а idle (нет новых событий), его watermark остаётся низким. Watermark стрима = MIN(watermark всех parallel sources). Один idle partition → весь pipeline watermark stuck. Все pending event-time timers (включая 30-min inactivity detector) НЕ FIRES — даже когда другие partitions активно поставляют данные. Это classic 'watermark stuck' проблема. Последствия: (1) inactivity alerts задерживаются на минуты-часы — нарушение SLA; (2) windows не fire — aggregated metrics не emit; (3) state накапливается потому что cleanup timers в onTimer не fires. Fix: WatermarkStrategy с `.withIdleness(Duration.ofMinutes(1))`. Это говорит Flink: если partition не emit records 1 min, помечать его как idle и игнорировать его watermark при computation aggregate. После idleness threshold watermark advance по active partitions, timers fires. Code: `WatermarkStrategy.<UserEvent>forBoundedOutOfOrderness(Duration.ofSeconds(20)).withIdleness(Duration.ofMinutes(1)).withTimestampAssigner((e, ts) -> e.getEventTime())`. Альтернативно — `withTimestampAssigner` от processing-time (но это уже не event-time semantics) или Watermark Alignment (FLIP-217) для multi-source jobs с drift. Третий вариант — переключить на processing-time timer (но теряем event-time correctness). Production-grade выбор: withIdleness — стандарт. Idleness threshold выбирать по nature data: для часто active partitions 1 min, для редких — 10-30 min."
+/>

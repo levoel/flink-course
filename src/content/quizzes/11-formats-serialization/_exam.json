@@ -1,0 +1,117 @@
+{
+  "moduleId": "11-formats-serialization",
+  "title": "Module 11 Exam — Форматы и сериализация",
+  "passThreshold": 70,
+  "_meta": {
+    "idPrefix": "flink-m11-exam",
+    "description": "8-question integrated exam for Module 11"
+  },
+  "questions": [
+    {
+      "id": "flink-m11-exam-q1",
+      "type": "multiple-choice",
+      "question": "TypeInformation hierarchy в Flink — какие подклассы дают best performance?",
+      "options": [
+        { "id": "a", "text": "Все одинаковы" },
+        { "id": "b", "text": "Tuple (~100% baseline), POJO (~95%), Avro Specific (~85%), Protobuf (~80%), Avro Generic (~75%), Kryo (~50% — катастрофа). Performance gap определяется наличием pre-built schema (POJO/Avro/Protobuf) vs reflection-based per-object discovery (Kryo) plus class FQN overhead в wire. Production rule: never accept GenericTypeInfo fallback" },
+        { "id": "c", "text": "Kryo всегда fastest" },
+        { "id": "d", "text": "JSON через Jackson быстрее POJO" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Performance hierarchy reflects how much serialization can be pre-computed vs done per-record. Tuple — positional binary, no field names, fastest. POJO — sorted fields, null markers per field, ~95% baseline. Avro Specific — codegen + pre-baked schema, ~85%. Protobuf — varint encoding + length-prefix, ~80%. Avro Generic — runtime field-by-name access, ~75%. Kryo — class FQN overhead + reflection per object, no schema validation, ~50% baseline и нет schema evolution. Production strategy: `pipeline.generic-types: false` для fail-fast против Kryo fallback. Choose format based on use case: Tuple intermediate, POJO domain events, Avro/Protobuf external contracts.",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m11-exam-q2",
+      "type": "multiple-choice",
+      "question": "Lombok-класс `@Data @Builder` без `@NoArgsConstructor` — какие именно проблемы это создаёт?",
+      "options": [
+        { "id": "a", "text": "Никаких — Flink handles automatically" },
+        { "id": "b", "text": "@Builder создаёт parameterized all-args ctor, no-arg ctor отсутствует. Flink TypeExtractor.hasPublicNoArgConstructor() returns false → GenericTypeInfo<MyClass> → KryoSerializer для всего класса → ~50% throughput drop. Production fix: @Data @Builder @NoArgsConstructor @AllArgsConstructor (последний нужен после @NoArgsConstructor удаляет @Builder-generated ctor)" },
+        { "id": "c", "text": "@Builder только slows down builds" },
+        { "id": "d", "text": "@Data deprecated в Lombok" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Lombok annotation interactions: @Data = @Getter + @Setter + @ToString + @EqualsAndHashCode + @RequiredArgsConstructor. @Builder generates static inner Builder class plus private all-args constructor for builder.build() to call. Single result: ONLY constructor is `<init>(field1, field2, ...)`. No `<init>()`. Flink TypeExtractor.analyzePojo() checks `Constructor<T> noArg = clazz.getConstructor()` — NoSuchMethodException → falls back to GenericTypeInfo<T> → KryoSerializer. Diagnosis: `javap -p MyClass.class` shows constructors. Fix: `@Data @Builder @NoArgsConstructor @AllArgsConstructor`. The @AllArgsConstructor is needed because @NoArgsConstructor removes @Builder's generated all-args ctor (build() fails without it). Net: POJO recognized, ~95% perf instead of ~50%.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-exam-q3",
+      "type": "multiple-choice",
+      "question": "Lambda `.map(v -> Tuple2.of(v.userId, 1L))` без `.returns()` — почему fail?",
+      "options": [
+        { "id": "a", "text": "Tuple2 deprecated" },
+        { "id": "b", "text": "Lambdas компилируются в invokedynamic calls к LambdaMetafactory — generic params не сохраняются в bytecode signature lambda class. Class.getGenericInterfaces() возвращает raw MapFunction без <String, Tuple2<...>>. TypeExtractor cannot infer return type → InvalidTypesException. Для named classes (anonymous MapFunction) — generics сохраняются в Signature attribute → TypeExtractor работает. Fix: .returns(Types.TUPLE(...)) или .returns(new TypeHint<...>() {})" },
+        { "id": "c", "text": "Java compiler bug" },
+        { "id": "d", "text": "Flink не поддерживает lambdas" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Generics erasure asymmetry: для named class generic params сохраняются в Class file Signature attribute, доступны через Class.getGenericInterfaces()/getGenericSuperclass(). Для lambdas — Java compiler использует invokedynamic + LambdaMetafactory.metafactory() для runtime synthesis lambda class. Generic params present в enclosing method signature, но НЕ в synthesized lambda class. Result: lambda's `getGenericInterfaces()` returns raw MapFunction. TypeExtractor cannot extract Tuple2<...>. Для Tuple types Flink throws InvalidTypesException (fail-fast по design — Tuple без params бесполезен). Для some classes — silent GenericTypeInfo. Fix patterns: (1) `.returns(Types.TUPLE(Types.STRING, Types.LONG))` — idiomatic. (2) `.returns(new TypeHint<Tuple2<String, Long>>() {})` — anonymous subclass preserves generics в supertype signature. (3) Named class implements ResultTypeQueryable.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-exam-q4",
+      "type": "multiple-choice",
+      "question": "Avro Specific vs Avro Generic vs Avro Reflect — когда какой выбирать?",
+      "options": [
+        { "id": "a", "text": "Specific всегда лучше" },
+        { "id": "b", "text": "Specific: .avsc → codegen, compile-time типы, ~85% perf — для known stable schemas, production. Generic: GenericRecord + runtime Schema, field-by-name access, ~75% perf — multi-tenant routing, schema discovery, dynamic transformations. Reflect: AvroSerializer создаёт schema из POJO reflection, ~80% perf — legacy POJO codebase migration без переписывания в .avsc" },
+        { "id": "c", "text": "Они identical, naming different" },
+        { "id": "d", "text": "Reflect deprecated" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Three Avro modes serve different operational needs. **Specific** is the default choice — Avro Maven plugin generates Java classes из .avsc, typed compile-time access (event.getUserId()), pre-baked schema in generated class, fast (~85% baseline). Best для known schema, production critical paths, Schema Registry integration through ConfluentRegistryAvroDeserializationSchema.forSpecific(Class, registry). **Generic** for flexibility — GenericRecord wraps any Schema + Object[] values, field access record.get('userId').toString() (returns CharSequence/Utf8, need .toString() conversion), schema travels with records via record.getSchema(). Best для multi-tenant pipeline routing different tenants' schemas, schema discovery scenarios, generic transformations like PII masking by field name pattern. **Critical**: requires explicit .returns(new GenericRecordAvroTypeInfo(schema)) — without it, Kryo fallback. **Reflect** as hybrid — AvroSerializer uses Avro ReflectData to generate schema from POJO via reflection. Your code looks POJO, but evolution + serialization go through Avro path. Best для existing POJO codebase wanting Avro evolution capabilities without rewriting in .avsc.",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m11-exam-q5",
+      "type": "multiple-choice",
+      "question": "Production deployment должен иметь несколько layers защиты от Kryo regression. Какие?",
+      "options": [
+        { "id": "a", "text": "Только code review достаточно" },
+        { "id": "b", "text": "Defense-in-depth: (1) pipeline.generic-types: false в production config.yaml — fail-fast на submission. (2) env.getConfig().disableGenericTypes() в main() — config-independent защита. (3) Integration test вызывает env.getStreamGraph() с disableGenericTypes() — forces TypeInformation resolution. (4) CI lint: grep .map(.*->.*) без .returns(. (5) Code review checklist для new types. (6) Monitoring alert на 'Falling back to GenericType' WARN log — backstop" },
+        { "id": "c", "text": "Только runtime monitoring" },
+        { "id": "d", "text": "Manual audit раз в месяц" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Defense-in-depth philosophy: один layer fails — другие catch. Production teams imeющие этот discipline report zero Kryo regressions за 6+ months. Detailed layers: (1) **Production config** `pipeline.generic-types: false` — Flink fails job submission with IllegalArgumentException про конкретный class имя. (2) **Programmatic** `env.getConfig().disableGenericTypes()` — defense if config.yaml не applied (env-specific override missing). (3) **CI integration test** — `LocalEnvironment` + disableGenericTypes() + buildPipeline() + getStreamGraph() — forces TypeInformation resolution для всех operators, throws при Kryo. Caught перед deploy. (4) **Static analysis** — grep heuristic catches lambda + Tuple/POJO without .returns() как style violation в PR. (5) **PR review checklist** — explicit pункты: new types are POJO/Avro, Lombok @NoArgsConstructor present, lambdas have type hints. (6) **Monitoring** — alert log pattern `Falling back to GenericType` — backstop on already-deployed job. Each layer has different failure mode и catches different oversights.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m11-exam-q6",
+      "type": "multiple-choice",
+      "question": "Schema evolution scenarios: какие изменения POJO Flink handles automatically через PojoSerializerSnapshot?",
+      "options": [
+        { "id": "a", "text": "Любые изменения handled automatically" },
+        { "id": "b", "text": "Compatible через automatic migration: add nullable field, remove field (data lost), reorder fields (alphabetical sort internally), primitive field with default. Incompatible (savepoint recovery fails): rename field без aliases (drop + add от Flink's perspective), change field type (long → int), change class name (package move). Для невозможных эволюций — State Processor API batch migration" },
+        { "id": "c", "text": "Только add field" },
+        { "id": "d", "text": "Только remove field" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "PojoSerializerSnapshot stores field names + types + ordering. На resolveSchemaCompatibility(): **Compatible** changes — add nullable field (default null after migration, compatibleAfterMigration), add primitive field (default 0/false), remove field (data lost but proceeds), reorder fields (alphabetical sorting internally — order irrelevant for compatibility). **Incompatible** changes — rename field (Flink sees drop + add без intent — data lost для renamed, no error), change type incompatibly (long → int — narrowing risks overflow), change class FQN (package move, rename — TypeSerializer cannot map). Workarounds: (1) **Avro instead of POJO** — aliases support rename, type widening rules richer. (2) **Custom TypeSerializerSnapshot** — implement own resolveSchemaCompatibility() с rename detection logic. (3) **State Processor API** — batch migration job, full control: split fields, merge, restructure, complex transformations. Production rule: для long-lived state — Avro Specific или Carefully designed POJO с known evolution paths.",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m11-exam-q7",
+      "type": "multiple-choice",
+      "question": "Protobuf vs Avro для production Kafka pipeline — какие decision factors?",
+      "options": [
+        { "id": "a", "text": "Всегда Avro" },
+        { "id": "b", "text": "Avro: Kafka-first ecosystem, Schema Registry первоклассная поддержка, stronger schema evolution (aliases для rename), better Iceberg/Parquet integration, cross-language consumers mature. Protobuf: gRPC-first (.proto уже source of truth для RPC), slightly compact wire (varint), well-known types (Any, Timestamp, Duration), better Java type safety. Choose ONE format pipeline-wide — mixing creates conversion overhead" },
+        { "id": "c", "text": "Protobuf только для high-throughput" },
+        { "id": "d", "text": "Они incompatible на runtime" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Decision matrix: **Avro wins** — (1) Existing Kafka + Schema Registry stack (Confluent ecosystem default). (2) Cross-language consumers (Python pandas Avro, Go avro, Rust avro-rs — mature). (3) Iceberg/Parquet downstream (Avro maps cleanly). (4) Schema evolution с aliases для rename (Protobuf cannot rename — field name only в .proto, but no built-in rename mapping для compatibility). (5) Avro Logical Types (decimal, timestamp-millis) для precise SQL semantics. **Protobuf wins** — (1) gRPC microservices уже define .proto для RPC — reuse same schemas для Kafka topics (single source of truth, no duplication). (2) Slightly compact wire (varint для small ints saves ~5-10%). (3) Well-known types (Any для unstructured, Timestamp, Duration). (4) Stronger backward type safety (proto3 default values вместо nulls в Avro union types). **Production rule**: ONE format pipeline-wide. Mixing Avro + Protobuf creates conversion costs (~30% overhead at cross-format steps) и dual schema governance complexity. Migration legacy formats: pick target format upfront, plan staged migration.",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m11-exam-q8",
+      "type": "true-false",
+      "question": "Каждый stateful operator в production Flink job ДОЛЖЕН иметь explicit `.uid('operator-name')` — без UID Flink назначает auto-UID на основе operator position в graph, и любой code change upstream (даже добавление log statement в map() выше) может break state mapping → silent state loss на recovery.",
+      "correctAnswer": true,
+      "explanation": "Auto-UID generation algorithm: Flink JobGraph builder computes UID hash from operator's position in graph (chain ID + position within chain + name). Add/remove operator upstream → all downstream operator positions shift → different auto-UIDs. Savepoint maps state by UID → recovery finds 'no state for new UID' → operator starts with empty state SILENTLY (no error, just state loss). Worst case examples: (a) Production team adds debug log statement before keyed state operator → re-chain → state UID shift → user profile state evaporates → fraud detection sees empty history → bypass passes through. (b) Refactor: extract intermediate map step → state UID changes → critical aggregation state lost. **Explicit @uid pattern**: `stream.keyBy(...).process(new MyFn()).uid('my-fn-state').name('My processing')`. UID = stable identifier для state, decoupled от graph topology. **Production checklist**: (1) Every stateful operator (KeyedProcessFunction, Window, AsyncFunction, ProcessFunction with state) имеет explicit .uid(). (2) CI lint: search `.process(.*\\)` без следующего `.uid(`. (3) Naming convention: `<module>-<purpose>-state` (например `fraud-user-history-state`). (4) Never reuse UID между different state types или different operators. With discipline — pipeline refactoring becomes safe; without — every refactor risks production data loss.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

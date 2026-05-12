@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "03-state-management/07-state-schema-evolution",
+  "moduleId": "03-state-management",
+  "_meta": {
+    "idPrefix": "flink-m03-07",
+    "description": "Quiz for schema evolution lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m03-07-q1",
+      "type": "multiple-choice",
+      "question": "POJO UserProfile с fields name+age. Добавляем нulllable Integer creditScore. Что произойдёт при restart с savepoint?",
+      "options": [
+        { "id": "a", "text": "INCOMPATIBLE — restart fails" },
+        { "id": "b", "text": "COMPATIBLE_AFTER_MIGRATION — existing entries имеют creditScore=null, new writes сохраняют real values. Bytes migrated на restore (old reader → new writer)" },
+        { "id": "c", "text": "COMPATIBLE_AS_IS — bytes остаются как были" },
+        { "id": "d", "text": "Восстановит, но потеряет name и age" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "POJOSerializer поддерживает добавление nullable полей как COMPATIBLE_AFTER_MIGRATION. Existing entries дефолтятся к null для нового creditScore. New writes сохраняют real values. Migration происходит на restore: Flink reads bytes старым serializer, пишет новым. Может быть slow для multi-GB state, но это startup-only cost. ВАЖНО: используйте Integer (wrapper, nullable), не int (primitive, не nullable — дефолт 0).",
+      "studyHint": "Повторите урок — POJO evolution rules",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m03-07-q2",
+      "type": "multiple-choice",
+      "question": "Нужно изменить field type с int на long в POJO state. Что делать?",
+      "options": [
+        { "id": "a", "text": "Просто change код, restart — Flink сделает widening automatically" },
+        { "id": "b", "text": "POJOSerializer считает это INCOMPATIBLE (даже widening). Нужен State Processor API: offline batch job читает old savepoint, преобразует state, пишет new savepoint. Альтернатива — переход на Avro (поддерживает type promotion)" },
+        { "id": "c", "text": "Использовать allowNonRestoredState" },
+        { "id": "d", "text": "Невозможно" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "POJO Serializer не поддерживает type changes даже widening (int→long). Two options: (1) State Processor API rebootstrap — offline batch transforms savepoint; (2) Avro Serializer поддерживает type promotion int→long→float→double automatically (если используете AvroSerializer вместо POJO). Recommendation на старте: prefer Avro для state, который будет evolve — built-in evolution rules мощнее.",
+      "studyHint": "Повторите урок — секция Allowable changes",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m03-07-q3",
+      "type": "multiple-choice",
+      "question": "Что такое State Processor API и когда его использовать?",
+      "options": [
+        { "id": "a", "text": "Это новый async API для real-time state" },
+        { "id": "b", "text": "Offline batch API для чтения savepoint как bounded DataStream, transform state arbitrary кодом, и записи нового savepoint. Use cases: incompatible schema changes, restructure state, initialize state from external source, change maxParallelism" },
+        { "id": "c", "text": "REST endpoint для query state" },
+        { "id": "d", "text": "Замена RocksDB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "State Processor API — escape hatch для миграций, которые auto evolution не покрывает. Это offline batch job: Savepoint.load() читает savepoint как DataStream, ваш код transforms, Savepoint.create().write() пишет новый. Use cases: (1) type changes (int→long); (2) restructure (split один ValueState на несколько MapState); (3) initialize state from external DB; (4) изменить maxParallelism; (5) audit/inspect. Heavy operation — multi-TB savepoint может занять часы.",
+      "studyHint": "Повторите урок — State Processor API",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m03-07-q4",
+      "type": "true-false",
+      "question": "Класс должен быть proper POJO (public field или getter/setter pair + public nullary constructor) чтобы schema evolution работал. Иначе Flink fallback на KryoSerializer, который НЕ поддерживает evolution.",
+      "correctAnswer": true,
+      "explanation": "True. Если класс не proper POJO — Flink fallback на Kryo. Kryo не имеет schema evolution: любое изменение полей = INCOMPATIBLE. Production lesson: при job start search в logs 'Class ... cannot be used as a POJO type' — это red flag. Fix POJO structure ДО первого deploy. Required: public class, public field ИЛИ private+getter+setter pair на каждое field, public no-arg constructor. Inheritance breaks POJO — flatten.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

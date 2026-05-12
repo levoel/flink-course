@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "18-capstone/02-design-phase",
+  "moduleId": "18-capstone",
+  "_meta": {
+    "idPrefix": "flink-m18-02",
+    "description": "Quiz for capstone design phase"
+  },
+  "questions": [
+    {
+      "id": "flink-m18-02-q1",
+      "type": "multiple-choice",
+      "question": "В design phase capstone — почему выбран Flink CDC directly без intermediate Kafka layer (вопреки textbook Debezium → Kafka → Flink pattern)?",
+      "options": [
+        { "id": "a", "text": "Просто потому что это новее" },
+        { "id": "b", "text": "Trade-offs: меньше hops (latency, ops complexity), no Kafka retention cost для CDC data, built-in schema evolution propagation в Flink CDC, simpler debugging. Trade-off: no Kafka buffer means replication slot pressure if Flink down — mitigation through monitoring slot lag + max_slot_wal_keep_size + alerting" },
+        { "id": "c", "text": "Kafka не support CDC" },
+        { "id": "d", "text": "Postgres не работает с Kafka" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Conscious architectural trade-off. Direct Flink CDC plusses: one less hop, no Kafka retention cost (для 1B events/day × 30 days = 30TB savings ~$3-5k/month), Flink CDC schema evolution propagation auto, simpler debugging. Trade-off: no Kafka buffer means slot pressure if Flink down. Mitigations: monitoring slot lag, max_slot_wal_keep_size guard, recovery procedures. Если scenarios evolve (multiple consumers, longer DR window), Kafka layer can be ADDED later without architectural rewrite. Это explicit trade-off с guardrails, not unconscious choice.",
+      "studyHint": "Повторите урок 02 — KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m18-02-q2",
+      "type": "multiple-choice",
+      "question": "Capstone state size estimate ~300-500GB. Почему ForSt backend критичен и не RocksDB?",
+      "options": [
+        { "id": "a", "text": "RocksDB просто старый" },
+        { "id": "b", "text": "ForSt disaggregated state — primary state на S3, локальный диск только cache. Cost: 500GB на каждый TM × 8 TMs = 4TB local disk = expensive provisioning. С ForSt — minimal local SSD cache. Recovery time metadata-only ~30s vs full state download minutes-hours с RocksDB. Critical для RTO 5 min SLO" },
+        { "id": "c", "text": "RocksDB не поддерживает 500GB" },
+        { "id": "d", "text": "Они идентичны, выбор стиль" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt revolutionizes state management для large stateful jobs. Cost analysis: RocksDB requires 500GB local SSD per TM × 8 TMs = 4TB SSD provisioning ($high per month). Recovery: traditional RocksDB downloads full state from S3 на restart — minutes-hours для 500GB. ForSt: state primary на S3 (cheap storage), local cache only ~50-100GB SSD per TM, recovery metadata-only ~30s. Capstone RTO 5 min — невозможно с traditional RocksDB на 500GB state. ForSt — это enabler для cloud-native production.",
+      "studyHint": "Повторите урок 02 — раздел 'State design'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m18-02-q3",
+      "type": "multiple-choice",
+      "question": "Capstone storage choice: Paimon как primary, Iceberg как mirror для critical tables. Почему не just Paimon или just Iceberg?",
+      "options": [
+        { "id": "a", "text": "Random choice" },
+        { "id": "b", "text": "Paimon primary — native streaming reads/writes, better для CDC pipeline, native upsert через PK + bucket. Iceberg mirror — broader ecosystem compatibility (Trino, Snowflake, BigQuery read Iceberg widely; Paimon adoption growing но smaller). Best of both: streaming через Paimon, analytics через Iceberg" },
+        { "id": "c", "text": "Они работают идентично" },
+        { "id": "d", "text": "Paimon просто новее" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Pragmatic dual-storage choice. Paimon: streaming-first design, native changelog producer, in-Flink compaction, better fit для CDC + real-time analytics. Iceberg: industry standard, broader compute ecosystem (Snowflake/BigQuery/Trino native), V2 spec supports upsert. Trade-off: dual writes = 2x storage cost для mirrored tables, но critical-only mirror reduces overhead. Stream writes through Paimon (fast, EOS), bigger analytics queries через Iceberg-compatible compute. Это not 'overengineering' — это recognizing different consumer profiles.",
+      "studyHint": "Повторите урок 02 — раздел 'Technology choices'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m18-02-q4",
+      "type": "true-false",
+      "question": "Single Flink job для всего pipeline (CDC + stateful + sinks) — это automatic anti-pattern, должно быть несколько jobs для isolation.",
+      "correctAnswer": false,
+      "explanation": "Это conscious design choice с trade-offs. Single job pros: easier ops (one deployment, one savepoint), simpler observability, shared resources, atomic state semantics. Cons: bug в one operator может kill entire job, single failure domain. Multiple jobs pros: isolation, independent scaling, fault domains. Cons: more deployments, savepoint coordination, cost of multiple JobManagers. For capstone (single team, manageable complexity) — single job with extensive testing + savepoint backup + blue/green strategy works. For multi-team scenarios или massive parallelism — multiple jobs lучше. Не automatic anti-pattern.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,422 @@
+---
+title: "Rollback strategy: savepoint retention и quarterly drill"
+order: 8
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Rollback", "Savepoint Retention", "Disaster Recovery", "Operational Discipline", "Quarterly Drill"]
+---
+
+# Rollback strategy
+
+Rollback — это не theoretical concept, а **mandatory operational capability** для production Flink. Каждый upgrade может пойти не так: code bug, schema incompatibility, resource regression, network issue. Без proven rollback procedure team в panic mode при incident, downtime stretches, business impact grows. В этом уроке: foundation rollback (retained savepoint), типичные rollback scenarios, automation, и critical practice — **quarterly drill** для verification procedure всё ещё works.
+
+---
+
+## Foundation: kept savepoint before upgrade
+
+Rule #1: **каждый upgrade должен сохранять savepoint от pre-upgrade state**. Это foundation rollback.
+
+```yaml
+# В FlinkDeployment
+spec:
+  job:
+    upgradeMode: savepoint              # always
+  flinkConfiguration:
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    state.savepoints.dir: s3://flink-prod/savepoints/fraud-detector
+```
+
+При operator-driven upgrade workflow:
+
+```text
+1. Operator triggers savepoint на blue (current version) → SP_PRE_UPGRADE
+2. SP_PRE_UPGRADE сохраняется в s3://flink-prod/savepoints/fraud-detector/
+3. Cancel blue, deploy green с SP_PRE_UPGRADE restore
+4. Green starts с EXACT state как blue имел
+5. SP_PRE_UPGRADE retained — это rollback artifact
+```
+
+Если green разваливается → restore from SP_PRE_UPGRADE → back to blue state.
+
+---
+
+## Rollback workflow
+
+### Scenario: post-deploy degradation
+
+```text
+0:00 — Deploy green (v1.43) via Operator. SP_PRE_UPGRADE created.
+0:15 — Green RUNNING. Initial metrics ОК.
+0:30 — Checkpoint failures rising. RocksDB exceptions в logs.
+0:45 — Alert fires: error rate > threshold.
+1:00 — Decision: rollback.
+```
+
+Rollback command (Operator-managed):
+
+```bash
+# Get latest pre-upgrade savepoint
+SP_PRE=$(kubectl get flinkdeployment fraud-detector \
+  -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}')
+
+# Rollback к previous image + pre-upgrade savepoint
+kubectl patch flinkdeployment fraud-detector --type merge -p "{
+  \"spec\": {
+    \"image\": \"registry.example.com/fraud-detector:1.42.0\",
+    \"job\": {
+      \"initialSavepointPath\": \"$SP_PRE\"
+    }
+  }
+}"
+
+# Operator workflow:
+# 1. Cancel green
+# 2. Update JM Deployment с image v1.42.0
+# 3. Submit job с initialSavepointPath = SP_PRE
+# 4. Job RUNNING на v1.42.0 с state from SP_PRE
+```
+
+```text
+1:00 — Rollback initiated.
+1:10 — Cancel green complete.
+1:12 — JM Deployment updated к v1.42.0.
+1:15 — Job RUNNING на v1.42.0.
+1:20 — Checkpoint success 100%, error rate normal.
+1:25 — Incident closed. Total downtime ~25 минут.
+```
+
+Без proper savepoint retention → этот workflow невозможен.
+
+---
+
+## Retention policy
+
+Savepoints retention — это **insurance policy**. Слишком short — нет rollback при late-detected issues. Слишком long — S3 costs growing.
+
+### Tiered retention strategy
+
+```yaml
+spec:
+  job:
+    autoSavepointSeconds: 3600          # savepoint каждый час
+    savepointHistory:
+      maxCount: 24                      # keep last 24 (24h)
+      maxAgeHours: 168                  # keep максимум 7 дней
+```
+
+Плюс manual retention для upgrades:
+
+```text
+Tier 1 — Hourly automatic
+  - Operator's autoSavepointSeconds: 3600
+  - Retention: 7 days (operator's maxAgeHours)
+  - Purpose: regular operational snapshots
+
+Tier 2 — Pre-upgrade savepoints
+  - Created automatically при image change
+  - Retention: 30 days (S3 tag + lifecycle policy)
+  - Purpose: emergency rollback within month
+
+Tier 3 — Weekly checkpoints (manual)
+  - Created Sundays via cron
+  - Retention: 90 days
+  - Purpose: longer-term rollback, audit
+
+Tier 4 — Monthly archive
+  - First Sunday of month
+  - Retention: 1 year
+  - Storage class: GLACIER (cheaper)
+  - Purpose: compliance, deep history
+
+Tier 5 — Annual archive
+  - January 1st
+  - Retention: forever
+  - GLACIER DEEP ARCHIVE
+  - Purpose: long-term compliance / audit
+```
+
+S3 lifecycle policy:
+
+```yaml
+Rules:
+  - Id: hourly-savepoint-retention
+    Filter:
+      Prefix: savepoints/fraud-detector/hourly/
+    Expiration: { Days: 7 }
+
+  - Id: upgrade-savepoint-retention
+    Filter:
+      And:
+        - Prefix: savepoints/fraud-detector/upgrades/
+        - Tag: { Key: tier, Value: upgrade }
+    Expiration: { Days: 30 }
+
+  - Id: weekly-glacier
+    Filter:
+      Prefix: savepoints/fraud-detector/weekly/
+    Transitions:
+      - Days: 30
+        StorageClass: GLACIER
+    Expiration: { Days: 90 }
+```
+
+---
+
+## What is "good enough" rollback window
+
+Question: 7 days enough? 30 days?
+
+Depends на **issue detection lag**. Когда issues типично detected:
+
+| Detection scenario | Time post-deploy |
+|---|---|
+| Immediate crash | менее 5 минут |
+| Checkpoint failures | 5-30 минут |
+| Performance regression | 1-24 hours |
+| Memory leak | 24 hours - 7 days |
+| Subtle output bug | 1-30 days |
+| Compliance issue (audit) | 30-90 days |
+
+**Rule**: retention >= max detection time для типов issues you care about. Most teams settle on 30 days для upgrade savepoints — covers memory leaks, subtle behavior bugs.
+
+---
+
+## Forward compatibility traps
+
+Roll-back assumes **forward compatibility**: old code can read new state schema. Not always true.
+
+### Trap 1: state schema breaking change
+
+```text
+v1.42 state: UserState { userId, txCount }
+v1.43 state: UserState { userId, txCount, lastSeenAt }  // added new field
+
+After v1.43 runs 1 hour, state contains some entries с lastSeenAt populated.
+
+Rollback к v1.42:
+- v1.42 code doesn't know про lastSeenAt
+- POJO/Avro evolution may auto-handle (ignore unknown field)
+- BUT savepoint format может contain new schema version → v1.42 reader fails
+```
+
+**Solution**: rollback к **pre-upgrade savepoint**, не к state из v1.43. Pre-upgrade savepoint has old schema → v1.42 reads fine.
+
+```bash
+# CORRECT:
+kubectl patch flinkdeployment fraud-detector -p '{
+  "spec": {
+    "image": "v1.42",
+    "job": {
+      "initialSavepointPath": "<SP_PRE_UPGRADE>"   # old schema
+    }
+  }
+}'
+
+# WRONG (would fail):
+# Use checkpoint from v1.43 → v1.42 can't read new schema
+```
+
+### Trap 2: data forward time
+
+После v1.43 runs hour и rollback:
+
+```text
+Pre-upgrade savepoint: state как of t=0
+Rollback к v1.42 + pre-upgrade savepoint: state как of t=0
+Real time: t = +1 hour
+
+→ Kafka offsets в savepoint = от t=0
+→ v1.42 starts reading from offsets t=0
+→ REPROCESSES 1 hour of events с v1.42 code
+
+Implications:
+- Downstream consumers see DUPLICATE events (1 hour reprocessed)
+- Kafka exactly-once с new transactional ID prefix → conflicts с already-committed v1.43 transactions
+- Need transactional ID prefix bump
+```
+
+**Solution**:
+- **Exactly-once sinks**: bump `transactional.id.prefix` при rollback. Else 2PC ID collision.
+- **Idempotent sinks**: deduplication handled naturally.
+- **At-least-once sinks**: accept duplicates, downstream must handle.
+- **Decision tree**: rollback приемлем if downstream tolerant к replay. Иначе — fix forward, не rollback.
+
+---
+
+## Automated rollback considerations
+
+Pattern:
+
+```yaml
+# Prometheus alert
+- alert: FlinkJobUnhealthyAfterUpgrade
+  expr: |
+    (
+      flink_jobmanager_job_numRestarts > 3
+      AND
+      flink_jobmanager_job_uptime < 600
+    ) OR (
+      avg_over_time(flink_jobmanager_job_lastCheckpointDuration[5m]) > 300000
+      AND time() - flink_jobmanager_lastUpgrade < 3600
+    )
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Flink job degraded after recent upgrade — consider rollback"
+
+# Webhook к automation
+# Automation script:
+# 1. Check spec.image vs status.lastReconciledSpec.image (was upgrade?)
+# 2. Get SP_PRE_UPGRADE from status.jobStatus.savepointInfo
+# 3. kubectl patch к prior image + pre-upgrade savepoint
+```
+
+Cautions с automation:
+
+- **False positives** — temporary degradation может trigger rollback. Tune alert threshold.
+- **Cascading rollback** — automation rollbacks → rollback fails → manual intervention anyway.
+- **Approval gate** — для critical jobs require human approval before auto-rollback.
+- **Notification only по умолчанию** — alert fires, paged engineer decides rollback. Auto-rollback только для well-tested patterns.
+
+Mature production 2026 — **alert + paged engineer + 1-click rollback**. Fully automated rare.
+
+---
+
+## Quarterly drill
+
+**Critical practice**: untested rollback procedure = no rollback procedure. Quarterly drill verifies:
+
+```text
+Q1 drill (March):
+1. Pick recent FlinkDeployment в staging
+2. Simulate upgrade gone wrong:
+   - Deploy "bad" image (e.g., v1.42-broken intentional)
+   - Verify Prometheus alerts fire
+3. Execute rollback runbook step-by-step
+4. Time taken: target менее 30 минут
+5. Verify state correctness post-rollback
+6. Document gaps в runbook
+7. Update procedures
+
+Q2 drill (June):
+- Test rollback for backend migration (ForSt → RocksDB)
+- More complex: needs canonical savepoint from prior migration
+- Verify retention policy retained needed savepoint
+
+Q3 drill (September):
+- Test rollback after 7 days of new version operation
+- Schema may have evolved subtly
+- Verify forward compatibility / data replay concerns
+
+Q4 drill (December):
+- End-of-year holistic — full DR + rollback combination
+- Region failure scenario + rollback simultaneously
+- Most comprehensive
+```
+
+Drill artifacts:
+- Updated runbook
+- Timing metrics (target RTO actual)
+- Identified gaps + fix tickets
+- On-call training (junior engineers practice)
+
+Without drill, rollback procedure decays — S3 paths changed, IAM rotated, runbook stale.
+
+---
+
+## Code-level rollback considerations
+
+### UID stability
+
+Rollback assumes UIDs stable между v1.42 ↔ v1.43. Если v1.43 changed UIDs (e.g., refactoring), rollback к v1.42 fails — different UIDs.
+
+**Discipline**: only change UIDs deliberately (with state migration plan). Code review checks.
+
+### Config compatibility
+
+v1.42 expects config `feature.flag.enabled: false`. v1.43 added new config `new.feature.enabled: true`. Rollback к v1.42:
+
+- v1.42 ignores `new.feature.enabled` — OK
+- But other configs from v1.43 deployment time may be incompatible
+
+**Test rollback в staging — full FlinkDeployment reverted, not just image**.
+
+### Dependency compatibility
+
+v1.43 deployed с new Kafka library version. Rollback к v1.42 with old Kafka — may have different Kafka client behavior. Test in staging.
+
+---
+
+## Production gotchas
+
+- **Savepoint not retained** — operator config забыли retain → no rollback possible. Always RETAIN_ON_CANCELLATION + savepointHistory.
+- **Savepoint deleted by lifecycle policy** — too aggressive retention → savepoint gone когда needed. Tier with longer retention для upgrade artifacts.
+- **Wrong savepoint chosen для rollback** — pick post-upgrade checkpoint instead of pre-upgrade savepoint → can fail с schema mismatch. Document procedure clearly.
+- **Transactional ID conflicts** — rollback replays Kafka events, EOS sink fails с duplicate transactional IDs. Bump prefix at rollback.
+- **HA storage path conflicts** — rolled-back cluster reuses HA path corrupted by failed v1.43 → restore fails. May need cleanup HA storage manually.
+- **Operator не replays** — old image tag may have been deleted from registry (если retention policy агрессивная). Pin specific tags.
+- **Drill not performed** — procedure stale, real incident first time = chaos. Quarterly drill non-negotiable.
+- **Multiple jobs depend on each other** — rolling back one без others = output inconsistency. Coordinate rollbacks для chained jobs.
+
+<Callout type="warning">
+**Most expensive mistake**: deploying breaking change Friday evening, fewer engineers available weekend, no recent rollback drill. Real incidents amplify when ops infrastructure unrehearsed. Schedule risky deploys early in week, ensure on-call coverage, verify retention covers Friday-to-Monday detection window.
+</Callout>
+
+<Callout type="tip">
+**Production rule 2026 для rollback**:
+1. Retention >= max detection time для типов issues you care about (default 30 days для upgrades)
+2. Pre-upgrade savepoint automatically created by operator (upgradeMode: savepoint)
+3. Tier retention: hourly (7d), upgrades (30d), weekly (90d), monthly archive (1y)
+4. Quarterly drill verifies procedure works
+5. Runbook documented в git, code-reviewed, on-call trained
+6. Rollback runbook accessible from PagerDuty alert
+7. Transactional ID prefix bumped при EOS rollback to avoid 2PC conflicts
+</Callout>
+
+---
+
+## Production runbook template
+
+```text
+# Flink Job Rollback Runbook
+Last updated: 2026-05-12
+Last quarterly drill: 2026-03-15
+
+## When to use this runbook
+- Recent deploy (within retention window) showing degradation
+- Decision criteria: severity > P2, root cause not quick-fix
+
+## Pre-rollback checks
+1. Verify recent deployment exists: `kubectl get flinkdeployment fraud-detector -o yaml | grep image`
+2. Get pre-upgrade savepoint: `kubectl get flinkdeployment fraud-detector -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}'`
+3. Verify savepoint accessible: `aws s3 ls <savepoint-path>/`
+4. Check forward compatibility implications: review schema changes между versions
+
+## Rollback execution
+1. Notify stakeholders: post to #flink-incidents
+2. Bump transactional ID prefix если EOS sink used
+3. Execute patch:
+   kubectl patch flinkdeployment fraud-detector ...
+4. Monitor: kubectl logs <jm-pod> -f
+5. Wait for RUNNING state
+6. Verify checkpoint success first 5 минут
+7. Verify metrics return к baseline
+
+## Post-rollback
+1. Document incident in tickets/wiki
+2. Schedule post-mortem within 48h
+3. Identify gaps in pre-deploy testing
+4. Update runbook if needed
+
+## Contacts
+- On-call: PagerDuty rotation flink-prod
+- Escalation: streaming-team-lead
+```
+
+---
+
+<KnowledgeCheck
+  question="Production team deploys v1.43 Friday 16:00 (Saturday Sunday — holiday). Monday 09:00 obrобнаружили: subtle bug в fraud detection — false positive rate growing slowly weekend. Decision — rollback. Какие challenges и как address?"
+  answer="Многоуровневый incident. Challenges: (1) Pre-upgrade savepoint от Friday 15:00 — 65 hours old. Default retention 7 days в operator's savepointHistory = OK. Tiered upgrade savepoint retention 30 дней = OK. Если retention был 24h — savepoint deleted, rollback невозможен. (2) **Data forward time**: между Friday 16:00 и Monday 09:00 — 65 hours new events processed. Rollback к v1.42 + Friday savepoint = REPROCESS 65 hours events с v1.42 code. Implications: (a) downstream consumers see DUPLICATE alerts (65h replay), if EOS sink — transactional ID bump required else 2PC conflicts; (b) downstream systems may have already acted on false positive alerts — undoing actions complex; (c) Kafka log retention — if some original events expired from Kafka topic, rollback can't reconstitute state from those (gap in replay). (3) **Forward compatibility** — v1.42 reads Friday savepoint (same schema) — OK. (4) **Subtle bug detection lag** — false positives grew slow weekend, alerts may not fire until Monday. Lessons: detection thresholds should catch slow regressions earlier. Approach: (1) Convene incident response Monday 09:30 — stakeholders, decision на rollback vs forward fix. (2) If rollback: bump transactional ID prefix (e.g., 'fraud-detector-tx-v2'), patch к v1.42 + Friday savepoint. (3) Downstream coordination: notify ops teams that alerts from 65h period are being replayed — may issue new versions of alerts or duplicate. (4) Communicate к business: weekend alerts may include false positives, action items may need re-evaluation. (5) Forward fix alternative: hotfix v1.43.1 fixing bug, deploy via blue/green forward — less data replay, more risk. Better choice depends on bug severity. (6) Post-mortem actions: improve canary detection (5% traffic в Monday morning instead of full Friday push), schedule risky deploys early weekday, deploy windowing config, alert thresholds tuning."
+/>

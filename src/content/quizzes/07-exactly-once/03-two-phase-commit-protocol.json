@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "07-exactly-once/03-two-phase-commit-protocol",
+  "moduleId": "07-exactly-once",
+  "_meta": {
+    "idPrefix": "flink-m07-03",
+    "description": "Quiz for Two-Phase Commit protocol lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m07-03-q1",
+      "type": "multiple-choice",
+      "question": "Опишите две фазы 2PC в Flink контексте — что происходит в каждой?",
+      "options": [
+        { "id": "a", "text": "Phase 1: write locally, Phase 2: replicate to followers" },
+        { "id": "b", "text": "Phase 1 (prepareCommit on barrier): flush данных в external system, txnId записан в Flink state, ack к JobManager. Phase 2 (commit on notifyCheckpointComplete): после того как все operators acked checkpoint(N), JM broadcasts notify, Committer.commit() финализирует pending transactions. Между ними данные exist но НЕ visible downstream" },
+        { "id": "c", "text": "Phase 1: vote, Phase 2: commit if all voted YES" },
+        { "id": "d", "text": "Phase 1: query, Phase 2: update — classic database 2PC" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink 2PC адаптация classic distributed 2PC для streaming контекста. **Phase 1 (Prepare)**: barrier(N) arrives at sink → prepareCommit() flushes external transaction (records записаны в Kafka/file/DB), но НЕ commit. txnId saved в Flink operator state. Sink acks barrier к JobManager. **Phase 2 (Commit)**: JobManager собирает acks от ВСЕХ operators, marks checkpoint(N) completed в CompletedCheckpointStore, broadcast notifyCheckpointComplete(N). Sink в этом callback вызывает Committer.commit(txnId) — финализирует pending transaction. Атомарно makes data visible. Отличие от classic 2PC: нет 'vote NO' opportunity в prepareCommit — flush либо succeeds, либо exception throws и checkpoint aborts. Между phases — data в pending state, invisible downstream (для Kafka consumer в read_committed mode).",
+      "studyHint": "Повторите урок — секция 'Фазы протокола'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m07-03-q2",
+      "type": "multiple-choice",
+      "question": "Crash scenario: sink completed prepareCommit(N), JobManager broadcast notifyCheckpointComplete(N), но TaskManager crashed ДО вызова commit(txnId). Что происходит на recovery?",
+      "options": [
+        { "id": "a", "text": "Data loss — commit не выполнен" },
+        { "id": "b", "text": "Checkpoint(N) marked completed (notifyCheckpointComplete already broadcasted). Restart from checkpoint(N). State содержит pendingCommittables(N). Flink вызывает Committer.commit() для pending — это recoverAndCommit behavior. External system либо finalize prepared txn, либо возвращает 'already committed' (idempotent). EOS preserved" },
+        { "id": "c", "text": "Дубликаты — sink replay делает повторный commit" },
+        { "id": "d", "text": "Job fails permanently" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Это canonical recovery scenario C. Checkpoint(N) is committed semantically — JM saved completed marker в CompletedCheckpointStore до broadcast. Restart from checkpoint(N) (not N-1) — state включает pendingCommittables saved в prepareCommit. Committer.commit() для recovery — это same code path что normal commit, но для already-prepared transactions. External system gets commitTransaction(txnId) — для Kafka это idempotent: если prior attempt finalized, returns success; если prepared but not committed, finalize; если timed out and aborted, fails. Latter case — почему transaction.timeout.ms критичен. Если recovery занял < timeout — prepared txn still alive, commit succeeds → EOS preserved. Если recovery > timeout — broker auto-aborted prepared → commit fails → data loss. Source replay с saved offsets обеспечивает что новые records (после checkpoint N) обрабатываются заново через next transaction.",
+      "studyHint": "Повторите урок — Crash scenario C",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-03-q3",
+      "type": "multiple-choice",
+      "question": "Чем Flink 2PC отличается от classic distributed 2PC (XA)?",
+      "options": [
+        { "id": "a", "text": "Никак — same protocol" },
+        { "id": "b", "text": "Classic 2PC: coordinator → participants vote YES/NO, commit if all YES; blocking on coordinator crash. Flink 2PC: НЕТ vote phase (flush либо succeeds либо exception → checkpoint aborts); coordinator (JobManager) HA через ZK/K8s; failure resolution automatic через checkpoint replay (не manual); 'transactions' = checkpoint cycles (~10s-1min) vs per-request в XA" },
+        { "id": "c", "text": "Flink 2PC проще — нет phases" },
+        { "id": "d", "text": "Flink не использует prepared state" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Flink упрощает classic 2PC для streaming контекста. **Vote phase eliminated**: prepareCommit не возвращает YES/NO — flush либо succeeds (continue), либо throws exception (checkpoint aborts, retry). Это reasonable simplification для streaming: либо все operators могут flush, либо нет — нет смысла partial votes. **Coordinator HA**: JobManager (coordinator) уязвим к single-point-failure, но Flink runs JM в HA mode через ZooKeeper или K8s ConfigMap. Если JM crashes — standby takes over, читает CompletedCheckpointStore, продолжает coordination. **Automatic recovery**: classic 2PC после coordinator crash требует manual transaction recovery (DBA work). Flink — automatic через checkpoint replay, no manual intervention. **Granularity**: XA — per-request transaction (latency-sensitive operations). Flink — per-checkpoint (cycle 10s-60s), batching many records per txn. Trade-off: больше latency (commit lag), но better throughput.",
+      "studyHint": "Повторите урок — секция 'Сравнение с классическим distributed 2PC'",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m07-03-q4",
+      "type": "true-false",
+      "question": "Committer должен быть идемпотентным — повторный commit(txnId) для already-committed transaction должен treated как success.",
+      "correctAnswer": true,
+      "explanation": "True. Это критическое требование для recovery correctness. Scenario: после notifyCheckpointComplete sink crashes, restart, recovery state восстанавливает pendingCommittables, Committer.commit() called для каждого. Но prior attempt мог уже частично commit (e.g., crash после Kafka commit succeeded но Flink не получил ack). На повторный commit Kafka возвращает либо success (idempotent), либо TransactionNotFoundException (already committed, transaction state purged). Если Committer treats either как success → EOS preserved. Если throws на 'not found' → job fails repeatedly до manual intervention. Implementation pattern: try-catch для known idempotent exceptions, call CommitRequest.signalAlreadyCommitted() (SinkV2 API). Kafka API specifically idempotent на повторные commits same transactional.id+producer.id+epoch. JDBC XA — idempotent через `XAResource.commit(xid, false)` для known prepared xids. Custom sinks — implementer must ensure idempotency.",
+      "bloomLevel": "applied"
+    }
+  ]
+}

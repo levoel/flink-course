@@ -1,0 +1,66 @@
+{
+  "lessonSlug": "08-table-sql/07-ai-functions",
+  "moduleId": "08-table-sql",
+  "_meta": {
+    "idPrefix": "flink-m08-07",
+    "description": "Quiz for AI functions (ML_PREDICT, VECTOR_SEARCH) lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m08-07-q1",
+      "type": "multiple-choice",
+      "question": "ML_PREDICT (FLIP-526, Flink 2.2): какие providers и performance characteristics?",
+      "options": [
+        { "id": "a", "text": "Только OpenAI" },
+        { "id": "b", "text": "Providers: (1) OpenAI — chat completions, embeddings; (2) Anthropic Claude — same API style; (3) Custom HTTP с request/response templating + JSONPath extraction; (4) Embedded ONNX/TensorFlow — model в TM memory, no network. Performance: LLM ~1-5s/inference (20-50/sec per worker), custom local ONNX ~10-100ms (100-1000/sec), embedded batched ~10K/sec. Built-in batching, rate limiting, caching, retries"
+        },
+        { "id": "c", "text": "Только embedded models" },
+        { "id": "d", "text": "JDBC только" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ML_PREDICT (FLIP-526) — comprehensive ML inference framework. **Provider catalog**: **(1) OpenAI** — most common. Chat completions, embeddings, moderation. `'provider' = 'openai'`, `'model' = 'gpt-4o'`. Configuration через `api_key`, `system_prompt`, `temperature`. **(2) Anthropic Claude** — `'provider' = 'anthropic'`, similar API style. **(3) Custom HTTP** — for self-hosted models, internal ML services. `'request.format'` templating, `'response.path.field'` JSONPath. Flexible — any REST API. **(4) Embedded ONNX/TensorFlow** — `'provider' = 'onnx'`, `'model.path' = '/opt/models/cls.onnx'`. Model loaded в TaskManager memory, inference local. Highest throughput. **(5) TensorFlow Serving** — separate connector для TF Serving gRPC. **Performance characteristics**: depend on provider. **LLM (OpenAI GPT-4)**: 1-5 second latency per request, throughput ~20-50/sec per worker. Bound by API rate limits и network latency. **Custom HTTP к internal service**: ~10-100ms latency, ~100-1000/sec. Throughput linearly scales с parallelism + external service capacity. **Embedded ONNX**: ~1-10ms per single inference, ~10K/sec batched (32-64 batch size). No network — limited by CPU/GPU. **Built-in features**: (a) **Async I/O underneath** — non-blocking parallel calls; (b) **Batching**: `'batch.size'` — group N inputs per provider call (especially LLM); (c) **Rate limiting**: `'rate.limit.rpm'` matches API quotas, avoids 429; (d) **Caching**: `'cache.enabled' = 'true'` + max-rows + expire — LRU cache repetitive inputs. Hit rate 30-90% depending on workload; (e) **Retries**: `'retry.max'` with exponential backoff; (f) **Timeout**: `'timeout.ms'` per request. **Latency-throughput trade-off**: larger batch = higher throughput but higher per-request latency. Tune based on SLA.",
+      "studyHint": "Повторите урок — секция 'Providers'",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m08-07-q2",
+      "type": "multiple-choice",
+      "question": "Design RAG (Retrieval-Augmented Generation) pipeline: user queries → embed → semantic search → return top-K similar items. Какие Flink AI functions использовать в одном SQL query?",
+      "options": [
+        { "id": "a", "text": "Только ML_PREDICT" },
+        { "id": "b", "text": "Combine ML_PREDICT (для embedding inference) + VECTOR_SEARCH (для similarity lookup) в одном SQL: SELECT q.session_id, q.user_query, similar.* FROM user_queries q, LATERAL TABLE(VECTOR_SEARCH(TABLE products, 'embedding', ML_PREDICT('embedder', q.user_query).embedding, 5, 'cosine')) AS similar. ML_PREDICT generates query embedding inline, VECTOR_SEARCH finds top-5 similar items по cosine distance. Все в streaming SQL — real-time RAG"
+        },
+        { "id": "c", "text": "Невозможно в SQL" },
+        { "id": "d", "text": "Только batch processing" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "**Composable AI functions** — flagship example Flink 2.2 capabilities. **Architecture**: (1) **Index products с pre-computed embeddings**: ```sql CREATE TABLE products (product_id STRING, name STRING, embedding ARRAY<FLOAT>, PRIMARY KEY (product_id) NOT ENFORCED) WITH ('connector' = 'paimon', 'vector.column' = 'embedding', 'vector.index.type' = 'hnsw', 'vector.index.metric' = 'cosine', 'vector.index.dim' = '1536'); ``` Paimon HNSW index built once, queried streaming. **(2) Define embedder model**: ```sql CREATE MODEL embedder INPUT (text STRING) OUTPUT (embedding ARRAY<FLOAT>) WITH ('provider' = 'openai', 'task' = 'embedding', 'model' = 'text-embedding-3-large', 'cache.enabled' = 'true'); ``` **(3) RAG query combining both**: ```sql SELECT q.session_id, q.user_query, similar.product_id, similar.name, similar.score FROM user_queries AS q, LATERAL TABLE(VECTOR_SEARCH(TABLE products, 'embedding', ML_PREDICT('embedder', q.user_query).embedding, 5, 'cosine')) AS similar(product_id, name, score); ``` **Execution flow**: для каждого user query (1) ML_PREDICT calls OpenAI embedding API (cached if repeated), returns ARRAY<FLOAT>; (2) VECTOR_SEARCH passes vector к Paimon HNSW index, returns top-5 cosine-similar products. (3) Result joined как additional columns to user_queries row. **All in streaming SQL** — every new user query gets real-time RAG results without custom code. **Materialized table wrap**: ```sql CREATE MATERIALIZED TABLE search_results FRESHNESS = INTERVAL '1' SECOND PRIMARY KEY (session_id, rank) NOT ENFORCED AS SELECT q.session_id, q.user_query, ROW_NUMBER() OVER (...) AS rank, similar.* FROM user_queries q, LATERAL TABLE(VECTOR_SEARCH(... ML_PREDICT('embedder', q.user_query).embedding ...)) AS similar; ``` Real-time search-as-you-type with declarative SQL. **Production patterns**: (a) cache embedder result aggressively — repeating queries cheap; (b) HNSW recall vs latency tunable via ef_search; (c) re-rank top-K с full attention model if precision matters (ML_PREDICT second stage); (d) hybrid retrieval (BM25 + vector) — combine traditional FULL-TEXT search с vector.",
+      "studyHint": "Повторите урок — секция 'Combine с ML_PREDICT для full RAG'",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m08-07-q3",
+      "type": "multiple-choice",
+      "question": "Production pipeline с ML_PREDICT (GPT-4) для 1M events/day. Cost calculation показывает $30K/day. Какие 4 optimization strategies?",
+      "options": [
+        { "id": "a", "text": "Просто accept cost" },
+        { "id": "b", "text": "(1) Pre-filter events с simple rules (regex/threshold) — only flagged go к LLM, 90% reduction. (2) Cache responses 'cache.enabled' = 'true' — repetitive inputs hit cache, 30-90% reduction. (3) Two-stage: cheap small model (DistilBERT ONNX) для confident cases, GPT only для uncertain — 10x cost reduction. (4) Sampling — predict 1 of 10 events, extrapolate. (5) Cheaper LLM tier — gpt-4o-mini ($0.15/1M tokens) vs gpt-4 — 25x cheaper"
+        },
+        { "id": "c", "text": "Только batch size" },
+        { "id": "d", "text": "Increase parallelism" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "$30K/day = $11M/year — unsustainable. Multi-pronged cost optimization standard pattern. **Strategy 1 — Pre-filter с rules**: Most events benign (90%+). Apply cheap deterministic filter before LLM. Examples: regex для obvious spam, amount threshold для transactions, language detection для multilingual content. ```sql SELECT ML_PREDICT('classifier', text) FROM events WHERE LENGTH(text) > 100 AND amount > 1000 AND NOT REGEXP_LIKE(text, '^(thanks|hello|bye)$'); ``` 90% reduction → $3K/day. **Strategy 2 — Aggressive caching**: `'cache.enabled' = 'true', 'cache.max-rows' = '100000', 'cache.expire-after-write' = '24h'`. Support tickets, fraud signals, content moderation — often repetitive. Hit rate 30-90% typical. Free for cache hits. 30% hit rate × $3K = $2.1K/day. **Strategy 3 — Two-stage cascade**: cheap small model first, LLM only для uncertain. (a) Fast ONNX DistilBERT classifier — ~$0 cost (CPU only); (b) LLM для low-confidence cases. ```sql SELECT CASE WHEN fast.confidence > 0.85 THEN fast.category ELSE llm.category END FROM events e, LATERAL TABLE(ML_PREDICT('fast_classifier', e.text)) fast, LATERAL TABLE(ML_PREDICT('llm', e.text)) llm WHERE fast.confidence > 0.85 OR llm.category IS NOT NULL; ``` 95% handled by fast model → only 5% LLM = $150/day. **Strategy 4 — Sampling**: для analytics use cases (not per-event criticality), predict 10% sample, extrapolate. 10x reduction. Caveat: not suitable где каждый event needs decision (fraud detection per transaction). **Strategy 5 — Model tier downgrade**: GPT-4 ($30/1M) → GPT-4o-mini ($0.15/1M) = 200x cheaper. Often sufficient quality для classification, summarization, simple reasoning. Self-hosted Mistral via custom HTTP — ~$0.001/1M если internal GPU pool. **Strategy 6 — Self-hosted LLM**: deploy Llama-3 на dedicated GPUs ($/hour predictable). Fixed cost, unlimited inferences. Cost-effective for >$10K/day external LLM bills. **Combined optimization**: Strategy 1 + 2 + 3 + 5 → $30K → $50-200/day. Sustainable. Production case studies show 100-1000x cost reductions через layered optimization.",
+      "studyHint": "Повторите урок — секция 'Production gotchas — Cost'",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m08-07-q4",
+      "type": "true-false",
+      "question": "ML_PREDICT с temperature=0 в LLM provider даёт fully deterministic результаты на replay (same input → same output).",
+      "correctAnswer": false,
+      "explanation": "False. Even с **temperature=0**, LLM responses NOT guaranteed deterministic. Sources of non-determinism: **(1) Floating-point non-associativity**: LLM compute uses GPU parallel operations. Order of additions matters для floating point — different GPU clock cycles может produce slightly different logits. Greedy sampling (argmax) usually selects same token, но edge cases где two top tokens differ by tiny margin → different choice. **(2) Provider-side updates**: OpenAI, Anthropic update models continuously. Same model name (e.g., 'gpt-4o') points to different weights over time. Strict reproducibility impossible without pinned snapshots. Some providers expose `'snapshot'` parameter для версионирование. **(3) Caching layer effects**: provider may use approximate caching internally — same query returns cached response even if model behavior shifted. Non-deterministic from user perspective. **(4) Tokenization**: subtle changes в tokenizer can change output (rare). **Mitigation strategies для near-deterministic behavior**: (a) **temperature=0** still recommended — removes random sampling, minimizes variance. (b) **seed parameter** в provider config (OpenAI supports `'seed'=42`) — pin random state. Not all providers support. (c) **Flink cache** `'cache.enabled' = 'true'` — first call cached, subsequent calls return cached value. **GUARANTEES deterministic** на replay для cached inputs. Production essential. (d) **Local embedded models** (ONNX, TensorFlow): fully deterministic if model file unchanged. No external dependencies, no GPU non-determinism (in CPU inference mode). For determinism-critical use cases — prefer embedded. **Implications**: (1) **Replay correctness**: Flink EOS guarantees exact internal state replay. But ML_PREDICT external calls may produce different outputs after recovery — sink might emit slightly different enrichment for same events. Accept this trade-off, или cache. (2) **Audit reproducibility**: financial/regulatory pipelines requiring exact reproduction need: cache + pinned model snapshot + temperature=0 + seed. (3) **A/B testing**: when comparing pipeline versions с same input, LLM variance complicates comparison — use cached responses или run в parallel for matched comparison.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

@@ -1,0 +1,356 @@
+---
+title: "Job submission lifecycle: от REST до running tasks"
+description: "Step-by-step: REST submit → Dispatcher → JobMaster → ResourceManager allocates slots → TaskManagers deploy tasks → barrier propagation. Тайминги."
+order: 7
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["Lifecycle", "Job Submission", "Deployment", "Tasks", "Timing"]
+---
+
+# Job submission lifecycle: от REST до running tasks
+
+Что происходит между моментом, когда вы вызываете `flink run my-app.jar`, и моментом, когда первая запись из Kafka обрабатывается в первом subtask-е? В этом уроке препарируем full lifecycle submission step-by-step, разберём тайминги каждого этапа и пойм, почему cold start streaming job обычно занимает 30-120 секунд.
+
+Этот урок интегрирует материал предыдущих: Dispatcher / RM / JM из урока 02, slots из 03, graph transformation из 04, deployment modes из 05, network channels из 06.
+
+---
+
+## Краткий обзор шагов
+
+<DiagramContainer title="Lifecycle от submit до running" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. Client compile main()"
+        tooltip="В Session mode: main() выполняется на клиенте. В Application mode: main() выполняется в JobManager. Compile → StreamGraph → JobGraph."
+      >
+        StreamGraph + JobGraph
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="REST upload" />
+    <FlowRow>
+      <DataBox
+        label="2. Dispatcher accepts"
+        tooltip="POST /jars/upload + POST /jars/{id}/run. Dispatcher сериализует JobGraph в HA storage (S3 + ZK/K8s pointer)."
+      >
+        Persist JobGraph
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="3. JobMaster created"
+        tooltip="Dispatcher запускает JobMaster для этой job. JobMaster инициализирует ExecutionGraph из JobGraph, поднимает CheckpointCoordinator, Scheduler, SlotPool."
+      >
+        ExecutionGraph initialization
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="4. Slot allocation"
+        tooltip="Scheduler запрашивает slots у ResourceManager. На K8s — может потребовать pod creation. На standalone — слоты из существующих TM-ов."
+      >
+        slots reserved
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="5. Task deployment"
+        tooltip="JobMaster посылает TaskDeploymentDescriptor каждому TaskManager-у через RPC. TaskManager запускает Task, восстанавливает state из checkpoint (если есть)."
+      >
+        TDD per subtask
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="6. Network setup + state restore"
+        tooltip="Tasks устанавливают input/output channels между собой. Если есть checkpoint — keyed state восстанавливается из DFS. Это самый длинный шаг для stateful jobs."
+      >
+        state restore + channels
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="7. RUNNING"
+        tooltip="Все subtasks RUNNING. Source начинает читать. Первая запись flow-ит через pipeline. Первый checkpoint триггерится через execution.checkpointing.interval."
+      >
+        первая запись pipe
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Шаг 1: Client compile main()
+
+В **Session mode** клиент (machine, где запущен `flink run`) выполняет `main()` метод jar-а:
+
+```java
+public class MyJob {
+    public static void main(String[] args) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // ... .map(), .keyBy(), .process()
+        env.execute("My Job");  // <- здесь происходит submission
+    }
+}
+```
+
+`env.execute()` собирает все вызовы в StreamGraph, оптимизирует chaining → JobGraph (см. урок 04). Затем `RestClusterClient` (внутри `flink run`) делает HTTP POST на Dispatcher с сериализованным JobGraph.
+
+В **Application mode** main() запускается **внутри** JobManager-а: client просто upload-ит jar и говорит «run main class». Тайминг compile добавляется к startup time JM-а.
+
+**Тайминг**: 1-5 сек для типичного pipeline (зависит от количества операторов и сложности type inference).
+
+---
+
+## Шаг 2: Dispatcher accepts submission
+
+Dispatcher принимает JobGraph через REST. Что он делает:
+
+1. **Validates JobGraph** — checks parallelism > 0, все vertex имеют слоты.
+2. **Persists JobGraph** — для HA recovery. JobGraph сериализуется в `high-availability.storageDir` (S3), pointer пишется в ZK/K8s ConfigMap.
+3. **Triggers JobMaster creation** — через `JobManagerRunnerFactory`.
+4. **Returns JobID** клиенту — UUID для tracking.
+
+```bash
+# Что видит client
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"entryClass":"com.example.MyJob"}' \
+  http://jobmanager:8081/jars/{jarid}/run
+# Response: {"jobid":"a1b2c3..."}
+```
+
+**Тайминг**: <1 сек.
+
+---
+
+## Шаг 3: JobMaster initialization
+
+JobMaster — отдельный сервис (Akka/Pekko actor с lifecycle). При старте:
+
+1. **Loads JobGraph** — десериализует из HA storage.
+2. **Restores from latest checkpoint/savepoint** — если job restart, читает `_metadata` файл checkpoint-а из DFS. Это даёт state pointers (per-task), которые потом отдадутся TM-ам.
+3. **Initializes ExecutionGraph** — JobGraph expand-ится в ExecutionGraph (см. урок 04). Создаются ExecutionVertex per parallelism.
+4. **Spins up subsystems** — CheckpointCoordinator, FailoverStrategy, Scheduler (Default или Adaptive), SlotPool.
+5. **Registers with ResourceManager** — JobMaster объявляет «я running, нужно N slots».
+
+**Тайминг**: 2-10 сек для типичного job. Зависит от размера ExecutionGraph (parallelism N означает N×M ExecutionVertex для N tasks с M vertices each).
+
+---
+
+## Шаг 4: Slot allocation
+
+Самый variable шаг. JobMaster через Scheduler говорит SlotPool: «нужно N slots для следующих ExecutionVertex-ов с такими slot sharing group и locality preferences».
+
+### В Application mode + K8s Native
+
+ResourceManager видит, что нет существующих TM-ов. Через `KubernetesResourceManager` создаёт pods:
+
+```
+JM → K8s API: create N TaskManager pods
+K8s → image pull (10-30s on cold node) → JVM startup (5-15s) → register
+TM → JM: "I'm ready, here are my slots"
+JM → SlotPool: slots available
+```
+
+**Тайминг**: 20-90 сек (image pull dominate). Для warm cache (image already on node) — 10-30 сек.
+
+### В Session mode
+
+ResourceManager уже имеет existing TM-ы и slots в pool. Allocation просто matching:
+
+```
+JM → SlotPool: nuжен slot для (vertex, sharing group "default")
+SlotPool → ResourceManager: дай свободный slot
+ResourceManager → JM: вот slot S5 на TaskManager TM3
+```
+
+**Тайминг**: <1 сек, если slots уже available.
+
+### Locality preferences
+
+При recovery from checkpoint Flink предпочитает «previous slot allocation» — same TM, where last running. Это позволяет **local recovery**: state уже в local RocksDB на этом TM, не нужно повторно скачивать из S3. Local recovery даёт 10-100x faster recovery для large state.
+
+```yaml
+state.backend.local-recovery: true
+process.taskmanager.working-dir: /var/flink-recovery
+```
+
+---
+
+## Шаг 5: Task deployment
+
+Когда slots выделены, JobMaster деплоит tasks. Для каждого ExecutionVertex создаётся **TaskDeploymentDescriptor (TDD)**:
+
+```
+TDD {
+  jobId, executionAttemptId, vertexId
+  serialized invokable (StreamTask class)
+  consumed partitions (input channel descriptors)
+  produced partitions (output channel descriptors)
+  serialized operator factory + chain
+  state handle (если restore from checkpoint)
+  slot resource profile
+}
+```
+
+TDD отправляется через RPC `TaskExecutorGateway.submitTask(TDD)` на конкретный TM.
+
+TaskManager при получении TDD:
+
+1. **Creates Task** — Java object с input/output gates.
+2. **Loads user code** — class loader из uploaded jar.
+3. **Instantiates StreamTask** — Flink runtime wrapper над user operator.
+4. **Returns to JM**: «task initialized, ready to start».
+
+**Тайминг**: 1-3 сек per TM (parallel for many slots).
+
+---
+
+## Шаг 6: Network setup и state restore
+
+Когда все tasks initialized, JobMaster шлёт `RunTask` сигнал. Каждый Task:
+
+1. **Устанавливает input channels** — connect к ResultPartition-ам upstream tasks через Netty. Credit announce.
+2. **Открывает output channels** — создаёт ResultPartition-ы для downstream.
+3. **State restore** — если есть state handle:
+   - Download SST файлов из DFS (S3) — это самый длинный шаг.
+   - Открывает RocksDB / ForSt instance на local disk.
+   - Bootstraps keyed state per assigned key groups (см. модуль 03).
+4. **Calls open() user method** — `RichFunction.open(parameters)`. Init connections, prepare buffers.
+
+**Тайминг state restore**: 5 сек (small state) — 30 мин (TB state, no local recovery). Главный bottleneck при recovery — DFS bandwidth. Incremental checkpoints помогают (download только delta), local recovery — drastically.
+
+---
+
+## Шаг 7: RUNNING
+
+Все subtasks RUNNING. Task threads начинают mailbox loop:
+
+```
+while (running) {
+  Mail mail = mailbox.poll();
+  if (mail != null) {
+    if (mail is barrier) checkpoint();
+    else if (mail is control) handleControl();
+    continue;
+  }
+  Buffer buf = inputGate.getNext();
+  if (buf != null) {
+    processElement(deserialize(buf));
+    continue;
+  }
+  parkNanos(1);  // backoff
+}
+```
+
+Source operators начинают reading from Kafka / source-а. Первая запись flow-ит через pipeline. JobMaster наблюдает status через heartbeats.
+
+CheckpointCoordinator триггерит первый checkpoint через `execution.checkpointing.interval`. Это часто момент, когда видны subtle issues — checkpoint fail если state restore был incomplete или DFS unavailable.
+
+---
+
+## Полная картина тайминга
+
+| Шаг | Application + K8s cold | Application + K8s warm | Session warm | Session cold |
+|---|---|---|---|---|
+| 1. Client compile | — | — | 1-5s | 1-5s |
+| 2. JM start | 30-90s (pod startup) | 10-20s | 0 (running) | 0 |
+| 3. JobMaster init | 2-10s | 2-10s | 2-10s | 2-10s |
+| 4. Slot allocation | 30-90s (TM pods) | 5-15s (warm) | <1s | 20-90s |
+| 5. Task deployment | 2-5s | 2-5s | 2-5s | 2-5s |
+| 6. State restore | 5s-30min | 5s-30min | 5s-30min | 5s-30min |
+| 7. RUNNING | — | — | — | — |
+| **Total** | **70s - 30min** | **20-60s + state** | **5-15s + state** | **25-100s + state** |
+
+Для small stateless jobs: 30-60 сек cold, 5-10 сек warm. Для large stateful (TBs RocksDB): start dominated by state restore (зависит от size and DFS).
+
+---
+
+## Optimizations для быстрого start
+
+### Pre-warm TaskManager pods
+
+```yaml
+# В Flink Kubernetes Operator
+spec:
+  taskManager:
+    replicas: 3   # 3 TM pod-а pre-warmed, ждут slots
+slotmanager.number-of-slots.min: 12   # minimum slots in cluster, всегда warm
+```
+
+При cold start TM-ы уже запущены — skip 30-90s pod startup.
+
+### Local recovery
+
+```yaml
+state.backend.local-recovery: true
+process.taskmanager.working-dir: /var/flink-recovery
+```
+
+При restart на same TM — read state из local disk, не из S3. 10-100x ускорение для large state.
+
+### Incremental checkpoints
+
+```yaml
+state.backend.incremental: true
+```
+
+Checkpoint содержит только delta — recovery читает less. Уже default для RocksDB / ForSt в 2.x.
+
+### Generic Log-Based Incremental Checkpoints (GIC)
+
+```yaml
+state.backend.changelog.enabled: true
+state.backend.changelog.dstl.dfs.base-path: s3://my-bucket/changelog
+```
+
+Async upload changelog в DFS. Checkpoint становится metadata-only (см. модуль 06).
+
+### ForSt с disaggregated state
+
+```yaml
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://my-bucket/forst-state
+```
+
+Primary state на S3. Recovery — открытие LSM на S3, без download. 100-1000x faster для TB-state.
+
+---
+
+## Failure scenarios mid-lifecycle
+
+| Сценарий | Поведение |
+|---|---|
+| **JobMaster fails between шагом 3-4** | HA recovery: standby JM поднимается, читает JobGraph + checkpoint, retry from шаг 3. |
+| **TaskManager fails в шаге 5** | Slot allocation возвращается, ResourceManager создаёт новый TM (K8s) или job FAILED (Standalone). |
+| **State restore fail (шаг 6)** | Task FAILED. Failover strategy restart-ит pipelined region. Если переupload fail снова — job FAILED. |
+| **Network channel setup fail** | Task FAILED, restart region. |
+| **First checkpoint fail** | Logged, не fatal. Следующий checkpoint попробует снова. После N consecutive failures (`execution.checkpointing.tolerable-failed-checkpoints`) job FAILED. |
+
+---
+
+## Production gotchas
+
+- **Cold start > SLA** — для critical streaming SLA включайте application mode с **warm TM pods** (slotmanager min) + **local recovery** + **incremental checkpoints**. Standby pods cost money, но 10-30s cold start vs 90s — производственно важно.
+- **State restore 30+ min** — переходите на ForSt или GIC. Local recovery работает только при same TM — после node failure не помогает.
+- **Slot allocation timeout** — `slot.request.timeout: 5min` default. При нехватке slots job FAILED. На K8s проверяйте, что node pool autoscaler успевает добавлять nodes.
+- **TM image pull dominate cold start** — pre-pulled image (DaemonSet image puller) сильно ускоряет.
+- **JobMaster init 30s+** — обычно слишком большой ExecutionGraph. Снижайте parallelism, или используйте Adaptive Scheduler.
+- **First record latency** — между «job RUNNING» и «first record at sink» может быть significant delay из-за watermark propagation (нужен `withIdleness` для idle partitions, иначе watermark не движется).
+
+<Callout type="tip">
+В production observability должна включать **per-stage timing metrics**: job-submitted-to-running latency, first-record-at-sink latency, checkpoint duration. Если эти растут — есть скрытая проблема (slot allocation, state size, network). Прометей метрики Flink: `jobmanager_job_uptime`, `jobmanager_job_lastCheckpointDuration`.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production Flink job в application mode на K8s падает каждые 4 часа из-за RocksDB compaction issue. State 200 GB. Recovery занимает 8 минут — нарушает SLA <2 минуты. Какие optimizations применить в order приоритета, и почему просто увеличить TM-ы не поможет?"
+  answer="Главный bottleneck — state restore (download 200 GB из S3). Приоритет optimizations: (1) **Local recovery**: `state.backend.local-recovery: true` + `process.taskmanager.working-dir: /var/flink-recovery` с persistent volume. При сбое JM/Task в **same TM** — read state из local disk, не из S3. Recovery ~30 сек вместо 8 минут. Но не помогает, если node умер. (2) **Incremental checkpoints** уже default в 2.x — verify enabled. Снижает per-checkpoint upload, но recovery всё равно download full state from baseline. (3) **Generic Log-Based Incremental Checkpoints (GIC)**: `state.backend.changelog.enabled: true`. Async upload changelog → checkpoint становится metadata-only. Recovery: replay changelog, который small. Reduces recovery до 2-3 минут. (4) **ForSt + disaggregated state**: state primary на S3, local — только cache. Recovery — открытие LSM на S3 (metadata-only operation, ~30 сек), data загружается на demand. Эта option для serious move к cloud-native. (5) **Решить root cause RocksDB compaction**: использовать `PredefinedOptions.FLASH_SSD_OPTIMIZED`, увеличить managed memory fraction, монитор stall_micros. (6) **Pre-warm TM pods**: уменьшит 30-60s pod startup. Почему просто **увеличить TM-ы не поможет**: state restore time зависит от **per-task state size + DFS bandwidth per task**, не от количества TM-ов. 200 GB state distributed по 8 TM = 25 GB per TM. Если у вас S3 throughput 100 MB/s per TM, это 250 сек = 4 мин просто на download. Увеличение до 16 TM даст по 12.5 GB per TM, восстановление в 125 сек. Линейно scale-ится только частично — но это требует full restart всех tasks вместо localized region failover. Real fix — реже скачивать (local recovery), или architecture change (GIC / ForSt). Просто scale up TMs — money waste без significant gain."
+/>

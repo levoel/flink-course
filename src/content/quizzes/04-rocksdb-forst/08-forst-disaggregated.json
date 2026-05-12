@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "04-rocksdb-forst/08-forst-disaggregated",
+  "moduleId": "04-rocksdb-forst",
+  "_meta": {
+    "idPrefix": "flink-m04-08",
+    "description": "Quiz for ForSt disaggregated state lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m04-08-q1",
+      "type": "multiple-choice",
+      "question": "Что такое ForSt (FLIP-427) и почему это важно для cloud-native Flink?",
+      "options": [
+        { "id": "a", "text": "Replacement Apache Kafka" },
+        { "id": "b", "text": "Disaggregated state backend (Flink 2.0). LSM-tree, но primary state на S3/HDFS/GCS, локальный диск только cache, async I/O. Recovery time INDEPENDENT of state size. Compute и storage decoupled — enables elastic scaling в cloud" },
+        { "id": "c", "text": "New compaction strategy" },
+        { "id": "d", "text": "Python integration layer" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt ('For Streaming') — flagship feature Flink 2.0 (март 2025). Disruptive: primary SST storage на distributed object storage (S3/HDFS/GCS), локальный NVMe только cache. Сравнимо со Snowflake decoupling compute от storage. Решает 3 fundamental problems с RocksDB на K8s: (1) local disk size не limits state; (2) recovery time independent of size (constant ~10 seconds vs 2+ hours для RocksDB при 1TB); (3) compute scales independently of storage. VLDB 2025 paper benchmarks показывают 75-120% RocksDB throughput при adequate cache. Async State API V2 MANDATORY для acceptable performance.",
+      "studyHint": "Повторите урок — Базовая идея ForSt",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m04-08-q2",
+      "type": "multiple-choice",
+      "question": "ForSt recovery time для 1TB state vs RocksDB?",
+      "options": [
+        { "id": "a", "text": "Same — оба downloading SST files" },
+        { "id": "b", "text": "RocksDB: 2.5 часа (download 1TB SST от S3). ForSt: ~12 секунд (read checkpoint metadata, open ForSt pointing к S3 SST files уже there). Cache warming async on-demand" },
+        { "id": "c", "text": "ForSt slower из-за S3 latency" },
+        { "id": "d", "text": "Зависит от network speed для обоих" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Constant-time recovery — killer feature ForSt. RocksDB recovery linear в state size: 1TB SST @ 1Gbps download = 2.5 часа. ForSt: SST files уже на S3 (primary storage), TaskManager reads только checkpoint metadata (~MB), opens ForSt instance pointing к existing S3 files → resume processing immediately. Initial reads have S3 latency (no cache), но job already running. Cache warms up over time на on-demand basis. VLDB 2025 benchmarks: 100GB recovery — RocksDB 14 min, ForSt 8 sec; 1TB — RocksDB 2.5h, ForSt 12 sec. Это enables true elastic scaling в cloud (no recovery penalty при pod migration).",
+      "studyHint": "Повторите урок — Recovery time analysis",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m04-08-q3",
+      "type": "multiple-choice",
+      "question": "Migration RocksDB → ForSt для production job, 800GB state. Какой план?",
+      "options": [
+        { "id": "a", "text": "Просто изменить state.backend.type в config, restart" },
+        { "id": "b", "text": "1. Verify Async State API V2 в job code; 2. Stop with CANONICAL savepoint (backend-portable format); 3. Update config (forst.primary-dir, cache.size, async-state: true); 4. Resume from canonical savepoint — ForSt rebuilds SST в S3 lazy on demand. 5. Validate recovery time, cache hit rate, throughput" },
+        { "id": "c", "text": "Невозможно — incompatible formats" },
+        { "id": "d", "text": "Только через full rebootstrap" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Proper migration через canonical savepoint. Steps: (1) Job code audit — все state.value()/update() заменить на asyncValue().thenAccept(). Это mandatory для ForSt, otherwise throws. (2) Stop с canonical format: flink stop --savepoint-format canonical — это backend-agnostic format (vs default native — backend-specific). (3) Update flink-conf: state.backend.type: forst, primary-dir: s3://bucket, local-dir: /tmp/cache, cache.size: 16gb (estimate working set), async-state: true (mandatory). (4) Resume: flink run -s canonical-savepoint — ForSt reads canonical, builds ForSt-native SSTs in S3 lazy. (5) Validation: recovery test (kill pod, <30s recovery), cache hit rate >85%, throughput ≥ baseline. One-way migration easier RocksDB → ForSt.",
+      "studyHint": "Повторите урок — Migration section",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m04-08-q4",
+      "type": "true-false",
+      "question": "ForSt без Async State API V2 будет работать с минимальной penalty (10-20% slower).",
+      "correctAnswer": false,
+      "explanation": "False. ForSt без Async API V2 = catastrophe. Math: S3 GET latency 50-100ms на cache miss. Sync state.value() blocks single-threaded mailbox thread subtask-а на эту latency. На 30% cache miss × 10k events/sec → 3000 misses/sec × 100ms = 300 секунд блокировки на каждую секунду wall clock — impossible. Throughput drops к ~200 events/sec (от 30k async). Practical: Flink throws exception при start если state.backend.execution.async-state не enabled с ForSt — это mandatory configuration. Apache benchmarks: ForSt+sync 200 events/sec, ForSt+async 30k events/sec — 150x разница. Это why FLIP-424/425 (async API) и FLIP-427 (ForSt) developed как single stack.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

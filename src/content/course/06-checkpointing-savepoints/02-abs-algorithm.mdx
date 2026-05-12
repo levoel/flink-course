@@ -1,0 +1,424 @@
+---
+title: "ABS Algorithm: Asynchronous Barrier Snapshotting walkthrough"
+description: "Полный walkthrough ABS — адаптация Chandy-Lamport для DAG. CheckpointCoordinator → barriers → alignment phase → snapshot → forward → sink ack. Sync vs async phase split."
+order: 2
+difficulty: "advanced"
+estimatedTime: 35
+topics: ["ABS", "Chandy-Lamport", "Checkpoint Barrier", "Alignment", "Snapshot", "CheckpointCoordinator"]
+---
+
+# ABS Algorithm: главный алгоритм Flink
+
+**Asynchronous Barrier Snapshotting (ABS)** — это сердце Flink's fault tolerance. Адаптация Chandy-Lamport algorithm (1985) для **DAG операторов**, ABS обеспечивает exactly-once семантику без блокирования обработки. Без ABS Flink был бы at-most-once stream processor, и вся state machinery (RocksDB, ForSt, key groups) была бы бесполезна.
+
+Этот урок — полный препарирование алгоритма: от CheckpointCoordinator на JobManager до final ack от sink, через alignment phase и async upload. После урока вы понимаете, почему checkpoint занимает миллисекунды а не минуты, и почему barrier alignment может быть проблемой под backpressure.
+
+---
+
+## Контекст: Chandy-Lamport и adaptation
+
+### Original Chandy-Lamport (1985)
+
+Distributed system из N processes, соединённых FIFO channels. Цель: записать **consistent global snapshot** без stopping the world.
+
+**Алгоритм**:
+1. Initiator выбирает процесс P, инжектит marker
+2. P записывает свой state, отправляет marker на все outgoing channels
+3. Process Q получает marker на channel C:
+   - Если первый marker для Q → записывает state, marks C empty, sends markers на все out channels
+   - Если не первый → записывает messages received on C with до этого момента
+4. Когда Q получил marker на все incoming channels → C state recorded
+5. Все Process state + all channel state = consistent snapshot
+
+### Adaptation для Flink DAG
+
+Flink — DAG операторов с **partitioned** channels (после shuffle). Адаптация:
+
+1. **Markers → Checkpoint Barriers** (специальные records в data stream)
+2. **States → Operator State + Keyed State** (per operator)
+3. **Channels → Network channels между subtasks**
+4. **Initiator → CheckpointCoordinator** (на JobManager)
+5. **Snapshot offload → DFS (S3, HDFS)** — не keeping в memory
+
+Главная инновация Flink — **async snapshot upload**: alignment + sync phase быстрая (миллисекунды), потом async DFS upload параллельно с processing.
+
+---
+
+## Большой walkthrough: full checkpoint cycle
+
+<DiagramContainer title="ABS Algorithm: end-to-end checkpoint flow" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="CheckpointCoordinator (JobManager)"
+        tooltip="Per-job singleton на JobMaster. Trigger checkpoint каждые execution.checkpointing.interval (default 0 = disabled). Maintains checkpoint metadata (epoch ID, pending barriers, acks). При triggerCheckpoint: assign ID, инжектит barrier во ВСЕ Source operators параллельно."
+      >
+        Trigger Checkpoint N
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="inject CheckpointBarrier(N) в каждый Source" />
+    <FlowRow>
+      <DataBox
+        label="Source operator (TaskManager)"
+        tooltip="Source получает barrier через triggerCheckpoint RPC. Snapshot source state (Kafka offsets через SourceReaderContext, или FileSource position). Forward barrier as special record вниз через output channels."
+      >
+        Source: snapshot offsets → emit barrier
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier flows как обычная запись" />
+    <FlowRow>
+      <DataBox
+        label="Stateless operator (map / filter)"
+        tooltip="Stateless operator получает barrier. Просто forward barrier downstream без snapshot (state нет). Это almost-no-op."
+      >
+        Forward barrier
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="barrier arrives на operator с 3 inputs" />
+    <FlowRow>
+      <DataBox
+        label="Stateful operator: alignment phase"
+        tooltip="Operator с 3 inputs. Получил barrier на canal A → блокирует A (буферизирует записи в InputBuffer). Продолжает читать B, C. Когда barrier на все 3 → alignment complete. Это блокирующая фаза для aligned checkpoints. Под backpressure может быть долго."
+      >
+        Block A, продолжать B, C
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="alignment complete → sync snapshot" />
+    <FlowRow>
+      <DataBox
+        label="Sync phase (sub-millisecond)"
+        tooltip="Создаётся immutable snapshot in-memory. RocksDB: native snapshot — hardlinks на immutable SST files (O(1) operation, no data copy). Heap state: copy-on-write через CopyOnWriteStateMap. Это синхронная фаза, blocking — но миллисекунды."
+      >
+        RocksDB native snapshot
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="forward barrier и async phase begins" />
+    <FlowRow>
+      <DataBox
+        label="Async phase + forward barrier"
+        tooltip="Forward barrier downstream немедленно (operator продолжает processing). В background AsyncSnapshotWriter uploads snapshot to DFS (S3/HDFS). Это async — не блокирует mainline processing."
+      >
+        Upload to DFS async + processing продолжается
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="all operators acked → checkpoint complete" />
+    <FlowRow>
+      <DataBox
+        label="Sink: snapshot + ack"
+        tooltip="Sink — terminal operator. После получения barrier на все inputs: snapshot state, ack to CheckpointCoordinator. Когда все operators acked, coordinator marks checkpoint complete, invokes notifyCheckpointComplete на всех operators (для 2PC sinks — commit Kafka transaction)."
+      >
+        Sink ack → coordinator
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Step-by-step deep dive
+
+### Step 1: Trigger от CheckpointCoordinator
+
+`CheckpointCoordinator` живёт в `JobMaster` (per-job singleton). Triggered by:
+- **Periodic timer** — каждые `execution.checkpointing.interval`
+- **Manual** — через REST API `POST /jobs/<id>/checkpoints`
+- **External event** — savepoint trigger
+
+```java
+// pseudocode
+public void triggerCheckpoint() {
+    long checkpointId = idCounter.incrementAndGet();
+    long timestamp = System.currentTimeMillis();
+
+    // 1. Reserve pending checkpoint
+    PendingCheckpoint pending = new PendingCheckpoint(checkpointId, allOperatorIds);
+    pendingCheckpoints.put(checkpointId, pending);
+
+    // 2. Inject barrier to all sources (parallel RPC)
+    for (ExecutionVertex source : sourceVertices) {
+        source.triggerCheckpoint(checkpointId, timestamp, CheckpointOptions.NORMAL);
+    }
+
+    // 3. Wait for acks (async) — see step 7
+}
+```
+
+Параллельная injection во все sources — критично для consistency. Если sources получают barrier в разное время, у них могут быть очень разные offsets, snapshot не consistent.
+
+### Step 2: Source receives barrier RPC
+
+Source operator имеет `triggerCheckpointAsync(checkpointId, timestamp)` метод (called via RPC):
+
+```java
+public void triggerCheckpointAsync(long checkpointId, long timestamp) {
+    // 1. Snapshot source state (Kafka offsets, file positions)
+    Map<TopicPartition, Long> offsets = sourceReader.snapshotState(checkpointId);
+
+    // 2. Emit checkpoint barrier через output (как обычная запись)
+    output.emitCheckpointBarrier(new CheckpointBarrier(checkpointId, timestamp));
+
+    // 3. Async: upload state to DFS, ack when done
+    asyncSnapshotWriter.submit(offsets, checkpointId);
+}
+```
+
+Barrier — это **special StreamElement**, emit'ится через normal output. Downstream operators видят его как часть data stream.
+
+### Step 3: Barrier propagation через chain
+
+Stateless operators (chained map/filter) при получении barrier просто forward:
+
+```java
+public void processBarrier(CheckpointBarrier barrier) {
+    output.emitBarrier(barrier);   // forward через chain
+}
+```
+
+Поскольку operator chained (один task, один thread), нет network shuffle — это almost instant.
+
+### Step 4: Stateful operator alignment
+
+Когда barrier приходит на operator с N input channels, начинается **alignment phase**:
+
+```java
+public void processBarrier(CheckpointBarrier barrier, int inputChannel) {
+    // 1. Mark canal как blocked
+    channelStates[inputChannel] = BLOCKED;
+    barriersReceived++;
+
+    // 2. Buffer записи на blocked channel
+    // (Это происходит автоматически в InputBuffer)
+
+    // 3. Если все channels blocked → alignment complete
+    if (barriersReceived == numInputChannels) {
+        triggerCheckpointSync(barrier);
+        unblockAllChannels();
+        barriersReceived = 0;
+    }
+}
+```
+
+**Что значит "blocked channel"**:
+- Operator продолжает читать data records с **не-blocked** channels
+- Records с blocked channels буферизируются в `InputBuffer` (per-channel)
+- Это **back-pressure** на upstream — если буфер заполняется, upstream останавливается
+
+**Под backpressure** alignment может затянуться: если на input A много данных (slow upstream B), то B барьер придёт через минуты после A → A буфер растёт → backpressure cascades upstream.
+
+### Step 5: Sync phase
+
+Когда alignment complete, начинается **synchronous snapshot phase**:
+
+```java
+public void triggerCheckpointSync(CheckpointBarrier barrier) {
+    // 1. Snapshot keyed state (per state primitive)
+    for (KeyedStateBackend backend : stateBackends) {
+        SnapshotResult snapshot = backend.snapshot(barrier.getId(), ...);
+        // RocksDB: native snapshot — hardlinks на immutable SST files
+        // Heap: CopyOnWriteStateMap — увеличивает version number
+    }
+
+    // 2. Snapshot operator state (non-keyed)
+    operatorStateBackend.snapshot(barrier.getId(), ...);
+
+    // 3. Forward barrier downstream
+    output.emitBarrier(barrier);
+
+    // 4. Schedule async upload
+    asyncSnapshotWriter.submit(snapshots);
+}
+```
+
+**Ключевая магия**:
+- **RocksDB native snapshot** — O(1) operation. SST files immutable (LSM property), Flink делает hardlinks через файловую систему. Никакого copy данных, никакого I/O.
+- **CopyOnWriteStateMap** для heap state — increment version, новые writes идут в new version, snapshot имеет old version.
+
+Sync phase обычно **< 100ms** даже для TB state. Это why Flink scalable.
+
+### Step 6: Async upload + forward barrier
+
+После sync phase — две вещи в parallel:
+
+1. **Mainline processing продолжается** — operator emit'ит forward barrier downstream, processes more records
+2. **Async writer** uploads snapshot к DFS
+
+```java
+// AsyncSnapshotWriter thread
+public void asyncUpload(SnapshotResult snapshot, long checkpointId) {
+    for (RawStateHandle handle : snapshot.handles()) {
+        // Upload bytes к S3/HDFS/GCS
+        CheckpointStorageLocation location = storage.upload(handle);
+    }
+
+    // Ack to coordinator
+    coordinator.acknowledgeCheckpoint(checkpointId, operatorId, location);
+}
+```
+
+Upload может занимать **минуты** для большого state. Но это **не блокирует** processing — это и есть «asynchronous» в ABS.
+
+### Step 7: Coordinator collects acks
+
+CheckpointCoordinator получает acks от всех operators:
+
+```java
+public void acknowledgeCheckpoint(long checkpointId, String operatorId, StateHandle state) {
+    PendingCheckpoint pending = pendingCheckpoints.get(checkpointId);
+    pending.ack(operatorId, state);
+
+    if (pending.allAcksReceived()) {
+        // 1. Persist checkpoint metadata to DFS
+        CompletedCheckpoint completed = pending.finalize();
+        checkpointStorage.persist(completed);
+
+        // 2. Mark as latest completed
+        latestCompletedCheckpoint = completed;
+
+        // 3. Notify all operators (для 2PC sinks)
+        for (ExecutionVertex vertex : allVertices) {
+            vertex.notifyCheckpointComplete(checkpointId);
+        }
+
+        // 4. Drop old checkpoints if retentionCount exceeded
+        cleanupOldCheckpoints();
+    }
+}
+```
+
+### Step 8: notifyCheckpointComplete
+
+После checkpoint complete coordinator вызывает `notifyCheckpointComplete(id)` на всех operators. Это critical для **transactional sinks**:
+
+```java
+// KafkaSink (упрощённо)
+public void notifyCheckpointComplete(long checkpointId) {
+    // Кommit Kafka transaction для этого checkpoint
+    // preCommit был на barrier, commit — здесь
+    pendingTransactions.get(checkpointId).commit();
+}
+```
+
+Это **Two-Phase Commit** — урок 03 модуля 07.
+
+---
+
+## State per operator: что сохраняется
+
+| Operator type | State |
+|---|---|
+| Source (Kafka) | Per-partition offsets |
+| Stateless (map, filter) | Нет |
+| Keyed (KeyedProcessFunction) | Keyed state (ValueState, MapState, ListState, ReducingState) |
+| Window | Per-window state (raw events или aggregates), trigger state, timer state |
+| Sink (transactional) | Pending transaction IDs |
+| Custom Operator state | non-keyed ListState через CheckpointedFunction |
+
+Все state объекты implement `StateSnapshotTransformer` — определяет как создавать immutable snapshot. RocksDB-based delegates к native snapshot, heap state — к CopyOnWriteStateMap.
+
+---
+
+## Sync vs Async phase: что и сколько
+
+| Phase | Duration | Blocks processing? |
+|---|---|---|
+| Alignment (aligned checkpoints) | 0ms — minutes (под backpressure) | Yes (blocked channels) |
+| Sync snapshot (RocksDB native, COW) | < 100ms (даже на TB state) | Yes (briefly) |
+| Async upload | Seconds — minutes | No |
+| Coordinator persist + ack notify | < 1s | No |
+
+Optimization: **alignment phase** — основной bottleneck. Решение: **unaligned checkpoints (FLIP-76)** — урок 03.
+
+---
+
+## Failure scenarios
+
+### Failure during alignment
+
+Operator dies до завершения alignment. На recovery:
+- CheckpointCoordinator detect через timeout (`execution.checkpointing.timeout`, default 10min)
+- Abort current checkpoint
+- Restart job from previous completed checkpoint
+- Source replay от saved offsets
+
+### Failure during async upload
+
+Operator died после sync, во время async upload к DFS:
+- Coordinator не получил ack
+- Eventually timeout → abort current checkpoint
+- Job restart from previous completed
+- Не corrupted state — incomplete upload просто discarded
+
+### Failure после notifyCheckpointComplete
+
+Checkpoint complete, но 2PC sink died перед commit:
+- На recovery sink reads pending transactions из state
+- recoverAndCommit() для каждой pending
+- Это **why** Kafka transaction.timeout.ms > checkpoint interval — иначе transaction expires, data loss
+
+---
+
+## Production gotchas
+
+### 1. Checkpoint duration > interval
+
+```
+execution.checkpointing.interval: 60s
+average checkpoint duration: 120s
+```
+
+Это означает: checkpoints overlap. По default `max-concurrent-checkpoints: 1` — следующий triggered только когда предыдущий done. Чpolza if you set concurrent > 1, можно нагрузить async upload bandwidth.
+
+**Fix**: increase interval, enable incremental + unaligned + GIC (уроки 03-05).
+
+### 2. Alignment ms = backpressure ms
+
+Web UI показывает `lastCheckpointDuration` decomposed: alignment time + sync time + async time. Если alignment > 1s — backpressure issue. Most важно метрики: `lastCheckpointAlignmentDuration`.
+
+Fix: enable unaligned checkpoints (`execution.checkpointing.unaligned: true`).
+
+### 3. Sync phase OOM (heap state)
+
+CopyOnWriteStateMap для heap state требует **shadow copy** старой версии. На TB heap state это means TB extra memory момент snapshot. OOM-Killer.
+
+**Fix**: switch на RocksDB (native snapshot — O(1), hardlinks, никакого extra memory) или ForSt (S3-based).
+
+### 4. Slow S3 — async timeout
+
+S3 PutObject throttling под high parallelism. Async upload может занять час → checkpoint timeout. Solutions: S3 prefix sharding (S3 limits per prefix), use file merging (FLIP-306), use GIC (DSTL — append-only log, less PUT requests).
+
+### 5. Checkpoint failures cascade
+
+Если checkpoint failed → restart from last completed. Если jobs flow много state changes между checkpoints, restart очень expensive (replay много данных через Kafka). Mitigations: smaller checkpoint interval, enable local recovery (`state.backend.local-recovery: true`).
+
+### 6. notifyCheckpointComplete не called после restart
+
+Сценарий: checkpoint N completed, до notifyCheckpointComplete sink died, restart. На recovery — Flink восстанавливает от N, но notifyCheckpointComplete уже не вызывается для N (новый checkpoint N+1 будет в будущем). Sink должен **в open()** проверить pending transactions из state и recoverAndCommit() для всех с epoch ≤ recovered checkpoint.
+
+### 7. Barrier alignment задерживает emit
+
+Operator не emit-ит records между alignment start и snapshot. Downstream видит «provoznoy» pattern: events flow → pause (alignment) → flow → pause → flow. Это OK normally, но для tight latency requirements может matter.
+
+### 8. CheckpointCoordinator overload
+
+На очень больших cluster (10K+ operators), coordinator может стать bottleneck — collecting acks, persisting metadata. Optimization: increase coordinator memory, reduce checkpoint interval, parallelize ack processing.
+
+---
+
+## Performance numbers (production)
+
+| Setup | Sync phase | Async phase | Total |
+|---|---|---|---|
+| 1GB state, RocksDB, NVMe → S3 | 5ms | 10s | 10s |
+| 100GB state, RocksDB, NVMe → S3 | 50ms | 5min | 5min |
+| 1TB state, RocksDB, NVMe → S3 | 200ms | 30min | 30min |
+| 1TB state, ForSt, S3 primary | 50ms (no upload!) | 1min | 1min |
+| 1TB state, GIC + DSTL | 100ms (DSTL flush) | seconds | seconds |
+
+Disaggregated state (ForSt) + GIC fundamentally меняет game — minutes → seconds для checkpoint duration на large state.
+
+---
+
+<KnowledgeCheck
+  question="Опишите полный ABS algorithm cycle от triggerCheckpoint до notifyCheckpointComplete. Какие phases blocking, какие async? Где RocksDB native snapshot спасает performance?"
+  answer="Full cycle: (1) CheckpointCoordinator (JobManager) trigger checkpoint каждые execution.checkpointing.interval — assigns checkpoint ID, RPC ко всем sources параллельно. (2) Source operators получают triggerCheckpointAsync(id) RPC, snapshot Kafka offsets через SourceReaderContext, emit CheckpointBarrier(id) через output. (3) Barrier flows как обычная запись через DAG. Stateless operators (map/filter) — просто forward (no state, no snapshot). (4) Stateful operator с N inputs — alignment phase: block channel A после получения barrier (буфер записи), продолжать читать B, C. Когда barrier на ВСЕХ N — alignment complete. Это BLOCKING phase, может быть долго под backpressure (затем unaligned checkpoints FLIP-76 как alternative). (5) Sync phase — миллисекунды, BLOCKING. RocksDB native snapshot — O(1) operation, hardlinks на immutable SST files (нет copy данных). Heap state — CopyOnWriteStateMap (increment version). Это где RocksDB native снимает game changing: даже на TB state sync phase < 100ms. (6) Forward barrier downstream немедленно — operator продолжает processing. Async phase: AsyncSnapshotWriter background thread uploads snapshot bytes к DFS (S3/HDFS). Это async, НЕ blocking. Может занимать seconds-minutes для large state. (7) Sink (terminal): получил barrier на все inputs → snapshot pending transaction IDs → ack to coordinator. (8) Coordinator collects acks. Когда all received: persist checkpoint metadata to DFS, mark as latestCompletedCheckpoint, call notifyCheckpointComplete(id) на всех operators. (9) notifyCheckpointComplete critical для 2PC sinks: KafkaSink commit transaction, JDBC sink commit, Iceberg publishes manifest. Без этого callback — at-least-once instead of exactly-once. Performance characteristics: alignment + sync — milliseconds (RocksDB native is hero), async upload — seconds-minutes (network bound), full cycle — typically seconds на normal state, может растягиваться до minutes на TB state без incremental/GIC. Unaligned checkpoints (FLIP-76) и Generic Log-Based Incremental Checkpoints (FLIP-158) — два direction оптимизации обеих phase: alignment и async, обсуждаются в уроках 03-05."
+/>

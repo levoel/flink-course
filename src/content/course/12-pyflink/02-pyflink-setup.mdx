@@ -1,0 +1,432 @@
+---
+title: "PyFlink setup: environment, packaging, deployment"
+description: "pip install apache-flink, venv, packaging requirements, archive uploads, Python version compatibility (3.11 для 2.2)."
+order: 2
+difficulty: "advanced"
+estimatedTime: 22
+topics: ["PyFlink", "Setup", "Packaging", "Python 3.11", "venv"]
+---
+
+# PyFlink setup: environment, packaging, deployment
+
+PyFlink — Python API над Flink JVM runtime. На клиентской стороне (где вы пишете код) PyFlink — Python pip package, который под капотом запускает JVM через Py4J gateway. На worker side в Process mode каждый TaskManager slot запускает отдельный Python interpreter process, общающийся с JVM через Apache Beam Portability framework (см. урок 05). Setup PyFlink требует understanding обеих сторон: dev environment локально для разработки и runtime environment на cluster для outsourcing Python code в TaskManagers.
+
+В этом уроке: установка PyFlink на dev machine, virtualenv setup, packaging Python deps для submission, archive upload mechanism для shipping Python environments в cluster, Python version compatibility matrix.
+
+---
+
+## Версия Python: что выбирать в 2026
+
+| Flink | Python versions | Recommendation |
+|---|---|---|
+| 1.16, 1.17 | 3.7, 3.8, 3.9, 3.10 | EOL — не для new projects |
+| 1.18 | 3.7, 3.8, 3.9, 3.10 | Legacy, мигрируйте |
+| 1.19, 1.20 | 3.8, 3.9, 3.10, 3.11 | 3.10 stable choice |
+| **2.0, 2.1** | **3.8, 3.9, 3.10, 3.11** | 3.11 рекомендован |
+| **2.2** | **3.9, 3.10, 3.11** | **3.11** — production default |
+
+Python 3.7 dropped в Flink 1.19 (EOL upstream). Python 3.8 dropped в 2.2 (EOL upstream 2024-10).
+
+**Production recommendation для Flink 2.2.x**: Python 3.11. Reasons:
+
+- Latest CPython с major performance improvements (~25% faster Python execution vs 3.10).
+- PEP 657 fine-grained error locations — better debug experience.
+- ExceptionGroup support (PEP 654) — лучше для async code.
+- Apache Beam Portability runtime fully supports 3.11.
+
+Python 3.12, 3.13 — пока не officially supported в Flink 2.2.x. Wait до Flink 2.3.
+
+---
+
+## Локальная установка
+
+### Через pip
+
+```bash
+# Создаём venv (обязательно — global pip install сломает system Python)
+python3.11 -m venv .venv
+source .venv/bin/activate
+
+# Verify Python version
+python --version
+# Python 3.11.x
+
+# Install PyFlink
+pip install apache-flink==2.2.0
+
+# Verify
+python -c "import pyflink; print(pyflink.version.__version__)"
+# 2.2.0
+```
+
+PyFlink pip package — ~300MB (содержит embedded JVM + Flink JARs для local mode + Apache Beam Portability runner). Это standalone — для локального development не нужен separate Flink installation.
+
+### Verification: hello world
+
+```python
+# hello.py
+from pyflink.datastream import StreamExecutionEnvironment
+
+env = StreamExecutionEnvironment.get_execution_environment()
+env.set_parallelism(1)
+
+stream = env.from_collection(["hello", "world", "pyflink"])
+stream.print()
+
+env.execute("hello-pyflink")
+```
+
+```bash
+python hello.py
+# 1> hello
+# 1> world  
+# 1> pyflink
+```
+
+Под капотом: pip package PyFlink запускает embedded JVM (через Py4J), создаёт MiniCluster, deploy-ит job, returns results через Python ↔ JVM bridge.
+
+---
+
+## Project structure
+
+```
+my-flink-project/
+├── .venv/                          # virtualenv
+├── pyproject.toml
+├── requirements.txt
+├── src/
+│   └── my_job/
+│       ├── __init__.py
+│       ├── job.py                  # main entry point
+│       ├── functions.py            # UDFs
+│       └── schemas.py              # Avro schemas, type definitions
+├── tests/
+│   └── test_functions.py
+└── dist/                           # build artifacts
+    └── my-job-1.0.0.zip
+```
+
+`pyproject.toml`:
+
+```toml
+[project]
+name = "my-flink-job"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "apache-flink==2.2.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyarrow>=14.0.0",     # для Pandas UDFs (см. урок 07)
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+```
+
+`requirements.txt` (для reproducible deployment):
+
+```text
+apache-flink==2.2.0
+pandas==2.1.3
+numpy==1.26.2
+pyarrow==14.0.1
+requests==2.31.0
+```
+
+> `requirements.txt` lock-style (с exact versions) — production must-have. Иначе production может pull новые versions с breaking changes.
+
+---
+
+## Deployment models
+
+<DiagramContainer title="PyFlink deployment paths" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Local mode"
+        tooltip="MiniCluster в одном JVM process, Python в том же process через Py4J. Простой setup, используется для dev/test. Limitation: no real distribution, parallelism ограничен local cores."
+      >
+        local (MiniCluster)
+      </DataBox>
+      <DataBox
+        label="Session cluster"
+        tooltip="Запущенный shared Flink cluster, submit-им Python job через `flink run -py job.py`. Cluster persists между submissions. Подходит для multi-tenant, dev/staging."
+      >
+        Session
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="Application mode (K8s)"
+        tooltip="Dedicated cluster per application. Job submitted с Python entry point. Производственный путь. Job lifecycle = cluster lifecycle. Используется через Flink Kubernetes Operator."
+      >
+        Application
+      </DataBox>
+      <DataBox
+        label="Per-Job mode"
+        tooltip="Legacy mode (deprecated в 2.x). Был между Session и Application. Используйте Application mode для new deployments."
+      >
+        Per-Job (legacy)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Submission: flink run -py
+
+Базовый submission:
+
+```bash
+flink run -py /path/to/job.py
+```
+
+С arguments:
+
+```bash
+flink run -py /path/to/job.py \
+  --jobName "fraud-detection" \
+  --parallelism 8 \
+  --pyExecutable /usr/bin/python3.11 \
+  --pyFiles /path/to/dependencies/
+```
+
+Key options:
+
+- `-py PATH` — entry Python script.
+- `-pyfs PATHS` — `--pyFiles`, additional Python files (modules, packages).
+- `-pyarch PATHS` — `--pyArchives`, ZIP archives with Python files (см. ниже).
+- `-pyexec PATH` — `--pyExecutable`, Python interpreter path в TaskManager.
+- `-pyclientexec PATH` — Python для client (где запускается `flink run`).
+- `-pyreq PATH` — `--pyRequirements`, path to `requirements.txt` для installation.
+
+---
+
+## Packaging Python dependencies — три approach
+
+### Approach 1: `pyFiles` для simple deps
+
+Если у вас просто несколько Python modules:
+
+```bash
+# Структура
+my_project/
+├── job.py
+├── utils.py
+└── functions.py
+
+flink run -py job.py -pyfs utils.py,functions.py
+```
+
+Эти файлы будут shipped в working directory каждого TaskManager Python process. Простой подход, ограничен: только simple `.py` files, не handles binary dependencies (numpy, pandas).
+
+### Approach 2: `pyRequirements` для pip-installable
+
+Для standard pip-managed packages:
+
+```bash
+flink run -py job.py \
+  -pyreq requirements.txt
+```
+
+PyFlink на каждом TaskManager:
+
+1. Создаёт fresh virtualenv в local directory.
+2. Запускает `pip install -r requirements.txt`.
+3. Python interpreter использует этот venv.
+
+**Plus**: simple, leverages existing pip ecosystem.
+**Minus**: pip install runs **per TaskManager**, network-dependent, slow startup (~30-60 sec per TM), fails если pypi недоступен.
+
+### Approach 3: `pyArchives` для frozen environments
+
+Production-grade approach: создать pre-built archive Python venv, upload его как archive:
+
+```bash
+# 1. Создаём venv с зависимостями
+python3.11 -m venv /tmp/pyflink-venv
+source /tmp/pyflink-venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Архивируем
+cd /tmp
+tar -czf pyflink-venv.tar.gz pyflink-venv/
+
+# 3. Submit job
+flink run -py job.py \
+  -pyarch /tmp/pyflink-venv.tar.gz#venv \
+  -pyexec venv/pyflink-venv/bin/python
+```
+
+`-pyarch file.tar.gz#alias`:
+
+- Archive extracted в working directory с именем `alias/`.
+- `-pyexec` указывает на Python interpreter внутри extracted archive.
+- Plus: zero install time, deterministic environment, works offline.
+- Minus: archive size может быть гигабайты (numpy, pandas, etc.), upload time.
+
+**Production rule**: для production workloads — pyArchives. Для quick dev/test — pyRequirements.
+
+---
+
+## Conda environments
+
+Conda — alternative к venv, лучше для scientific Python (numpy/scipy/sklearn precompiled binaries).
+
+```bash
+# Create conda env
+conda create -n pyflink-env python=3.11
+conda activate pyflink-env
+conda install pandas numpy pyarrow
+pip install apache-flink==2.2.0
+
+# Package as archive
+conda pack -n pyflink-env -o pyflink-conda.tar.gz
+
+# Submit
+flink run -py job.py \
+  -pyarch pyflink-conda.tar.gz#env \
+  -pyexec env/bin/python
+```
+
+`conda-pack` creates portable archive без conda runtime — works на любом host с compatible OS.
+
+Use case: ML workloads с native extensions (TensorFlow, PyTorch, ONNX runtime). Conda handles native deps лучше pip.
+
+---
+
+## Cluster-side Python: PYTHONPATH, system Python
+
+В Application mode на K8s, TaskManager pod images должны иметь:
+
+1. Python 3.11 installed (matching client version).
+2. Path to Python interpreter known к Flink (`-pyexec` или config).
+
+Dockerfile example:
+
+```dockerfile
+FROM flink:2.2.0-java17
+
+# Install Python 3.11
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create symlink
+RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# Verify
+RUN python --version
+
+# Default Python interpreter для Flink
+ENV PYFLINK_CLIENT_EXECUTABLE=/usr/bin/python3.11
+ENV PYFLINK_EXECUTABLE=/usr/bin/python3.11
+```
+
+С Flink Kubernetes Operator:
+
+```yaml
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: my-pyflink-job
+spec:
+  image: my-registry/flink-py311:2.2.0
+  flinkVersion: v2_2
+  job:
+    jarURI: local:///opt/flink/opt/flink-python_2.12-2.2.0.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args: ["-py", "/opt/job/main.py", "-pyarch", "/opt/job/venv.tar.gz#venv"]
+    parallelism: 4
+```
+
+---
+
+## Configuration
+
+`config.yaml` settings relevant для PyFlink:
+
+```yaml
+python:
+  executable: /usr/bin/python3.11
+  client.executable: /usr/bin/python3.11
+  fn-execution.bundle.size: 1000           # records per Python bundle (см. урок 05)
+  fn-execution.bundle.time: 1000           # ms timeout per bundle
+  fn-execution.framework: PROCESS          # PROCESS или THREAD (см. урок 06)
+  fn-execution.arrow.batch.size: 10000     # для Pandas UDFs (см. урок 07)
+  fn-execution.memory:
+    managed: true                          # use Flink-managed memory для Python
+```
+
+`bundle.size` — Flink батчит records в bundles перед отправкой в Python process. Большие bundles = better throughput, larger latency.
+
+---
+
+## Testing locally
+
+```python
+# tests/test_functions.py
+import pytest
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.common import Types
+from my_job.functions import extract_user_id
+
+
+def test_extract_user_id():
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+
+    result = env.from_collection([
+        {"event": "click", "user": 1},
+        {"event": "view", "user": 2}
+    ]).map(extract_user_id, output_type=Types.INT()).execute_and_collect()
+
+    user_ids = list(result)
+    assert user_ids == [1, 2]
+```
+
+```bash
+pytest tests/
+```
+
+PyFlink в test mode использует MiniCluster — fully local, no cluster needed. Run в CI без infrastructure.
+
+---
+
+## Production gotchas
+
+- **Python version mismatch client/cluster** — самая частая проблема. Client Python 3.10, cluster Python 3.11 → pickle/cloudpickle разный, ошибки serialization UDFs. Pin **identical** versions через Docker images.
+- **Pip dependency conflicts** — `apache-flink` pulls determined versions, ваш `requirements.txt` может conflict. Use `pip-tools` для resolved lockfiles.
+- **`pyRequirements` slow startup** — pip install per-TaskManager, при scaling up 50 TMs это 50 parallel pip installs к Pypi. Часто rate-limited. Production prefer pyArchives.
+- **Archive size** — venv с pandas/numpy/pyarrow может weigh 1-2GB. Slow upload, slow extraction. Strip unused packages, use `--no-deps` for transitive minimal.
+- **Native deps в archive** — numpy, scipy, pyarrow используют native code. Archive built on macOS НЕ работает на Linux. Build на target OS or in matching Docker.
+- **PYTHONPATH leakage** — system Python с system packages может shadow archive. Use absolute path `/opt/archive/venv/bin/python` без relying на PATH.
+- **Multiprocessing inside UDF** — Python multiprocessing inside Flink UDF может deadlock или leak processes. Flink manages parallelism — не создавайте свои pools.
+- **Side-effects in UDF init** — UDF class loaded per Python process. Heavy init (load model from S3) — happens N раз. Use lazy init pattern.
+- **GIL contention в thread mode (PEMJA)** — несколько threads JVM делят один Python GIL → contention. Process mode имеет separate interpreter per slot — нет GIL contention, но IPC overhead (см. уроки 05-06).
+- **Python error stacks теряют JVM context** — Python exception в UDF wrapped в Py4JJavaError на JVM stack. Лучше structured logging внутри UDF чем exception bubble.
+
+<Callout type="warning">
+Версия Python должна **идентично совпадать** между client (где `flink run`) и cluster (TaskManager pods). Pickle protocol, cloudpickle, native ABI compatibility — всё зависит от exact CPython version. Production rule: pin Python version в Docker image, в pyproject.toml `requires-python = "==3.11.*"`, в CI tests verify version match.
+</Callout>
+
+<Callout type="tip">
+Production checklist для PyFlink deployment: (1) Docker image с Python 3.11 + matching client image для CI. (2) pyArchives via conda-pack для большие envs или pip venv tar.gz для simple. (3) `requirements.txt` lock-style с exact versions. (4) `flink run` командная line documented в Helm chart / Terraform — reproducible. (5) Locally test через MiniCluster перед deploy. (6) Staging cluster identical config production.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Команда мигрирует Java Flink job на PyFlink из-за shift к ML-heavy workload. Опишите production-grade PyFlink setup для Application mode на Kubernetes: Docker image, environment packaging, submission, version pinning, и какие gotchas мониторить в первые недели."
+  answer="**Docker image strategy**: Base image `flink:2.2.0-java17` extended с Python 3.11.7 (pinned patch version). Dockerfile: `FROM flink:2.2.0-java17` + install python3.11 + python3.11-dev + python3.11-venv + pip + native libs (libsqlite3, libssl) needed для transitive numpy/scipy. Set ENV `PYFLINK_EXECUTABLE=/usr/bin/python3.11`. Single Docker image для всех TaskManagers — guarantees identical Python ABI. **Environment packaging**: build pyArchives с conda-pack (preferred для ML workloads с numpy/pandas/pytorch). Build pipeline: создаём conda env с pinned `environment.yml` (python=3.11.7, pandas==2.1.3, numpy==1.26.2, pyarrow==14.0.1, torch==2.1.1, apache-flink==2.2.0), `conda-pack -o pyflink-env.tar.gz`. Upload в S3 (или K8s ConfigMap для small envs, but ML envs обычно 2-3GB → S3). На submission: `flink run -py job.py -pyarch s3://artifacts/pyflink-env.tar.gz#env -pyexec env/bin/python`. **Submission через Flink Kubernetes Operator**: FlinkDeployment CRD с `entryClass: org.apache.flink.client.python.PythonDriver`, `args: ['-py', '/opt/job/main.py', '-pyarch', 's3://.../venv.tar.gz#venv', '-pyexec', 'venv/bin/python']`. Worker pods automatically pull tar from S3 (через Flink artifact fetcher), extract, use bundled Python. **Version pinning** (3 layers): (1) Dockerfile Python: `python3.11.7` (pinned patch). (2) `requirements.txt` / `environment.yml` с exact versions для всех ML libs. (3) `pyproject.toml`: `requires-python = '==3.11.*'` (any patch within 3.11). Client environment (CI/dev) использует **same Docker image** через docker-compose — guarantees ABI match. **Configuration**: `config.yaml` с `python.executable: env/bin/python` (relative к archive), `python.fn-execution.bundle.size: 1000` для balanced latency/throughput, `python.fn-execution.framework: PROCESS` (default для UDFs, см. урок 05). **Monitor в first weeks** — пять categories: (1) **Startup time** — alert если TaskManager Python init > 60s. Causes: large archive (>3GB), slow S3 transfer, GIL contention при concurrent init. Mitigation: split archive в base + delta updates, parallel artifact prefetch. (2) **Throughput per Python TM** — track via metrics `flink_taskmanager_job_task_operator_numRecordsOutPerSecond`. PyFlink process mode ~30-50% Java baseline. Если ниже — check IPC overhead, bundle size, Python UDF performance via cProfile. (3) **Memory** — Python heap (separate от JVM) + JVM heap. Both monitor через K8s metrics. Python process leak common. Restart policy с memory limit. (4) **Errors in Python UDFs** — Py4JJavaError stacks теряют Python context. Structured logging внутри UDF + sidecar log aggregation (Fluent Bit). Watchdog на unhandled exceptions. (5) **Dependency conflicts** — после Flink 2.2 → 2.3 upgrade, env compatibility check obligatory. Test pyArchive on staging before bumping Flink version. **Production safeguards**: (a) Canary deploy — 5% traffic на new Python env first, monitor 24h. (b) Automated regression tests — нагрузочные tests via JMeter/Locust → Kafka → measure end-to-end latency p99. (c) State Processor API integration tests — verify Python state serialization не сломалась после env update. (d) Documented rollback plan — keep previous pyArchive in S3 immutable, ability quickly redeploy."
+/>

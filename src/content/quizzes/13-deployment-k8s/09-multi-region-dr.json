@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "13-deployment-k8s/09-multi-region-dr",
+  "moduleId": "13-deployment-k8s",
+  "_meta": {
+    "idPrefix": "flink-m13-09",
+    "description": "Quiz for Multi-region setup and DR lesson"
+  },
+  "questions": [
+    {
+      "id": "flink-m13-09-q1",
+      "type": "multiple-choice",
+      "question": "RPO и RTO в контексте Flink — чем определяются?",
+      "options": [
+        { "id": "a", "text": "RPO и RTO зависят только от network speed" },
+        { "id": "b", "text": "RPO — checkpoint interval + replication lag (сколько events можно потерять). RTO — savepoint restore time + cluster provisioning (через сколько job снова работает)" },
+        { "id": "c", "text": "Это абстрактные business metrics, не technical" },
+        { "id": "d", "text": "RPO определяется CPU, RTO — disk speed" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "RPO (Recovery Point Objective) = max data loss приемлемое = checkpoint interval (e.g. 60s) + CRR replication lag (~30s) = ~1-2min для tight setup, 15-60min для cross-region savepoint-based. RTO (Recovery Time Objective) = max recovery time = savepoint restore time (большое state — минуты) + cluster provisioning (K8s — 15-30min cold start) = total 30-90 минут typically. Different deployment patterns дают different trade-offs: single-region (no DR, cheapest), cross-region savepoints (RPO 15-60min, RTO 30-60min), active-passive (RPO 5min, RTO 15-30min), active-active (RPO <1s, RTO <1min, 2x cost).",
+      "studyHint": "Повторите урок — RPO и RTO в контексте Flink",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m13-09-q2",
+      "type": "multiple-choice",
+      "question": "Critical fraud job, 200GB state, RPO=15min, RTO=30min. Какая стратегия?",
+      "options": [
+        { "id": "a", "text": "Single-region — slim chance of disaster" },
+        { "id": "b", "text": "Cross-region savepoints + ForSt disaggregated state + pre-provisioned DR EKS. Savepoint каждые 10min, S3 CRR на savepoint prefix, Kafka MM2 для offsets, quarterly DR drill" },
+        { "id": "c", "text": "Active-active dual-write" },
+        { "id": "d", "text": "Backup на ленту раз в день" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Sweet spot для critical 200GB job. Setup: (1) Primary EKS us-east-1, DR EKS us-west-2 pre-provisioned (smaller, scale up при failover); (2) Savepoint каждые 10min (RPO budget 15min — savepoint 10min + CRR lag 1-2min); (3) ForSt с disaggregated state — savepoint становится metadata-only operation, 200GB savepoint secунды а не минуты (огромный win для RPO); (4) S3 CRR на savepoints prefix; (5) Kafka MM2 или Confluent Cluster Linking для offset continuity; (6) Terraform для DR FlinkDeployment apply с latest replicated savepoint; (7) Quarterly DR drill. Без ForSt 200GB savepoint = 5-10 минут write = breaks RPO budget. ForSt — game changer для DR.",
+      "studyHint": "Повторите урок — Реальный пример: финтех + KnowledgeCheck",
+      "bloomLevel": "evaluative"
+    },
+    {
+      "id": "flink-m13-09-q3",
+      "type": "multiple-choice",
+      "question": "ForSt cross-region restore — какая проблема и как её решить?",
+      "options": [
+        { "id": "a", "text": "Никакой проблемы — работает identically" },
+        { "id": "b", "text": "ForSt primary URI указывает на S3 primary region (us-east-1), который недоступен. Решение: update `state.backend.forst.primary-dir` на DR region S3 + (опционально) предварительно скопировать primary data в DR region" },
+        { "id": "c", "text": "ForSt не поддерживает multi-region" },
+        { "id": "d", "text": "Нужно конвертировать в RocksDB" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "ForSt с disaggregated state хранит primary state на S3. URI hardcoded в config: state.backend.forst.primary-dir: s3://flink-us-east-1/state/. При DR в us-west-2 этот URI ссылается на недоступный bucket. Решения: (1) Update config: state.backend.forst.primary-dir: s3://flink-us-west-2/state/ + предварительно replicate primary data из us-east-1 в us-west-2 (continuous через CRR или one-time на failover); (2) Использовать canonical savepoint и full bootstrap state в DR region (медленнее но проще). DR config DIFFERENT from primary — это easy to forget при FlinkDeployment template reuse.",
+      "studyHint": "Повторите урок — Cross-region savepoint format considerations + Production gotchas",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m13-09-q4",
+      "type": "true-false",
+      "question": "DR procedure, который никогда не тестирован в реальных условиях — это эффективно отсутствие DR. Quarterly drill обязателен.",
+      "correctAnswer": true,
+      "explanation": "True. Untested DR = no DR. Без drill: (1) procedures устаревают (S3 paths изменились, IAM policies дрейфят); (2) team не знает runbook; (3) hidden dependencies (DNS, Kafka, IAM) unblockable at the worst moment; (4) actual recovery time неизвестен — bookhuilters claim 30min, реально 4 часа. Quarterly drill: симулировать region failure (block S3 access), provision DR cluster, restore from latest savepoint, measure RTO, verify data integrity, document gaps. Real disaster — не время debug. Каждый drill улучшает procedure.",
+      "bloomLevel": "evaluative"
+    }
+  ]
+}

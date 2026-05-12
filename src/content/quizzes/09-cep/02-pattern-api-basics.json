@@ -1,0 +1,63 @@
+{
+  "lessonSlug": "09-cep/02-pattern-api-basics",
+  "moduleId": "09-cep",
+  "_meta": {
+    "idPrefix": "flink-m09-02",
+    "description": "Quiz для Pattern API basics: begin, where, next, within, times"
+  },
+  "questions": [
+    {
+      "id": "flink-m09-02-q1",
+      "type": "multiple-choice",
+      "question": "Зачем перед CEP.pattern(...) обязательно делать keyBy(...)?",
+      "options": [
+        { "id": "a", "text": "Чтобы pattern эмитил matches в правильном порядке" },
+        { "id": "b", "text": "Чтобы NFA state и partial matches были изолированы per key — без keyBy все events идут в один NFA, что нарушает per-entity semantics и убивает performance" },
+        { "id": "c", "text": "Это требование для Flink Web UI отображения" },
+        { "id": "d", "text": "keyBy не обязателен, можно без него" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "CEP runs как KeyedProcessFunction — state partitioned per key. Без keyBy: (1) все events глобально идут в один NFA — incorrect semantics для большинства use cases (например мы хотим '3 fails per user', не '3 fails глобально'); (2) один subtask обрабатывает весь stream — no parallelism; (3) state скапливается без партиционирования. Non-keyed CEP допустим только для global system-wide patterns ('any-fail spike across system') и редко на production.",
+      "studyHint": "Повторите урок — секция CEP.pattern + PatternStream + select",
+      "bloomLevel": "conceptual"
+    },
+    {
+      "id": "flink-m09-02-q2",
+      "type": "multiple-choice",
+      "question": "Что произойдёт если pattern не имеет within(Duration)?",
+      "options": [
+        { "id": "a", "text": "Pattern компилируется но никогда не эмитит matches" },
+        { "id": "b", "text": "Partial matches накапливаются неограниченно — memory leak per key, state растёт linearly с числом events. На production это unsustainable" },
+        { "id": "c", "text": "Flink throws ошибку на pattern compilation" },
+        { "id": "d", "text": "within применяется по умолчанию = 1 hour" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "Без within(Duration) NFA не может prune partial matches. Pattern 'A followedBy B' без within: каждый matched A создаёт partial match, который ждёт B forever. Если B никогда не приходит для конкретного key — state растёт линейно. Production gotcha: pattern works в unit tests (короткий stream), но deteriorates на production. Always use within() — это единственный way bound state.",
+      "studyHint": "Повторите урок — секция Window constraint: within",
+      "bloomLevel": "applied"
+    },
+    {
+      "id": "flink-m09-02-q3",
+      "type": "multiple-choice",
+      "question": "В чём разница между SimpleCondition и IterativeCondition?",
+      "options": [
+        { "id": "a", "text": "SimpleCondition только для primitive types, IterativeCondition для objects" },
+        { "id": "b", "text": "SimpleCondition смотрит только на current event (cheap, O(1)); IterativeCondition имеет access к previously matched events через ctx.getEventsForPattern(name) — это O(N) per check, может deteriorate в O(N²) для длинных partial matches" },
+        { "id": "c", "text": "IterativeCondition deprecated в Flink 2.x" },
+        { "id": "d", "text": "Никакой разницы — это alias-ы" }
+      ],
+      "correctAnswer": "b",
+      "explanation": "SimpleCondition.of(predicate) — cheap, takes только current event. IterativeCondition имеет Context с getEventsForPattern(name) для running aggregations 'current > sum of previous N'. Cost: O(N) per check где N = matched events in partial match. Для oneOrMore с длинной sequence это O(N²) total. Profile carefully на production. Если можно — pre-aggregate upstream через KeyedProcessFunction и используйте SimpleCondition.",
+      "studyHint": "Повторите урок — секция IterativeCondition",
+      "bloomLevel": "analytical"
+    },
+    {
+      "id": "flink-m09-02-q4",
+      "type": "true-false",
+      "question": "В event time mode CEP match эмитится сразу после того как все matching events arrived, без задержки.",
+      "correctAnswer": false,
+      "explanation": "False. В event time mode match эмитится только когда watermark проходит границу 'first_event_timestamp + within(Duration)'. Это inherent latency — даже если pattern matched 'logically', NFA ждёт watermark progression чтобы гарантировать что late events не нарушат matching. Если нужна real-time emission (sub-second) — используйте processing time mode или tight forBoundedOutOfOrderness bound. Production gotcha: pattern works в unit-test (single thread, instant watermark), но slow в production из-за watermark lag.",
+      "bloomLevel": "analytical"
+    }
+  ]
+}

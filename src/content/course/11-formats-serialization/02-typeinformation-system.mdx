@@ -1,0 +1,386 @@
+---
+title: "TypeInformation system: как Flink выводит types"
+description: "TypeInformation hierarchy: BasicTypeInfo, PojoTypeInfo, TupleTypeInfo, RowTypeInfo, Avro/Protobuf, GenericTypeInfo. Type extraction, generics erasure pitfalls."
+order: 2
+difficulty: "advanced"
+estimatedTime: 24
+topics: ["TypeInformation", "TypeExtractor", "PojoTypeInfo", "GenericTypeInfo"]
+---
+
+# TypeInformation system: как Flink выводит types
+
+`TypeInformation<T>` — это центральная абстракция Flink над типами данных. Каждый поток `DataStream<T>` имеет связанную с ним `TypeInformation<T>`, и от того, какой именно подкласс `TypeInformation` Flink сумел вывести, зависит **всё**: какой `TypeSerializer` будет сериализовать каждую запись на shuffle, какие colums будут видны Table API при конверсии, как state будет персистентен в RocksDB, и — критично — будет ли применён медленный Kryo fallback (см. урок 07).
+
+Если вы не контролируете TypeInformation, вы не контролируете performance. В этом уроке препарируем иерархию, разберём механизм TypeExtractor через `Class.getGenericSuperclass()` и поймём, почему lambdas + generics — рецепт catastrophe.
+
+---
+
+## Иерархия TypeInformation
+
+<DiagramContainer title="TypeInformation hierarchy" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="TypeInformation<T>"
+        tooltip="Абстрактный root. Содержит createSerializer(ExecutionConfig), getTypeClass(), getArity() и метаданные для сериализации. Каждый подкласс реализует свой TypeSerializer."
+      >
+        root abstraction
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="BasicTypeInfo"
+        tooltip="Long, Integer, String, Double, Boolean, Date, BigDecimal, BigInteger, Char, Short, Byte, Float, Void. Самый быстрый serializer — native binary writes без headers. Не требует никакой introspection."
+      >
+        primitives
+      </DataBox>
+      <DataBox
+        label="PojoTypeInfo"
+        tooltip="Класс с public no-arg constructor + (public fields ИЛИ getters/setters). Reflection-based, но introspection делается один раз в TypeExtractor. Field order детерминирован — сортируется по имени для schema evolution. Поддерживает per-field nullability."
+      >
+        POJO classes
+      </DataBox>
+      <DataBox
+        label="TupleTypeInfo"
+        tooltip="Tuple0...Tuple25 (Flink-специфичные классы из org.apache.flink.api.java.tuple). Positional, fast. НО: lambdas + Tuple = generics erasure → GenericTypeInfo. Всегда нужен .returns(Types.TUPLE(...))"
+      >
+        Tuple2/3/.../25
+      </DataBox>
+    </FlowRow>
+    <FlowRow>
+      <DataBox
+        label="RowTypeInfo"
+        tooltip="org.apache.flink.types.Row — мост между DataStream и Table API. Содержит named fields с RowKind (INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE) для changelog streams. Используется внутри Table API/SQL для всех intermediate представлений."
+      >
+        Row (Table API)
+      </DataBox>
+      <DataBox
+        label="AvroTypeInfo / ProtobufTypeInfo"
+        tooltip="Для Avro SpecificRecord/GenericRecord и Protobuf Message. Используют свои native serializers (AvroSerializer, ProtobufSerializer). Schema evolution через TypeSerializerSnapshot."
+      >
+        Avro / Protobuf
+      </DataBox>
+      <DataBox
+        label="GenericTypeInfo"
+        tooltip="ОПАСНО. Fallback для всего, что не подходит под другие категории. Использует Kryo serializer внутри. 50% perf hit, нет schema evolution. С pipeline.generic-types: false — job fails fast вместо silent degradation."
+      >
+        Kryo fallback
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Performance hierarchy (relative throughput, ~10M records/sec baseline на Tuple):
+
+```
+Tuple                  100% baseline (positional binary)
+POJO                    95% (reflection setup amortized)
+Avro Specific           85% (codegen, типизированные классы)
+Protobuf                80% (varint encoding overhead)
+Avro Generic            75% (more reflection через GenericRecord)
+Kryo                    50% ← ИЗБЕГАТЬ В PRODUCTION
+Kryo + registered ser   70% (улучшение с custom Kryo serializers)
+```
+
+---
+
+## Как Flink выводит TypeInformation
+
+Все API-методы Flink (`map`, `filter`, `flatMap`, `process`...) принимают `TypeInformation` либо неявно (через `TypeExtractor`), либо явно (через `.returns(...)` или `TypeHint`).
+
+### TypeExtractor: рефлексия по generics
+
+```java
+DataStream<String> input = env.fromElements("a", "b", "c");
+DataStream<Tuple2<String, Integer>> mapped = input
+    .map(new MapFunction<String, Tuple2<String, Integer>>() {
+        @Override
+        public Tuple2<String, Integer> map(String value) {
+            return Tuple2.of(value, value.length());
+        }
+    });
+```
+
+Здесь Flink через `Class.getGenericSuperclass()` извлекает `Tuple2<String, Integer>` из generic signature анонимного класса `MapFunction<String, Tuple2<String, Integer>>`. Это работает потому, что **named class сохраняет generic signature**, в отличие от lambda.
+
+### Lambdas: erasure-катастрофа
+
+```java
+// ПЛОХО: после компиляции generic info стёрта
+DataStream<Tuple2<String, Integer>> bad = input
+    .map(v -> Tuple2.of(v, v.length()));
+// → InvalidTypesException: The return type cannot be determined automatically
+```
+
+Lambdas в Java компилируются в `invokedynamic` без сохранения `<String, Integer>` в signature. Flink не может извлечь generic параметр.
+
+Решение — explicit `.returns()`:
+
+```java
+DataStream<Tuple2<String, Integer>> good = input
+    .map(v -> Tuple2.of(v, v.length()))
+    .returns(Types.TUPLE(Types.STRING, Types.INT));   // ← ОБЯЗАТЕЛЬНО
+```
+
+Или через `TypeHint`:
+
+```java
+DataStream<Tuple2<String, Integer>> good = input
+    .map(v -> Tuple2.of(v, v.length()))
+    .returns(new TypeHint<Tuple2<String, Integer>>(){});  // anonymous subclass сохраняет generics
+```
+
+`TypeHint` — это `abstract class TypeHint<T>` — анонимная подкласс-инстанциация сохраняет generic параметр в bytecode (через `getGenericSuperclass()` extractable).
+
+<Callout type="warning">
+Самый частый bug в production Flink: lambda с Tuple/POJO без `.returns()`. Flink молча падает на GenericTypeInfo → Kryo → 50% perf. В уроке 07 покажем `pipeline.generic-types: false` для fail-fast.
+</Callout>
+
+---
+
+## Detailed: PojoTypeInfo
+
+POJO — preferred type для user data в Flink. Условия:
+
+1. **Public no-arg constructor** (обязательно для deserialization).
+2. **Все non-static fields**: либо `public`, либо имеют `public getX()/setX()`.
+3. Все field types — recognized Flink types (recursively POJO, BasicTypeInfo, etc.).
+
+```java
+public class Transaction {
+    public long txId;                  // public field — OK
+    private String userId;             // private + getter/setter — OK
+    public Instant eventTime;
+    public double amount;
+
+    public Transaction() {}            // ОБЯЗАТЕЛЬНО
+
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+}
+```
+
+Flink через `PojoTypeExtractor` извлекает list of `PojoField`, сортирует **по имени** (детерминированный порядок для schema evolution), создаёт `PojoSerializer`. Один раз — при job submission. Hot path просто пишет/читает поля.
+
+### Detection rules
+
+```java
+public class TypeExtractor {
+    static TypeInformation<X> analyzePojo(Class<X> clazz) {
+        if (!hasPublicNoArgConstructor(clazz)) return new GenericTypeInfo<>(clazz);
+        for (Field f : clazz.getDeclaredFields()) {
+            if (isStatic(f) || isTransient(f)) continue;
+            if (!isPublic(f) && !hasPublicGetterSetter(clazz, f)) {
+                return new GenericTypeInfo<>(clazz);  // → Kryo
+            }
+        }
+        return new PojoTypeInfo<>(clazz, fields);
+    }
+}
+```
+
+Это упрощение, но передаёт суть: **одно нарушенное условие → Kryo fallback**.
+
+---
+
+## Detailed: TupleTypeInfo
+
+Tuples — самый быстрый serializer (positional binary, no field names). Но требуют explicit type hint после lambda:
+
+```java
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.common.typeinfo.Types;
+
+DataStream<Tuple2<String, Long>> counted = input
+    .map(v -> Tuple2.of(v.userId, 1L))
+    .returns(Types.TUPLE(Types.STRING, Types.LONG));
+```
+
+Tuple до 25 элементов (`Tuple0`...`Tuple25`). Если больше — нужен POJO.
+
+`Types` helper class — удобный builder TypeInformation:
+
+```java
+Types.STRING       // BasicTypeInfo<String>
+Types.LONG         // BasicTypeInfo<Long>
+Types.TUPLE(...)   // TupleTypeInfo
+Types.POJO(MyClass.class)  // PojoTypeInfo
+Types.LIST(Types.STRING)   // ListTypeInfo<String>
+Types.MAP(Types.STRING, Types.INT)  // MapTypeInfo
+Types.ROW_NAMED(names, types)  // RowTypeInfo для Table API
+```
+
+---
+
+## RowTypeInfo — мост к Table API
+
+`org.apache.flink.types.Row` — universal record type для Table API. Каждый Row держит:
+
+- Массив `Object[]` значений.
+- `RowKind` enum (INSERT, UPDATE_BEFORE, UPDATE_AFTER, DELETE) — для changelog streams.
+- Optional field names (через `RowTypeInfo`).
+
+```java
+import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
+
+DataStream<Row> rows = env.fromElements(
+    Row.ofKind(RowKind.INSERT, 1L, "alice", 100.5),
+    Row.ofKind(RowKind.UPDATE_BEFORE, 1L, "alice", 100.5),
+    Row.ofKind(RowKind.UPDATE_AFTER, 1L, "alice", 200.0)
+).returns(Types.ROW_NAMED(
+    new String[]{"id", "name", "amount"},
+    Types.LONG, Types.STRING, Types.DOUBLE
+));
+
+// Конверсия в Table
+Table table = tEnv.fromChangelogStream(rows);
+```
+
+RowTypeInfo критичен для interop с CDC connectors (Debezium, Flink CDC) и для Table → DataStream → Table round-trips.
+
+---
+
+## Avro / Protobuf — schema-based types
+
+Для inter-service data exchange нужны schema-defined types. Flink integration:
+
+### Avro
+
+```java
+// Avro SpecificRecord — generated class
+DataStream<UserEvent> avroStream = env.fromSource(
+    KafkaSource.<UserEvent>builder()
+        .setValueOnlyDeserializer(
+            ConfluentRegistryAvroDeserializationSchema.forSpecific(
+                UserEvent.class, "http://schema-registry:8081"))
+        .build(),
+    WatermarkStrategy.noWatermarks(),
+    "kafka-avro");
+// TypeInformation = AvroTypeInfo<UserEvent>, не Kryo
+```
+
+### Protobuf (apache-flink-protobuf plugin)
+
+```java
+// Auto-detected для com.google.protobuf.Message
+DataStream<UserEventProto> pbStream = ...;
+// TypeInformation = PbTypeInfo<UserEventProto>
+```
+
+В уроках 05-06 детальный разбор.
+
+---
+
+## Practical: проверка TypeInformation в runtime
+
+Иногда нужно убедиться, какой именно TypeInformation Flink вывел:
+
+```java
+TypeInformation<Transaction> typeInfo = TypeExtractor.getForClass(Transaction.class);
+System.out.println(typeInfo);
+// org.apache.flink.api.java.typeutils.PojoTypeInfo<Transaction>
+//   txId: Long
+//   userId: String
+//   eventTime: GenericType<java.time.Instant>  ← ВНИМАНИЕ
+//   amount: Double
+```
+
+Если видите `GenericType<...>` в выводе — это Kryo fallback для конкретного field. Например, `java.time.Instant` не POJO (нет no-arg constructor). Решения: custom `TypeInformation` для `Instant` через ExecutionConfig, либо хранить как `long epochMillis`.
+
+### ExecutionConfig: registering serializers
+
+```java
+ExecutionConfig config = env.getConfig();
+// Custom serializer для Instant (через PojoSerializer impossible, нужен TypeInfoFactory)
+config.registerTypeWithKryoSerializer(Instant.class, InstantKryoSerializer.class);
+// Или
+config.registerPojoType(MyClass.class);  // Force POJO detection
+```
+
+В Flink 2.x preferred path — `@TypeInfo` annotation на класс:
+
+```java
+@TypeInfo(InstantTypeInfoFactory.class)
+public class Wrapper { Instant ts; }
+```
+
+---
+
+## Generics erasure: глубокий разбор
+
+Почему Java generics стираются и как Flink с этим борется:
+
+```java
+// На уровне source code
+DataStream<Tuple2<String, Long>> stream = ...;
+
+// После компиляции (bytecode)
+DataStream<Object> stream = ...;   // generic params стёрты для local vars
+
+// НО: на uses через named class — generics сохраняются
+public class MyMap implements MapFunction<String, Tuple2<String, Long>> { ... }
+// → Class.getGenericInterfaces() возвращает [MapFunction<String, Tuple2<String, Long>>]
+// → TypeExtractor может извлечь
+```
+
+Lambdas — особый случай: они компилируются в `invokedynamic` calls к `LambdaMetafactory`, и generic info теряется.
+
+```java
+// Lambda — generic info НЕ сохраняется в bytecode
+MapFunction<String, Tuple2<String, Long>> lambda = v -> Tuple2.of(v, 1L);
+// Class.getGenericInterfaces() возвращает [MapFunction]  ← raw, no params
+```
+
+Это fundamental limitation JVM. Workarounds:
+
+1. **`.returns(TypeInformation)`** — explicit, обязательный для lambdas с generic returns.
+2. **`TypeHint`** — anonymous subclass сохраняет params.
+3. **Named class instead of lambda** — verbose, но self-documenting.
+
+---
+
+## Production gotchas
+
+- **`.returns()` забыт после lambda** — самый частый bug. Job работает, но Kryo fallback тихо съедает 50% perf.
+- **POJO field types — не Flink-aware** — например, `java.time.Instant`, `BigDecimal` (есть BasicTypeInfo) — но `Optional<T>`, `Either<L,R>` — нет. Превратятся в Kryo.
+- **Inner non-static class** — не POJO (synthetic `this$0` reference). Сделайте `public static class` или вынесите наружу.
+- **Lombok `@Data`** — генерирует getters/setters но не no-arg constructor по default. Нужен `@NoArgsConstructor`.
+- **Records (Java 14+)** — POJO-compatible начиная с Flink 1.18+. До этого — Kryo fallback.
+- **Sealed classes / interfaces** — Flink не знает sub-types. Используйте `@TypeInfo` factory или explicit `Types.GENERIC(SealedBase.class)` — но это Kryo.
+- **Иерархии с inheritance** — `PojoSerializer` НЕ поддерживает polymorphism. Если `class Cat extends Animal`, и stream `DataStream<Animal>`, при serialize Cat-instance fields поверх Cat будут lost. Решение: flat POJO с type field, либо Avro/Protobuf union types.
+- **Type hint на anonymous class в Scala** — Scala compiler делает другие вещи с generics, но Scala API removed в 2.0.
+
+<Callout type="tip">
+В production добавляйте `TypeInformation` audit-step в CI: запустите `env.getStreamGraph()` локально, walk через nodes, assert что нет `GenericTypeInfo`. Это catches bugs раньше production.
+</Callout>
+
+---
+
+## Configuration summary
+
+```yaml
+# config.yaml — production-grade defaults
+pipeline:
+  generic-types: false           # Fail-fast при Kryo fallback (см. урок 07)
+  auto-type-registration: true   # Регистрирует known types proactively
+  force-avro: false              # Не форсить Avro когда POJO достаточно
+  force-kryo: false              # Никогда не форсить Kryo
+```
+
+В Java code:
+
+```java
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.getConfig().disableGenericTypes();   // Java equivalent of pipeline.generic-types: false
+```
+
+После этого, любая попытка использовать non-POJO/non-Avro/non-Protobuf class приведёт к `IllegalArgumentException` на job submission, а не к silent Kryo fallback.
+
+---
+
+<KnowledgeCheck
+  question="У вас есть `DataStream<UserEvent>`, где UserEvent — POJO с публичным конструктором и публичными полями `Long userId`, `String name`, `java.time.Instant eventTime`. Вы делаете `.map(e -> Tuple2.of(e.userId, e.eventTime))` без `.returns()`. Опишите detailed что произойдёт с типизацией и performance."
+  answer="Lambda + Tuple2 → generics erasure → InvalidTypesException ИЛИ silent GenericTypeInfo (зависит от Flink version и места применения). На современном Flink (1.18+) обычно сразу `InvalidTypesException: The return type of function 'map' cannot be determined automatically due to type erasure`. Если `pipeline.generic-types: true` (default до 2.x) и Flink всё-таки выводит generic — будет `GenericTypeInfo<Tuple2>` → Kryo serializer для outer Tuple, а внутри Kryo попытается serialize `Long` (фастпасс) и `Instant` (через Kryo registry, обычно через `JodaDateTimeSerializer` или unregistered class → 200-байт overhead per record на FQN). Throughput downgrade: 50% от baseline. Решение: `.returns(Types.TUPLE(Types.LONG, Types.INSTANT))`. НО `Types.INSTANT` не существует — `java.time.Instant` не имеет BasicTypeInfo. Реальное решение: либо хранить `long epochMillis` вместо `Instant` (BasicTypeInfo, fast), либо использовать `LocalDateTimeSerializer` через ExecutionConfig.registerTypeWithKryoSerializer (Kryo с custom serializer = ~70% perf), либо custom TypeInformation через `@TypeInfo(InstantTypeInfoFactory.class)` (POJO performance). Production rule: **в hot path event time = long, конверсия в Instant только в UI/logs**. Дополнительно: `env.getConfig().disableGenericTypes()` чтобы fail-fast в CI вместо production discovery."
+/>

@@ -1,0 +1,461 @@
+---
+title: "RocksDB → ForSt migration: cross-backend cutover"
+order: 7
+difficulty: "advanced"
+estimatedTime: 28
+topics: ["Backend Migration", "RocksDB", "ForSt", "Disaggregated State", "Canonical Savepoint"]
+---
+
+# RocksDB → ForSt migration — DEEP DIVE
+
+ForSt — это новый state backend, представленный в Flink 2.0 (FLIP-427). «For Streaming» — это LSM-tree поверх RocksDB API, но с **disaggregated state** на S3/HDFS и async I/O. Для production, который ходит на RocksDB годами и хочет benefits cloud-native state (recovery time не зависит от state size, autoscaling без full state copy), нужна migration. Это **cross-backend migration** — особый case с своими требованиями, в отличие от regular savepoint-restore.
+
+В этом уроке: что такое ForSt в 2-3 abzац, polный migration workflow, verification steps, production checklist, gotchas.
+
+---
+
+## ForSt в 60 секунд
+
+RocksDB: state на локальном диске TaskManager-а. Recovery requires copying SST files из DFS в local disk → slow для большого state. Rescale requires moving state между TMs.
+
+ForSt: state primary хранится на S3/HDFS. Локальный диск — только cache. Recovery instantaneous (state pointers reuse). Rescale fast (no full state movement). См. уроки модуля 04 для глубокого dive.
+
+Trade-offs:
+- ForSt: optimal для disaggregated cloud-native workflows, async I/O делает performance OK
+- RocksDB: faster для local-only workflows без disaggregated state
+
+В 2026 production trend — migrate к ForSt для better scaling and recovery characteristics.
+
+---
+
+## Почему cross-backend migration сложный
+
+RocksDB native savepoint format ≠ ForSt native savepoint format. Они **incompatible** binary formats. Direct restore RocksDB native savepoint в ForSt backend = FAIL.
+
+Решение — **canonical format**:
+
+```text
+RocksDB job
+   ↓ canonical savepoint (universal binary format)
+[transition point]
+   ↓ restore canonical savepoint
+ForSt job
+```
+
+Canonical — это universal, backend-agnostic format. RocksDB writer serializes к canonical, ForSt reader deserializes от canonical. Same logical state, different storage representations.
+
+---
+
+## Полный migration workflow
+
+<DiagramContainer title="RocksDB → ForSt migration: 7 шагов" color="purple">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="1. Pre-migration: assess state"
+        tooltip="Measure: state size (1GB? 1TB? 10TB?), checkpoint frequency, S3 region availability. Plan downtime window. Verify ForSt config tested на staging."
+      >
+        assessment
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="2. Staging test"
+        tooltip="ForSt config + canonical savepoint workflow tested на staging environment. Verify state restore works, throughput acceptable, async I/O config correct."
+      >
+        staging validation
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="3. Trigger canonical savepoint"
+        tooltip="flink stop --type canonical --savepointPath s3://migration/rocksdb-to-forst/sp/ <jobid>. CANONICAL обязательно. Native не работает cross-backend."
+      >
+        canonical SP
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="4. Update FlinkDeployment config"
+        tooltip="state.backend.type: forst + ForSt-specific config (primary-dir на S3, cache-dir, cache size, async I/O thread pool size)."
+      >
+        config swap
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="5. Restart job с restoring from canonical"
+        tooltip="kubectl apply (Operator handles) ИЛИ flink run-application -s s3://migration/sp/. ForSt reads canonical format, deserializes к ForSt-native representation, primary state writes к S3."
+      >
+        restart on ForSt
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="6. Verification — first hours critical"
+        tooltip="Checkpoint success rate. Throughput. Latency. State size в S3 matches. Sample reads return correct values. Compare metrics к pre-migration baseline."
+      >
+        validate
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" />
+    <FlowRow>
+      <DataBox
+        label="7. Cleanup + monitoring"
+        tooltip="Keep RocksDB canonical savepoint 30 days для rollback. Monitor week-long stability. Optionally remove old RocksDB local disk pool."
+      >
+        long-term watch
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+---
+
+## Step-by-step с commands
+
+### 1. Pre-migration assessment
+
+```bash
+# Check current state size
+kubectl exec -it <jm-pod> -- flink savepoint --inspect s3://flink-prod/checkpoints/latest/
+
+Output:
+   Total state size: 245 GB
+   Operators:
+     fraud-detector: 200 GB (keyed)
+     window-aggregator: 45 GB (keyed)
+
+# Plan window:
+# - Canonical savepoint: ~10-15 min для 245 GB (mostly write-bound)
+# - Job restart: ~5 min
+# - Validation: 1-4 hours
+# - Total downtime window: ~30-60 min, plus monitoring period
+```
+
+### 2. Staging test
+
+Deploy clone of production job в staging с small sample state:
+
+```yaml
+# staging FlinkDeployment
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-detector-staging
+spec:
+  image: registry.example.com/fraud-detector:1.42.0
+  flinkConfiguration:
+    state.backend.type: forst
+    state.backend.forst.primary-dir: s3://flink-staging/forst-state/
+    state.backend.forst.cache.dir: /opt/flink/forst-cache
+    state.backend.forst.cache.size-based-limit: 5gb
+    state.backend.forst.async.io.thread-pool-size: "8"
+    state.checkpoints.dir: s3://flink-staging/checkpoints/
+    # ... etc
+  job:
+    initialSavepointPath: s3://flink-staging/savepoints/sampled-canonical-sp/
+```
+
+Run staging 24-48 hours, verify:
+- Checkpoint success 100%
+- Throughput matches RocksDB baseline (or within acceptable degradation)
+- No timeouts на async state operations
+- Sample fraud detection results correct
+
+### 3. Trigger canonical savepoint в production
+
+```bash
+# Via Flink CLI
+flink stop --type canonical \
+           --savepointPath s3://flink-prod/migration/rocksdb-to-forst/sp-final/ \
+           <jobid>
+
+# OR via Operator (FlinkDeployment)
+kubectl patch flinkdeployment fraud-detector --type merge -p '{
+  "spec": {
+    "job": {
+      "savepointTriggerNonce": '$(date +%s)'
+    },
+    "flinkConfiguration": {
+      "state.savepoints.type": "canonical"
+    }
+  }
+}'
+
+# Wait savepoint DONE
+kubectl get flinkdeployment fraud-detector -w
+# Watch status.jobStatus.savepointInfo.state → COMPLETED
+```
+
+**Critical**: `--type canonical` ОБЯЗАТЕЛЕН. Если default native, restore на ForSt будет FAIL.
+
+### 4. Update FlinkDeployment с ForSt config
+
+```yaml
+spec:
+  flinkConfiguration:
+    # Was: state.backend.type: rocksdb
+    state.backend.type: forst
+
+    # ForSt specific config
+    state.backend.forst.primary-dir: s3://flink-prod/forst-state/fraud-detector/
+    state.backend.forst.cache.dir: /opt/flink/forst-cache
+    state.backend.forst.cache.size-based-limit: 20gb
+    state.backend.forst.async.io.thread-pool-size: "16"
+    state.backend.forst.compaction.style: LEVEL
+    state.backend.forst.write-buffer-size: 128mb
+
+    # Async State API V2 настоятельно рекомендуется с ForSt
+    state.api-v2.async.enabled: "true"
+
+    # Existing config preserved
+    state.checkpoints.dir: s3://flink-prod/checkpoints/fraud-detector
+    state.savepoints.dir: s3://flink-prod/savepoints/fraud-detector
+    # ...
+  taskManager:
+    resource:
+      cpu: 4
+      memory: 8192m
+    podTemplate:
+      spec:
+        containers:
+          - name: flink-main-container
+            volumeMounts:
+              - name: forst-cache
+                mountPath: /opt/flink/forst-cache
+        volumes:
+          - name: forst-cache
+            emptyDir:
+              sizeLimit: 50Gi      # local cache для ForSt
+  job:
+    initialSavepointPath: s3://flink-prod/migration/rocksdb-to-forst/sp-final/
+    upgradeMode: savepoint
+```
+
+### 5. Apply config
+
+```bash
+kubectl apply -f fraud-detector-forst.yaml
+
+# Operator делает:
+# - savepoint trigger (если spec.job.savepointTriggerNonce changed) — но уже сделан
+# - cancel current job
+# - update JM Deployment (image same, just config change)
+# - submit new job с initialSavepointPath restoring canonical savepoint
+# - Job starts с ForSt backend
+```
+
+### 6. Verification
+
+First hour:
+
+```bash
+# Checkpoint success
+kubectl logs <jm-pod> | grep "Checkpoint .* completed"
+# Expected: 100% success rate
+
+# State size growing в S3 ForSt primary
+aws s3 ls s3://flink-prod/forst-state/fraud-detector/ --recursive --summarize | tail -3
+# Total Size growing, similar к previous RocksDB state size
+
+# Throughput
+curl http://<jm-rest>:8081/jobs/<jobid>/metrics?get=numRecordsInPerSecond
+# Compare к pre-migration baseline
+
+# Sample reads
+flink savepoint --inspect <new-savepoint-after-checkpoint>
+# Verify operators have expected state sizes
+
+# Async I/O metrics
+curl http://<jm-rest>:8081/jobs/<jobid>/metrics?get=stateApi.aec.activeBufferSize
+# Should not be saturated (если saturated — increase thread-pool-size)
+```
+
+Если anything off → roll-back immediately.
+
+### 7. Long-term cleanup
+
+```bash
+# Keep RocksDB canonical savepoint 30 days
+# Tag в S3 для retention:
+aws s3api put-object-tagging \
+  --bucket flink-prod \
+  --key migration/rocksdb-to-forst/sp-final/ \
+  --tagging 'TagSet=[{Key=migration,Value=keep-30d}]'
+
+# After 30 days successful operation → manual delete
+aws s3 rm --recursive s3://flink-prod/migration/rocksdb-to-forst/sp-final/
+
+# Optionally remove old RocksDB local disk allocations from K8s node pool
+# (ForSt nuts much less local disk, only cache size)
+```
+
+---
+
+## Production checklist
+
+```text
+Pre-migration:
+[ ] Staging test passed 24+ hours
+[ ] Canonical savepoint format verified (--type canonical)
+[ ] ForSt config tested: primary-dir accessible, cache mount works, async thread pool sized
+[ ] Rollback plan documented: keep RocksDB savepoint 30d, fast rollback procedure
+[ ] Downtime window scheduled (low traffic period)
+[ ] On-call team briefed
+
+Migration:
+[ ] Canonical savepoint successful (verify in S3)
+[ ] FlinkDeployment updated к ForSt config
+[ ] Job stable на ForSt after restart (no rapid restarts)
+[ ] Checkpoint success 100% first hour
+[ ] Throughput within ±10% of baseline
+[ ] No new errors в logs
+
+Post-migration (first week):
+[ ] Daily checkpoint success monitoring
+[ ] State size growth normal (no unexpected growth — may indicate cache misconfig)
+[ ] Latency p99 acceptable (с ForSt cache misses == S3 latency, monitor tail)
+[ ] Memory pressure ОК (managed memory + cache в balance)
+[ ] Rollback procedure tested на staging again
+```
+
+---
+
+## Common pitfalls
+
+### Pitfall 1: Native savepoint вместо canonical
+
+```bash
+# WRONG:
+flink stop --savepointPath s3://... <jobid>   # defaults к native
+
+# Restore на ForSt FAILS:
+# "Cannot restore RocksDB native savepoint to ForSt backend"
+
+# RIGHT:
+flink stop --type canonical --savepointPath s3://... <jobid>
+```
+
+Easy to miss. Always explicit `--type canonical`.
+
+### Pitfall 2: Forgot ForSt-specific config
+
+```yaml
+# WRONG (missing primary-dir):
+state.backend.type: forst
+# job starts but defaults к local — defeats purpose
+
+# RIGHT:
+state.backend.type: forst
+state.backend.forst.primary-dir: s3://flink-prod/forst-state/  # MUST be set
+state.backend.forst.cache.dir: /opt/flink/forst-cache
+state.backend.forst.cache.size-based-limit: 20gb
+```
+
+### Pitfall 3: Async I/O thread pool too small
+
+```yaml
+# WRONG (default 4 threads):
+state.backend.forst.async.io.thread-pool-size: "4"
+# Bottleneck — high latency p99
+
+# RIGHT (8-16 для production):
+state.backend.forst.async.io.thread-pool-size: "16"
+```
+
+Async I/O parallelism critical для ForSt (S3 latency 50-100ms — нужно parallel reads to hide latency).
+
+### Pitfall 4: Async API V2 не enabled
+
+```yaml
+# WRONG: ForSt + sync state API
+# state.api-v2.async.enabled: "false" or absent
+
+# RIGHT: explicit enable
+state.api-v2.async.enabled: "true"
+```
+
+ForSt с sync state API — performance disaster (S3 GET блокирует mailbox thread, throughput сваливается к 200 events/sec). Async API V2 mandatory для ForSt.
+
+### Pitfall 5: Insufficient cache size
+
+```yaml
+# WRONG (1 GB cache для 200 GB state):
+state.backend.forst.cache.size-based-limit: 1gb
+# Cache miss rate 99% — S3 reads на каждый state access
+
+# RIGHT:
+state.backend.forst.cache.size-based-limit: 20gb    # 10% of state size minimum
+# Cache hit rate 80%+, S3 reads только для cold data
+```
+
+Rule of thumb: cache size ≥ 5-10% от total state size для acceptable performance.
+
+---
+
+## Rollback procedure
+
+If issues found post-migration:
+
+```bash
+# 1. Trigger rollback FlinkDeployment update
+kubectl patch flinkdeployment fraud-detector --type merge -p '{
+  "spec": {
+    "flinkConfiguration": {
+      "state.backend.type": "rocksdb"
+    },
+    "job": {
+      "initialSavepointPath": "s3://flink-prod/migration/rocksdb-to-forst/sp-final/"
+    }
+  }
+}'
+
+# 2. Operator делает:
+# - cancel current ForSt job
+# - update JM Deployment с RocksDB config
+# - restart с RocksDB backend restoring canonical savepoint
+# - Same canonical savepoint works для both backends!
+
+# 3. Verify back on RocksDB
+kubectl logs <jm-pod> | grep "state.backend.type"
+
+# 4. Document issue, fix on staging, retry migration later
+```
+
+Canonical savepoint format = restorable на любой backend, поэтому rollback symmetric.
+
+---
+
+## Production gotchas
+
+- **`--type canonical` forgotten** — most common mistake. Always explicit. Set `state.savepoints.type: canonical` globally чтобы avoid.
+- **ForSt primary-dir не S3** — если default local path, не disaggregated. Defeats purpose. Always external storage URI.
+- **Cache size too small** — performance degradation. Monitor cache hit rate, tune.
+- **Async I/O thread pool too small** — bottleneck. Start с 8-16 threads.
+- **Async API V2 not enabled** — sync API + ForSt = throughput disaster.
+- **Network policies blocking S3** — pod-to-S3 access requires K8s NetworkPolicy or VPC endpoint configuration.
+- **IAM permissions** — ServiceAccount needs S3 read/write for ForSt primary-dir bucket.
+- **State size growth surprise** — ForSt encoding may differ от RocksDB. Some state may use more bytes (canonical → ForSt-native re-encoding). Plan headroom.
+- **First checkpoint latency spike** — после restore первый checkpoint slow (state files refactor). Subsequent normal.
+- **Cache warm-up** — initial period после restore cache cold, latency higher. Acceptable transient (~30-60 минут).
+
+<Callout type="warning">
+RocksDB → ForSt — one-way decision for most teams. Rollback technically possible (same canonical savepoint), but business operations adapt around new performance characteristics. Plan migration carefully: staging test, low-traffic window, on-call coverage, rollback procedure tested. Не rush production migration без preparation.
+</Callout>
+
+<Callout type="tip">
+В 2026 most new Flink deployments на K8s start с ForSt — disaggregated state native fit для cloud. Existing RocksDB deployments migrate progressively when scaling pressure or operational complexity warrants. Не all jobs needs ForSt — small-state jobs (under 10 GB) РокsDB simpler. ForSt sweet spot — 100GB-10TB state с rescale frequency.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job RocksDB, 1.5TB state, parallelism=32. Plan migration к ForSt для autoscaling benefits. Какой workflow обеспечивает minimum risk?"
+  answer="Carefully staged workflow: (1) **Staging validation 1-2 weeks** — clone production job в staging с sample savepoint (100GB extracted from prod). Test ForSt config: primary-dir на S3, cache size 10GB, async thread pool 16, Async API V2 enabled. Run 7-14 дней, monitor checkpoint success, throughput vs RocksDB baseline (acceptable 10-20% throughput degradation для disaggregated state, but per-record latency может быть better with cache hits). (2) **Pre-migration prep** — schedule downtime window 1-2 hours during low traffic. Brief on-call team. Verify S3 IAM permissions, NetworkPolicy для pod-to-S3. Document rollback procedure. (3) **Trigger canonical savepoint в production** — `flink stop --type canonical` ОБЯЗАТЕЛЬНО. 1.5TB canonical savepoint ~ 30-45 минут (mostly S3 write throughput). Verify в S3 — files present, _metadata readable. (4) **Update FlinkDeployment config** — state.backend.type: forst, primary-dir, cache-dir, cache size 50GB (~3% of state — sweet spot), async thread pool 16, Async API V2 enabled. (5) **kubectl apply** — Operator делает restart с canonical savepoint restore на ForSt backend. Watch JM logs для restore progress. ~10-15 минут до steady state. (6) **First hour validation** — checkpoint success 100%, throughput within ±15% baseline, no error spikes. (7) **First week monitoring** — daily checkpoint success, state size в S3 growth normal, latency p99 acceptable. (8) **Keep canonical savepoint 30 days** — для emergency rollback к RocksDB. Same canonical works on both backends — symmetric rollback. Если week-long stability — declare success, optionally cleanup old. Risks mitigated: staging test catches config issues, canonical savepoint enables rollback, monitoring catches regression early, downtime window avoids peak load."
+/>

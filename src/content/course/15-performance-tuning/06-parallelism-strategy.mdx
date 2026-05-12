@@ -1,0 +1,479 @@
+---
+title: "Parallelism strategy: source/operator/sink, slot sharing, skew detection"
+description: "Source/operator/sink parallelism tuning, slot sharing groups (split state-heavy ops в свой group), keyBy distribution skew detection и mitigation"
+order: 6
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Parallelism", "Slot Sharing", "keyBy", "Data Skew", "Tuning"]
+---
+
+# Parallelism strategy
+
+Parallelism в Flink — это не один знаменатель «pipeline.parallelism: 100». Это композиция: source parallelism, operator parallelism, sink parallelism, slot sharing groups, keyBy distribution. Неверная композиция приводит к одному из трёх failure modes: idle resources (over-provisioned), bottleneck (under-provisioned), data skew (uneven distribution).
+
+В этом уроке препарируем правильный подход: как выставить parallelism per stage, когда split slot sharing groups, и как detect/mitigate data skew после keyBy.
+
+---
+
+## Parallelism уровни в Flink
+
+```java
+// 1. Cluster-wide default:
+// parallelism.default: 4 (в config)
+
+// 2. Job-wide:
+env.setParallelism(8);
+
+// 3. Per-operator:
+stream.map(...).setParallelism(16);
+
+// 4. Per-source (FLIP-27 sources):
+KafkaSource<T> source = KafkaSource.builder()...build();
+env.fromSource(source, ...).setParallelism(12);
+
+// 5. Per-sink:
+.sinkTo(...).setParallelism(4);
+```
+
+Hierarchy: per-operator overrides job, job overrides cluster default. Если операцию обязательно сделать sequentially (e.g. global window) — `setParallelism(1)`.
+
+---
+
+## Source parallelism: bound by partitions
+
+```java
+KafkaSource<Event> source = KafkaSource.<Event>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("events")
+    .setGroupId("flink-consumer")
+    ...
+    .build();
+
+env.fromSource(source, ws, "kafka-source")
+    .setParallelism(12);   // ≤ Kafka partitions
+```
+
+Правило: **source parallelism ≤ min(partitions, available slots)**.
+
+- Если partitions=8, parallelism=16 → 8 subtasks idle (no partitions assigned).
+- Если partitions=100, parallelism=10 → каждый subtask читает 10 partitions (multiplexed).
+
+Optimal: parallelism = partitions если slots позволяют. Если меньше — round-robin partition assignment.
+
+С `setParallelism(P)` и `setMaxParallelism(MP)` для FLIP-27 source — splits assigned dynamically через SplitEnumerator. Hybrid Sources (FLIP-150) комбинируют split enumerators (S3 backfill + Kafka live).
+
+---
+
+## Operator parallelism: heavy ops separately
+
+```java
+stream.map(...)                  // light, parallelism=8
+    .keyBy(Event::getUserId)
+    .process(new HeavyProcessor())  // heavy, parallelism=32
+    .setParallelism(32)
+    .map(...)                    // light again
+    .setParallelism(8);
+```
+
+Pattern: heavy operator (CPU-bound или state-heavy) масштабируется отдельно. Pre/post мапы лёгкие — меньше parallelism.
+
+**Гранулярная регулировка** требует rebalance/keyBy между уровнями (иначе данные просто проходят через chained tasks). С keyBy всё автоматом перераспределяется.
+
+---
+
+## Sink parallelism: bottleneck-aware
+
+```java
+.sinkTo(kafkaSink)
+    .setParallelism(4);          // Kafka может принять 4 parallel producers
+```
+
+Правило: **sink parallelism = thoughtput кратность downstream system capacity**.
+
+- Kafka sink: parallelism = partitions outgoing topic (для optimal distribution).
+- JDBC sink: parallelism × batch size ≈ DB connection pool capacity.
+- Elasticsearch sink: parallelism × bulk size ≈ ES indexing rate.
+
+**Anti-pattern**: sink parallelism = job parallelism. Если sink slow, все upstream backpressured.
+
+**Better**: sink as separate stage с меньшим parallelism и async I/O:
+
+```java
+DataStream<Result> processed = ...;
+processed
+    .rebalance()                            // shuffle к sink parallelism
+    .sinkTo(kafkaSink)
+    .setParallelism(4);
+```
+
+---
+
+## Slot sharing groups
+
+By default все operators одного job в **default slot sharing group** — могут жить в одном slot:
+
+```
+Slot 0: [Source-0] + [Map-0] + [KeyedProcess-0] + [Sink-0]
+Slot 1: [Source-1] + [Map-1] + [KeyedProcess-1] + [Sink-1]
+...
+```
+
+Это efficient — N parallel subtasks занимают N slots даже если в job 10 operators. Но один heavy operator может «душить» соседей по slot.
+
+**Slot sharing group** разделяет operators по slots:
+
+```java
+stream
+    .map(...).slotSharingGroup("light")
+    .keyBy(...)
+    .process(...).slotSharingGroup("heavy")    // own slot family
+    .sinkTo(...);
+```
+
+После этого:
+
+```
+Slot 0: [Source-0] + [Map-0] + [Sink-0]      (group "light")
+Slot 1: [KeyedProcess-0]                      (group "heavy")
+Slot 2: [Source-1] + [Map-1] + [Sink-1]
+Slot 3: [KeyedProcess-1]
+...
+```
+
+<DiagramContainer title="Slot sharing groups: isolation heavy operator" color="emerald">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Default group (all in one slot)"
+        tooltip="Default slot sharing — все operators одного job шарят slot. N parallel subtasks → N slots. Heavy operator душит соседей."
+      >
+        Source + Map + Process + Sink in slot
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label=".slotSharingGroup(...)" />
+    <FlowRow>
+      <DataBox
+        label="Light group"
+        tooltip="Source + Map + Sink в одной slot family. Light memory/CPU usage. Может уместиться много parallel subtasks в slot."
+      >
+        Source-N + Map-N + Sink-N
+      </DataBox>
+      <DataBox
+        label="Heavy group"
+        tooltip="KeyedProcess с большим RocksDB state в отдельной slot family. Get полный managed memory budget. Isolation от light operators."
+      >
+        KeyedProcess-N (separate slot)
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+### Когда split slot sharing
+
+| Сценарий | Использовать? |
+|---|---|
+| State-heavy operator (большой RocksDB) | **Да** — изолировать managed memory |
+| ML inference operator (large model in heap) | **Да** — heap pressure |
+| Sync external API call (long blocking) | **Да** — не блокирует sibling subtasks |
+| Lightweight transforms | Нет — default sharing efficient |
+| Все operators похожих по cost | Нет |
+
+Cost split: больше slots требуется, less efficient packing.
+
+---
+
+## keyBy и data skew
+
+`keyBy(KeySelector)` использует hash-based partitioning. Каждый subtask владеет некоторыми **key groups** (default 128). Распределение:
+
+```
+hash(key) % max_parallelism → key group → subtask
+```
+
+Default `max_parallelism = 128` (для 1-16 subtasks) — это плохой выбор для скейла. С max_parallelism=128 нельзя rescale за 128 subtasks. Set explicitly:
+
+```java
+env.setMaxParallelism(1024);
+```
+
+`max_parallelism` определяет ceiling — нельзя увеличить parallelism выше maxParallelism. **Меняется только через savepoint + restart** — нельзя alter в runtime. Set заранее с запасом.
+
+---
+
+## Skew detection
+
+Симптомы skew:
+- Один subtask `busy=100%`, другие `idle=80%`.
+- `numRecordsInPerSecond` per subtask показывает 10× разницу между subtasks.
+- Один TaskManager OOM, другие idle.
+
+Прометрика для алертинга:
+
+```promql
+# Coefficient of variation across subtasks:
+stddev_over_time(numRecordsInPerSecond[5m])
+/ avg_over_time(numRecordsInPerSecond[5m])
+> 0.5
+```
+
+>0.5 coefficient of variation = severe skew.
+
+---
+
+## Skew mitigation: two-stage aggregation
+
+Classic approach: salt the hot key, two-stage aggregation.
+
+```java
+// Stage 1: salt key для distribution
+DataStream<KV> stage1 = stream
+    .keyBy(record -> record.getUserId() + "_" + (record.hashCode() % 16))
+    .timeWindow(Time.minutes(1))
+    .aggregate(new PartialAggregator());
+
+// Stage 2: re-aggregate by real key
+DataStream<KV> stage2 = stage1
+    .keyBy(KV::getUserId)
+    .timeWindow(Time.minutes(1))
+    .aggregate(new FinalAggregator());
+```
+
+Stage 1 распределяет нагрузку по 16 «under-keys». Stage 2 финально агрегирует. Network shuffle двойной, но throughput не ограничен hot key.
+
+---
+
+## Skew mitigation: pre-aggregation в source
+
+Если sink — aggregation, делайте partial aggregation **до** keyBy:
+
+```java
+stream
+    .keyBy(...)                          // local pre-aggregation
+    .timeWindow(...)
+    .reduce(...)                          // local partial
+    .keyBy(globalKey)                     // shuffle к global aggregator
+    .timeWindow(...)
+    .reduce(...);
+```
+
+Reduce пред-shuffle уменьшает volume на 10-100x (depending on cardinality).
+
+---
+
+## Custom partitioning
+
+Если skew critical и cardinality предсказуема, можно использовать custom partitioner:
+
+```java
+stream.partitionCustom(new CustomPartitioner(), Event::getUserId);
+
+public class CustomPartitioner implements Partitioner<String> {
+    @Override
+    public int partition(String key, int numPartitions) {
+        if (hotKeys.contains(key)) {
+            // Round-robin для hot keys
+            return (counter++) % numPartitions;
+        }
+        // Normal hash для остальных
+        return Math.abs(key.hashCode()) % numPartitions;
+    }
+}
+```
+
+Caveat: `partitionCustom` ломает keyed state semantics. Используется для non-keyed paths.
+
+---
+
+## DataStreamUtils.reinterpretAsKeyedStream
+
+Если у вас уже pre-shuffled data (через external shuffle или upstream Flink stage), можно избежать повторного shuffle:
+
+```java
+DataStream<Event> preShuffled = ...;
+
+KeyedStream<Event, String> keyed =
+    DataStreamUtils.reinterpretAsKeyedStream(
+        preShuffled,
+        Event::getUserId,
+        TypeInformation.of(String.class)
+    );
+```
+
+Это «trust me, this is keyed» — Flink не делает shuffle. Save 1 stage of network.
+
+**Critical**: данные **должны** быть правильно partitioned. Если нет → state corruption.
+
+---
+
+## Sources/sinks parallelism (FLIP-27)
+
+С FLIP-27 sources parallelism динамический. `SplitEnumerator` (на JobManager) распределяет splits на `SourceReader`-ы (на TaskManager):
+
+```
+SplitEnumerator (JobManager):
+  - discovers splits (e.g., Kafka partition discovery)
+  - assigns splits to readers
+  - rebalances on reader add/remove
+
+SourceReader (TaskManager):
+  - reads its assigned splits
+  - emits records к downstream
+```
+
+С watermarks и autoscaler (FLIP-271) source может dynamically scale без restart job — but только при `Adaptive Scheduler`.
+
+---
+
+## Production tuning patterns
+
+### Pattern 1: Streaming с Kafka source, KeyedProcess, Kafka sink
+
+```java
+env.setParallelism(8);  // baseline
+env.setMaxParallelism(1024);
+
+DataStream<Event> source = env.fromSource(kafkaSource, ws, "src")
+    .setParallelism(8);  // = partitions
+
+source
+    .map(parse).setParallelism(8)
+    .keyBy(Event::getUserId)
+    .process(stateful)
+        .setParallelism(16)              // heavy state, отдельно
+        .slotSharingGroup("state")
+    .sinkTo(kafkaSink)
+        .setParallelism(4);              // batched async
+```
+
+### Pattern 2: Backfill + live стрим (Hybrid)
+
+```java
+HybridSource<Event> source = HybridSource
+    .builder(s3FileSource)        // bounded
+    .addSource(kafkaSource)       // unbounded
+    .build();
+
+env.fromSource(source, ws, "hybrid")
+    .setParallelism(32);           // высокий для backfill speed
+```
+
+После backfill autoscaler downscale-ит к steady-state load.
+
+### Pattern 3: Skew-prone aggregation
+
+```java
+stream
+    .keyBy(r -> r.getUserId() + "_" + (r.hashCode() & 15))   // salted
+    .timeWindow(Time.minutes(1))
+    .aggregate(new Partial())
+        .setParallelism(64)              // wide spread
+    .keyBy(KV::getUserId)
+    .timeWindow(Time.minutes(1))
+    .aggregate(new Final())
+        .setParallelism(8);              // меньше final
+```
+
+---
+
+## Production gotchas
+
+### Gotcha 1: max parallelism не меняется в runtime
+
+```java
+env.setMaxParallelism(128);  // default ~ 128 для small jobs
+```
+
+Захотели scale до 200 subtasks — нельзя. Reload state с savepoint + restart с большим max_parallelism (но это re-shuffle всех keys). **Set заранее с запасом**: 1024 или 4096 для будущего scale.
+
+### Gotcha 2: Source parallelism > partitions = idle subtasks
+
+```
+Topic partitions: 8
+Source parallelism: 16
+→ 8 subtasks idle, 8 active
+```
+
+Flink не перепартиционирует Kafka topic. Diagnosis: `numRecordsInPerSecond` per source subtask = 0 для половины.
+
+**Fix**: parallelism = partitions, OR partitions сразу больше.
+
+### Gotcha 3: slot sharing group в чужой operator chain
+
+```java
+stream
+    .map(...).slotSharingGroup("X")
+    .keyBy(...)
+    .process(...).slotSharingGroup("Y");
+```
+
+`keyBy` уже разбивает chain — это OK. Но:
+
+```java
+stream
+    .map(m1).slotSharingGroup("X")
+    .map(m2).slotSharingGroup("Y");  // ← chain break не происходит
+```
+
+Между chained operators slot sharing groups может вызвать неожиданное chain break. Verify в Web UI DAG view.
+
+### Gotcha 4: Skew после rebalance disappears
+
+```java
+stream
+    .rebalance()        // round-robin distribution
+    .map(...)
+    .keyBy(...);        // re-shuffle
+```
+
+После rebalance data евenly distributed, но keyBy снова концентрирует по hot keys. Skew возвращается. Rebalance не решает skew downstream.
+
+### Gotcha 5: setMaxParallelism влияет на state granularity
+
+Default max_parallelism = 128 → 128 key groups → каждый subtask владеет N/128 групп.
+
+Если max_parallelism=4096 и parallelism=8 → каждый subtask владеет 512 групп. Больше granularity, но больше overhead в state organization.
+
+Не выставляйте max_parallelism чрезмерно высоко без причины.
+
+### Gotcha 6: keyBy с low-cardinality key
+
+Если distinct keys = 10, parallelism = 32 — только 10 subtasks получают данные (max 1 key per subtask). 22 idle.
+
+**Fix**: keyBy на composite key, или меньше parallelism.
+
+### Gotcha 7: Adaptive scheduler и parallelism
+
+С `jobmanager.scheduler: adaptive` (default 2.0 для streaming с reactive mode) parallelism dynamic. setParallelism — это hint, реальный определяется scheduler-ом по available slots.
+
+Для строгого контроля — Default scheduler.
+
+---
+
+## Diagnostic checklist для parallelism
+
+1. **Source parallelism = partitions?** Если нет — выровнять.
+2. **Web UI DAG colors**: red operator → bump parallelism.
+3. **numRecordsInPerSecond per subtask**: skew detection.
+4. **Slot allocation**: все slots used? Если меньше — increase parallelism. Если больше slots чем нужно — overprovisioned.
+5. **Sink rate**: matched к downstream system capacity?
+6. **State per subtask**: даже распределено?
+7. **setMaxParallelism**: достаточно для future scale?
+
+---
+
+<Callout type="warning">
+Set `setMaxParallelism` ОДИН раз при создании job с большим запасом (1024 или 4096). Изменение этого параметра требует ПОЛНОГО re-shuffle state через savepoint + restart, что для large state может занять часы. Не повторяйте ошибку выставить default ~128 и потом упереться в ceiling в production.
+</Callout>
+
+---
+
+<Callout type="note">
+Slot sharing groups — мощный инструмент изоляции, но злоупотребление приводит к фрагментации slots и неэффективному использованию ресурсов. Правило: split только если есть конкретная причина (state-heavy operator, ML model, sync external call). Default sharing efficient для большинства pipelines.
+</Callout>
+
+---
+
+<KnowledgeCheck
+  question="Production job: parallelism=32, keyBy(userId), один TaskManager OOM-Killed regularly (раз в 6-12 часов), другие 7 TaskManager-ов работают normally. State backend RocksDB. Web UI показывает: subtask 12 busy=100% постоянно, остальные ~40-60%. numRecordsInPerSecond: subtask 12 = 50k/sec, остальные ~2-5k/sec. Диагноз и план fix?"
+  answer="Classic data skew: один hot key (или несколько hot keys, mapped в один key group, mapped в subtask 12). 50k/sec vs 2-5k/sec — 10-25× разница, severe skew. Один TaskManager (host subtask 12) перегружен по CPU, memory (большой state для hot key), eventually OOM. Diagnose: (1) Verify это keyBy skew, не другая проблема. Check distribution: запрос REST API на subtask metrics, sort by numRecordsInPerSecond — subtask 12 outlier. (2) Identify hot key. Add temporary metric: getRuntimeContext().getMetricGroup().counter('record-' + record.getUserId().substring(0,2)) — top 2 chars by frequency, sample какой userId hottest. Или check user code logs sample. Скорее всего: либо single 'whale' user (один account c millions events), либо bot/synthetic traffic single userId. (3) Confirm state size impact. Метрика state.backend.rocksdb.size-all-mem-tables per subtask — subtask 12 будет показывать значительно больше state. Mitigation strategy (приоритезированно): (1) Short-term: two-stage aggregation с salting. keyBy(userId + '_' + hashCode() % 32) → reduce → keyBy(userId) → reduce. 32× spread hot key across 32 subtasks. Cost: extra shuffle, but evens load. (2) Medium-term: identify и handle hot users separately. Side output для top-K users (через MapState top-K aggregator на upstream): split stream на 'hot' (custom partitioning round-robin) и 'cold' (normal keyBy). Hot path processed без keyBy, через broadcast или global aggregator. (3) Long-term: business logic review. Это bot? Filter at source. Это legitimate big user? Designate special handling (dedicated job, separate priority lane). Production application — adversarial detection. (4) Защита от OOM в short term: per-key state size limits через TTL state.setTtl(Duration.ofHours(1)) с CLEANUP_FULL_SNAPSHOT — не позволит state расти бесконечно для hot key. (5) Verify post-fix: numRecordsInPerSecond coefficient of variation должен упасть с 25× до < 2×. Set up Prometheus alert: stddev / avg > 0.5 → alert skew. Critical insight: increasing parallelism (32 → 64) НЕ решает skew — hot key всё равно concentrated в одном subtask из 64. Только salting/custom partitioning fix-ит underlying problem."
+/>

@@ -1,0 +1,377 @@
+---
+title: "Pandas UDFs: vectorized через Apache Arrow"
+description: "Pandas UDFs via Apache Arrow zero-copy. Batch processing 10-50x faster than row-wise. func_type='pandas' decorator."
+order: 7
+difficulty: "advanced"
+estimatedTime: 26
+topics: ["Pandas UDF", "Apache Arrow", "Vectorization", "Zero-copy", "Batch Processing"]
+---
+
+# Pandas UDFs: vectorized через Apache Arrow
+
+Row-wise Python UDF — even в thread mode (PEMJA, урок 06) — обрабатывает один record за раз. Для большинства numerical / pandas-style операций это inefficient: numpy/pandas optimized для **vectorized batch operations** на arrays, не single values. Pandas UDF в PyFlink — alternative execution model: Flink batches records в pandas Series/DataFrame, передаёт **через Apache Arrow zero-copy memory** в Python, UDF получает entire batch, returns batch результат.
+
+Результат — **10-50x speedup** vs row-wise UDF для vectorizable operations, и **~90-95% Java baseline** для batch-style transformations. Pandas UDFs — практически unbeatable для numerical processing, feature engineering, sklearn model inference.
+
+В этом уроке: Apache Arrow zero-copy mechanism, Pandas Scalar UDF и Aggregate UDF, performance bench, practical examples (feature engineering, ML inference), production gotchas.
+
+---
+
+## Apache Arrow: zero-copy bridge
+
+Apache Arrow — cross-language columnar memory format. Designed для **zero-copy** sharing data между different runtimes (JVM, Python, R, C++) без serialization overhead. Flink + PyFlink использует Arrow как transport layer для batch transfer.
+
+<DiagramContainer title="Pandas UDF data flow через Arrow" color="blue">
+  <FlowColumn>
+    <FlowRow>
+      <DataBox
+        label="Flink RowData (JVM)"
+        tooltip="Flink internal row representation, hot path. Has BinaryRow и GenericRowData implementations. Native JVM heap memory."
+      >
+        RowData batch (1000 rows)
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Arrow columnar encoding (no copy)" />
+    <FlowRow>
+      <DataBox
+        label="Arrow RecordBatch"
+        tooltip="Columnar memory representation. Each column = contiguous memory buffer (int32 array, float64 array, variable-length strings, etc.). Memory layout designed для CPU SIMD и cache-friendly access."
+      >
+        Arrow RecordBatch
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="down" label="Shared memory access (zero-copy)" />
+    <FlowRow>
+      <DataBox
+        label="Pandas DataFrame (Python)"
+        tooltip="Python pandas DataFrame — columns точно те же memory buffers что Arrow. Без copying — pandas видит JVM memory напрямую (для compatible types). UDF получает pd.Series/pd.DataFrame, applies vectorized operations."
+      >
+        pd.DataFrame
+      </DataBox>
+    </FlowRow>
+    <Arrow direction="up" label="Result batch (Arrow → RowData)" />
+    <FlowRow>
+      <DataBox
+        label="Flink downstream"
+        tooltip="Pandas Series result → Arrow → Flink RowData → next operator. Loop closes batch-by-batch."
+      >
+        Continue pipeline
+      </DataBox>
+    </FlowRow>
+  </FlowColumn>
+</DiagramContainer>
+
+Key insight: **standard PyFlink UDF — record-by-record marshal (cost dominates)**. Pandas UDF — **bulk transfer of entire columnar batch with no element-by-element copy**.
+
+---
+
+## Two types: Scalar и Aggregate
+
+### Scalar Pandas UDF — maps batch in → batch out (same size)
+
+```python
+from pyflink.table.udf import udf
+from pyflink.table import DataTypes
+import pandas as pd
+import numpy as np
+
+
+@udf(input_types=[DataTypes.DOUBLE()],
+     result_type=DataTypes.DOUBLE(),
+     func_type='pandas')        # ← key: vectorized
+def double_value(v: pd.Series) -> pd.Series:
+    return v * 2                  # batch operation, fast
+```
+
+Compare row-wise:
+
+```python
+@udf(input_types=[DataTypes.DOUBLE()], result_type=DataTypes.DOUBLE())
+def double_value_slow(v):
+    return v * 2                  # row-by-row, slow
+```
+
+UDF call frequency:
+
+- **Row-wise**: called 10M times для 10M records.
+- **Pandas (batch_size=10000)**: called 1000 times для 10M records, each call processes 10000 records as numpy vectorized op.
+
+Performance gain: **10-50x faster** для simple numerical operations.
+
+### Aggregate Pandas UDF — reduces batch to single value
+
+```python
+from pyflink.table.udf import udaf
+
+@udaf(input_types=[DataTypes.DOUBLE()],
+      result_type=DataTypes.DOUBLE(),
+      func_type='pandas')
+def weighted_mean(v: pd.Series) -> float:
+    # Custom aggregation logic vectorized
+    weights = np.exp(-np.arange(len(v)) * 0.1)  # decay weights
+    return float(np.average(v, weights=weights))
+```
+
+Used в SQL aggregation context:
+
+```sql
+SELECT user_id, weighted_mean(score) FROM events GROUP BY user_id
+```
+
+---
+
+## Configuration
+
+```yaml
+python:
+  fn-execution.arrow.batch.size: 10000   # records per Arrow batch (default 10k)
+  fn-execution.bundle.size: 100000        # records per outer bundle
+  fn-execution.bundle.time: 1000          # ms timeout
+```
+
+Bundle hierarchy:
+
+```
+Flink job
+└── Bundle (e.g., 100000 records, sent к Python process / thread)
+    └── Arrow RecordBatch (e.g., 10000 records, zero-copy transfer)
+        └── Pandas DataFrame (UDF processes whole batch)
+```
+
+Tuning:
+
+- **Arrow batch size слишком высокая**: high memory per UDF call, может OOM Python heap.
+- **Arrow batch size слишком низкая**: batch processing overhead dominates, fewer benefits over row-wise.
+- **Default 10000** — обычно sweet spot для most workloads.
+
+---
+
+## Performance benchmarks
+
+10M records single-thread:
+
+```
+UDF type                                  Throughput      vs Java
+─────────────────────────────────────────────────────────────────
+Java MapFunction (baseline)               250k rec/sec    100%
+Pandas UDF, batch=10000, numpy op         235k rec/sec    94%
+Pandas UDF, batch=1000                    210k rec/sec    84%
+Pandas UDF, batch=100                     150k rec/sec    60%
+Thread mode (PEMJA), simple UDF           220k rec/sec    88%
+Process mode, bundle=1000                  120k rec/sec    48%
+Row-wise Python в pandas op               40k rec/sec     16%
+```
+
+Key insights:
+
+1. **Pandas UDF batch>1000 — near Java parity** (~85-95%).
+2. **Vectorization beats row-wise even when row-wise uses pandas internally** — overhead of calling pandas per row >> batch op.
+3. **Batch size matters** — small batches lose Arrow zero-copy benefits.
+
+Для realistic workloads (feature engineering 20 columns с string + numeric operations):
+
+```
+Java equivalent                          200k rec/sec
+Pandas UDF                                170k rec/sec (~85%)
+Thread mode row-wise                       80k rec/sec (~40%)
+Process mode                                40k rec/sec (~20%)
+```
+
+Pandas UDF тут — 4x faster чем thread mode row-wise.
+
+---
+
+## Practical examples
+
+### Example 1: Feature engineering
+
+```python
+@udf(input_types=[DataTypes.DOUBLE(), DataTypes.DOUBLE(), DataTypes.DOUBLE()],
+     result_type=DataTypes.DOUBLE(),
+     func_type='pandas')
+def momentum_indicator(close: pd.Series,
+                       volume: pd.Series,
+                       sma_20: pd.Series) -> pd.Series:
+    """Compute momentum indicator vectorized."""
+    # Все операции на pandas Series — pure numpy vectorized
+    price_change = (close / sma_20) - 1.0
+    volume_zscore = (volume - volume.mean()) / volume.std()
+    return price_change * np.tanh(volume_zscore)
+
+
+# Используем в Table API
+t_env.create_temporary_function("momentum", momentum_indicator)
+
+t_env.execute_sql("""
+    INSERT INTO signals
+    SELECT 
+        symbol,
+        ts,
+        momentum(close, volume, sma_20) AS signal
+    FROM ohlcv
+""")
+```
+
+Real workload: feature engineering на market data 100k events/sec — Pandas UDF легко справляется.
+
+### Example 2: ML model inference
+
+```python
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+
+
+class FraudClassifier:
+    """Sklearn model — Pandas UDF wrapper."""
+
+    def __init__(self):
+        self.model = None
+
+    def open(self, function_context):
+        # Load model once per slot
+        self.model = joblib.load("/models/fraud_v3.joblib")
+
+    def eval(self, amount: pd.Series,
+             velocity: pd.Series,
+             merchant_risk: pd.Series) -> pd.Series:
+        # Batch prediction — sklearn natively vectorized
+        X = pd.DataFrame({
+            "amount": amount,
+            "velocity": velocity,
+            "merchant_risk": merchant_risk
+        })
+        probs = self.model.predict_proba(X)[:, 1]  # probability fraud
+        return pd.Series(probs)
+
+
+fraud_udf = udf(
+    FraudClassifier(),
+    input_types=[DataTypes.DOUBLE(), DataTypes.DOUBLE(), DataTypes.DOUBLE()],
+    result_type=DataTypes.DOUBLE(),
+    func_type='pandas')
+
+t_env.create_temporary_function("fraud_score", fraud_udf)
+
+t_env.execute_sql("""
+    INSERT INTO fraud_alerts
+    SELECT *
+    FROM (
+        SELECT 
+            tx_id, 
+            user_id, 
+            amount, 
+            fraud_score(amount, user_velocity, merchant_risk) AS score
+        FROM transactions
+    ) WHERE score > 0.85
+""")
+```
+
+Sklearn `predict_proba` — vectorized по design. Pandas UDF batches Flink records, sklearn processes them as numpy batch (cache-friendly, SIMD-aware). For Random Forest 100 trees, scoring 10k records — single millisecond. Throughput 100k+/sec achievable.
+
+### Example 3: NLP / text processing
+
+```python
+@udf(input_types=[DataTypes.STRING()],
+     result_type=DataTypes.STRING(),
+     func_type='pandas')
+def extract_phone(texts: pd.Series) -> pd.Series:
+    """Extract phone numbers vectorized regex."""
+    pattern = r'\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}'
+    return texts.str.extract(pattern, expand=False).fillna("")
+```
+
+Pandas `Series.str.*` operations — C-level optimized vectorized. Much faster than Python per-record regex.
+
+### Example 4: Aggregation
+
+```python
+@udaf(input_types=[DataTypes.DOUBLE()],
+      result_type=DataTypes.ROW([DataTypes.FIELD("mean", DataTypes.DOUBLE()),
+                                   DataTypes.FIELD("std", DataTypes.DOUBLE()),
+                                   DataTypes.FIELD("p99", DataTypes.DOUBLE())]),
+      func_type='pandas')
+def compute_stats(values: pd.Series):
+    return {
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "p99": float(values.quantile(0.99))
+    }
+
+
+t_env.execute_sql("""
+    SELECT 
+        user_id,
+        window_start,
+        compute_stats(amount).mean AS avg_amount,
+        compute_stats(amount).p99 AS p99_amount
+    FROM TABLE(TUMBLE(TABLE tx, DESCRIPTOR(ts), INTERVAL '1' HOUR))
+    GROUP BY user_id, window_start, window_end
+""")
+```
+
+Aggregation UDFs — perfect для custom statistics не covered SQL built-ins.
+
+---
+
+## When Pandas UDF не optimal
+
+| Scenario | Better alternative |
+|---|---|
+| Single-record state mutation | Java KeyedProcessFunction |
+| External API calls (LLM, REST) | Async UDF Flink 2.2 (урок 08) |
+| Non-vectorizable algorithm (graph traversal per record) | Row-wise UDF |
+| Complex Python state machines | DataStream API |
+| Very small batches expected (low throughput) | Row-wise thread mode |
+| GPU inference (PyTorch with large model) | Process mode with batched calls |
+
+Vectorization wins только для **batch-operable computations** — pandas/numpy operations, sklearn batch predict, vectorized regex. Если ваш UDF имеет per-record conditionals or sequential dependencies — vectorization не помогает.
+
+---
+
+## Production gotchas
+
+- **`func_type='pandas'` забыт** — UDF runs row-wise через thread/process mode. ~10x slower silent. Check decorator parameter.
+- **Heavy per-batch initialization** — `open()` runs once per slot, не per batch. Don't reinitialize model per call.
+- **Pandas type compatibility** — Flink DOUBLE → numpy.float64 (OK), Flink STRING → pandas object dtype (slower). Numeric ops fastest.
+- **Variable-length result series** — `eval` must return Series of **same length** as input. Returning shorter/longer causes errors.
+- **Nullable types** — Flink null values → pandas NaN for floats, None для objects. UDF must handle.
+- **Memory pressure** — Arrow batch in Python — actual memory allocation. Heavy batch processing (sklearn predict 50k×100 features) — могут переполнять Python heap. Monitor `python_resident_memory_bytes`.
+- **GIL still applies** — даже vectorized ops release GIL only durante C code. Heavy pure-Python wrapping vectorized ops still GIL-bound.
+- **Decimal type semantics** — Flink DECIMAL → pandas Decimal или string (depending конверсия) — perf hit, не vectorized. Use DOUBLE если precision OK.
+- **Aggregate UDF window state** — для streaming aggregations Flink maintains state per group. UDAF eval called когда window emit-it — make sure stateless.
+- **Native deps в archive** — pandas 2.x, pyarrow 14+, numpy 1.26+ — bundle в pyArchive. Mismatch versions может break Arrow protocol.
+- **Schema mismatch** — UDF return type must match SQL declaration. Mismatch causes ConverterException на runtime.
+
+<Callout type="warning">
+Pandas UDF result Series **must have same length** as input. Common bug: filter inside UDF returns shorter series. Use boolean mask + assign NaN для filtered, не drop. Example:
+```python
+def filter_high(v: pd.Series) -> pd.Series:
+    return v.where(v > 100, np.nan)  # OK: same length, NaN for filtered
+    # NOT: v[v > 100]  # different length, ERROR
+```
+</Callout>
+
+<Callout type="tip">
+Pandas UDF — **best practical choice** для most numerical PyFlink workloads. Easy migration: take существующий row-wise UDF, vectorize operations using pandas/numpy, add `func_type='pandas'`. Если UDF code already uses pandas (common — many Python data engineers), conversion часто trivial. Expected speedup 5-20x. Always benchmark с production-representative data — synthetic benchmarks могут mislead.
+</Callout>
+
+---
+
+## Decision matrix: which Python execution mode
+
+| Workload | Execution mode | Why |
+|---|---|---|
+| Numerical / pandas batch ops | **Pandas UDF** | Arrow zero-copy + vectorization |
+| Simple Python UDF (string, business rules) | **Thread mode** (PEMJA) | Low overhead, fast per-record |
+| ML model inference (sklearn, simple PyTorch) | **Pandas UDF** | Batch predict naturally vectorized |
+| GPU PyTorch / TensorFlow с complex setup | **Process mode** | Isolation, native dep safety |
+| LLM / external API calls | **Async UDF** (Flink 2.2, урок 08) | Concurrent in-flight |
+| Custom Python state machine | **DataStream API** | Process mode by default |
+| Untrusted / unproven UDFs | **Process mode** | Failure isolation |
+
+---
+
+<KnowledgeCheck
+  question="Production PyFlink job обрабатывает stock market data с ~50 numeric features per event, applies sklearn RandomForestClassifier для fraud scoring. Currently process mode, throughput 30k events/sec, target 200k. Описать optimization plan через Pandas UDF + Arrow с конкретными configurations, code changes, и expected outcomes."
+  answer="**Phase 1 — Analysis**. Current bottleneck: process mode with row-wise UDF means sklearn predict called 30k times/sec на single records (each predict ~10μs overhead × parallelism factor). RandomForestClassifier predicts on numpy arrays — natively vectorized for batches. Single-record predict wastes 80%+ of sklearn's batch optimization. **Phase 2 — Code migration to Pandas UDF**. (1) Wrap existing UDF as Pandas: ```python\\nclass FraudClassifier:\\n    def __init__(self):\\n        self.model = None\\n    def open(self, function_context):\\n        self.model = joblib.load('/models/fraud_v3.joblib')\\n    def eval(self, *features: pd.Series) -> pd.Series:\\n        X = pd.DataFrame(dict(zip(\\n            ['amount','velocity','merchant_risk',...],\\n            features\\n        )))\\n        return pd.Series(self.model.predict_proba(X)[:, 1])\\n\\nfraud_udf = udf(\\n    FraudClassifier(),\\n    input_types=[DataTypes.DOUBLE()] * 50,\\n    result_type=DataTypes.DOUBLE(),\\n    func_type='pandas'  # KEY: vectorized via Arrow\\n)```. (2) Register: `t_env.create_temporary_function('fraud_score', fraud_udf)`. (3) SQL unchanged — `SELECT fraud_score(f1, f2, ..., f50) FROM events`. **Phase 3 — Configuration tuning**. (a) `python.fn-execution.arrow.batch.size: 10000` — default OK, large batches good для sklearn (parallelization внутри predict_proba). Test 5000, 10000, 20000 to find sweet spot. (b) `python.fn-execution.bundle.size: 100000` — outer bundle, less critical с pandas UDF but still amortizes JVM↔Python boundary. (c) `python.fn-execution.bundle.time: 1000ms` — flush stale partial batches. (d) `taskmanager.memory.task.off-heap.size: 1g` — sklearn RandomForest model + Arrow batches need off-heap memory (model ~200MB + batch buffers). (e) Keep process mode (`python.fn-execution.framework: PROCESS`) — sklearn с PyTorch potential incompatibility с PEMJA thread mode, isolation safer. Process mode + Pandas UDF combo — Arrow makes IPC less painful через batching. **Phase 4 — Slot и parallelism**. Current 8 TM × 4 slots = 32 parallel = 30k/sec → 1k per subtask. Target 200k/sec / 32 parallel = 6.25k per subtask. Pandas UDF achievable ~10k per subtask с batch_size=10000 (one predict call per 10k records, sklearn вектор predict ~5ms for 10k×50 features). **Phase 5 — Memory considerations**. (a) Each Python process holds model copy (200MB × 32 slots = 6.4GB total across cluster) — verify k8s pod memory limits. (b) Arrow batch buffers ephemeral but peak ~50MB per batch × 32 = 1.6GB total. (c) Total: cluster needs 10-12GB allocated к Python processes. **Phase 6 — Validation testing**. (1) Locally with sample 100k events: row-wise vs Pandas UDF — measure throughput, latency, memory. Expected 5-10x speedup. (2) Staging deploy: replay production traffic 1M events, monitor full job metrics. Expected throughput 150-250k. (3) Verify accuracy unchanged — fraud_score distribution should match between row-wise и batch (sklearn deterministic, but float ops могут slightly differ). **Phase 7 — Production rollout**. (1) Canary 5% traffic с new code, 24h monitoring. (2) Compare alert rates, latency, resource usage. (3) Gradual ramp up 25% → 50% → 100% over 1 week. (4) Keep row-wise version в hot standby для rollback. **Expected outcomes**: (a) Throughput 30k → 200k+ (target achieved). (b) Latency p99 ~50ms (was ~200ms due to row-wise overhead). (c) CPU per record drops 10x (sklearn batch processing 10x more efficient than per-record). (d) Memory slightly higher due model loaded per slot (acceptable trade-off). **Metrics для monitoring**: `python_taskmanager_pythonScalarFunctionOperator_processBundleMs` — should drop massively с Pandas UDF. `flink_taskmanager_job_task_operator_numRecordsOutPerSecond` — primary KPI. Python heap stable (model loaded once, doesn't grow). **Long-term opportunities**: (1) Migrate sklearn → ONNX runtime для another 2x speedup. (2) If GPU available — TensorRT/CUDA optimization для another 5-10x. (3) Async UDF (Flink 2.2, урок 08) if model becomes external service. (4) Feature pre-computation via Table API joining materialized features table (reduces work in UDF itself)."
+/>
