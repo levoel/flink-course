@@ -49,7 +49,7 @@
       "correctAnswer": "c",
       "explanation": "Triple-combo combinatorial explosion: followedByAny — non-det relaxed, каждый matching A создаёт state с каждым subsequent B → cartesian; oneOrMore — variable-length, growing per event; allowCombinations — все 2^N subsets matching events. Combined: для N=20 = 1M ComputationStates, каждая с shared events pointers. State blow-up, checkpoint stall, JVM OOM. Production safe alternative: followedBy (single match per A), bound через times(min, max), MATCH_RECOGNIZE с tight WITHIN, или custom state machine.",
       "studyHint": "Повторите урок — секция Why complex patterns expensive",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-05-q4",

@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "maxParallelism IMMUTABLE после старта. Savepoint содержит maxParallelism=128. setParallelism(200) > 128 → conflict, restart fails. Единственный путь — State Processor API offline batch: read savepoint → re-bootstrap с новым maxParallelism → write new savepoint. Для multi-TB savepoint это часы работы. Production lesson: ВСЕГДА env.setMaxParallelism(1024) явно при первом deploy.",
       "studyHint": "Повторите урок — секция Production gotchas",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-04-q3",
@@ -57,7 +57,7 @@
       "question": "setMaxParallelism(1024) на job с parallelism=4 создаст significant overhead и замедлит работу.",
       "correctAnswer": false,
       "explanation": "False. Overhead установки больших maxParallelism — micro (несколько KB metadata в JobManager и SnapshotMetaData). Cost несравним с риском неспособности scale в будущем. Recommendation: setMaxParallelism(1024) или 4096 для production — практически free insurance против rebootstrap. Только не используйте абсурдно большие значения (типа 32768) на small jobs — это уже излишество.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

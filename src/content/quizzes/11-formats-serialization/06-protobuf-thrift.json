@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Protobuf wire format использует tag numbers (1, 2, 3...) — field names в wire отсутствуют. Reuse tag number — catastrophe: stored data с `tag 5 = int64 legacy_id = 12345` при чтении новой schema (`tag 5 = string region`) интерпретирует 8 bytes int64 как UTF-8 string → garbled output или decode exception. Old running consumers стартуют падать на messages, written by new producers с reused tag. Schema Registry Protobuf compatibility check ЛОВИТ это, но только if registry в use. Protection mechanism: `reserved 5; reserved 'old_field';` в .proto — compiler rejected любую попытку reuse tag 5 или name 'old_field'. Production rule: never delete fields без reserve. Naming change (`old_field` → `new_field` с same tag) — OK (field names only в .proto, не в wire), но recommend keep aliases для documentation continuity.",
       "studyHint": "Повторите урок 06 — секцию 'Schema evolution в Protobuf' и critical reserve pattern",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-06-q3",
@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Decision factors: **Avro wins when** — (1) Existing Kafka + Schema Registry ecosystem (de-facto standard, first-class support в Confluent stack). (2) Cross-language consumers (Python pandas, Go, Rust — все имеют mature Avro libs). (3) Iceberg/Parquet downstream — Avro maps cleanly. (4) Schema evolution с aliases для rename (Protobuf не имеет). (5) Logical types (decimal, timestamp-millis) для precise SQL. **Protobuf wins when** — (1) gRPC services already define .proto files — reuse same schemas (single source of truth). (2) Slightly more compact wire (varint encoding for small ints — ~5-10% savings). (3) Well-known types (`Any`, `Timestamp`, `Duration`, `Struct`) для unstructured data. (4) Stronger backward type safety (proto3 default values вместо nulls). (5) Polyglot RPC + streaming в одной schema repo. **Production rule**: choose ONE format pipeline-wide. Mixing creates conversion overhead (~30% on cross-format steps) и schema governance complexity.",
       "studyHint": "Повторите урок 06 — секцию 'Use case matrix: какой формат для чего'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-06-q4",

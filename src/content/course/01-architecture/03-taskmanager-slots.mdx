@@ -152,7 +152,7 @@ taskmanager.memory.managed.fraction: 0.4       # 1638 MB (RocksDB!)
 То есть из 4 ГБ только ~1.1 ГБ доступно user heap. Если у вас `numberOfTaskSlots: 4`, на slot приходится ~280 MB heap. Это часто меньше, чем ожидают разработчики.
 
 <Callout type="warning">
-Самая частая ошибка — поднять `numberOfTaskSlots` без увеличения `process.size` и удивиться OOM. Каждый slot уменьшает heap budget per subtask. На 4 GB TM с 8 slots на subtask приходится <150 MB — нереалистично для большинства workloads.
+Самая частая ошибка — поднять `numberOfTaskSlots` без увеличения `process.size` и удивиться OOM. Каждый slot уменьшает heap budget per subtask. На 4 GB TM с 8 slots на subtask приходится &lt;150 MB — нереалистично для большинства workloads.
 </Callout>
 
 ---

@@ -57,7 +57,7 @@
       "question": "TupleTypeInfo не поддерживает schema evolution — добавление компонента (Tuple2 → Tuple3) или изменение типа компонента (Long → Double) приводит к incompatible serializer snapshot, savepoint не восстанавливается.",
       "correctAnswer": true,
       "explanation": "TupleSerializerSnapshot хранит arity + per-component TypeSerializerSnapshot. На recovery resolveSchemaCompatibility сравнивает: (1) Same class (TupleN)? — fail если arity changed. (2) Same component types? — recursive snapshot comparison per component. Add component: TupleSerializerSnapshot для old (Tuple2) hat arity=2, new serializer Tuple3 has arity=3 → incompatible(), savepoint fails recovery. Change component type Long → Double: per-component snapshot resolution returns incompatible → overall incompatible. Workaround если уже deployed: State Processor API batch migration читает state с TupleSerializer<old>, пишет с TupleSerializer<new> или POJO. Production rule: keyed state и operator state — NEVER Tuple. Только POJO/Avro для long-lived state.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

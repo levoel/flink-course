@@ -49,7 +49,7 @@
       "correctAnswer": "a",
       "explanation": "State Processor API (flink-state-processor-api) — escape hatch для невозможных schema migrations. Use cases: (1) Rename field properly (avoiding aliases workaround). (2) Split field: `signupDate: Instant → signupYear: int + signupMonth: int`. (3) Merge fields. (4) Restructure: ValueState<List<Item>> → MapState<ItemKey, Item>. (5) Filter state: keep только entries matching criteria. (6) Convert serializer type: Kryo → POJO. **How it works**: standalone batch Flink job. (1) `Savepoint.load(env, path, backend)` — read existing savepoint. (2) `existing.readKeyedState('operator-uid', readerFn)` — get DataStream<KeyedState> of old format. (3) Transform via map() в new format. (4) `NewSavepoint.create(backend, maxPar).withKeyedState('operator-uid', bootstrapFn, newStream)` — write new savepoint. (5) `newSavepoint.write('new-path')`. Streaming job restarts с new savepoint. **Production workflow**: stop streaming with savepoint → run migration batch job → start streaming with new savepoint. Was experimental до 1.15, stable 1.16+. Critical для long-lived stateful jobs with breaking schema changes.",
       "studyHint": "Повторите урок 08 — секцию 'State Processor API — escape hatch'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-08-q4",
@@ -57,7 +57,7 @@
       "question": "Explicit `@uid('operator-name')` для всех stateful operators обязателен в production. Без UID Flink назначает auto-UID на основе operator position в graph, и любой code change (даже adding log statement в map() выше) ломает state mapping — savepoint становится unrelatable к new operators.",
       "correctAnswer": true,
       "explanation": "Auto-UID generation: Flink JobGraph builder назначает UIDs на основе operator position (chain ID + position в chain). Любое изменение upstream operators (add/remove map, change parallelism, alter chain breaks) → repositioning → different auto-UIDs для downstream stateful operators. Savepoint мапит state by UID → recovery finds 'no state for new UID' → state lost silently (operator restartится с empty state). Worst case: business logic critical state (user profiles, fraud history) evaporates на deploy. **Explicit @uid pattern**: `stream.keyBy(...).process(new MyFn()).uid('my-fn-state').name('My processing')`. UID — stable identifier для state, не зависит от graph topology. Name — display only. **Production checklist**: каждый stateful operator (KeyedProcessFunction, Window, AsyncFunction с state, etc.) имеет explicit `.uid()`. CI lint: scan code для `.process(.*)` без следующего `.uid(`. Naming convention: `<module>-<purpose>-state` (например `fraud-detection-user-history`). Не reuse UID между different state types. **State Migration safety**: with explicit UIDs, можно safely refactor pipeline structure (rearrange map/filter, add new stages) — stateful operators preserve their state через UID consistency.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Universal lakehouse problem. Streaming sink → file per checkpoint per subtask. С parallelism 8 + 1min checkpoint = 480 files/hour. Cost: listing slow (Iceberg manifests grow), query engines (Presto, Athena) do many small reads, S3 throttling. FileSink не compacts — responsibility отдельной job. Multi-layer mitigation: (1) Sink-side: larger checkpoint interval или rolling policy для 100-512MB target. (2) Downstream: Iceberg's RewriteDataFilesAction (Spark), Paimon's automatic background compaction, Hudi async compaction. (3) Architectural: choose lakehouse format с native compaction (Paimon — automatic) vs raw FileSink (manual).",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-04-q3",

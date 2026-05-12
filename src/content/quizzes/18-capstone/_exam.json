@@ -19,7 +19,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Conscious architectural choice. Direct Flink CDC plusses: cost savings ($3-5k/month no Kafka retention для 30TB), latency, schema evolution built-in. Risk: replication slot fill-up if Flink down — Postgres disk crash possible. Mitigations transform risk: monitoring + alerting + bound guard + runbooks. Production responsibility design with guardrails, не unconscious choice. Production prod requires explicit risk assessment + mitigation per architectural decision.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-exam-q2",
@@ -117,7 +117,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Multi-dimensional production concerns. Each category covers distinct risk: code bugs (10-100x cheaper to catch early); state design (anti-patterns surface на scale); EOS (silent data loss possible); deployment (config issues common); observability (без её troubleshooting impossible); performance (capacity surprises); security (catastrophic breaches); DR (untested = false confidence); op readiness (без on-call = pipeline fails). Comprehensive coverage prevents tunneled launch focus. Process > vibes — concrete checklist beats individual memory.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-exam-q9",
@@ -131,7 +131,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Production readiness не black-or-white. Risk-based framework: (1) Identify hard blockers (chaos testing — unknown production behavior); (2) Acceptable risks with monitoring (state growth с capacity headroom); (3) Quick post-launch fixes (retention policy Day-1); (4) Planned deferrals (DR runbook game day in 2 weeks). Communication: concrete data ('5 untested failure modes = unknown production behavior') overcomes pressure ('just launch faster'). Process protects team — launches что pass checklist have dramatically better success rate. Trust process, not vibes.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-exam-q10",
@@ -139,7 +139,7 @@
       "question": "Capstone полностью покрывает skills нужные для senior Flink engineer role. After course, ready для unsupervised production responsibility.",
       "correctAnswer": false,
       "explanation": "Honest assessment: capstone — strong foundation, не complete senior expertise. Course teaches: design patterns, implementation patterns, deployment basics, observability foundations, chaos awareness. Need 6-12 months production for senior-level confidence: actual incident response (3 AM debugging across diverse failure modes), capacity planning + cost optimization (year of budget management), cross-team architecture decisions (stakeholder communication, technology evaluation, migrations), specific scale claims (actually done 50k events/sec exactly-once, not just designed it). Honest interview framing: 'Built capstone production-grade pipeline. Strong fundamentals, comfortable learning, hungry for production exposure.' Overclaiming = credibility risk. Course gives strong starting point, production experience completes path к senior.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Classic signs: direct memory grows linearly (not plateau), size-all-mem-tables exceeds budget (3.8GB vs expected 1.6GB) → 2.4x превышение. WBM не работает. Diagnosis: (1) Check для custom RocksDBOptionsFactory — если present, verify class extends DefaultConfigurableOptionsFactory и calls super.createDBOptions() FIRST; (2) Check state.backend.rocksdb.memory.managed (default true, но some legacy configs disable); (3) Verify managed.fraction makes sense (0.4-0.5 typical). Fix: remove custom factory или extend Default properly. After fix: direct_memory_used plateau ~ managed budget, size-all-mem-tables < write-buffer-ratio × managed. Prevention: CI check для RocksDBOptionsFactory subclass — auto-fail if not extends DefaultConfigurableOptionsFactory.",
       "studyHint": "Повторите урок — Production gotchas",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-06-q4",

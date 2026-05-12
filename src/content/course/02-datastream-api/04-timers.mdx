@@ -62,7 +62,7 @@ Important: `onTimer` вызывается для всех зарегистрир
     <FlowRow>
       <DataBox
         label="Timer ждёт"
-        tooltip="Watermark всё ещё < 10:30. Timer хранится в TimerService (по сути priority queue в state). При checkpoint persistится."
+        tooltip="Watermark всё ещё &lt; 10:30. Timer хранится в TimerService (по сути priority queue в state). При checkpoint persistится."
       >
         в queue, не fires
       </DataBox>
@@ -359,7 +359,7 @@ Timers — это **keyed state**. Хранятся в:
 
 Все taymery в queue ordered по timestamp. Когда watermark advance:
 
-1. Pull all timers с `timer.ts <= new_watermark` из queue.
+1. Pull all timers с `timer.ts &lt;= new_watermark` из queue.
 2. Sort by timestamp.
 3. For each timer call `onTimer(ts, ctx, out)` sequentially **в mailbox thread**.
 

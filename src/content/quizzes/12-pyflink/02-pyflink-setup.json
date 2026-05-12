@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Production Kubernetes deployment requires careful coordination. **Docker image**: FROM flink:2.2.0-java17 + apt-get install python3.11 python3.11-dev python3.11-venv pip + system libs (sqlite3, ssl, libgomp если numpy uses OpenMP). Set ENV PYFLINK_EXECUTABLE=/usr/bin/python3.11. Single image для consistency. **Environment archive**: conda-pack или tar venv с pinned versions всех deps (pandas, numpy, pyarrow, ML libs, apache-flink). Upload S3 (или K8s ConfigMap для small <10MB envs). **FlinkDeployment CRD** (Flink Kubernetes Operator): apiVersion: flink.apache.org/v1beta1, kind: FlinkDeployment, spec.image: my-registry/flink-py311:2.2.0, spec.job.entryClass: org.apache.flink.client.python.PythonDriver, spec.job.args: ['-py', '/opt/job/main.py', '-pyarch', 's3://...']. Flink artifact fetcher downloads archive, extracts, uses bundled Python. **Version pinning** layers: (1) Dockerfile: python3.11.7 specific patch. (2) requirements.txt: exact versions. (3) pyproject.toml: requires-python='==3.11.*'. (4) Client environment = same Docker image via docker-compose. **Configuration**: python.fn-execution.bundle.size=1000, python.fn-execution.framework=PROCESS (или THREAD per workload), task off-heap memory для embedded Python.",
       "studyHint": "Повторите урок 02 — секцию 'Cluster-side Python' и FlinkDeployment example",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m12-02-q4",
@@ -57,7 +57,7 @@
       "question": "Python version mismatch между client (где `flink run`) и cluster (TaskManager pods) — самая частая проблема в PyFlink production. Client Python 3.10, cluster Python 3.11 → pickle protocol mismatch, cloudpickle различия, native ABI incompatibility → ошибки serialization UDFs. Production rule: pin IDENTICAL versions через single Docker image.",
       "correctAnswer": true,
       "explanation": "Python version exactness требуется на нескольких уровнях: (1) **Pickle protocol** — protocol version меняется minor versions. 3.10 default pickle.HIGHEST_PROTOCOL=5, 3.11 same но byte-level differences possible. (2) **cloudpickle** — serializes Python objects (functions, closures) for shipping к TaskManagers. cloudpickle 2.x has compat checks but minor version differences в Python bytecode (which cloudpickle includes) may cause issues. (3) **Native ABI** — numpy, pandas, pyarrow compiled against specific CPython ABI (limited stable API). Cross-version installs may segfault or produce subtle bugs. (4) **Standard library changes** — между minor versions есть semantic differences (e.g., asyncio behavior changes). **Production rule**: use SAME Docker image для CI, dev, staging, production. Image based on python:3.11.7-slim или similar pinned patch version. Client uses image via docker-compose, K8s uses same image для TaskManager pods. pyproject.toml: `requires-python = '==3.11.*'`. CI verification step: assert installed Python version matches expected. **Common failure modes**: (a) Cloud client (Cloud9, JetBrains Gateway) uses different Python than K8s — pickle deserialization fails. (b) macOS dev (Python 3.11.5 via brew) deploys к Linux 3.11.7 — usually OK, but native ABI subtle issues. (c) Image cache не invalidated на K8s after rebuild — old image still in use.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

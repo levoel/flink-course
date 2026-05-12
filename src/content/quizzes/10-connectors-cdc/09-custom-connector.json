@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "#1 source of production bugs в custom connectors. Flink at-least-once delivers commits — может call Committer.commit() для same Committable multiple times (recovery scenarios). Non-idempotent throws → retry storm → infinite loop. Idempotent contract: either catch already-committed exceptions и treat as success, или design unique transaction IDs that can be safely re-submitted. Same pattern в KafkaSink (Kafka transactional commit idempotent), FileSink (rename .pending → final, if already renamed: OK). Custom committers must explicitly implement. Production scenario: TM killed после Committer.commit() succeeds но перед persisting state — recovery re-submits — без idempotence first commit succeeds, second 'fails' → spurious error → manual intervention.",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-09-q3",
@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Decision criteria: Custom когда standard не покрывает proprietary/specialized systems. Не custom для slightly-different version of standard (JDBC handles unusual SQL dialects, Kafka connector handles Kafka-compatible MQs через config). Custom = long-term commitment: maintain через Flink upgrades, savepoint backward compatibility (serializer versions), extensive recovery testing (TM kill, JM failover, network partition), idempotent committer obligation. Production approach: prefer standard wherever possible, custom only if business-critical proprietary integration. Investment: 3-6 months developer time for production-grade custom connector + ongoing maintenance. Worth для unique systems, not для convenience.",
       "studyHint": "Повторите урок — секция Когда custom connector",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-09-q4",

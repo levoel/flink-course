@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Flink 2.0 — cloud-native переориентация. Disaggregated state делает state portable между nodes (не tied к local disk). Flink Kubernetes Operator (official Apache project) с autoscaler и in-place rescaling делает elastic scaling возможным. Application mode (без shared Session cluster) — proper Kubernetes deployment модель. Это сравнимо с Snowflake / BigQuery подходом — compute и storage decoupled.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m00-exam-q6",
@@ -83,7 +83,7 @@
       "question": "Курс намеренно не покрывает DataSet API, Scala API, SourceFunction, SinkFunction и Stateful Functions — потому что эти технологии removed или sunsetted в Flink 2.x экосистеме.",
       "correctAnswer": true,
       "explanation": "Курс — 2.x-first. DataSet API removed в 2.0 (заменён unified DataStream с Boundedness). Scala API removed (Java-first философия). SourceFunction/SinkFunction/SinkV1 removed (FLIP-27 Source API + FLIP-191 SinkV2). Stateful Functions sunsetted в 2026 из-за неактивности. Учить legacy не имеет смысла — production deployments активно мигрируют на новые API. Также не покрываются Reactive Mode (заменён Adaptive Scheduler), Queryable State (deprecated), flink-conf.yaml format (заменён standard YAML config.yaml).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

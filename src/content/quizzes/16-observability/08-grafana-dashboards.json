@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Alert fatigue убивает production reliability. 'for: 10m' instead of '5m' — only sustained backpressure triggers, reduces transient noise 80%. De-duplication: 30 backpressured subtasks → 1 alert per job, not 30. Inhibition rules в Alertmanager: backpressure и checkpoint failures correlated (root cause shared) — show only one. Silence windows: known deployment / K8s upgrade windows pre-silenced. Alert quality SLO: false positive rate < 10% critical, < 25% high. Track. Continuously tune. Less is more: every alert actionable, every page justified.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-08-q4",
@@ -57,7 +57,7 @@
       "question": "Production Grafana dashboards должны быть в Git (dashboards-as-code) + provisioned через CI/CD, не manual edits в UI.",
       "correctAnswer": true,
       "explanation": "True. Manual dashboards drift, undocumented, lost on Grafana restore. Versioned JSON в Git — single source of truth. Grafana provisioning: /var/lib/grafana/dashboards/flink/*.json, datasource provisioning yaml. Terraform Grafana provider для automation. Production benefits: (1) Audit trail changes, (2) Code review для dashboard changes, (3) Backup-free restore, (4) Environment parity (dev/staging/prod same dashboards), (5) Easy clone/template для new jobs. Quarterly review — retire stale panels, add new metrics for emerging concerns. Stale dashboards теряют trust команды.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

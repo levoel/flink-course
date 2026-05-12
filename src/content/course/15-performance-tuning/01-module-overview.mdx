@@ -80,8 +80,8 @@ taskmanager.network.memory.buffer-debloat.enabled: true
 | GC | Pause | Use case |
 |---|---|---|
 | G1 (default) | 10-200ms | General-purpose |
-| ZGC | < 10ms | Low-latency, large heap |
-| Shenandoah | < 10ms | Like ZGC, alternative |
+| ZGC | &lt; 10ms | Low-latency, large heap |
+| Shenandoah | &lt; 10ms | Like ZGC, alternative |
 
 ```yaml
 env.java.opts: "-XX:+UseZGC -XX:MaxGCPauseMillis=10"

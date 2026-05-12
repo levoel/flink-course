@@ -19,7 +19,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Classic production trap. maxParallelism = number of key groups (atomic state distribution units). Изменение = вся hash distribution invalid (keyGroupId = murmurHash(key) % maxParallelism). Не fixable on live job. Only State Processor API offline rebootstrap: canonical savepoint → batch job reads old state, writes new savepoint с new maxParallelism — 1.5TB ~3-4h. Production rule: setMaxParallelism(1024) при first deploy = ~1% overhead, saves potential hours/days migration later. Free insurance.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-exam-q2",
@@ -47,7 +47,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Cross-backend migration multi-faceted. Canonical mandatory (native locked к backend). ForSt config critical: primary-dir определяет disaggregation (without — local default defeats purpose), cache size affects hit rate (1GB cache for 200GB state = 99% miss = disaster), async I/O thread pool hides S3 latency, Async API V2 mandatory (sync + ForSt = 200 events/sec catastrophe vs async 30k). Staging 1-2 weeks — catch config issues, throughput baseline. Symmetric rollback through canonical — keep insurance 30 days.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-exam-q4",
@@ -83,7 +83,7 @@
       "question": "В production 2026 для state evolution: Avro с schema registry + UIDs на всех stateful operators + canonical savepoint при major changes + 30-day retention для upgrade savepoints + quarterly rollback drill — это full discipline stack.",
       "correctAnswer": true,
       "explanation": "True. Full production discipline в 2026: (1) Avro state с Confluent Schema Registry — best long-term evolution support с aliases, promoted types, defaults, cross-language; (2) `.uid('descriptive-name')` на всех stateful operators + `pipeline.auto-generate-uids: false` enforcement → state continuity guaranteed; (3) Canonical savepoint при backend migrations, major version upgrades, State Processor API jobs — universal format; (4) Tiered retention: hourly 7d, upgrades 30d, weekly 90d glacier, monthly 1y, annual forever — covers всё detection lag scenarios; (5) Quarterly drill verifies rollback procedure actually works — без drill procedure decays. Это comprehensive stack для production-grade state evolution discipline.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

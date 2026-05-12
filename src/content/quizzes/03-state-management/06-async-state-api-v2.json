@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "ForSt = primary state на S3, локальный диск только cache. Cache miss = 50-100ms S3 GET. Sync API блокирует single-threaded mailbox subtask-а на это время. Numerical: 30% cache miss × 10k events/sec × 100ms = 300 секунд блокировки/секунду wall clock — невозможно. Async API делегирует state I/O в AEC worker pool (8 threads), mailbox продолжает работать. Apache benchmarks: ForSt+sync = 200 events/sec, ForSt+async = 30k events/sec — 150x разница. Без async API ForSt unusable.",
       "studyHint": "Повторите урок — секция ForSt + Async",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-06-q4",

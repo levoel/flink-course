@@ -232,7 +232,7 @@ spec:
 | main() runs где | Inside JM pod | На клиенте (`flink run`) |
 | Resource isolation | Hard (dedicated JM + TM) | Soft (shared slots) |
 | Failure blast radius | Только эта app | Все jobs в cluster |
-| Cold start | 10-60 сек (pod create) | <2 сек (slot allocate) |
+| Cold start | 10-60 сек (pod create) | &lt;2 сек (slot allocate) |
 | Memory overhead per job | Высокий (свой JM) | Низкий (shared JM) |
 | Production use case | Streaming jobs 24/7 | Ad-hoc SQL, exploration, small batch |
 | Versioning | Per-app independent | One Flink version per cluster |

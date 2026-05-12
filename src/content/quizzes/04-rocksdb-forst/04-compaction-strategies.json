@@ -34,7 +34,7 @@
       "correctAnswer": "a",
       "explanation": "Universal compaction специально для write-heavy SSD endurance scenarios. Math: Leveled WA=60x → 200k writes × value_size × 60 = огромная I/O. Universal WA=10-15x → 5-7x меньше disk wear. Config: state.backend.rocksdb.compaction.style: UNIVERSAL, universal.size-amplification-percent: 100, universal.max-merge-width: -1, увеличить thread.num до 8. Trade-offs accept: (1) read P99 1ms vs 0.5ms — OK для 20% reads; (2) space amp +50% — need extra disk; (3) compaction spikes — provision CPU. Monitor write stall events. Alternative если read-critical: stay Leveled, optimize writebuffer.size до 256MB (меньше flushes), уменьшить level multiplier до 5 (меньше levels) — partial improvement.",
       "studyHint": "Повторите урок — Decision matrix",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-04-q3",

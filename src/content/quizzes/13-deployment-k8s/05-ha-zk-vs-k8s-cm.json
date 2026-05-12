@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "K8s ConfigMap-based HA — production default 2026. Преимущества: (1) no external dependency — K8s API уже есть; (2) cloud-native — leverage K8s RBAC, watch streams; (3) simpler ops — нет ZK ensemble для patching/backup; (4) GitOps-friendly. ZK HA имеет смысл только для bare-metal Flink (вне K8s) или legacy infrastructure с уже работающим ZK. Без HA = SPOF, JM crash = data loss / downtime.",
       "studyHint": "Повторите урок — Когда выбирать что",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-05-q4",

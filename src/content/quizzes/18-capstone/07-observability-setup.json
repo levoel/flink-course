@@ -57,7 +57,7 @@
       "question": "Observability — это one-time setup. После initial deployment dashboards и alerts остаются accurate индефинитно.",
       "correctAnswer": false,
       "explanation": "Observability requires ongoing investment. Entropy: (1) Dashboards stale — new features добавлены, dashboard не updated; (2) Alerts no longer relevant — thresholds too tight/loose for current state, false positives common; (3) Runbooks outdated — fixes описанные не работают на current infrastructure; (4) Metric cardinality drift — new labels exploding Prometheus storage; (5) Dashboard sprawl — каждый team создаёт свои, hard to find canonical. Production maturity requires: quarterly review, runbook drills, alert tuning based на incident postmortems, dashboard pruning. Treat observability как product требующий maintenance.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

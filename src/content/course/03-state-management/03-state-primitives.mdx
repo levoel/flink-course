@@ -383,7 +383,7 @@ RocksDB value: serialized ACC (не OUT!)
 
 Каждый StateDescriptor требует знать TypeSerializer для T. Flink resolve это в порядке:
 
-1. **Class<T>** — простые типы (Long.class, String.class)
+1. **Class&lt;T&gt;** — простые типы (Long.class, String.class)
 2. **TypeInformation.of(class)** — explicit
 3. **TypeHint** — для generics (Tuple, List)
 
@@ -548,7 +548,7 @@ Tests на in-memory benchmark, 100k operations per key:
 | Primitive | RocksDB ops | Hashmap ops | Серьёзность |
 |---|---|---|---|
 | ValueState (small T) | ~10μs | ~100ns | Same magnitude |
-| ValueState (Map<K,V> as T) | ~5ms / op | ~5μs | RocksDB 1000x медленнее — антипаттерн |
+| ValueState (Map&lt;K,V&gt; as T) | ~5ms / op | ~5μs | RocksDB 1000x медленнее — антипаттерн |
 | MapState | ~10μs per entry | ~100ns | Per-entry хорошо scales |
 | ListState | ~10μs per element | ~100ns | Append optimized |
 | ReducingState | ~15μs | ~200ns | Чуть больше из-за reduce call |

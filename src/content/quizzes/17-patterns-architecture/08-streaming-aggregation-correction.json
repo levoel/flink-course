@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Critical mental model: streaming aggregates имеют fundamental drift (late events, watermark approximations, schema issues). Для money — это unacceptable. Architecture: (1) Streaming Flink → Iceberg streaming aggregate table (с allowedLateness 30-60min); (2) Daily Spark batch reads raw events + streaming aggregates, computes corrections, overwrites reconciled table; (3) Billing system reads ТОЛЬКО reconciled table. Streaming = preview, batch = settle. Без этого даже tiny drift (0.1%) на scale = тысячи $ ошибок. Lesson из реальных incidents — мерчанты получают wrong invoices когда streaming agg = authoritative.",
       "studyHint": "Повторите урок 08 — раздел 'Pattern 3: Periodic batch reconciliation' и KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-08-q4",

@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "SplitEnumerator runs sequentially в SourceCoordinator. Heavy blocking ops (S3 listing 10M files) блокируют processing split requests от readers → idle readers waiting for work. SplitEnumeratorContext.callAsync(supplier, handler) provides async work mechanism — supplier runs в separate thread, handler called в coordinator thread when done. Plus best practices: limit S3 listing scope через prefix-based partitioning (year/month/day), cache results, use Iceberg/Paimon manifest для O(1) listing вместо O(N) listing. Это common production issue с custom FileSource over massive directories.",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-02-q4",

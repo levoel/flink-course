@@ -57,7 +57,7 @@
       "question": "Schema evolution с `schema.change.behavior: try-evolve` гарантирует zero downtime для всех schema changes в production.",
       "correctAnswer": false,
       "explanation": "try-evolve attempts apply but logs warning if не can. Не gives zero downtime guarantee. (1) Destructive changes (DROP COLUMN, RENAME) — try-evolve может gracefully skip, но downstream queries относящие к removed column сломаются (это data issue, не Flink issue); (2) Incompatible type changes (VARCHAR → INTEGER) — both modes fail. Безopasность: production prod должен иметь Postgres DDL governance + alerting на destructive changes + lakehouse retention 30+ days для recovery. try-evolve вспомогательный tool, не silver bullet.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

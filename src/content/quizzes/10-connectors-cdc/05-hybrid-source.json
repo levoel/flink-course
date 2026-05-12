@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Common production gap — watermark vs hand-off mismatch. Watermark monotonically progresses в Flink — never backwards. Если historical processing fast и watermark advanced до e.g., 2026-05-12 23:59:59, потом Kafka starts от 2026-05-12 00:00:00 — все Kafka events с timestamps между этими points 'late' (timestamp < watermark) → dropped или silent в late side outputs. Fix: dynamic factory ensures Kafka start = last_historical_timestamp + 1ms = continuous progression. Alternative: increase overlap intentionally + downstream de-dup. Universal pattern: hand-off timestamp must align с actual end of historical phase.",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-05-q4",

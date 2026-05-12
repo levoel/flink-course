@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "Flink CDC 3.x replacement для Debezium-based lakehouse ingestion. Key advantages: (1) Single deployment vs Debezium+KafkaConnect+Kafka+downstream. (2) Declarative YAML — entire pipeline в файле, no Java code. (3) Schema evolution auto-propagation — ALTER TABLE в Postgres flows через pipeline, Paimon applies ALTER TABLE автоматически; в Debezium downstream coordinates manually. (4) Native exactly-once к lakehouse — direct, no Kafka intermediate. (5) AI integration built-in (3.3+) — OPENAI_EMBEDDING/CHAT/SENTIMENT inline. (6) Lower latency, simpler ops. Use Debezium для: Kafka-centric architectures с many heterogeneous consumers (microservices, ML, analytics).",
       "studyHint": "Повторите урок — секция Flink CDC vs Debezium",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-08-q2",
@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Critical Postgres CDC operational gotcha. Replication slots — durable state в Postgres что remembers что данный consumer должен see (last consumed LSN). WAL не recycled пока всех slots не прошли это (oldest confirmed_flush_lsn). Если pipeline crash и не restart — slot remains, WAL grows unbounded, disk fills. Real production incidents tooks down whole DBs. Mitigations: (1) Monitor pg_replication_slots view actively (Datadog/Prometheus). (2) Alert if slot active=false longer than threshold. (3) Auto-drop slots для retired pipelines. (4) Set wal_keep_size cap. Critical: на permanent pipeline removal, manually drop slot.",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-08-q3",

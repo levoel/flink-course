@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Critical reality check на autoscaler limitations. Autoscaler designed для unknown traffic patterns, не sudden known spikes. Mailbox timings need 5-10min metrics window + stabilization period before scaling decisions. K8s cluster autoscaler (separate from Flink autoscaler) adds further delay для node provisioning. For Black Friday 5x: combined scaling takes 15-20min — unacceptable. Pre-event preparations are non-negotiable: manual pre-scale (kubectl patch parallelism), pre-provision nodes, increased bounds, staging test. Autoscaler — safety net, not primary capacity strategy. Lesson: 'autoscaler handles it' misconception causes production incidents.",
       "studyHint": "Повторите урок 06 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-06-q4",

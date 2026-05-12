@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Metrics tell that latency bad — traces tell why. Common patterns from analysis: (a) state-access slow (hot key, RocksDB compaction concurrent); (b) async I/O slow (DB query, connection pool exhausted); (c) sink slow (Kafka broker overload, transaction timeout); (d) serialization slow (large objects, complex schema); (e) chained operator blocked. Structured attributes критичны: filter в Tempo 'show me slow events where state_size > 1MB' impossible без attributes. Production setup: enable tail-based sampling (when duration > 500ms) для tail latency events. Combine с metrics панель в Grafana для correlation.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-05-q4",

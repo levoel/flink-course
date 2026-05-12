@@ -1,5 +1,6 @@
 ---
 title: "maxParallelism: immutable trap и rebootstrap"
+description: "maxParallelism immutable после старта — key groups механика и rebootstrap через State Processor API"
 order: 5
 difficulty: "advanced"
 estimatedTime: 24
@@ -82,7 +83,7 @@ subtaskIndex = keyGroupId * currentParallelism / maxParallelism
       </DataBox>
       <DataBox
         label="..."
-        tooltip="Redistribution: state files reorganize между subtasks. Все ОК пока parallelism <= maxParallelism."
+        tooltip="Redistribution: state files reorganize между subtasks. Все ОК пока parallelism &lt;= maxParallelism."
       >
         ...
       </DataBox>
@@ -96,7 +97,7 @@ subtaskIndex = keyGroupId * currentParallelism / maxParallelism
     <Arrow direction="down" label="rescale to parallelism = 200" />
     <FlowRow>
       <DataBox
-        label="PROBLEM: 128 / 200 < 1 KG per subtask"
+        label="PROBLEM: 128 / 200 &lt; 1 KG per subtask"
         tooltip="Невозможно. Нужно минимум 1 KG per subtask. 128 max parallelism = max 128 subtasks. Restore с parallelism > maxParallelism = FAIL."
       >
         IMPOSSIBLE
@@ -387,7 +388,7 @@ flinkConfiguration:
   parallelism.default: "8"                               # current
 ```
 
-Можно scheduler.max-parallelism < pipeline.max-parallelism (e.g., 200 < 1024). Это говорит: «key groups support до 1024 subtasks, но сейчас не хочу scheduler scale выше 200». Гибко.
+Можно scheduler.max-parallelism &lt; pipeline.max-parallelism (e.g., 200 &lt; 1024). Это говорит: «key groups support до 1024 subtasks, но сейчас не хочу scheduler scale выше 200». Гибко.
 
 ---
 

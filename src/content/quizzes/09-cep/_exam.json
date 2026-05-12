@@ -47,7 +47,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Это classic CEP production deterioration. Чек все три факторы: unbounded within → state grows linearly per key forever; followedByAny → N×M combinatorial matches при busy keys; oneOrMore greedy → каждый matching event extends partial match. Combined эффект — exponential state growth, checkpoint duration scales с state size, eventually OOM. Fix: tight within(), prefer followedBy unless explicit need overlapping, bound через times(min,max). Если эти изменения compromise semantics — migrate к custom state machine.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-exam-q4",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "c",
       "explanation": "Three-step pattern имеет mix per-device (steps 1-2) + cross-device (step 3 — adjacent device). Pattern API runs per-key (deviceId) — может handle steps 1-2, но cross-device correlation для adjacent device требует joining streams from different keys. Production architecture: layer 1 — per-device CEP detects HIGH_TEMP + SHUTDOWN sequence, emits 'device-down' alerts. Layer 2 — KeyedProcessFunction keyBy(area) собирает 'device-down' alerts + tracks recent HIGH_TEMP events from adjacent devices через ValueState, applies cross-device condition.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-exam-q5",
@@ -83,7 +83,7 @@
       "question": "Best production CEP architecture обычно combines layers: upstream enrichment (KeyedProcessFunction со state) → Pattern API/MATCH_RECOGNIZE для standard temporal sequences → downstream correlator (KeyedProcessFunction для cross-key/multi-source correlation).",
       "correctAnswer": true,
       "explanation": "Правда. Production-grade CEP architectures rarely pure Pattern API. Layered approach: (1) enrichment layer добавляет context (is_new_ip, fraud_score, user_segment) через KeyedProcessFunction со ValueState; (2) CEP layer применяет declarative patterns на enriched events; (3) correlator layer joins cross-key state, applies dynamic rules через broadcast state. Каждый layer focuses на одной concern — easier to maintain, scale, debug. Pure Pattern API ограничен structurally (no async I/O, no cross-key, no dynamic patterns), pure state machine — verbose for simple sequences. Combine для best of both.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

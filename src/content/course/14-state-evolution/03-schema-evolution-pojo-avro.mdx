@@ -1,5 +1,6 @@
 ---
 title: "Schema evolution для POJO и Avro"
+description: "Backwards-compatible schema evolution для POJO и Avro serializers — что можно, что ломается, custom serializer"
 order: 3
 difficulty: "advanced"
 estimatedTime: 24
@@ -56,7 +57,7 @@ Flink использует **PojoSerializer** который сериализу�
 
 | Operation | Supported? | Comment |
 |---|---|---|
-| **Добавить nullable field** | Yes | Old state читается с new=null. Optional<T> или wrapper types работают |
+| **Добавить nullable field** | Yes | Old state читается с new=null. Optional&lt;T&gt; или wrapper types работают |
 | **Удалить field** | Yes | Old state с field — value silently dropped |
 | **Переименовать field** | No | Flink matches по name — переименование = remove + add. Old data lost |
 | **Изменить тип field** | No (limited) | Поддерживается только subset (long ↔ int), most cases FAIL |
@@ -447,5 +448,5 @@ Same result, more explicit.
 
 <KnowledgeCheck
   question="Production job stateful state `Map<UserId, Set<TransactionId>>`. UserId и TransactionId — custom typed classes. Через год хотим добавить field в TransactionId. Restore from savepoint после code change FAILS с deserialization error. Что произошло и как фиксить?"
-  answer="Diagnosis: проверьте startup logs предыдущего deploy на использование serializer. Custom typed classes (UserId, TransactionId) скорее всего fall back to **Kryo** — потому что они не POJO (вероятно immutable с final fields и constructor-based, что breaks PojoSerializer rules) и не Avro. Kryo **не поддерживает schema evolution** — любое изменение class structure breaks deserialization. Fixes (в порядке предпочтения): (1) **Refactor к POJO** — public no-arg constructor + setters или public fields. Schema evolution then works for nullable fields. Some teams выбирают immutable POJOs с factory methods и getters только — Flink type extractor it accepts. (2) **Migrate к Avro** — define schema с aliases support, generate classes. Best для long-term production. (3) **Custom TypeSerializer** — full control, but high effort. (4) **State Processor API migration** — read old state с old class, write new savepoint с new class. Best as one-time when automatic не работает. Pre-deploy prevention: всегда checking startup logs на 'cannot be used as a POJO type' warnings. Это signal что class falls к Kryo — bomb waiting to explode при evolution. Лучше discover проблему в dev, не production.",
+  answer="Diagnosis: проверьте startup logs предыдущего deploy на использование serializer. Custom typed classes (UserId, TransactionId) скорее всего fall back to **Kryo** — потому что они не POJO (вероятно immutable с final fields и constructor-based, что breaks PojoSerializer rules) и не Avro. Kryo **не поддерживает schema evolution** — любое изменение class structure breaks deserialization. Fixes (в порядке предпочтения): (1) **Refactor к POJO** — public no-arg constructor + setters или public fields. Schema evolution then works for nullable fields. Some teams выбирают immutable POJOs с factory methods и getters только — Flink type extractor it accepts. (2) **Migrate к Avro** — define schema с aliases support, generate classes. Best для long-term production. (3) **Custom TypeSerializer** — full control, but high effort. (4) **State Processor API migration** — read old state с old class, write new savepoint с new class. Best as one-time when automatic не работает. Pre-deploy prevention: всегда checking startup logs на 'cannot be used as a POJO type' warnings. Это signal что class falls к Kryo — bomb waiting to explode при evolution. Лучше discover проблему в dev, не production."
 />

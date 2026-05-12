@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Detail review: (a) Add new MapState — OK, new state begins empty, existing 'fraud-detector' state untouched, POJO/Avro evolution для outer class needs separate review. (b) Remove 'legacy-counter' — leaves orphan state. State Processor API one-time cleanup before deploy = cleanest. --allowNonRestoredState — quick but state forever. (c) UID rename — even 'no logic change' = state continuity broken. 'enrichment' state в savepoint не маппится к 'enrichment-v2'. State loss = behavior change despite claim 'no logic change'. Options: State Processor API migration preserves state, or explicit state loss acceptance (only if operator stateless or state loss acceptable).",
       "studyHint": "Повторите урок — Runbook: типичные upgrade scenarios + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-06-q4",
@@ -57,7 +57,7 @@
       "question": "Каждый production upgrade с state changes должен быть tested на staging с realistic production savepoint (или sampled production state) перед production deploy.",
       "correctAnswer": true,
       "explanation": "True. Staging должен mirror production: state schema, code dependencies, infrastructure config. Synthetic test data misses state edge cases от prod (extreme key distributions, unicode edge cases, NULL handling, large maps в state). Best practice — sampled production savepoint (10% sample) restored в staging — realistic state diversity, manageable scale. Run 24-48h verify: no errors, correct outputs, normal state size growth. Skipping staging = production-as-staging = customers as test subjects. Schema breaking changes especially critical — test before exposing production state.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

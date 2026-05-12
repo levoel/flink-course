@@ -308,7 +308,7 @@ WITH (
 
 `PARTIAL` cache — LRU + TTL. Per-subtask cache (no cross-subtask sharing).
 
-`FULL` cache — loads entire dim table at startup, refreshes periodically. Для small dim tables (<1M rows).
+`FULL` cache — loads entire dim table at startup, refreshes periodically. Для small dim tables (&lt;1M rows).
 
 ```sql
 'lookup.cache' = 'FULL',
@@ -351,9 +351,9 @@ Or use PgBouncer (connection pool middleware) — 1 PgBouncer connection serves 
 |---|---|---|---|---|
 | Sync JDBC lookup | 10-100ms blocking | ~50/sec per subtask | Low | Низкий throughput, simple |
 | Async I/O JDBC | 10-100ms async | ~5000/sec per subtask | Medium | High throughput, fresh data |
-| Async I/O + Partial cache | <1ms cache hit, 10-100ms miss | ~50000/sec при high hit rate | Medium-high | Most production |
-| Full cache (reload periodic) | <1ms все | Unlimited per subtask | Low | Small dim table (<1M rows) |
-| Broadcast state (load once) | <1ms | Unlimited | Medium | Static dim with rare updates |
+| Async I/O + Partial cache | &lt;1ms cache hit, 10-100ms miss | ~50000/sec при high hit rate | Medium-high | Most production |
+| Full cache (reload periodic) | &lt;1ms все | Unlimited per subtask | Low | Small dim table (&lt;1M rows) |
+| Broadcast state (load once) | &lt;1ms | Unlimited | Medium | Static dim with rare updates |
 | External low-latency cache (Redis) | 1-5ms | ~1000/sec sync, 10000/sec async | High | Need ultra-low latency, distributed dim |
 
 ---
@@ -426,5 +426,5 @@ SQLite locks DB на write. Multiple Flink writers serialize. **Avoid SQLite** �
 
 <KnowledgeCheck
   question="У вас Flink job делает lookup users dim table в Postgres для каждого order event (100k events/sec). Какая архитектура?"
-  answer="Single sync lookup даст 50 events/sec per subtask — нужно 2000 parallelism для 100k events/sec, что unfeasible. Production architecture: (1) Async I/O — RichAsyncFunction с HikariCP pool (20 connections per subtask). Capacity 100 in-flight, timeout 1s, ordered output (или unordered если downstream tolerant). (2) Lookup cache — PARTIAL LRU с max 100k rows, TTL 15min. Hit rate обычно 80-95% (Pareto distribution активных users) — большинство queries hit cache (<1ms), miss queries параллельно к Postgres. (3) Connection pooling — Hikari на 20 connections × parallelism. С parallelism 8 = 160 connections. Postgres max_connections=500 или PgBouncer middleware. (4) Throughput estimate: 8 subtasks × ~5k events/sec (с cache) = 40k events/sec. Если нужно больше — увеличить parallelism (linear scaling до DB bottleneck). (5) Если DB latency too high or update-аctually часто: rate change events streamed via Flink CDC, broadcast к stream, обновления applied к keyed state (eliminate JDBC lookups completely для hot users). Это classic architecture для high-throughput enrichment."
+  answer="Single sync lookup даст 50 events/sec per subtask — нужно 2000 parallelism для 100k events/sec, что unfeasible. Production architecture: (1) Async I/O — RichAsyncFunction с HikariCP pool (20 connections per subtask). Capacity 100 in-flight, timeout 1s, ordered output (или unordered если downstream tolerant). (2) Lookup cache — PARTIAL LRU с max 100k rows, TTL 15min. Hit rate обычно 80-95% (Pareto distribution активных users) — большинство queries hit cache (&lt;1ms), miss queries параллельно к Postgres. (3) Connection pooling — Hikari на 20 connections × parallelism. С parallelism 8 = 160 connections. Postgres max_connections=500 или PgBouncer middleware. (4) Throughput estimate: 8 subtasks × ~5k events/sec (с cache) = 40k events/sec. Если нужно больше — увеличить parallelism (linear scaling до DB bottleneck). (5) Если DB latency too high or update-аctually часто: rate change events streamed via Flink CDC, broadcast к stream, обновления applied к keyed state (eliminate JDBC lookups completely для hot users). Это classic architecture для high-throughput enrichment."
 />

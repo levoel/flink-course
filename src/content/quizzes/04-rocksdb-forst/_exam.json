@@ -19,7 +19,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Universal compaction specifically для write-heavy с SSD endurance concerns. Math: Leveled WA=60x → 200k × value × 60 = enormous disk I/O. Universal WA=10-15x → 5-6x меньше disk wear. Config: compaction.style: UNIVERSAL, universal.max-merge-width: -1, thread.num: 8. Trade-offs: read P99 higher, space amp 1.8x, compaction CPU spikes. Alternative architectural — ForSt: primary storage на S3 means local SSD не bears state writes, только cache writes. SSD endurance no longer concern. Recovery time becomes constant. Combination: switch к ForSt + Async API V2 — best long-term solution для cloud-native deployment с large state.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-exam-q2",
@@ -33,7 +33,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Самый частый production bug в Flink. Mechanism: Flink's DefaultConfigurableOptionsFactory injects WriteBufferManager в DBOptions через super.createDBOptions(). Custom factory без super() или extending Default = WBM lost. Без WBM: каждая Column Family allocates own MemTable (default 64-128MB) без global coordination. На state-heavy operator с 10 state primitives × 4 slots × 128MB = 5GB pure MemTable memory, plus Block Cache fragmentation (8MB per CF × 10 × 4 = 320MB), plus immutable MemTables awaiting flush. Direct memory grows linearly, exceeds managed budget, OS OOM-Killer terminates. Diagnosis: Status.JVM.Memory.Direct.MemoryUsed linear growth + size-all-mem-tables > write-buffer-ratio × managed. Fix: extend DefaultConfigurableOptionsFactory и call super.createDBOptions(opts, handles) FIRST before applying overrides, OR use flink-conf properties вместо custom factory (state.backend.rocksdb.thread.num: 8 instead of factory).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-exam-q3",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "ForSt — main решение для constant-time recovery. Plan: (1) Code audit — verify all state access async (state.asyncValue().thenAccept). Mandatory for ForSt. (2) Stop с canonical savepoint (backend-portable). (3) Update flink-conf: state.backend.type: forst, forst.primary-dir: s3://bucket, forst.local-dir: /tmp/cache, forst.cache.size: 16gb (estimate working set), async-state: true. (4) Resume from canonical. (5) Validate: kill pod test (recovery <30s), cache hit rate >85%, throughput baseline. Numbers: RocksDB recovery 90 min для 800GB. ForSt: ~12 seconds (checkpoint metadata read, SST уже на S3, lazy cache warming). Cost: RocksDB needs m5d.4xlarge ~$648/mo, ForSt needs m5d.xlarge + S3 ~$221/mo (3x savings). Caveats: ensure multi-Gbps к S3 (use VPC endpoint), cache sizing critical, monitor cache_hit_rate. Flink 2.2 production-ready.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-exam-q5",
@@ -83,7 +83,7 @@
       "question": "FLIP-424/425 (Async State API V2) и FLIP-427 (ForSt) — это two parts of single stack. Async API V2 mandatory для ForSt из-за S3 latency 50-100ms на cache miss.",
       "correctAnswer": true,
       "explanation": "True. Это flagship feature pair Flink 2.0 (March 2025). Async State API V2 developed specifically для ForSt: S3 latency 50-100ms на cache miss блокирует mailbox thread sync API — throughput drops до 200 events/sec. С Async API V2 mailbox делегирует state requests AEC (Asynchronous Execution Controller), continues processing. AEC parallelizes I/O в worker pool (default 8 threads). Per-key ordering preserved через RequestBuffer. Throughput jumps до 30k+ events/sec. Apache benchmarks: ForSt+sync 200 events/sec vs ForSt+async 30k events/sec — 150x разница. Без Async API V2 ForSt unusable. Flink enforces это: throws exception if attempt ForSt без async-state: true. Local RocksDB также benefits от async (10-20% gain), но не critically dependent.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

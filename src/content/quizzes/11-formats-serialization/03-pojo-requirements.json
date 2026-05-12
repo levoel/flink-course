@@ -57,7 +57,7 @@
       "question": "Java records (Java 14+) распознаются Flink как POJO-equivalent с Flink 1.18+, и работают без Lombok аnnotations или ручного no-arg constructor — Flink использует canonical record constructor для deserialization.",
       "correctAnswer": true,
       "explanation": "Records были введены в Java 14 (preview), stable в 16. Flink добавил native record support в 1.18 через RecordSerializer (отдельный от PojoSerializer). Каждый record имеет: implicit canonical constructor (все fields в declaration order), accessor methods (`id()`, `name()` instead of `getId()`, `getName()`), implicit equals/hashCode/toString. Flink использует canonical constructor вместо no-arg + setters — нет необходимости в setable fields. Trade-offs: (1) Records immutable — нельзя modify в-place, каждое update создаёт new instance (overhead vs mutable POJO для very hot paths). (2) Pre-1.18 Flink не поддерживает — Kryo fallback. (3) Records могут содержать те же problematic field types (Instant, Optional) — recursive POJO check applies same. (4) Schema evolution — records add component требует new canonical constructor → может ломать compatibility, used carefully.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

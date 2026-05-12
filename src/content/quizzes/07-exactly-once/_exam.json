@@ -47,7 +47,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "**THE killer pitfall** of KafkaSink EOS. Default Kafka client `transaction.timeout.ms` = 60s. Default broker `transaction.max.timeout.ms` = 900000ms (15min). Both insufficient for realistic Flink recoveries. Sequence under failure: (1) prepareCommit flushes records в Kafka prepared transaction state; (2) Crash; (3) Recovery starts but takes 45min; (4) After 15min (broker max), broker auto-aborts prepared transactions — records helpfully marked aborted, invisible для read_committed consumers; (5) Recovery completes at min 45, Flink calls commitTransaction для long-gone transactionId → Kafka returns InvalidTxnStateException/TransactionNotFoundException; (6) Flink either throws (job fails repeatedly) or silently treats as success (data loss). Fix: (a) Producer setProperty(\"transaction.timeout.ms\", \"3600000\"). (b) **Critically** also update broker `transaction.max.timeout.ms=3600000` — without this producer setting silently clamped to broker max. (c) Verify через JMX. (d) Integration test asserts effective timeout. (e) Monitor for timeout events. Trade-off для longer timeout: pending transactions block downstream consumer LSO advance. 1 hour balances safety vs blocking.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-exam-q4",
@@ -89,7 +89,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Critical debugging skill. **Investigation hierarchy**: (1) **PRIMARY hypothesis** — verifier config. Without isolation.level=read_committed, ALL EOS chaos tests fail because aborted transactions visible. Quick fix and re-run resolves 90% of cases. (2) **If still failing after read_committed fix** — escalate: (a) Verify transaction.timeout.ms ≥ measured recovery duration with safety margin. Slow recoveries (image pull, large state restore) могут exceed default 60s. (b) Audit Flink JM logs для checkpoint sequence — какой N completed, какой aborted. Cross-reference с TM logs for prepareCommit/commit calls. (c) Check Kafka broker logs для transaction state transitions: PrepareCommit → CompleteCommit (good) vs PrepareCommit → CompleteAbort (timeout). (d) Verify transactional.id consistency: prefix matches across restarts, subtask-to-ID mapping deterministic. (e) Run individual scenarios isolated — A first (easiest), then B, ..., E. If A passes but C fails — issue is с preCommit/notify timing. (f) Increase logging verbosity TRANSACTION level for client/broker. **Last resort** — file Flink JIRA с reproduction repo. But almost always solved by verifier config or timeout tuning.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-exam-q7",
@@ -97,7 +97,7 @@
       "question": "TwoPhaseCommitSinkFunction (Flink 1.x) и SinkV2 (Flink 2.x FLIP-191) дают одинаковые EOS гарантии, но SinkV2 архитектурно лучше потому что отделяет SinkWriter и Committer в разные operators, что enable-ит pre-commit topology для compaction и post-commit topology для catalog publish.",
       "correctAnswer": true,
       "explanation": "True. EOS гарантии identical — both implement 2PC protocol via prepareCommit + commit on notifyCheckpointComplete. Same recovery semantics, same crash scenario handling. Architectural differences: **TwoPhaseCommitSinkFunction (legacy)**: monolithic class, single operator combines Writer + Committer logic. Subclass implements 4 abstract methods (beginTransaction, preCommit, commit, abort). No pre/post commit topology. State management через CheckpointedFunction. Removed in Flink 2.0. **SinkV2 (modern)**: separate Sink, SinkWriter, Committer interfaces. Each runs in distinct operator с own parallelism. Decomposition enables: (1) **SupportsPreCommitTopology** — full DataStream API между Writer и Committer для compaction, dedup, aggregation. Resolves small file problem cleanly. (2) **SupportsPostCommitTopology** — terminal operator after Committer для Iceberg manifest publish, Hive update. (3) **Different parallelism**: Writer 32 (throughput), Committer 1 (catalog atomicity), Pre/PostCommit independently scaled. (4) **CommitRequest API** для fine-grained retry control (retryLater, signalAlreadyCommitted, signalFailedWithKnownReason). (5) Better composability с AsyncSinkBase (FLIP-171) для async batching sinks. Migration path: Iceberg, Paimon, KafkaSink, FileSink — all уже на SinkV2 в 2.x. Custom sinks should migrate из deprecated SinkFunction/TwoPhaseCommitSinkFunction.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

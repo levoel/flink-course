@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Это classic CUMULATE vs HOP comparison. HOP(size=24h, slide=1min): создаёт overlap factor = 24*60/1 = 1440. Каждое событие state-add в 1440 windows. На 1M users × 1440 windows = 1.44B state entries. CUMULATE(step=1min, maxSize=1day): semantics — window_start fixed at midnight, window_end grows каждые step minutes. После maxSize reset (new window_start). Internal state: 1 window per key — emit incremental result каждые step minutes, не fresh aggregate. 1M users × 1 window = 1M state entries. 1440x state reduction. Также CUMULATE — explicit semantic 'rolling/cumulative with reset', easier reason about than equivalent HOP.",
       "studyHint": "Повторите урок — раздел 'CUMULATE'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m05-08-q3",

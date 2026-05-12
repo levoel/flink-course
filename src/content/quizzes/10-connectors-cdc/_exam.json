@@ -33,7 +33,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Idiomatic Flink CDC 3.x production deployment. Postgres source с logical replication slot, incremental snapshot для no-lock initial load. Transforms inline: OPENAI_EMBEDDING для real-time vector ingestion (cache by content hash для cost control). Schema evolution auto-propagate через try-evolve. Paimon sink streaming-first format с native upsert, automatic compaction, native CDC integration. Tune bucket count (~1GB/bucket), parallelism для throughput. Critical operational concerns: monitor replication slot actively (slot persists per pipeline, WAL не освобождается без active consumption — disk fills if pipeline down), tune Kafka-like timeouts. Это modern lakehouse architecture replacing Lambda (Spark+Flink+manual).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-exam-q3",
@@ -47,7 +47,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "#1 production gotcha для KafkaSink EOS. Kafka coordinates transactions independently от Flink — transaction.timeout.ms = max время transaction может быть open. Default 60s designed для quick OLTP. Streaming jobs с checkpoint intervals 5-10 min не fit default. Mismatch → coordinator aborts transactions → either records committed но Flink не знает → 'duplicates' OR aborted but Flink думает committed → 'lost'. Subtle bug — appears periodic. Fix: explicit setProperty('transaction.timeout.ms', '1800000'). Verify broker.config transaction.max.timeout.ms permits (server-side cap). Production rule: 3× checkpoint_interval, 30 min typical, broker max set 30+ min.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-exam-q4",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Classic Hybrid Source use case — replaces Lambda architecture. FileSource (BOUNDED) реrads S3 Parquet history, KafkaSource (CONTINUOUS_UNBOUNDED) reads live. Hybrid Source switches при FileSource exhaustion. Dynamic factory с switchContext.getPreviousEnumeratorState() extracts last_historical_timestamp — Kafka starts там → no gap, no overlap. Critical: state per user (ValueState<UserBaseline>) populated during historical phase (computes mean transaction amount, frequency, locations) — продолжает comparison через live phase. Same operator state spans switch — exactly-once preserved automatically. Tuning: historical phase = high throughput, scale up RocksDB Block Cache и parallelism; live phase = standard. Это modern Kappa architecture в Flink.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-exam-q5",
@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Production-grade high-throughput enrichment. Sync JDBC = 50/sec per subtask = need 2000 parallelism = unrealistic. Multi-layer optimization: Async I/O (pipelined concurrent queries, capacity-bounded with aggressive timeout, ordered vs unordered choose based downstream) — 5000/sec без cache. Plus PARTIAL LRU cache (Pareto distribution active users → 80-95% hit rate, <1ms) — multiplies к 50k+/sec. Connection pooling HikariCP, DB-side max_connections or PgBouncer middleware. Architectural option: if updates frequent или cache invalidation too coarse — Flink CDC stream user changes, broadcast к main stream, maintain в keyed state — eliminates JDBC entirely. Standard architecture для personalization, fraud detection, recommendation systems.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-exam-q6",

@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "Critical Kafka EOS gotcha. Default Kafka transaction.timeout.ms = 60s, broker max = 15min. If Flink checkpoint takes > transaction.timeout.ms → Kafka aborts transaction → Flink thinks it's still alive → records либо lost либо при recovery duplicated. Production rule: transaction.timeout.ms = max(2 × checkpoint_interval, 900_000ms). Also broker config transaction.max.timeout.ms must allow this. Plus enable.idempotence=true (mandatory для EOS). Setup correctly — true exactly-once preserved end-to-end.",
       "studyHint": "Повторите урок — Production gotcha #1",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-03-q2",

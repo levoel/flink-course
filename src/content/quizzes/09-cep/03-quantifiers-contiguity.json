@@ -49,7 +49,7 @@
       "correctAnswer": "c",
       "explanation": "followedByAny — non-deterministic relaxed — каждый A создаёт partial match с каждым subsequent B. N×M matches. 10000 × 10000 = 100M matches → JVM OOM. Реальный production incident: видеоплатформа использовала followedByAny для watch_start/end pairs, traffic spike → 100M matches → out of memory. Mitigation: использовать followedBy (single match per A) unless genuinely need overlapping. Если нужны — добавить extra predicates чтобы reduce candidates, или migrate к MATCH_RECOGNIZE с tight WITHIN.",
       "studyHint": "Повторите урок — Production gotchas: followedByAny",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-03-q4",

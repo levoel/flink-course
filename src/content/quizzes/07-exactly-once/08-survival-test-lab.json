@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "**90% probability** false positive из verifier config. Kafka transactional API maintains transaction markers в log: BEGIN/COMMIT/ABORT entries plus actual records. **read_uncommitted** (default): consumer видит all records включая aborted transactions. **read_committed**: consumer skips aborted transactions, видит только committed. Для EOS verification обязательно read_committed — иначе все records от failed commits (нормальные в chaos scenarios) выглядят как 'EOS duplicates'. Это очень частый bug при первом EOS testing. Action plan для investigation: (1) Verify consumer props — `props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, \"read_committed\")`. (2) Re-run test 100 iterations. (3) Если все ещё duplicates — escalate: check Flink JM logs для checkpoint sequence, check Kafka broker logs для transaction state, verify transactional.id consistency across recovery. (4) Запустить kafka-console-consumer с `--isolation-level read_committed` для manual cross-check. Edge case: if `transaction.timeout.ms` too small relative to recovery time, real data loss occurs (но это missing, не duplicates).",
       "studyHint": "Повторите урок — секция 'Production gotchas'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-08-q2",
@@ -57,7 +57,7 @@
       "question": "Single-broker Kafka в docker-compose lab — representative для testing production EOS deployment.",
       "correctAnswer": false,
       "explanation": "False. Single broker — useful для quick functional testing, но НЕ representative для production. Production-realistic test требует: (1) **3+ brokers** с `replication.factor=3`, `min.insync.replicas=2`. Это tests EOS под broker failure (kill 1 broker mid-flight, EOS should survive). (2) **transaction.state.log.replication.factor=3** — без этого transactions logged на single broker, broker crash = transaction state lost. (3) **3 controllers в KRaft mode** для metadata HA. (4) **3+ Zookeeper если using ZK mode** (deprecated). (5) **Cross-AZ replication** на cloud для realistic disaster scenarios. Single broker limitations в lab: (a) cannot test EOS под Kafka cluster failures; (b) `replication.factor=1` means single point of failure; (c) `acks=all` waits только для 1 replica — performance unrealistic; (d) network partitioning не testable. Lab progression: start single broker для functional correctness, then expand до 3 brokers для production-grade chaos. Tools для realistic testing: KIP-500 docker images, Strimzi K8s operator, или managed Kafka на dev cluster. Add chaos: kill brokers (rolling), network delays (tc qdisc), disk I/O throttling. EOS должна survive ALL combinations.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

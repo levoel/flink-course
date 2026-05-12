@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Sampling at multiple stages bisects problem space efficiently. Always sample BOTH input и output suspected operator — diff reveals stage transformation. Hypothesis discovered через sampling — likely fraud detector logic broken (recent schema change, rule references field changed semantics). Production lesson: Runtime Sampling shines в these scenarios — narrow-down через stages takes 5-10 minutes. С access control (production), proper PII blocklist для sensitive operators. Train team на using этот diagnostic playbook standard.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-06-q4",
@@ -57,7 +57,7 @@
       "question": "Runtime Data Sampling — security risk если access не controlled, потому что samples содержат real production data, possibly PII.",
       "correctAnswer": true,
       "explanation": "True. Production sampling раскрывает реальные production данные в UI. Без blocklist для PII operators и без access control — это security/compliance violation (GDPR, CCPA для регулируемых юрисдикций). Production config: runtime-sampling.operator-blocklist для PII-sensitive operators (user-pii-processor, payment-handler), runtime-sampling.access-control.enabled: true, required-role flink-debugger. Plus reverse proxy с OAuth2/SSO. Audit log sampling requests. Training: 'sampling != free debugging для anything'. Review с security team перед production rollout.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

@@ -359,7 +359,7 @@ MurmurHash на String hashCode даёт хорошее распределени
 keyBy(e -> e.userId % 1000)  // ❌ всё в 1000 key groups
 ```
 
-Modulo-based keys ограничивают распределение. Если key cardinality < maxParallelism, не все key groups будут utilised.
+Modulo-based keys ограничивают распределение. Если key cardinality &lt; maxParallelism, не все key groups будут utilised.
 
 ---
 

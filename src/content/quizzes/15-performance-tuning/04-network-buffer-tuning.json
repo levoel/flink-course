@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Long alignment time — не state size issue. Aligned checkpoints (default EXACTLY_ONCE): operator ждёт barrier по всем input channels прежде чем snapshot. Slow downstream → in-flight data накапливается → barrier ждёт обработки в очереди. 5min alignment = огромный in-flight backlog. Solutions stacked: (1) buffer-debloat — biggest win, in-flight уменьшается → alignment ускоряется; (2) unaligned checkpoints — fallback после aligned-timeout, in-flight включается в snapshot; (3) buffers-per-channel: 1 — меньше in-flight at baseline; (4) Kafka transaction.timeout.ms: 1200000 (20min, иначе transaction может expire прежде чем checkpoint complete → data loss).",
       "studyHint": "Повторите урок — Production tuning patterns + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-04-q4",

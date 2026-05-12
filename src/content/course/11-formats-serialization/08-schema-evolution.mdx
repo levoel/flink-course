@@ -409,7 +409,7 @@ Q: Schema change?
 </Callout>
 
 <Callout type="tip">
-Architectural rule: для long-lived state используйте **Avro Specific** или **carefully designed POJO** — никогда Tuple, Kryo, или Map<K, Object>. Schema evolution capability должна быть first-class concern при дизайне state types. Если можно "ничего не менять годами" в state types — pipeline хрупкий, любое business change forces migration.
+Architectural rule: для long-lived state используйте **Avro Specific** или **carefully designed POJO** — никогда Tuple, Kryo, или Map&lt;K, Object&gt;. Schema evolution capability должна быть first-class concern при дизайне state types. Если можно "ничего не менять годами" в state types — pipeline хрупкий, любое business change forces migration.
 </Callout>
 
 ---

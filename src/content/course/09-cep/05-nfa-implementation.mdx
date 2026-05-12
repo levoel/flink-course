@@ -252,7 +252,7 @@ event=X:  s2 ─IGNORE→ s2   →  (no change)
 event=C1: s2 ─TAKE(C)→ s3  →  ComputationState{s3, [A1, B1, B2, C1]}  ← FULL MATCH
 ```
 
-Output: match {A: A1, B: [B1, B2], C: C1}.
+Output: match `{A: A1, B: [B1, B2], C: C1}`.
 
 Если `AFTER MATCH SKIP PAST LAST ROW` (default) — после match-а computation states purged, NFA restarts с следующего event.
 

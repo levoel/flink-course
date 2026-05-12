@@ -34,7 +34,7 @@
       "correctAnswer": "c",
       "explanation": "Mixed approach оптимален. Stateful jobs (10) → Application mode: dedicated JM+TMs, hard isolation managed memory для RocksDB (нельзя позволить sharing с другими jobs), independent versioning, savepoint-based upgrades. Stateless (20) → Session: per-job JM overhead (2GB×20=40GB) был бы пустой тратой, slot sharing повышает utilization, ad-hoc operations быстрее. Моноподходы плохи: only Application — 30 JM pod-ов overhead, медленный deploy small jobs. Only Session — heavy state jobs голодают друг друга по managed memory, один crash валит весь fleet.",
       "studyHint": "Повторите урок 05 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m01-05-q3",
@@ -57,7 +57,7 @@
       "question": "В production оptимально иметь один большой Session cluster со всеми 50 stateful streaming jobs — это даёт лучшую утилизацию ресурсов и упрощает ops.",
       "correctAnswer": false,
       "explanation": "Это anti-pattern. Один большой Session cluster со многими stateful jobs создаёт: (1) при JM crash recovery всех jobs одновременно (минуты+), (2) heavy job голодает других по managed memory / CPU, (3) одна Flink версия для всех — невозможно smooth migration, (4) failure blast radius huge — один TM crash убивает slots всех jobs на нём, (5) Dispatcher REST bottleneck при много submissions. Правильно — Application mode per job, isolated FlinkDeployment manifests, GitOps. Session mode оправдан для ad-hoc SQL, dev environment, или many small stateless jobs.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

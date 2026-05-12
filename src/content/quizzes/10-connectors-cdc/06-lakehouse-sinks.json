@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Different design philosophies. Paimon (originally Flink Table Store, Apache с 2024): LSM-tree native (как RocksDB but на object storage), streaming-first, native upsert/delete, automatic background compaction, native Flink CDC integration. Choose для Flink-centric streaming workloads. Iceberg: manifest-based snapshots, batch-first дизайн (хотя streaming supported), requires explicit compaction job. Choose для broad ecosystem (multi-engine queries Trino + Spark + Flink + Athena). For greenfield Flink CDC → lakehouse pipeline — Paimon preferred. For mixed workload analytics — Iceberg.",
       "studyHint": "Повторите урок — Сравнительная таблица",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-06-q3",
@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Committer parallelism=1 — fundamental design constraint Iceberg/lakehouse sinks. Atomic commit requires serial coordination — metadata.json updates через CAS (optimistic concurrency control). С multiple parallel committers — conflicting writes. Iceberg parallel writes (multiple writers parallel) supported но finalizing commit serial. Mitigation: reduce committable cardinality (fewer файлов с larger size — pre-commit compaction critical), tune JVM heap, optimize partition expressions. For chronically slow committer — architectural change: Paimon (LSM-style commit cheaper), или batch-style downstream (less frequent commits).",
       "studyHint": "Повторите урок — Production gotcha #3",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-06-q4",

@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Modern Hybrid — pragmatic combination. Storage: Iceberg/Paimon lakehouse. Compute: Flink (streaming), Spark (batch ML training), Trino (ad-hoc). Все читают same tables. Преимущества над Lambda: один storage layer (vs Cassandra views + S3 raw + Kafka), shared schema, Iceberg time travel = built-in replay capability. Преимущества над pure Kappa: ML training natively batch over Iceberg (не replay миллиарды events), regulatory batch reconciliation simpler, ad-hoc queries Trino fast. Это default 2026 для new analytics platforms.",
       "studyHint": "Повторите урок 07 — раздел 'Modern hybrid pattern'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-07-q4",

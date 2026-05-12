@@ -33,7 +33,7 @@ State TTL (Time-To-Live) решает это: каждый state entry имее�
         label="TTL elapsed"
         tooltip="После TTL = T entry считается expired. Само по себе значение в backend остаётся (lazy cleanup). Чтобы освободить storage — cleanup strategy должен зачистить."
       >
-        ts + TTL < NOW → expired
+        ts + TTL &lt; NOW → expired
       </DataBox>
     </FlowRow>
     <Arrow direction="down" label="state.value() read поведение" />
@@ -356,7 +356,7 @@ descriptor.enableTimeToLive(metricsTtl);
 
 ### 4. TTL overhead на metadata
 
-Каждый state entry с TTL хранит +8 bytes timestamp. На MapState<String, Long> где value = 8 bytes, overhead = 50%. Для huge maps это noticeable.
+Каждый state entry с TTL хранит +8 bytes timestamp. На MapState&lt;String, Long&gt; где value = 8 bytes, overhead = 50%. Для huge maps это noticeable.
 
 ### 5. UpdateType.OnReadAndWrite превращает read в write
 

@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Pure GPT-4: latency 200-500ms (NOT в 50ms budget), cost 100k events × $0.01/1k × 500 tokens = $3500/hour (NOT в $1000/day). Pure ONNX: latency OK, cost OK, но quality для finalization gaps. Гибрид pattern: (1) cheap ONNX на all 500k events/sec — pre-ranking, score 0-1; (2) top-10% routed к Haiku/GPT-3.5 batched (50 records/batch); (3) top-0.1% (most important decisions) — GPT-4; (4) cache identical user-product pairs 1 min. Result: latency 5-15ms average, cost $X00/day. Multi-tier ML — production reality.",
       "studyHint": "Повторите урок 05 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-05-q3",

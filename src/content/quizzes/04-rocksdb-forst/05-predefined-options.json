@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "flink-conf property — safe approach. state.backend.rocksdb.thread.num: 8 устанавливает background jobs preserving все остальное (PredefinedOptions, WriteBufferManager, Block Cache injection). Custom factory (option a) — dangerous: new DBOptions() без super.createDBOptions() = WBM лост = OOM через часы. Если нужен custom factory — ALWAYS extend DefaultConfigurableOptionsFactory и call super first. Best practice: 95% of customizations через flink-conf properties — custom factory only для extreme cases с specific RocksDB internals access (rare).",
       "studyHint": "Повторите урок — Programmatic option override",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-05-q3",

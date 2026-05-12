@@ -19,7 +19,7 @@
       "correctAnswer": "c",
       "explanation": "Decision matrix: Pattern API covers 70% production cases — declarative, NFA-optimised, watermark-driven correctness. KeyedProcessFunction covers 30% — когда нужны structural capabilities Pattern API не даёт: (1) multi-source correlation (Pattern API per-key only); (2) dynamic patterns runtime through Broadcast state; (3) external lookups через Async I/O (IterativeCondition не имеет async API); (4) custom state shape (not bound to NFA structure); (5) low-latency emit без watermark progression. Best architectures combine: enrichment (state machine) → CEP → correlator (state machine).",
       "studyHint": "Повторите урок — Comparison decision matrix",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-07-q2",
@@ -49,7 +49,7 @@
       "correctAnswer": "c",
       "explanation": "Pattern API isolates per-key — нельзя нативно correlate events across users в одном partial match. Workaround keyBy(merchant) теряет per-user isolation, но это правильно для этого case: per-merchant state список recent transactions, в processElement проверяем cross-user condition (different userId + different location + within 5 min). Это state machine territory — custom state shape (List<TxRecord>), explicit TTL cleanup, custom emit logic. Pattern API не подходит structurally.",
       "studyHint": "Повторите урок — Case 3: multi-source correlation",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-07-q4",

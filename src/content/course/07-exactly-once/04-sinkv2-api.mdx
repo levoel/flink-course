@@ -416,7 +416,7 @@ public class KinesisSink<T> extends AsyncSinkBase<T, PutRecordsRequestEntry> {
 
 ### 1. Committer parallelism vs Writer parallelism
 
-По умолчанию Committer has **same parallelism** как Writer. Можно изменить — но осторожно: если Committer parallelism < Writer, committables shuffled через keyBy (Flink определяет sharding key). Это может нарушить commit order гарантии.
+По умолчанию Committer has **same parallelism** как Writer. Можно изменить — но осторожно: если Committer parallelism &lt; Writer, committables shuffled через keyBy (Flink определяет sharding key). Это может нарушить commit order гарантии.
 
 **Fix**: оставлять default unless у вас precise use case (e.g., global commit для Hive metastore).
 

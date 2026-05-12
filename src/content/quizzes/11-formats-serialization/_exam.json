@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Defense-in-depth philosophy: один layer fails — другие catch. Production teams imeющие этот discipline report zero Kryo regressions за 6+ months. Detailed layers: (1) **Production config** `pipeline.generic-types: false` — Flink fails job submission with IllegalArgumentException про конкретный class имя. (2) **Programmatic** `env.getConfig().disableGenericTypes()` — defense if config.yaml не applied (env-specific override missing). (3) **CI integration test** — `LocalEnvironment` + disableGenericTypes() + buildPipeline() + getStreamGraph() — forces TypeInformation resolution для всех operators, throws при Kryo. Caught перед deploy. (4) **Static analysis** — grep heuristic catches lambda + Tuple/POJO without .returns() как style violation в PR. (5) **PR review checklist** — explicit pункты: new types are POJO/Avro, Lombok @NoArgsConstructor present, lambdas have type hints. (6) **Monitoring** — alert log pattern `Falling back to GenericType` — backstop on already-deployed job. Each layer has different failure mode и catches different oversights.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-exam-q6",
@@ -103,7 +103,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Decision matrix: **Avro wins** — (1) Existing Kafka + Schema Registry stack (Confluent ecosystem default). (2) Cross-language consumers (Python pandas Avro, Go avro, Rust avro-rs — mature). (3) Iceberg/Parquet downstream (Avro maps cleanly). (4) Schema evolution с aliases для rename (Protobuf cannot rename — field name only в .proto, but no built-in rename mapping для compatibility). (5) Avro Logical Types (decimal, timestamp-millis) для precise SQL semantics. **Protobuf wins** — (1) gRPC microservices уже define .proto для RPC — reuse same schemas для Kafka topics (single source of truth, no duplication). (2) Slightly compact wire (varint для small ints saves ~5-10%). (3) Well-known types (Any для unstructured, Timestamp, Duration). (4) Stronger backward type safety (proto3 default values вместо nulls в Avro union types). **Production rule**: ONE format pipeline-wide. Mixing Avro + Protobuf creates conversion costs (~30% overhead at cross-format steps) и dual schema governance complexity. Migration legacy formats: pick target format upfront, plan staged migration.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-exam-q8",
@@ -111,7 +111,7 @@
       "question": "Каждый stateful operator в production Flink job ДОЛЖЕН иметь explicit `.uid('operator-name')` — без UID Flink назначает auto-UID на основе operator position в graph, и любой code change upstream (даже добавление log statement в map() выше) может break state mapping → silent state loss на recovery.",
       "correctAnswer": true,
       "explanation": "Auto-UID generation algorithm: Flink JobGraph builder computes UID hash from operator's position in graph (chain ID + position within chain + name). Add/remove operator upstream → all downstream operator positions shift → different auto-UIDs. Savepoint maps state by UID → recovery finds 'no state for new UID' → operator starts with empty state SILENTLY (no error, just state loss). Worst case examples: (a) Production team adds debug log statement before keyed state operator → re-chain → state UID shift → user profile state evaporates → fraud detection sees empty history → bypass passes through. (b) Refactor: extract intermediate map step → state UID changes → critical aggregation state lost. **Explicit @uid pattern**: `stream.keyBy(...).process(new MyFn()).uid('my-fn-state').name('My processing')`. UID = stable identifier для state, decoupled от graph topology. **Production checklist**: (1) Every stateful operator (KeyedProcessFunction, Window, AsyncFunction, ProcessFunction with state) имеет explicit .uid(). (2) CI lint: search `.process(.*\\)` без следующего `.uid(`. (3) Naming convention: `<module>-<purpose>-state` (например `fraud-user-history-state`). (4) Never reuse UID между different state types или different operators. With discipline — pipeline refactoring becomes safe; without — every refactor risks production data loss.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

@@ -57,7 +57,7 @@
       "question": "'Мы chaos-тестировали один раз' — достаточно для production-ready streaming pipeline.",
       "correctAnswer": false,
       "explanation": "Chaos testing — ongoing requirement, не one-time. Production environments evolve: new features added, scale changes, infrastructure migrations, dependencies upgraded. Annual chaos coverage should include all critical scenarios. New incident types discovered в production add to chaos suite. 'We chaos-tested it once' — false sense of security. Production maturity practices: weekly staging chaos для key scenarios, monthly broader coverage, quarterly production game days. Mature companies (Netflix Chaos Monkey origin) treat chaos as routine, not exceptional. Without ongoing testing — drift between tested и actual production behavior expands invisibly.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

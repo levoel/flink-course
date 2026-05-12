@@ -242,7 +242,7 @@ config.setAlignedCheckpointTimeout(Duration.ofSeconds(30));   // hybrid
 
 ### Use aligned by default if:
 - Backpressure редкий или managed
-- State не очень большой (< 100GB)
+- State не очень большой (&lt; 100GB)
 - Recovery time critical (aligned cheaper recovery)
 - Simple operations, predictable load
 
@@ -250,7 +250,7 @@ config.setAlignedCheckpointTimeout(Duration.ofSeconds(30));   // hybrid
 - Backpressure частый (peak loads, bursty traffic)
 - Checkpoint duration > checkpoint interval consistently
 - Large parallelism (1000+ tasks) — alignment phase scales badly
-- Source latency critical (Kafka transaction.timeout.ms < checkpoint duration → data loss risk)
+- Source latency critical (Kafka transaction.timeout.ms &lt; checkpoint duration → data loss risk)
 
 ### Use hybrid (recommended):
 - **Production по умолчанию** — start aligned, escalate под backpressure

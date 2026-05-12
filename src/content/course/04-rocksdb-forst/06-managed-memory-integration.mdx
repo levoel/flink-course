@@ -182,7 +182,7 @@ Cache hit rate depends on:
 - Access pattern (random vs sequential)
 - Number of CFs sharing budget
 
-Healthy cache hit rate: >90%. <50% = badly undersized cache.
+Healthy cache hit rate: >90%. &lt;50% = badly undersized cache.
 
 ---
 
@@ -280,7 +280,7 @@ flink_taskmanager_<state>_rocksdb_block_cache_usage   # BC current usage
 
 В Grafana dashboard:
 - `direct_memory_used` should plateau, not grow linearly
-- `size-all-mem-tables` should be < write-buffer-ratio × managed
+- `size-all-mem-tables` should be &lt; write-buffer-ratio × managed
 - `block_cache_usage` should be ~ (1 - write-buffer-ratio) × managed
 
 Если `direct_memory_used` keeps growing = memory leak (often custom factory без WBM).
@@ -309,7 +309,7 @@ state.backend.rocksdb.memory.write-buffer-ratio: 0.5    # default
 
 For write-heavy (50%+ writes): bump к 0.6-0.7. Bigger MemTables absorb writes, fewer L0 files.
 
-For read-heavy (<10% writes): drop к 0.3. More memory к Block Cache.
+For read-heavy (&lt;10% writes): drop к 0.3. More memory к Block Cache.
 
 For balanced: stay at 0.5.
 
@@ -416,12 +416,12 @@ Premature tuning fractions без measuring → guessing. Always:
    - Spikes coinciding с restart → checkpoint memory pressure
 
 2. **`size-all-mem-tables`** per CF:
-   - Sum < write-buffer-ratio × managed → OK
+   - Sum &lt; write-buffer-ratio × managed → OK
    - Sum > budget → WBM not enforcing
 
 3. **`block-cache-hit / (hit+miss)`** ratio:
    - >90% → cache adequate
-   - <50% → cache too small, increase managed.fraction
+   - &lt;50% → cache too small, increase managed.fraction
 
 4. **K8s pod memory usage**:
    - Stable below limit → OK
@@ -469,5 +469,5 @@ Helpful mental model: RocksDB native memory — это «дикая» off-heap �
 
 <KnowledgeCheck
   question="Production TaskManager (8GB process.size, managed.fraction=0.4 = 3.2GB managed). Logs показывают TaskManager постепенно растёт по memory, через 4 часа K8s OOMKill. Status.JVM.Memory.Direct.MemoryUsed = 4.5GB перед kill. state.backend.rocksdb.metrics.size-all-mem-tables показывает 3.8GB. Что произошло и как fix?"
-  answer="Multiple symptoms point к single root cause: WriteBufferManager не enforcing budget. Total MemTable budget should be ~1.6GB (50% of 3.2GB managed × write-buffer-ratio default 0.5). Actual: 3.8GB MemTables. Это в 2.4x превышает budget. Diagnosis: либо (1) custom RocksDBOptionsFactory не extends DefaultConfigurableOptionsFactory, либо (2) state.backend.rocksdb.memory.managed: false установлено (старый legacy config), либо (3) custom factory создаёт fresh DBOptions без super.createDBOptions(). Probable scenario: Some recent deploy added custom factory для slight tweak (e.g., max_background_jobs=8) but did не extends Default. Без super() call, WriteBufferManager инжекция skipped → каждая CF allocates own 64-128MB MemTable без shared budget. На 10 CF × 4 slots = 2.5-5GB pure MemTable memory, plus Block Cache (separately broken), immutable MemTables awaiting flush. Direct memory continuously grows until pod limit. Fix steps: (1) Audit state.backend.rocksdb.options-factory — if present, verify класс extends DefaultConfigurableOptionsFactory; (2) Если можно — REMOVE custom factory, заменить tweaks через flink-conf properties (state.backend.rocksdb.thread.num: 8 instead of factory); (3) Verify state.backend.rocksdb.memory.managed: true (default true since 1.10, но some legacy configs may have false); (4) Post-fix monitoring: direct_memory_used should plateau ~ 3.2GB total, size-all-mem-tables < 1.6GB. Prevention: in CI, add check для RocksDBOptionsFactory subclassing — auto-fail PR if not extends DefaultConfigurableOptionsFactory."
+  answer="Multiple symptoms point к single root cause: WriteBufferManager не enforcing budget. Total MemTable budget should be ~1.6GB (50% of 3.2GB managed × write-buffer-ratio default 0.5). Actual: 3.8GB MemTables. Это в 2.4x превышает budget. Diagnosis: либо (1) custom RocksDBOptionsFactory не extends DefaultConfigurableOptionsFactory, либо (2) state.backend.rocksdb.memory.managed: false установлено (старый legacy config), либо (3) custom factory создаёт fresh DBOptions без super.createDBOptions(). Probable scenario: Some recent deploy added custom factory для slight tweak (e.g., max_background_jobs=8) but did не extends Default. Без super() call, WriteBufferManager инжекция skipped → каждая CF allocates own 64-128MB MemTable без shared budget. На 10 CF × 4 slots = 2.5-5GB pure MemTable memory, plus Block Cache (separately broken), immutable MemTables awaiting flush. Direct memory continuously grows until pod limit. Fix steps: (1) Audit state.backend.rocksdb.options-factory — if present, verify класс extends DefaultConfigurableOptionsFactory; (2) Если можно — REMOVE custom factory, заменить tweaks через flink-conf properties (state.backend.rocksdb.thread.num: 8 instead of factory); (3) Verify state.backend.rocksdb.memory.managed: true (default true since 1.10, но some legacy configs may have false); (4) Post-fix monitoring: direct_memory_used should plateau ~ 3.2GB total, size-all-mem-tables &lt; 1.6GB. Prevention: in CI, add check для RocksDBOptionsFactory subclassing — auto-fail PR if not extends DefaultConfigurableOptionsFactory."
 />

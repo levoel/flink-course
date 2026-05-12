@@ -57,7 +57,7 @@
       "question": "Confluent Schema Registry с compatibility mode NONE является anti-pattern в production — позволяет любые schema changes без validation, что может привести к catastrophic deserialization errors на running consumers.",
       "correctAnswer": true,
       "explanation": "Schema Registry compatibility mode controls schema validation на commit. NONE отключает все checks — любая schema accepted (including breaking changes). Это recipe for production disaster: один careless `PUT /subjects/.../versions` commit с required field (no default) ломает ВСЕХ running consumers на ВСЕХ topics использующих subject. Real-world example: дата команды добавила `paymentMethod: string` (required) → все Flink consumers падают с AvroTypeException → pipeline backpressure → downstream sinks idle → revenue impact. Production rule: ВСЕГДА минимум BACKWARD compatibility, для shared infrastructure — BACKWARD_TRANSITIVE или FULL_TRANSITIVE. Configure через registry API: `PUT /config/<subject> {compatibility: 'BACKWARD'}`. Также: CI/CD pipeline должен include schema compatibility check как required gate перед merge. Tools: confluent-cli, buf (для Protobuf), avro-tools.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

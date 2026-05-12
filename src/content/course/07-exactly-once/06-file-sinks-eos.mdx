@@ -380,7 +380,7 @@ Parallelism 32, bucket per hour, 24h = 32 * 24 = 768 final files per day. Пос
 
 Если truncate не supported (S3), recovery in-progress file через rewrite. Если crash mid-rewrite → data inconsistency.
 
-**Fix**: short rolling intervals (< 1 hour), monitor pending count.
+**Fix**: short rolling intervals (&lt; 1 hour), monitor pending count.
 
 ### 6. Hadoop classpath conflict
 

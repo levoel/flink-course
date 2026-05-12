@@ -323,7 +323,7 @@ Logic: state минимальный (HashMapStateBackend), zero RocksDB — mana
 
 ## Critical configuration mistakes
 
-### Ошибка 1: pod memory limit < process.size
+### Ошибка 1: pod memory limit &lt; process.size
 
 K8s pod limit 8GB, `process.size: 8g`. В runtime JVM Overhead и Metaspace оккупируют 1GB, OS overhead (cgroup memory tracking, sockets) ещё 200MB — выходит ~9.2GB суммарно. Pod получает OOMKill.
 

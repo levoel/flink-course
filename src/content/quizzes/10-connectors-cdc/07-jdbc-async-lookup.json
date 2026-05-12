@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Production architecture для high-throughput enrichment requires multiple optimizations stacked. Layer 1 Async I/O: pipelined concurrent queries (capacity 100), aggressive timeout. Layer 2 Cache: PARTIAL LRU+TTL — Pareto distribution active users means 80-95% cache hit (<1ms), miss async to DB. Critical multiplier — без cache 5k/sec per subtask, с cache 50k/sec. Layer 3 Pool: HikariCP, sized по DB limit; PgBouncer middleware для multiplexing. Layer 4 Architectural: если cache invalidation too coarse — stream user updates via Flink CDC, broadcast к main stream, maintain keyed state — eliminates JDBC lookups entirely для hot users. Это standard pattern fraud detection / personalization architectures.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m10-07-q3",

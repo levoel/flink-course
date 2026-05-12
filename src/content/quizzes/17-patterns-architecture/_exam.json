@@ -33,7 +33,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Three patterns для different dim profiles. Broadcast cost = N parallelism × dim_size в heap — fast lookup (микросекунды) но bounded by memory. Lookup — unbounded dim size, async I/O capacity tuning critical, eventual consistency (cache TTL = stale window). Temporal — point-in-time correctness, deterministic replay, but state holds versions (TTL обязателен для cleanup). Production pipelines often combine: countries broadcast + users lookup + prices temporal.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-exam-q3",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Production scale recommendation engine: 500k events/sec × premium LLM = $thousands/hour, latency 200ms — оба out of budget. Multi-tier solution: cheap ONNX для majority (99% events get pre-ranking), middle-tier (Haiku/3.5) для refinement (0.9%), premium (GPT-4) для critical (0.1%). Predictions cache massively reduces QPS на popular product-user pairs. ML_PREDICT inline снимает overhead отдельного ML microservice. VECTOR_SEARCH для embedding similarity. Все в одной job — Flink 2.2 disruption для streaming ML pipelines.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-exam-q5",
@@ -89,7 +89,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Modern Hybrid pragmatically combines best practices. Iceberg/Paimon как lakehouse — single storage layer; streaming + batch + ad-hoc query все share same tables. Flink streaming pipeline пишет в Iceberg (EOS). Spark batch ML training reads Iceberg. Trino ad-hoc. На bug fix: Flink Hybrid Source replay (Iceberg parallel backfill + Kafka live), atomic cutover. На regulatory: nightly Spark reconciliation. Lambda пытался решить same problem но через две системы — сейчас не нужно. Pure Kappa имеет проблемы с ML training и long Kafka retention costs.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-exam-q7",
@@ -103,7 +103,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Critical mental model. Streaming aggregations имеют fundamental drift из множества источников (late events, watermark approximations, schema issues, code bugs). Для money — unacceptable без reconciliation. Architecture pattern: (1) Streaming Flink → Iceberg aggregate (real-time view); (2) Nightly Spark reconciles из raw events + compares + overwrites reconciled; (3) Billing reads ONLY reconciled; (4) Side output late events для investigation; (5) allowedLateness для reducing drift размер. Streaming = preview, batch = authoritative source of truth. Без этого даже 0.1% drift = тысячи $ ошибок на scale.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-exam-q8",
@@ -111,7 +111,7 @@
       "question": "Flink Agents (preview 0.2.1) — это production-ready replacement для LangChain/LangGraph для всех use cases AI agent applications.",
       "correctAnswer": false,
       "explanation": "Не production-ready и не replacement. (1) Preview status: 0.2.x с breaking API changes, immature observability, small community. Production critical paths не должны depend полностью. (2) Не replacement: LangChain wins на maturity, community, rapid iteration, Python ecosystem. Flink Agents wins на production infrastructure (EOS, durability, scaling). (3) Production strategy: hybrid pilot — keep mature production tools для critical workflows, parallel pilot Flink Agents на narrow scope для learning. (4) Roadmap: 1.0 GA — Q4 2026 / Q1 2027. Use both wisely.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

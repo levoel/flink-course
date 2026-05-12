@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "HTTP webhook receiver — non-replayable source. После Flink crash клиент уже ушёл с 200 OK ответом (если accept-ed). На recovery Flink восстанавливает state с saved offset, но 'offset' для webhook не имеет смысла — записи никто не повторит. Items, received between last successful checkpoint и crash, потеряны. Это at-most-once Layer 1, итог at-most-once независимо от sink. Fix: добавить buffer **между** webhook и Flink. Production pattern — HTTP receiver → Kafka topic → Flink pipeline. Kafka replayable, Flink читает с offset, EOS preserved. Custom non-replayable sources (UDP, plain TCP, sockets) имеют такую же проблему.",
       "studyHint": "Повторите урок — секция 'Layer 1 — Replayable source'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-02-q4",

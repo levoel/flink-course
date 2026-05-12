@@ -361,7 +361,7 @@ Job recovery time = 20min (downloads 2TB state)
 **Mitigation**: increase `transaction.timeout.ms` к expected max recovery time × 2.
 
 <Callout type="warning">
-Kafka `transaction.timeout.ms` < recovery time = at-least-once вместо EOS. После crash восстановление 2TB state занимает 20 минут, а transaction expires через 15 минут → in-flight transactions abort, duplicates на restart. Production rule: `transaction.timeout.ms >= 2 × expected_max_recovery_time` + monitor recovery duration в Prometheus.
+Kafka `transaction.timeout.ms` &lt; recovery time = at-least-once вместо EOS. После crash восстановление 2TB state занимает 20 минут, а transaction expires через 15 минут → in-flight transactions abort, duplicates на restart. Production rule: `transaction.timeout.ms >= 2 × expected_max_recovery_time` + monitor recovery duration в Prometheus.
 </Callout>
 
 ### 4. Region failover requires no global state

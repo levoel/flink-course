@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Risk-based prioritization. Chaos testing 5/8 missing = 5 unknown failure modes = blind launch risk. Production-impactful. State growth 5% — concerning но не immediate blocker if capacity OK для 3 months. Archive retention — quick Day-1 fix, не launch blocker. DR runbook — false confidence без testing, but acceptable to launch если SLA не regulator-required. Stakeholder communication: 'Launch blocked: completing chaos test scenarios. ETA 4-7 days. Trade-off: complete launch readiness vs production risk. Recommend complete.' Concrete data overcomes vague pressure. Process > vibes.",
       "studyHint": "Повторите урок 09 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-09-q3",
@@ -57,7 +57,7 @@
       "question": "Production readiness checklist — это one-time milestone. После initial launch passed, не нужно revisit.",
       "correctAnswer": false,
       "explanation": "Production readiness — continuous responsibility, не one-time. Codebases change (new features, refactors), infrastructure changes (K8s upgrades, dependency updates), team changes (new on-call members, mentoring needed), scale changes (capacity revisits), failure modes discovered (chaos testing additions). Practices to maintain readiness: (1) checklist revisited перед major changes (re-launch criteria); (2) quarterly review of all categories; (3) post-incident additions к checklist; (4) onboarding new team members через checklist; (5) yearly comprehensive audit. 'Checked the boxes once' = false security as system evolves.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

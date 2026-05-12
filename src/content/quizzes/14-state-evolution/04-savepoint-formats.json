@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Two simultaneous changes — major version + backend. Canonical обязателен потому что (1) cross-backend RocksDB→ForSt; (2) cross-version 2.2→2.3 safer (format changes possible). Cost: canonical 100GB ~3-8 минут vs native ~30-60 сек — приемлем для once-off migration. CLAIM restore mode: one-way decision, Flink takes ownership savepoint files, incremental reuse. BUT keep separate canonical savepoint для rollback (independent of CLAIM ownership) — production safety > speed. Native here = FAIL (incompatible backends).",
       "studyHint": "Повторите урок — Format choice decision tree + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-04-q3",
@@ -57,7 +57,7 @@
       "question": "Production savepoint retention strategy — multi-tiered: hourly (7d), upgrade (30d), weekly (90d glacier), monthly (1y), annual (forever). Aggressive single-tier retention опасен.",
       "correctAnswer": true,
       "explanation": "True. Single-tier retention (e.g., 7 days only) misses long detection lag issues (memory leaks, subtle bugs detected weeks later, compliance audits). Multi-tiered: hourly automatic (operator's autoSavepointSeconds + savepointHistory) для regular ops (7d); upgrade savepoints (S3 tag) для rollback window (30d); weekly Sundays для longer history (90d, GLACIER); monthly archives (1y); annual для compliance (forever, DEEP ARCHIVE). S3 lifecycle policy automates transitions. Cost balance: GLACIER cheap, hot tier limited. Retention >= max detection time для caring issue types.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

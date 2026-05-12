@@ -97,7 +97,7 @@
       "question": "Per-record logging в hot path (processElement, map) — best practice для production debugging.",
       "correctAnswer": false,
       "explanation": "False. Per-record logging — главный антипаттерн production logging. 100k records/sec × 1KB = 100MB/sec disk write → disk full, log pipeline overload, $$$$ storage cost. Used by inexperienced devs — code reviews must catch. Alternatives: (1) Sampled logging (counter % 100000 == 0 = 1 of 100k); (2) Error-only (errors rare); (3) Event-driven (state transitions, alerts). Volume rule: < 100 lines/sec per TM в steady state. Modern Flink 2.3+: используйте FLIP-570 Runtime Sampling для ad-hoc inspection — properly designed для это.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-exam-q8",
@@ -125,7 +125,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Alert fatigue — главная угроза. 200+ alerts/week → on-call ignores all → real incidents lost. Tiered prevents этого. Critical = wake-up justified (rare, < 5/month). High = same-day attention. Medium = trend issues weekly review. Info = observability. Alertmanager routing: critical → PagerDuty, high → Slack mention, medium → daily digest. 'for: 10m' — eliminates transient backpressure spikes (90% noise). De-duplication: group_by job_name not subtask. Inhibition rules: silence correlated alerts. Quarterly review.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-exam-q10",
@@ -139,7 +139,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Modern observability triangle: metrics (what), traces (why), logs (что именно случилось). + Web UI для live diagnosis, FLIP-570 sampling для ad-hoc record inspection, history server для post-mortem. Не silver bullet — each tool different strengths. Metrics historical trends + alerting. Traces для slow individual events / checkpoints. Logs для rare events: errors, lifecycle, config changes. Together = comprehensive production debugging capability. Without всех — blind spots в production.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

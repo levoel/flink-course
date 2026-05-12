@@ -57,7 +57,7 @@
       "question": "Stateful microservice pattern на Flink уместен для всех use cases, включая простой CRUD над сущностями.",
       "correctAnswer": false,
       "explanation": "Anti-pattern. Stateful Flink — large architectural decision, требует команду которая понимает event-sourcing, CQRS, schema evolution. Для простых CRUD (создать запись, прочитать, обновить, удалить) — traditional REST + Postgres. Stateful Flink оправдан для core domain critical state machines (orders, payments, fraud, IoT shadows), не для каждой таблицы. Overengineering — реальная цена ошибки.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

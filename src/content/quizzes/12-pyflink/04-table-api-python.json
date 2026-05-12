@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Decision matrix detailed: **PyFlink Table API** — ideal для (1) ETL streaming SQL-expressible: CDC → window aggregation → Iceberg/Paimon sink. (2) Schema-driven workflows: CREATE TABLE + INSERT INTO SELECT. (3) Joining streams with reference data (lookup joins, temporal joins). (4) When data team is Python-first, не deep Java expertise. Performance: ~100% Java baseline (JVM execution under hood). **PyFlink DataStream** — needed когда (1) Custom keyed state machine с complex per-key logic не expressible в SQL (multi-step fraud detection, state-based business rules). (2) Custom event-time timers с specific scheduling. (3) Side outputs с custom routing. (4) Connect two unrelated streams с custom co-processing logic. Performance: process mode ~30-50%, thread mode ~70-90%, pandas UDF ~90-95% Java. **Java DataStream** — choose when (1) High throughput >100k events/sec/subtask с stateful processing — Python overhead в state ops compounds. (2) Latency-critical <50ms p99 — Python tooling adds even в thread mode small overhead. (3) FlinkCEP for complex event patterns — Java only. (4) DataStream V2 (FLIP-409) features — Java only. (5) Custom connectors implementing FLIP-27 Source API or SinkV2 — must be Java currently. (6) Operating teams have strong Java expertise. **Hybrid pattern**: Java для high-throughput state-heavy processing, output features to Kafka, PyFlink для ML inference на features. Two jobs, two deployments, each optimized.",
       "studyHint": "Повторите урок 04 — секцию 'Когда выбирать Table API vs DataStream'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m12-04-q4",

@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Production trap. Restore fails 'Cannot restore: max parallelism = 128, requested = 256'. Solution: rebootstrap state. Workflow: (1) canonical savepoint; (2) State Processor batch job — read old state with old maxParallelism=128, BootstrapTransformation для new key group distribution, SavepointWriter.newSavepoint(env, backend, 2048) с new maxParallelism; (3) 1.5TB ~ 3-4 hours batch processing на distributed cluster (16+ parallelism, big disks); (4) Validate new savepoint; (5) Restart streaming с new savepoint, unblocked scale до 256. Lesson: ALWAYS setMaxParallelism(1024+) при first deploy — free insurance.",
       "studyHint": "Повторите урок — Production trap + Rebootstrap workflow + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-05-q3",

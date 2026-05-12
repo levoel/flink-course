@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Critical interaction. Default network buffers большие (32KB-1MB per channel) — на 1000 subtasks × multiple channels = potentially GBs in-flight. С unaligned checkpoints этот ChannelState persisted во время snapshot — fundamentally doubles checkpoint size. Configuration: taskmanager.network.memory.buffer-debloat.enabled: true, target: 1s. Buffer size dynamically adjusted к amount of data что processor могут handle in target time (1s). Result: typical buffer 10-100x smaller, ChannelState manageable. Without debloating: 500GB ChannelState на extreme backpressure. With: 5GB. 100x reduction. Production unaligned без buffer debloating — anti-pattern.",
       "studyHint": "Повторите урок — раздел 'Configuration cheat sheet'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-03-q4",

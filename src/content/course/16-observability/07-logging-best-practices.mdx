@@ -58,7 +58,7 @@ public Result map(Event e) {
    }
    ```
 
-Volume rule: **< 100 log lines/sec per TaskManager в steady state**. Если больше — re-evaluate.
+Volume rule: **&lt; 100 log lines/sec per TaskManager в steady state**. Если больше — re-evaluate.
 
 ---
 
@@ -221,9 +221,9 @@ Switching:
 
 | Level | Use case | Frequency in production |
 |---|---|---|
-| ERROR | Unrecoverable errors, alerts | < 1 / hour |
-| WARN | Recoverable issues, anomalies | < 100 / hour |
-| INFO | Lifecycle events (job start, checkpoint complete) | < 1000 / hour |
+| ERROR | Unrecoverable errors, alerts | &lt; 1 / hour |
+| WARN | Recoverable issues, anomalies | &lt; 100 / hour |
+| INFO | Lifecycle events (job start, checkpoint complete) | &lt; 1000 / hour |
 | DEBUG | Detailed flow, NOT in production | OFF |
 | TRACE | Per-record, NEVER in production | OFF |
 

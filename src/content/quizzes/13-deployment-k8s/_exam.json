@@ -19,7 +19,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Полный production stack 2026 на K8s: (1) Application mode — изоляция, GitOps-friendly (per-job mode removed в 2.0); (2) Flink Kubernetes Operator — declarative CRDs, reconciliation, automatic savepoints; (3) Adaptive Scheduler — pre-requisite для elastic scaling; (4) FLIP-271 Autoscaler — metric-based decisions; (5) FLIP-291 in-place rescale — без savepoint при rescale; (6) K8s ConfigMap HA — cloud-native, нет ZK; (7) ForSt disaggregated state — state на S3, savepoint metadata-only; (8) GitOps — каждое изменение PR, audit trail через git. Стек заменяет 90% операционной сложности automation.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-exam-q2",
@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "K8s ConfigMap HA — default 2026 для new K8s deployments. Преимущества: (1) leverage K8s API уже доступный; (2) leader election через atomic ConfigMap/Lease updates с optimistic concurrency; (3) no extra cluster для maintain; (4) cleaner ops, GitOps-friendly; (5) auto-cleanup при FlinkDeployment delete. ZK HA жизнеспособен только в bare-metal / YARN setups где K8s нет, или legacy ZK ensemble уже на месте. Without HA вообще = JM SPOF, crash = downtime / data loss.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-exam-q6",

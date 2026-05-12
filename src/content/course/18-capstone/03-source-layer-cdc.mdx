@@ -279,7 +279,7 @@ spec:
 Strategy для capstone:
 
 1. **Запуск snapshot ночью** — minimum traffic window. 0:00-6:00 UTC.
-2. **Read replica с minimum lag** — verify pg_replication_slot lag < 1min перед запуском.
+2. **Read replica с minimum lag** — verify pg_replication_slot lag &lt; 1min перед запуском.
 3. **Parallelism начально 4** — не 8 во время snapshot. После snapshot complete — scale up через autoscaler.
 4. **Chunk size 100k** — balance между request size и memory footprint.
 5. **Monitoring** — `SELECT * FROM pg_stat_activity WHERE query LIKE 'COPY%'` watch postgres-side load.

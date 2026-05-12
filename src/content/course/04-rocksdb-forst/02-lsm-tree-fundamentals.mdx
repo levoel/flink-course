@@ -221,7 +221,7 @@ state.backend.rocksdb.compression_per_level:
     <FlowRow>
       <DataBox
         label="1. Active MemTable"
-        tooltip="Check in-memory skiplist первым делом. O(log n), все в RAM. Cache hit обычно <1μs."
+        tooltip="Check in-memory skiplist первым делом. O(log n), все в RAM. Cache hit обычно &lt;1μs."
       >
         Skiplist lookup
       </DataBox>
@@ -442,7 +442,7 @@ Flink keys (часто Long, String через MurmurHash) уже random distrib
 
 | Operation | Latency P50 | Latency P99 |
 |---|---|---|
-| MemTable hit (read) | <1μs | 5μs |
+| MemTable hit (read) | &lt;1μs | 5μs |
 | Block cache hit | 10μs | 50μs |
 | L0 disk read (NVMe) | 50μs | 200μs |
 | L1-L3 disk read | 100μs | 500μs |

@@ -1,5 +1,6 @@
 ---
 title: "Blue/green deploys через savepoints"
+description: "Blue/green deploys через savepoints — zero downtime upgrade strategy с canary validation"
 order: 8
 difficulty: "advanced"
 estimatedTime: 26
@@ -33,7 +34,7 @@ Workflow Flink:
 
 Между шагами 1-5 — **gap**. Точная длительность зависит от savepoint size:
 
-- Small state (< 10 GB) — savepoint 30-60s, total downtime ≈ 1 минута
+- Small state (&lt; 10 GB) — savepoint 30-60s, total downtime ≈ 1 минута
 - Medium state (50-100 GB) — savepoint 2-5 минут
 - Large state (TB+) — savepoint 10-30 минут
 

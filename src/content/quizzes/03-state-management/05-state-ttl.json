@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "NeverReturnExpired — safe для correctness: read возвращает null если entry expired, даже если он физически ещё в RocksDB (cleanup async). ReturnExpiredIfNotCleanedUp — best-effort: возвращает stale value пока physical cleanup не сработал. Risky для correctness — application может видеть expired data часами (slow compaction). Используйте только для best-effort cleanup без correctness требований (например performance optimization на cold data).",
       "studyHint": "Повторите урок — секция StateVisibility",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-05-q4",

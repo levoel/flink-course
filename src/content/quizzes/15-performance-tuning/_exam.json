@@ -89,7 +89,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Severe data skew. keyBy partitioning use hash → если cardinality неравномерна (один hot key), один subtask overwhelmed. Diagnose: coefficient of variation numRecordsInPerSecond > 0.5 = severe. Hot user patterns: whale account, bot synthetic traffic. Critical insight: parallelism 32→64 НЕ помогает — hot key всё равно в одном subtask из 64. Только salting splits load. Cost salting: extra shuffle stage, но evens load. Long-term: business logic — bot detection, special handling.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-exam-q7",
@@ -97,7 +97,7 @@
       "question": "max-concurrent-checkpoints: 2+ безопасно для всех state backends — увеличивает effective throughput через parallel checkpoint progress.",
       "correctAnswer": false,
       "explanation": "False. С 2+ parallel checkpoints RocksDB не может evict immutable MemTables (referenced both active checkpoints) → MemTable accumulation → write stall. Production rule: max-concurrent: 1 для RocksDB. 2+ только для HashMap state (no concurrent reference issue). Если нужна faster checkpoint visibility: incremental checkpoints + Changelog backend (FLIP-158, sub-second consistent) — proper solution. Concurrent checkpoints — anti-pattern для RocksDB jobs, может привести к degraded performance вместо ожидаемого ускорения.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-exam-q8",
@@ -111,7 +111,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "FLIP-158 (1.15 experimental, 1.16 stable). НЕ silver bullet. Решает specifically variability проблему. Когда RocksDB incremental sufficient — не нужен. Когда checkpoint size sawtooth (50GB после L0→L1 compaction) → downstream latency spikes → Changelog даёт constant small deltas. Configuration: state.backend.changelog.enabled: true, periodic-materialize.interval: 10min (balance recovery vs DFS overhead). Production rule: enable когда конкретная проблема со spikes, не profilactically.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-exam-q9",
@@ -133,7 +133,7 @@
       "question": "K8s pod memory limit должен ровно совпадать с taskmanager.memory.process.size — Flink calculates точно.",
       "correctAnswer": false,
       "explanation": "False. OS-level overhead (cgroup memory accounting, page cache для mmap'нутых RocksDB SST files, socket buffers, /tmp tmpfs если local dir там) добавляет 1-2GB поверх Flink budget. JVM не видит OS overhead. Result: cgroup memory.usage exceeds pod limit → K8s OOMKill (exit 137). JVM heap/direct memory выглядят OK. Production rule: pod.limit = process.size × 1.15 минимум (15% headroom). Например process.size=14g на pod.limit=16Gi. Также verify state.backend.rocksdb.localdir НЕ на tmpfs — иначе RocksDB пишет в memory.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

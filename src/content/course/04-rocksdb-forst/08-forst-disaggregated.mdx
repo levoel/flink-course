@@ -233,7 +233,7 @@ state.backend.forst.cache.prefetch-block-count: 4       # adjacent blocks
 
 - **Working set** = data accessed in last hour (estimate via access pattern)
 - **Cache size** = working set × 1.2-1.5 (overhead для cold spikes)
-- **Cache miss rate target**: <10% для production
+- **Cache miss rate target**: &lt;10% для production
 
 If working set unknown, start с 4-8GB cache, monitor `cache_hit_rate` metric, tune.
 
@@ -292,14 +292,14 @@ Savings come from:
 
 | Scenario | RocksDB | ForSt |
 |---|---|---|
-| Small state (<10GB) | ✅ | Overkill |
+| Small state (&lt;10GB) | ✅ | Overkill |
 | Medium state (10-100GB), low recovery time | ✅ | ✅ |
 | Large state (>100GB) | OK с большими nodes | ✅ better |
 | TB+ state | Painful | ✅ excellent |
 | Elastic scaling required | ❌ | ✅ |
 | K8s ephemeral storage | ❌ | ✅ |
 | Multi-region failover | Hard | ✅ (replicate S3) |
-| Strict latency P99 < 1ms | ✅ | OK with large cache |
+| Strict latency P99 &lt; 1ms | ✅ | OK with large cache |
 | Cold state, occasional access | Wasteful disk | ✅ pay per GET |
 
 ---
@@ -345,7 +345,7 @@ Fix: enable `async-state: true` (it's required для ForSt, не optional).
 state.backend.forst.cache.size: 512mb   # too small для 50GB working set
 ```
 
-Cache hit rate < 50% → most reads hit S3 → latency 50ms per access → throughput <5k events/sec.
+Cache hit rate &lt; 50% → most reads hit S3 → latency 50ms per access → throughput &lt;5k events/sec.
 
 Monitor `forst_cache_hit_rate`. Target >85%.
 
@@ -363,7 +363,7 @@ Optimization: increase cache, batch reads (`io.max-batch-size: 64`), use S3 Expr
 
 ### 5. Network bandwidth to S3
 
-ForSt assumes high network bandwidth к S3 (multi-Gbps). On bad connectivity (< 1Gbps), throughput suffers.
+ForSt assumes high network bandwidth к S3 (multi-Gbps). On bad connectivity (&lt; 1Gbps), throughput suffers.
 
 Run TaskManager в same AZ as S3 bucket. Use S3 VPC endpoint to avoid egress charges и latency.
 
@@ -403,8 +403,8 @@ flink_taskmanager_state_forst_in_flight_requests
 
 Healthy:
 - `cache_hit / (hit + miss)` > 0.85
-- `s3_get_latency_p99` < 200ms
-- `in_flight_requests` < `io.parallelism`
+- `s3_get_latency_p99` &lt; 200ms
+- `in_flight_requests` &lt; `io.parallelism`
 
 ---
 
@@ -465,6 +465,6 @@ Setup ForSt с MinIO (S3 mock):
 ---
 
 <KnowledgeCheck
-  question="Production Flink 2.x job, 800GB state, K8s deployment. Текущий setup — RocksDB на local NVMe. Recovery после pod migration = 90 minutes. Хотим уменьшить до <30 секунд. Какой стек миграции?"
-  answer="Migration к ForSt — это primary решение для recovery time. Plan: (1) Verify Async State API V2 usage в job code — все state access должен быть state.asyncValue().thenAccept(...) (mandatory для ForSt). Migrate sync calls. (2) Provision S3 bucket с appropriate region (same as TaskManager EKS cluster). Configure IAM role для pod через IRSA. (3) Set up MinIO или real S3 dev environment, тест migration в staging с representative state size. (4) Update flink-conf.yaml: state.backend.type: forst, state.backend.forst.primary-dir: s3://bucket/state, state.backend.forst.local-dir: /tmp/forst-cache, state.backend.forst.cache.size: 16gb (estimate working set), state.backend.execution.async-state: true. (5) Migration via canonical savepoint: stop --savepoint-format canonical, change config, resume from savepoint. ForSt reads from canonical, creates ForSt-native SSTs in S3 lazy on demand. (6) Post-migration validation: recovery test (kill pod, observe time — should be <30s), throughput baseline (compare к RocksDB pre-migration, target 100%+ с adequate cache), cache hit rate >85%. Cost analysis: RocksDB needed 1TB NVMe pods (m5d.2xlarge ~$648/mo), ForSt needs 100GB NVMe pods (m5d.xlarge ~$163/mo) + S3 storage 800GB × $0.023 = $18/mo + S3 GETs ~$40/mo = $221/mo total — 3x cost savings. Real benefit: 90 min → 12 seconds recovery, plus elastic scaling (compute independent от storage), plus stronger DR с S3 replication. Caveats: ensure network к S3 multi-Gbps (use S3 VPC endpoint), cache sizing critical (working set analysis), monitor cache_hit_rate в production. Flink 2.2 production-ready."
+  question="Production Flink 2.x job, 800GB state, K8s deployment. Текущий setup — RocksDB на local NVMe. Recovery после pod migration = 90 minutes. Хотим уменьшить до &lt;30 секунд. Какой стек миграции?"
+  answer="Migration к ForSt — это primary решение для recovery time. Plan: (1) Verify Async State API V2 usage в job code — все state access должен быть state.asyncValue().thenAccept(...) (mandatory для ForSt). Migrate sync calls. (2) Provision S3 bucket с appropriate region (same as TaskManager EKS cluster). Configure IAM role для pod через IRSA. (3) Set up MinIO или real S3 dev environment, тест migration в staging с representative state size. (4) Update flink-conf.yaml: state.backend.type: forst, state.backend.forst.primary-dir: s3://bucket/state, state.backend.forst.local-dir: /tmp/forst-cache, state.backend.forst.cache.size: 16gb (estimate working set), state.backend.execution.async-state: true. (5) Migration via canonical savepoint: stop --savepoint-format canonical, change config, resume from savepoint. ForSt reads from canonical, creates ForSt-native SSTs in S3 lazy on demand. (6) Post-migration validation: recovery test (kill pod, observe time — should be &lt;30s), throughput baseline (compare к RocksDB pre-migration, target 100%+ с adequate cache), cache hit rate >85%. Cost analysis: RocksDB needed 1TB NVMe pods (m5d.2xlarge ~$648/mo), ForSt needs 100GB NVMe pods (m5d.xlarge ~$163/mo) + S3 storage 800GB × $0.023 = $18/mo + S3 GETs ~$40/mo = $221/mo total — 3x cost savings. Real benefit: 90 min → 12 seconds recovery, plus elastic scaling (compute independent от storage), plus stronger DR с S3 replication. Caveats: ensure network к S3 multi-Gbps (use S3 VPC endpoint), cache sizing critical (working set analysis), monitor cache_hit_rate в production. Flink 2.2 production-ready."
 />

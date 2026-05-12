@@ -308,7 +308,7 @@ Variables: `$namespace`, `$job_name`, `$operator_name`, `$tm_id`. Filterable vie
     <FlowRow>
       <DataBox
         label="P0 — Critical (page on-call)"
-        tooltip="User-facing impact OR proven data loss risk. Job stopped, persistent checkpoint failures (>2 in 10min), OOMKilled TaskManager. Expected frequency < 5/month. Wakes engineer at 3am. Must have runbook + clear remediation."
+        tooltip="User-facing impact OR proven data loss risk. Job stopped, persistent checkpoint failures (>2 in 10min), OOMKilled TaskManager. Expected frequency &lt; 5/month. Wakes engineer at 3am. Must have runbook + clear remediation."
       >
         PagerDuty → on-call phone
       </DataBox>
@@ -364,7 +364,7 @@ Alerts categorized по severity:
 flink_jobmanager_numRunningJobs{namespace="prod"} < expected_count
 ```
 
-Alert: «Job <name> stopped в production. On-call investigate immediately.»
+Alert: «Job &lt;name&gt; stopped в production. On-call investigate immediately.»
 
 **2. Persistent checkpoint failures**
 
@@ -378,7 +378,7 @@ Alert: «Checkpoint failing repeatedly. Risk of data loss / recovery issues.»
 
 ```promql
 increase(kube_pod_container_status_terminated_reason{
-  pod=~"flink-taskmanager.*",
+  pod=~"flink-taskmanager.*"
   reason="OOMKilled"
 }[5m]) > 0
 ```
@@ -395,7 +395,7 @@ avg_over_time(
 ) > 800
 ```
 
-For 5min. Alert: «Sustained backpressure в <operator>. Possible bottleneck.»
+For 5min. Alert: «Sustained backpressure в &lt;operator&gt;. Possible bottleneck.»
 
 **5. Watermark stuck**
 
@@ -679,7 +679,7 @@ Job переименован, dashboard panels reference old name. Empty panels.
 
 Every metric alerts → on-call ignores all.
 
-**Fix**: 3 tiers (critical/high/medium). Critical = wake-up рекомендация. Medium = digest, weekly review. Tune thresholds — false positive < 5%.
+**Fix**: 3 tiers (critical/high/medium). Critical = wake-up рекомендация. Medium = digest, weekly review. Tune thresholds — false positive &lt; 5%.
 
 ### Gotcha 6: Missing alert runbook
 
@@ -732,5 +732,5 @@ Alert fatigue убивает production reliability. Если on-call игнор
 
 <KnowledgeCheck
   question="Production scenario: 50 Flink jobs в кластере, on-call complains об alert fatigue. Analysis показывает: 200+ alerts/week, 90% «backpressure spike» fires но resolve themselves через 2-5 минут (transient). Real incidents (5-10/month) сильно затеряны в шумe. План оптимизации dashboards + alerting?"
-  answer="Анализ root cause: low-quality alerts (transient backpressure spikes), no tiered severity, no de-duplication, дезориентирующий dashboard. План optimization: (1) Triage current alerts. Categorize last 4 weeks of alerts: какой alert fired, какой outcome (real incident vs noise vs auto-resolved). Identify top 5 noisy alerts (likely backpressure, GC, throughput dips). Top 5 useful alerts (job down, checkpoint fail repeatedly, OOMKill). (2) Re-tier по severity. Critical (P0, page): только событий с user-facing impact. Job down (proven service degradation), persistent checkpoint failures (data loss risk), OOMKilled (auto-restart impact). Expected frequency: < 5/month. High (P1, Slack mention): sustained issues (5+ minutes), not transient. Backpressure > 5min sustained, watermark stuck > 10min. Expected: 1-3/week. Medium (P2, digest): trend issues, capacity planning. State growth, GC elevated, throughput downward trend. Expected: weekly digest. Info (P3, Slack channel no notification): observability artifacts, не require action. (3) Add 'for' duration к alerts. Critical insight: 90% backpressure alerts resolve в 2-5 min (transient). Most alerts должны require 'for: 10m' или больше. Backpressure: previously `> 800` (instant), now `avg_over_time[5m] > 800 for 10m` — only sustained backpressure triggers. Reduces transient noise by 80%. (4) De-duplication. Если 30 subtasks backpressured → 30 alerts (anti-pattern). Group by job_name: aggregate alert per job, not per subtask. group_by: ['job_name', 'alertname']. One alert covers multi-subtask incident. (5) Implement alert correlation. CheckpointFailing + Backpressure обычно correlated — they're symptoms of same root cause. Alertmanager inhibition rules: silence Backpressure если CheckpointFailing активен (root cause обычно checkpoint anyway). Reduces double alerts. (6) Add silence windows. Известные maintenance windows (deploy, K8s upgrades) — auto-silence. Reduces false alerts during expected disruption. (7) Runbook discipline. Каждый alert links к runbook с структурой: (a) Symptoms, (b) Diagnosis steps (3-5 step playbook), (c) Common fixes, (d) Escalation. На-call после alert: open runbook, follow checklist. No googling, no guessing. (8) Dashboard simplification. (a) Fleet overview: high-level only — running jobs count, aggregate throughput, recent incidents. Не 30 panels с deep metrics. (b) Per-job dashboard linked from fleet — drill-down on-demand. (c) Specialized 'incident response' dashboard: filtered к specific job + time range, linked к traces/logs. Используется only during incident. (9) Quarterly dashboard review. Stale panels remove. New metrics add (new dependencies, new SLOs). Document changes в Git (dashboards-as-code). (10) Alert quality SLO. Set target: false positive rate < 10% для critical, < 25% для high. Track actually. Если category exceeds threshold, retune. Specific changes для example noise sources: (a) Backpressure: 'for: 10m' instead of '5m' for high severity, 'for: 30m' для critical. Remove instant alert. (b) GC time elevated: change from instant > 10s/min к 'for: 15m sustained > 10s/min'. (c) Throughput drop: only alert если sustained > 30min and не correlated с known upstream issue. (d) Watermark stuck: 'for: 15m' instead of '5m' (small fluctuations don't matter). (11) Implementation timeline. Week 1: identify noisy alerts, document. Week 2: implement 'for' durations, de-duplication, inhibition rules. Week 3: deploy runbooks, dashboards-as-code. Week 4: measure alert volume reduction. Target: 50-70% reduction в alert volume. Expected outcome: 200/week → 60-80/week. Real incidents still firing, noise eliminated. On-call trust restored — alerts now signal, not noise. Lesson: alerting quality > alerting quantity. Less is more — every alert should be actionable, every page should be justified. Continuous tuning required."
+  answer="Анализ root cause: low-quality alerts (transient backpressure spikes), no tiered severity, no de-duplication, дезориентирующий dashboard. План optimization: (1) Triage current alerts. Categorize last 4 weeks of alerts: какой alert fired, какой outcome (real incident vs noise vs auto-resolved). Identify top 5 noisy alerts (likely backpressure, GC, throughput dips). Top 5 useful alerts (job down, checkpoint fail repeatedly, OOMKill). (2) Re-tier по severity. Critical (P0, page): только событий с user-facing impact. Job down (proven service degradation), persistent checkpoint failures (data loss risk), OOMKilled (auto-restart impact). Expected frequency: &lt; 5/month. High (P1, Slack mention): sustained issues (5+ minutes), not transient. Backpressure > 5min sustained, watermark stuck > 10min. Expected: 1-3/week. Medium (P2, digest): trend issues, capacity planning. State growth, GC elevated, throughput downward trend. Expected: weekly digest. Info (P3, Slack channel no notification): observability artifacts, не require action. (3) Add 'for' duration к alerts. Critical insight: 90% backpressure alerts resolve в 2-5 min (transient). Most alerts должны require 'for: 10m' или больше. Backpressure: previously `> 800` (instant), now `avg_over_time[5m] > 800 for 10m` — only sustained backpressure triggers. Reduces transient noise by 80%. (4) De-duplication. Если 30 subtasks backpressured → 30 alerts (anti-pattern). Group by job_name: aggregate alert per job, not per subtask. group_by: ['job_name', 'alertname']. One alert covers multi-subtask incident. (5) Implement alert correlation. CheckpointFailing + Backpressure обычно correlated — they're symptoms of same root cause. Alertmanager inhibition rules: silence Backpressure если CheckpointFailing активен (root cause обычно checkpoint anyway). Reduces double alerts. (6) Add silence windows. Известные maintenance windows (deploy, K8s upgrades) — auto-silence. Reduces false alerts during expected disruption. (7) Runbook discipline. Каждый alert links к runbook с структурой: (a) Symptoms, (b) Diagnosis steps (3-5 step playbook), (c) Common fixes, (d) Escalation. На-call после alert: open runbook, follow checklist. No googling, no guessing. (8) Dashboard simplification. (a) Fleet overview: high-level only — running jobs count, aggregate throughput, recent incidents. Не 30 panels с deep metrics. (b) Per-job dashboard linked from fleet — drill-down on-demand. (c) Specialized 'incident response' dashboard: filtered к specific job + time range, linked к traces/logs. Используется only during incident. (9) Quarterly dashboard review. Stale panels remove. New metrics add (new dependencies, new SLOs). Document changes в Git (dashboards-as-code). (10) Alert quality SLO. Set target: false positive rate &lt; 10% для critical, &lt; 25% для high. Track actually. Если category exceeds threshold, retune. Specific changes для example noise sources: (a) Backpressure: 'for: 10m' instead of '5m' for high severity, 'for: 30m' для critical. Remove instant alert. (b) GC time elevated: change from instant > 10s/min к 'for: 15m sustained > 10s/min'. (c) Throughput drop: only alert если sustained > 30min and не correlated с known upstream issue. (d) Watermark stuck: 'for: 15m' instead of '5m' (small fluctuations don't matter). (11) Implementation timeline. Week 1: identify noisy alerts, document. Week 2: implement 'for' durations, de-duplication, inhibition rules. Week 3: deploy runbooks, dashboards-as-code. Week 4: measure alert volume reduction. Target: 50-70% reduction в alert volume. Expected outcome: 200/week → 60-80/week. Real incidents still firing, noise eliminated. On-call trust restored — alerts now signal, not noise. Lesson: alerting quality > alerting quantity. Less is more — every alert should be actionable, every page should be justified. Continuous tuning required."
 />

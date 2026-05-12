@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Proper migration через canonical savepoint. Steps: (1) Job code audit — все state.value()/update() заменить на asyncValue().thenAccept(). Это mandatory для ForSt, otherwise throws. (2) Stop с canonical format: flink stop --savepoint-format canonical — это backend-agnostic format (vs default native — backend-specific). (3) Update flink-conf: state.backend.type: forst, primary-dir: s3://bucket, local-dir: /tmp/cache, cache.size: 16gb (estimate working set), async-state: true (mandatory). (4) Resume: flink run -s canonical-savepoint — ForSt reads canonical, builds ForSt-native SSTs in S3 lazy. (5) Validation: recovery test (kill pod, <30s recovery), cache hit rate >85%, throughput ≥ baseline. One-way migration easier RocksDB → ForSt.",
       "studyHint": "Повторите урок — Migration section",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-08-q4",
@@ -57,7 +57,7 @@
       "question": "ForSt без Async State API V2 будет работать с минимальной penalty (10-20% slower).",
       "correctAnswer": false,
       "explanation": "False. ForSt без Async API V2 = catastrophe. Math: S3 GET latency 50-100ms на cache miss. Sync state.value() blocks single-threaded mailbox thread subtask-а на эту latency. На 30% cache miss × 10k events/sec → 3000 misses/sec × 100ms = 300 секунд блокировки на каждую секунду wall clock — impossible. Throughput drops к ~200 events/sec (от 30k async). Practical: Flink throws exception при start если state.backend.execution.async-state не enabled с ForSt — это mandatory configuration. Apache benchmarks: ForSt+sync 200 events/sec, ForSt+async 30k events/sec — 150x разница. Это why FLIP-424/425 (async API) и FLIP-427 (ForSt) developed как single stack.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

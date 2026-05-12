@@ -336,8 +336,8 @@ checkpoint.bytes-persisted-per-checkpoint  # actually uploaded bytes
 
 Healthy:
 - `bytes-persisted` ~ 5-10% `size` (incremental working well)
-- `duration` < interval (checkpoints не piling up)
-- `alignment-time` < 1s (no severe backpressure)
+- `duration` &lt; interval (checkpoints не piling up)
+- `alignment-time` &lt; 1s (no severe backpressure)
 
 Alert thresholds:
 - `duration` > 80% interval → tune checkpoint interval bigger
@@ -358,7 +358,7 @@ Alert thresholds:
 | Format | Backend-specific | Backend-specific |
 | Canonical savepoint | Yes | No (need canonical) |
 
-**Default recommendation**: incremental enabled. Только turn off для tiny state (<1GB) где overhead не payback.
+**Default recommendation**: incremental enabled. Только turn off для tiny state (&lt;1GB) где overhead не payback.
 
 ---
 
@@ -389,12 +389,12 @@ It's a continuous garbage collection of SSTs based на actual usage. Elegant an
 ---
 
 <Callout type="tip">
-Incremental checkpointing — main reason почему RocksDB backend usable для TB-scale state. Без него каждый checkpoint upload 1TB = infeasible. Always enable (`state.backend.incremental: true`) для production. Только тривиальные jobs (<1GB state) могут без.
+Incremental checkpointing — main reason почему RocksDB backend usable для TB-scale state. Без него каждый checkpoint upload 1TB = infeasible. Always enable (`state.backend.incremental: true`) для production. Только тривиальные jobs (&lt;1GB state) могут без.
 </Callout>
 
 ---
 
 <KnowledgeCheck
   question="Job с RocksDB, 500GB state. Checkpoint каждые 60 секунд. Incremental disabled. Что произойдёт с S3 costs и performance? Как fix?"
-  answer="Catastrophic costs и performance. С full checkpoints каждые 60 секунд: 500GB × 60 checkpoints/hour = 30TB upload per hour, 720TB per day. S3 bandwidth costs alone: $X/GB × 30TB = огромные суммы. Upload time: even с 10Gbps network — 500GB / 1.25GB/s = 400 секунд. Это превышает checkpoint interval — checkpoints overlap, system заходит в death spiral. Plus storage: 500GB × num-retained (default 1) = 500GB just for current. Recommended fix: enable state.backend.incremental: true. Incremental upload только delta — typically 1-5% per checkpoint. 500GB state → 5-25GB upload per checkpoint. Bandwidth requirement drops от 8.3 GB/s до 0.4 GB/s. Storage: 500GB × 1.05 = 525GB (через shared SST reuse). Recovery time не improves with incremental — нужен full SST set для restore — но это OK trade-off vs ongoing bandwidth/cost. Plus enable local-recovery для in-place restart speed. Дополнительная optimization: combine с ForSt для recovery independent of size. Validation после fix: monitor checkpoint.bytes-persisted-per-checkpoint < 5% of checkpoint.size — это incremental working правильно. duration < 60s — checkpoints not piling. S3 costs: drop 95%+."
+  answer="Catastrophic costs и performance. С full checkpoints каждые 60 секунд: 500GB × 60 checkpoints/hour = 30TB upload per hour, 720TB per day. S3 bandwidth costs alone: $X/GB × 30TB = огромные суммы. Upload time: even с 10Gbps network — 500GB / 1.25GB/s = 400 секунд. Это превышает checkpoint interval — checkpoints overlap, system заходит в death spiral. Plus storage: 500GB × num-retained (default 1) = 500GB just for current. Recommended fix: enable state.backend.incremental: true. Incremental upload только delta — typically 1-5% per checkpoint. 500GB state → 5-25GB upload per checkpoint. Bandwidth requirement drops от 8.3 GB/s до 0.4 GB/s. Storage: 500GB × 1.05 = 525GB (через shared SST reuse). Recovery time не improves with incremental — нужен full SST set для restore — но это OK trade-off vs ongoing bandwidth/cost. Plus enable local-recovery для in-place restart speed. Дополнительная optimization: combine с ForSt для recovery independent of size. Validation после fix: monitor checkpoint.bytes-persisted-per-checkpoint &lt; 5% of checkpoint.size — это incremental working правильно. duration &lt; 60s — checkpoints not piling. S3 costs: drop 95%+."
 />

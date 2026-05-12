@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "Honest self-assessment important для career growth + interview integrity. Confident claims: курс daught foundations + capstone built — verifiable via portfolio (architecture diagrams, code, design decisions discussed). Need production experience: troubleshooting depth from incidents, capacity reality from observation, cross-team decisions from interactions. Interview framing: 'Built capstone production-grade pipeline. Looking forward to applying в team production scale. Strong fundamentals, comfortable learning, hungry for incident response experience.' This is true и appropriate — overstating production credibility-risk.",
       "studyHint": "Повторите урок 10 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-10-q2",
@@ -57,7 +57,7 @@
       "question": "Streaming systems expertise — niche skill с limited career value в 2026+.",
       "correctAnswer": false,
       "explanation": "Opposite of true. Streaming + real-time data engineering — growing demand, limited supply expertise. 2026 market signals: senior+ Flink engineers commanding $200-350k+ US (comparable EU/UK senior), specialty roles в FAANG/large e-commerce/finance, increased corporate streaming adoption (real-time CDC, ML pipelines, agent runtime). Niche enough that few engineers have deep production experience — competitive advantage. Expertise compounds — 5+ years production Flink experience = senior+ level. Investment в depth here long-term career upside. Streaming + AI/ML intersection (ML_PREDICT, Flink Agents) further increases demand. Not 'just niche' — valuable specialty.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

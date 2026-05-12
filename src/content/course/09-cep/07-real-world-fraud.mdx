@@ -132,7 +132,7 @@ Pattern<EnrichedEvent, ?> takeover = Pattern.<EnrichedEvent>begin("login")
     ...
 ```
 
-`IPHistoryEnricher` — обычный KeyedProcessFunction со ValueState<Set<String>> historical IPs. CEP fed уже clean events. Это **production-grade pattern**.
+`IPHistoryEnricher` — обычный KeyedProcessFunction со `ValueState<Set<String>>` historical IPs. CEP fed уже clean events. Это **production-grade pattern**.
 
 ---
 

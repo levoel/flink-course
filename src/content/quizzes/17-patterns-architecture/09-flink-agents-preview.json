@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Pragmatic adoption strategy для preview tech. 0.2.x — API breaking changes ожидаются, observability immature, community small. Полное rollout критических workflows = risk. Полное игнорирование = lose learning, можно miss что-то когда Flink Agents становится default. Optimal: (1) keep mature production tools (LangGraph/LangChain) для critical paths; (2) pilot Flink Agents на narrow scope — one specific workflow, low risk; (3) measure operational reality (recovery, scaling, EOS practical benefit); (4) when 0.3-1.0 GA — evaluate full migration с established team familiarity. Это applicable к любой emerging tech adoption.",
       "studyHint": "Повторите урок 09 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m17-09-q4",
@@ -57,7 +57,7 @@
       "question": "Flink Agents — это direct replacement для LangChain/LangGraph для всех use cases.",
       "correctAnswer": false,
       "explanation": "Не replacement, complement. LangChain/LangGraph wins на: maturity (2+ years production), community size, rapid iteration, Python ecosystem depth. Flink Agents wins на: production-grade infrastructure (EOS, durability, autoscaling, observability built-in). Когда Flink Agents лучше: scale (millions events/day), money-critical tools (refunds, payments), durable state requirements. Когда LangChain лучше: prototyping, dev, smaller scale, не need EOS. Production reality 2026: use both — LangChain для most agents, Flink Agents для high-scale production-critical.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

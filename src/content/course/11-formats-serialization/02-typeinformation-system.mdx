@@ -287,7 +287,7 @@ System.out.println(typeInfo);
 //   amount: Double
 ```
 
-Если видите `GenericType<...>` в выводе — это Kryo fallback для конкретного field. Например, `java.time.Instant` не POJO (нет no-arg constructor). Решения: custom `TypeInformation` для `Instant` через ExecutionConfig, либо хранить как `long epochMillis`.
+Если видите `GenericType&lt;...>` в выводе — это Kryo fallback для конкретного field. Например, `java.time.Instant` не POJO (нет no-arg constructor). Решения: custom `TypeInformation` для `Instant` через ExecutionConfig, либо хранить как `long epochMillis`.
 
 ### ExecutionConfig: registering serializers
 

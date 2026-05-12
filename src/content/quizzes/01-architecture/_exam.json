@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Application mode = production default для serious streaming. Dedicated cluster per app, hard isolation, savepoint-based upgrades через FlinkDeployment, GitOps. Session mode для: ad-hoc SQL CLI, Zeppelin/Jupyter notebooks, many small stateless jobs где shared cluster экономит memory. Mixed approach в production — application для critical stateful, один session cluster для massive fleet of stateless. Per-job mode REMOVED в Flink 2.0 (FLIP-419) — application полностью его заменил.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m01-exam-q5",
@@ -103,7 +103,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Cold start application mode дефолтом 70-300+ сек. Optimization stack: pre-warm pods skip 30-90s pod startup. Local recovery: при same-TM restart skip S3 download (10-100x speed для large state, но не работает при node failure). Incremental checkpoints (default в 2.x) уменьшают per-checkpoint upload. GIC: async upload changelog, recovery — replay small log. ForSt: state primary на S3, recovery metadata-only ~30s даже для TBs. Buffer debloating: drastically снижает checkpoint duration при backpressure. Unaligned checkpoints (см. модуль 06): barrier overtake, не ждёт alignment.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m01-exam-q8",
@@ -111,7 +111,7 @@
       "question": "Per-job mode и Reactive Mode оба удалены в Flink 2.0 — production setups должны использовать Application mode + Adaptive Scheduler соответственно.",
       "correctAnswer": true,
       "explanation": "Flink 2.0 cleanup. Per-job mode (FLIP-419): removed, заменён Application mode который полностью покрывает функционал. Reactive Mode (старый elastic scaling): заменён Adaptive Scheduler (FLIP-160) с in-place rescaling (FLIP-291). Также removed: DataSet API, Scala API, SourceFunction/SinkFunction (заменены FLIP-27 + FLIP-191 SinkV2), flink-conf.yaml format (заменён standard YAML config.yaml). Это структурное упрощение API surface — production должна migrate с legacy на новые abstractions.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

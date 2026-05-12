@@ -49,7 +49,7 @@
       "correctAnswer": "c",
       "explanation": "Mixed approach optimal. Stateful jobs: Application mode каждая — (1) 80GB RocksDB требует dedicated managed memory; (2) blast radius isolation — recovery 80GB не должен валить соседей; (3) independent scale/version. Stateless 20: Session cluster — (1) per-job JM overhead 2GB × 20 = 40GB трата; (2) slot sharing повышает utilization; (3) common Flink version не критична. Only Application = 30 JM-pods overhead. Only Session = stateful jobs голодают по memory + JM crash валит 30 jobs.",
       "studyHint": "Повторите урок — секция Когда какой mode + Production gotchas",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-02-q4",

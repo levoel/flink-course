@@ -102,31 +102,31 @@ Agents — это extending Flink в **agent runtime** territory. Streaming engi
 from flink_agents import Agent, Tool, Memory, OpenAIProvider
 
 agent = Agent(
-    name="customer-support",
+    name="customer-support"
     provider=OpenAIProvider(
-        model="gpt-4-turbo",
+        model="gpt-4-turbo"
         api_key="${OPENAI_API_KEY}"
     ),
     system_prompt="""You are a customer support agent for ACME Corp.
         Always be polite. Use tools to look up customer information.
-        Escalate to human if uncertain.""",
+        Escalate to human if uncertain."""
     tools=[
         Tool.from_postgres(
-            name="lookup_customer",
-            description="Look up customer by ID",
-            connection_url="jdbc:postgresql://prod-db/customers",
+            name="lookup_customer"
+            description="Look up customer by ID"
+            connection_url="jdbc:postgresql://prod-db/customers"
             query_template="SELECT * FROM customers WHERE id = :customer_id"
         ),
         Tool.from_kafka_topic(
-            name="create_ticket",
-            description="Create support ticket",
-            topic="support_tickets",
+            name="create_ticket"
+            description="Create support ticket"
+            topic="support_tickets"
             schema=TicketSchema
         ),
         Tool.from_http(
-            name="check_order_status",
-            description="Check order status from internal API",
-            endpoint="https://internal-api/orders/{order_id}",
+            name="check_order_status"
+            description="Check order status from internal API"
+            endpoint="https://internal-api/orders/{order_id}"
             method="GET"
         ),
     ],
@@ -174,7 +174,7 @@ from flink_agents import MCPTool
 
 # MCP server (например, filesystem / github / shopify) подключается:
 github_tools = MCPTool.from_server(
-    server_url="mcp://github-mcp-server:8000",
+    server_url="mcp://github-mcp-server:8000"
     auth_token="${GITHUB_TOKEN}"
 )
 
@@ -194,11 +194,11 @@ MCP (Model Context Protocol, открыт Anthropic 2024) — стандарт �
 # Subscribe agent к stream of events
 agent.run_on_stream(
     input_stream=KafkaSource(
-        topics="support_requests",
+        topics="support_requests"
         format="avro"
     ),
     output_stream=KafkaSink(
-        topic="agent_responses",
+        topic="agent_responses"
         delivery_guarantee="exactly_once"
     ),
     key_by="conversation_id",     # routing по conversation
@@ -208,7 +208,7 @@ agent.run_on_stream(
 
 Under the hood:
 - Flink graph: KafkaSource → keyBy(conversationId) → AgentProcessFunction → KafkaSink (EOS).
-- AgentProcessFunction: ValueState<Conversation> for memory, async LLM calls, async tool calls.
+- AgentProcessFunction: `ValueState<Conversation>` for memory, async LLM calls, async tool calls.
 - Checkpoint coordination ensures EOS for tool side effects.
 
 ---
@@ -249,12 +249,12 @@ Multi-agent chains — это normal Flink DAG, агенты — это опер
 ```python
 # 24/7 первая линия поддержки
 support_agent = Agent(
-    name="acme-support-l1",
+    name="acme-support-l1"
     provider=AnthropicProvider(model="claude-opus-4-7"),
     system_prompt="""You are ACME's L1 customer support.
         - Greet customers, ask for order ID.
         - Look up info, answer simple questions.
-        - For complex issues, create ticket + escalate.""",
+        - For complex issues, create ticket + escalate."""
     tools=[
         lookup_customer, lookup_order, check_shipping,
         create_ticket, refund_request
@@ -276,11 +276,11 @@ Real-world data: large e-commerce companies (Klarna, Bolt) уже использ
 ```python
 # Auto-approve/decline loan applications
 loan_agent = Agent(
-    name="loan-decision",
+    name="loan-decision"
     provider=BedrockProvider(model="claude-3.5"),
     system_prompt="""Evaluate loan applications. Use tools to check credit,
         employment, history. Auto-approve if score > 0.85, decline if < 0.3,
-        escalate human otherwise.""",
+        escalate human otherwise."""
     tools=[
         check_credit_bureau, verify_employment, check_history,
         emit_decision  # Kafka publish для downstream processing
@@ -299,9 +299,9 @@ Critical: EOS гарантирует, что один application = одно dec
 
 ```python
 iot_agent = Agent(
-    name="device-monitor",
+    name="device-monitor"
     provider=OpenAIProvider(model="gpt-4"),
-    system_prompt="Diagnose device anomalies. Suggest mitigation.",
+    system_prompt="Diagnose device anomalies. Suggest mitigation."
     tools=[
         query_metrics, query_logs, check_similar_devices,
         page_oncall, schedule_maintenance
@@ -351,8 +351,8 @@ Flink Agents — это не replacement для LangChain, а **production runti
 ```python
 # Tool: publish to Kafka topic 'orders'
 publish_order = Tool.from_kafka_topic(
-    name="publish_order",
-    topic="orders",
+    name="publish_order"
+    topic="orders"
     schema=OrderSchema
 )
 

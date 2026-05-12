@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Главный bottleneck — state restore (download 200 GB из S3). Просто scale up TM-ов не поможет линейно: per-task download остаётся ограничен S3 throughput per TM. Реальные optimizations (приоритет): (1) Local recovery — для same-TM restart ~30 сек, но не помогает при node failure; (2) GIC — async upload changelog, recovery replay малого log-а; (3) ForSt — disaggregated state на S3 убирает download полностью, recovery metadata-only; (4) Pre-warm TM pods — экономит 30-90 сек pod startup. Также RocksDB compaction tuning чтобы реже падать.",
       "studyHint": "Повторите урок 07 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m01-07-q3",

@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Архитектурные разницы для streaming updates. **Iceberg model**: flat list of immutable files. Update record = equality delete file (помечает старую запись deleted) + new data file. Read merges: scan data files, apply equality deletes, return remaining. Pros: simple architecture, multi-engine compatibility. Cons: (a) read amplification растёт с delete file count; (b) compaction = separate rewrite_files action which fully rewrites partitions; (c) latency between sink commit и optimal read structure. **Paimon model**: LSM-tree поверх Parquet/ORC. Records sorted by primary key, organized в levels (L0/L1/.../Ln). Update record = new entry, LSM merge consolidates over time. Compaction integrated: writer thread может trigger sync L0→L1 compact, или async background. Changelog producer feature: each commit Paimon emits stream of changes (INSERT/UPDATE/DELETE) для downstream Flink/Spark streaming consumers — essentially CDC из data lake. When use what: Paimon — CDC sink, frequent updates, latency-sensitive, single-engine (Flink-heavy). Iceberg — append-heavy, multi-engine reads (Spark, Trino, Snowflake), historical data lake, time-travel queries.",
       "studyHint": "Повторите урок — секция 'Iceberg vs Paimon — when to use what'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-07-q3",
@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Three-pronged remediation для classic small file + metadata bloat problem. **Phase 1 — immediate metadata cleanup**: `CALL system.expire_snapshots(table => 'db.events', older_than => DATE_SUB(CURRENT_DATE, 7), retain_last => 10)` — physically deletes old snapshot files + orphan data files. metadata.json shrinks от MBs до KBs. Query planning time drops immediately. Schedule этого daily. **Phase 2 — file compaction**: `CALL system.rewrite_data_files(table => 'db.events', strategy => 'binpack', options => map('target-file-size-bytes', '268435456'))` (256MB). Reads small files, writes merged большие, commit as single snapshot. Expensive (TB IO) — schedule off-peak. После: 8M files → ~30K files, query latency 5min → 5s. **Phase 3 — preventive sink changes**: implement SupportsPreCommitTopology для inline compaction (or use FlinkSink.distributionMode(HASH) для better batching). **Phase 4 — operational**: reduce sink parallelism (32 → 8) — less fanout per partition; increase checkpoint interval (60s → 5min) — larger batches per commit. **Phase 5 — ongoing**: schedule daily rewrite_data_files + expire_snapshots в Airflow. Monitor `iceberg.table.snapshot.size` и `iceberg.table.data.file.count`. New deployments should use Paimon если streaming-heavy — native compaction integrated.",
       "studyHint": "Повторите урок — Production gotchas и cheat sheet",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m07-07-q4",

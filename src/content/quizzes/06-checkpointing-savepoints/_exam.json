@@ -19,7 +19,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Full ABS cycle с blocking/async breakdown: (1) Trigger: CheckpointCoordinator on JobManager, periodic timer, parallel RPC to all sources; (2) Source: snapshot Kafka offsets, emit CheckpointBarrier через output; (3) Barrier propagation: stateless operators forward, almost no-op chained; (4) Alignment phase (BLOCKING aligned): operator с N inputs blocks channel A after first barrier, buffers records, продолжает читать B/C, blocking until barrier on ALL N — under backpressure 1-30min; (5) Sync phase (BLOCKING but FAST, ms-100ms): RocksDB native snapshot = hardlinks на immutable SST files (O(1)), heap state = CopyOnWriteStateMap increment version. Per TB state still milliseconds; (6) Forward barrier immediately downstream, async upload to DFS begins (NOT blocking mainline processing); (7) Sink (terminal): получил barrier на все inputs, snapshot pending transactions, ack to coordinator; (8) Coordinator collects acks, persists checkpoint metadata, invokes notifyCheckpointComplete on all operators — critical для 2PC sinks (Kafka commit, Iceberg manifest publish). Total: alignment + sync ≈ ms-minutes (mostly alignment под backpressure), async upload ≈ seconds-minutes (network bound). Optimizations addressing each phase: unaligned (FLIP-76) removes alignment, GIC (FLIP-158) stabilizes async через DSTL.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-exam-q2",
@@ -33,7 +33,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Comprehensive checkpoint stability solution. Layered approach addressing each potential bottleneck: (1) Unaligned hybrid — handles backpressure без long alignment, bounded duration. Important: combine с buffer debloating иначе ChannelState explodes. (2) Buffer debloating — dynamically adjusts buffer size к ~1s data, minimizes ChannelState (potentially TBs without). Must-have с unaligned. (3) GIC/DSTL — fundamental shift: stable seconds checkpoint duration regardless of state size. DSTL append-only log flushed on checkpoint (ms), materialization separate periodic cycle (10 min). На TB state без GIC = minutes, with = seconds. (4) Incremental — diff SST upload for materializations, 5-20% bandwidth vs full. (5) Local recovery — local SST copies для same-node restart (20x speedup). (6) ForSt — disaggregated state on S3, checkpoint becomes metadata-only operation, recovery time independent of state size. Cloud-native, but adds latency for state access (mitigated by Async State API V2). (7) Kafka transaction timeout buffer — accommodates max checkpoint duration × 2. Without all layers: variable duration causes transaction expiration → data loss. Production-grade EOS pipelines требуют complete stack.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-exam-q3",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Production migration multi-step procedure. Critical aspects: (1) Explicit UIDs prerequisites — без них state не restored after topology changes (Flink 2.2 may have implicit topology changes). (2) Code updates для compatibility: Flink 2.0 removed SourceFunction/SinkFunction/DataSet — refactor; ForSt requires Async State API V2 (sync calls degrade to sync DFS reads — catastrophic latency). (3) Canonical savepoint — REQUIRED для cross-backend (RocksDB → ForSt) AND cross-version (1.18 → 2.2) migration. Native не work. Timing: 1-3h для 5TB (canonical is full serialization, 3-10x slower than native). Set --savepoint-timeout 4-6h. (4) New cluster deployment с ForSt + GIC standard. ForSt configuration: primary-dir на S3, local cache для performance. (5) Restore deserializes canonical к ForSt-native format. Hours. (6) Parallel validation — run обе clusters reading same Kafka offset (separate consumer groups), compare outputs. (7) Cutover gradual — switch downstream consumers, monitor metrics. (8) Retention — keep old savepoint 30 days, can rollback к 1.18 + RocksDB. Total elapsed: 2-3 weeks safe (prep, migration day, validation). Без canonical savepoint impossible — would need full state rebuild via Kafka replay (weeks).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-exam-q5",
@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Layered optimization for large installation. Diagnose: 2000 × 10 files × 2880 checkpoints/day = 57M files/day. S3 PUT throttle 3.5K/sec вдребезги exceeded. Listings slow, costs high. Solutions: (1) FLIP-306 file merging — PRIMARY fix для stated symptoms. 50-100x file count reduction → 1-2M files/day, well below throttling, listings fast, costs 10-50x lower. Default with Flink 1.20+. (2) GIC — addresses checkpoint duration variability. Stable seconds checkpoints regardless of state size. Critical для EOS. (3) Unaligned hybrid — handles backpressure без blocking checkpoint. (4) Local recovery — fast same-node restart, 20x speedup для transient TM failures. (5) Adaptive scheduler — sticky placement increases local recovery hit. (6) ForSt — ultimate cloud-native (disaggregated state, S3 primary). Adds latency to state access (mitigated by Async State API V2), removes local disk constraint. (7) S3 prefix sharding — distributes throttle limits between checkpoint, DSTL, materialization. Different bucket prefixes recommended. (8) Monitoring: Prometheus metrics для lastCheckpointDuration, lastCheckpointAlignmentDuration, S3 4xx error rate. Alerts on degradation. Implementation order: file merging first (immediate biggest impact), GIC second (stability), ForSt third (cloud-native). Test each in staging. Expected result: stated 8min duration → 8sec, throttling resolved, costs $200/day → $20/day. Production rule для large installations (>500 parallelism, >1TB state): file merging + GIC mandatory baseline.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-exam-q6",
@@ -83,7 +83,7 @@
       "question": "Для production EOS pipeline с Kafka transactional sink mandatory enabled: incremental checkpoints + GIC + unaligned hybrid + region failover + local recovery — это required baseline configuration, не optional optimizations.",
       "correctAnswer": true,
       "explanation": "True. Production EOS pipelines с Kafka transactional sinks требуют layered protection. Каждый component addresses specific failure mode: (1) Incremental checkpoints (state.backend.incremental: true) — упгрейд: SST sharing, 5-20% bandwidth vs full. Без него — every checkpoint full upload, infeasible на TB scale. (2) GIC (state.backend.changelog.enabled: true + DSTL config) — STABLE checkpoint duration through DSTL append-only log. Without GIC checkpoint duration variable (p99 minutes), Kafka transaction.timeout.ms must be conservatively long (1h+), more memory pressure on brokers, periodic transaction expirations → data loss. (3) Unaligned hybrid (FLIP-76) — bounded duration under backpressure. Buffer debloating mandatory companion. Without — backpressure spikes cause alignment timeout, checkpoint failures cascade. (4) Region failover (default Flink 1.10+, verify enabled) — isolated restart scope, 2-10x recovery speedup. Without — every transient failure restart entire job. (5) Local recovery (state.backend.local-recovery: true) — fast same-node recovery (20x speedup for transient failures). Without — every restart downloads TB from S3. Each layer protects от specific failure mode. Missing any одного introduces unbounded recovery time, data loss risk, OR production toil. Production rule этот baseline = required configuration, not optional. Code reviews should check it. Это validated сотнями production incidents.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

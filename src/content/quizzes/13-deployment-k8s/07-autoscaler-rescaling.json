@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Conservative behavior. 14:00 spike начинается. 14:05 window full → metrics show high busy time → scale up. 14:10 еще scaling up. К 14:25 параллелизм 16-20. 14:30 spike закончился — но scale-down.interval=1h означает no scale down ещё час. До 15:30 over-provisioned. Это preference correctness over cost. Для agile reaction: reduce stabilization (5→2min), scale-down (1h→15min), accept thrashing risk. Для bursty (5min spikes) autoscaler не подходит — use static provisioning.",
       "studyHint": "Повторите урок — Stabilization windows: anti-flapping + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-07-q4",

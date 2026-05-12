@@ -347,7 +347,7 @@ Iceberg fills null. OK. Но reverse — Flink writes new field, table not yet a
 Iceberg commits — snapshot per checkpoint. Snapshot includes ALL data writes within checkpoint interval. Watermark progress определяет когда events visible:
 
 - Event time = T1, checkpoint at T2 (T2 > T1) → snapshot committed → event visible.
-- Late event (event time = T0, T0 < watermark) — dropped before reaching sink, not in snapshot.
+- Late event (event time = T0, T0 &lt; watermark) — dropped before reaching sink, not in snapshot.
 
 Latency от event arrival до snapshot visibility ≈ checkpoint interval. Tune accordingly.
 

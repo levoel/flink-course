@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "POJO Serializer не поддерживает type changes даже widening (int→long). Two options: (1) State Processor API rebootstrap — offline batch transforms savepoint; (2) Avro Serializer поддерживает type promotion int→long→float→double automatically (если используете AvroSerializer вместо POJO). Recommendation на старте: prefer Avro для state, который будет evolve — built-in evolution rules мощнее.",
       "studyHint": "Повторите урок — секция Allowable changes",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-07-q3",

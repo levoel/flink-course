@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "Sliding window state multiplier = window_size / slide. 24h/1min = 1440. Каждое событие добавляется в 1440 windows' state. С ProcessWindowFunction (хранит raw events) — exponential state growth, RocksDB OOM. Fixes по эскалации: (1) AggregateFunction — Flink держит running aggregate (single double per window per key) вместо raw events, state стабилен; (2) Table API CUMULATE — built-in 'rolling' semantic с reset, O(1) state per window per key, не 1440; (3) Custom KeyedProcessFunction с MapState и manual emit/cleanup. CUMULATE — обычно лучший choice для 'last 24h with 1min updates' pattern.",
       "studyHint": "Повторите урок — раздел 'Sliding Windows'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m05-06-q2",

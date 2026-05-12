@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Engine один — NFA, performance эквивалентна. Trade-offs API-based: MATCH_RECOGNIZE преимущества — fully SQL (embeds в pipelines), native FIRST/LAST/SUM aggregates, schema evolution через DDL, declarative. Pattern API преимущества — programmatic generation (patterns из user config), complex IterativeCondition с running state, type safety на compile time. Production: MATCH_RECOGNIZE для most production cases с aggregations, Pattern API для programmatic / dynamic / Java-heavy contexts.",
       "studyHint": "Повторите урок — Сравнительная таблица",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m09-04-q4",

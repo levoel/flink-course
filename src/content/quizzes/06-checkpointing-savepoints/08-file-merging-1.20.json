@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Selection criteria. Use FLIP-306 file merging если: (1) High parallelism (>200 subtasks) — generates много files per checkpoint; (2) Sub-minute checkpoint intervals — high file creation rate; (3) Many state primitives per operator — каждый primitive separate file; (4) S3 throttling observed (503 SlowDown errors, slow checkpoints); (5) Bucket listings slow (operations painful); (6) Cost reduction needed (charged per S3 request). Maybe skip если: (1) Small parallelism (<50) — natural file count manageable; (2) Large state per subtask — files already > 32MB threshold, no merging beneficial; (3) HDFS storage — different limits than S3, less pressure; (4) Debugging clarity preferred — separate SSTs easier explore с aws s3 cp; (5) Simple ops setup. Production large-scale (2000 subtasks, TB state): mandatory. Small jobs: optional.",
       "studyHint": "Повторите урок — раздел 'Когда использовать'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-08-q4",

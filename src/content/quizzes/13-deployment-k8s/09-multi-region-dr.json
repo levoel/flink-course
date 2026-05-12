@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Sweet spot для critical 200GB job. Setup: (1) Primary EKS us-east-1, DR EKS us-west-2 pre-provisioned (smaller, scale up при failover); (2) Savepoint каждые 10min (RPO budget 15min — savepoint 10min + CRR lag 1-2min); (3) ForSt с disaggregated state — savepoint становится metadata-only operation, 200GB savepoint secунды а не минуты (огромный win для RPO); (4) S3 CRR на savepoints prefix; (5) Kafka MM2 или Confluent Cluster Linking для offset continuity; (6) Terraform для DR FlinkDeployment apply с latest replicated savepoint; (7) Quarterly DR drill. Без ForSt 200GB savepoint = 5-10 минут write = breaks RPO budget. ForSt — game changer для DR.",
       "studyHint": "Повторите урок — Реальный пример: финтех + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-09-q3",
@@ -57,7 +57,7 @@
       "question": "DR procedure, который никогда не тестирован в реальных условиях — это эффективно отсутствие DR. Quarterly drill обязателен.",
       "correctAnswer": true,
       "explanation": "True. Untested DR = no DR. Без drill: (1) procedures устаревают (S3 paths изменились, IAM policies дрейфят); (2) team не знает runbook; (3) hidden dependencies (DNS, Kafka, IAM) unblockable at the worst moment; (4) actual recovery time неизвестен — bookhuilters claim 30min, реально 4 часа. Quarterly drill: симулировать region failure (block S3 access), provision DR cluster, restore from latest savepoint, measure RTO, verify data integrity, document gaps. Real disaster — не время debug. Каждый drill улучшает procedure.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

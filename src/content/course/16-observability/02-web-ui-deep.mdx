@@ -27,7 +27,7 @@ Web UI находится на JobManager: `http://jobmanager:8081`.
 | **Task Managers** | Per-TM logs, metrics, threads | Specific TM diagnosis |
 | **Configuration** | Effective config | Verify deployment |
 
-Основная debugging работа в **Jobs → Running → <Job ID>**.
+Основная debugging работа в **Jobs → Running → &lt;Job ID&gt;**.
 
 ---
 
@@ -40,9 +40,9 @@ DAG view — главная диагностическая поверхност�
     <FlowRow>
       <DataBox
         label="Green box"
-        tooltip="busyTimeMsPerSecond < 50%. Operator имеет capacity reserve. Healthy для большинства pipelines."
+        tooltip="busyTimeMsPerSecond &lt; 50%. Operator имеет capacity reserve. Healthy для большинства pipelines."
       >
-        busy < 50% (healthy)
+        busy &lt; 50% (healthy)
       </DataBox>
       <DataBox
         label="Yellow box"
@@ -129,7 +129,7 @@ Watermarks — это «event-time progress» сигнал. Если watermark s
 **Где смотреть**:
 1. Click на source operator → Watermarks tab.
 2. Сравнить current input watermark с current event time:
-   - Если разница < 1min → healthy.
+   - Если разница &lt; 1min → healthy.
    - Если разница > 10min → stuck.
    - Если разница > 1hour → severe issue.
 
@@ -159,7 +159,7 @@ ID | Status   | Trigger Time | Latest Ack | End-to-End | Sync | Async | Alignmen
 14 | COMPLETE | 14:25:00     | 14:25:09   | 9s         | 60ms | 8.2s  | 0.7s      | 12 GB      | -
 ```
 
-**Sync phase**: должна быть < 100ms. Если выше — issue в state backend init.
+**Sync phase**: должна быть &lt; 100ms. Если выше — issue в state backend init.
 
 **Async phase**: main contributor к total duration. Зависит от:
 - State size

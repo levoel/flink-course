@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Avro best для production long-term: (1) Centralized schema management (registry); (2) Aliases enable rename без migration; (3) Promoted types (int→long, float→double); (4) Explicit defaults для all new fields; (5) Cross-language — Java Flink + Python consumers ML pipeline; (6) Setup effort окупается через год evolution. POJO good для simple cases, но rename проблематичен. Kryo — never для state (no evolution). Custom serializer — edge cases only (high effort). Avro requires upfront work (schema files, generated classes, registry integration), but pays back в long-term operations.",
       "studyHint": "Повторите урок — Avro evolution + Production tip",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-03-q4",

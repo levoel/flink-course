@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "High cardinality observability требует proper tooling. Vanilla Prometheus great для small-medium, но не scales enterprise streaming platforms. Quick win: drop subtask_index label — metrics aggregate per operator вместо per subtask. Lose subtask-level granularity (skew detection harder), keep operator-level. VictoriaMetrics: high cardinality optimized, Prometheus-compatible (Grafana plug-and-play), better compression. Migration: dual-write период (remote_write from Prometheus к VM), verify consistency, switchover Grafana, decommission Prometheus. 1-2 weeks staged. Long-term: split tiers для cost efficiency.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-04-q4",

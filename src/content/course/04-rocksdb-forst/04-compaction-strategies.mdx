@@ -371,7 +371,7 @@ Compaction может run concurrently с checkpoint snapshot. Это OK — Fli
 | Read-heavy, stable latency required | Leveled |
 | Write-heavy (>50% of ops are writes) | Universal |
 | Large state (>100GB) | Leveled (better read perf) |
-| Small state (<10GB) | Leveled (default OK) |
+| Small state (&lt;10GB) | Leveled (default OK) |
 | TTL-heavy с frequent clear | Leveled (better tombstone cleanup) |
 | SSD endurance critical | Universal (low WA) |
 | Mixed predictable workload | Leveled |
@@ -409,5 +409,5 @@ Compaction tuning — last optimization, не first. Start с PredefinedOptions,
 
 <KnowledgeCheck
   question="Write-heavy workload: 200k writes/sec, 80% writes / 20% reads, NVMe SSD с limited endurance budget. Текущий setup — Leveled compaction, write amplification 60x. SSD будет dead через 2 года. Что менять?"
-  answer="Switch на Universal compaction — это специально решение write-heavy с SSD endurance concerns. Reasoning: Leveled WA 60x = на каждый 1GB user writes 60GB пишется на SSD за lifetime. Universal WA 8-12x — в 5-7 раз меньше disk wear. С 200k writes/sec × 200 bytes value × 60 (leveled WA) = 2.4GB/sec disk writes. Switch к universal: 200k × 200 × 10 = 400MB/sec — SSD endurance продлевается в ~6x. Trade-offs: (1) read latency P99 будет higher (1ms vs 0.5ms) — acceptable для 20% reads; (2) space amplification 1.8x vs 1.2x = +50% disk usage — нужно extra space; (3) compaction spikes — нужен ParallelismController на client side для smooth backpressure. Tuning: state.backend.rocksdb.compaction.style: UNIVERSAL, universal.size-amplification-percent: 100, universal.max-merge-width: -1, увеличить thread.num до 8 для absorb spikes. Validation: monitor rocksdb_bytes_written / user_bytes_written (target <15x), watch для write stalls. Алтернатива если read latency critical — stay leveled, увеличить write_buffer_size до 256MB (меньше flushes), уменьшить multiplier до 5 (меньше levels) — reduces WA до ~30x частично."
+  answer="Switch на Universal compaction — это специально решение write-heavy с SSD endurance concerns. Reasoning: Leveled WA 60x = на каждый 1GB user writes 60GB пишется на SSD за lifetime. Universal WA 8-12x — в 5-7 раз меньше disk wear. С 200k writes/sec × 200 bytes value × 60 (leveled WA) = 2.4GB/sec disk writes. Switch к universal: 200k × 200 × 10 = 400MB/sec — SSD endurance продлевается в ~6x. Trade-offs: (1) read latency P99 будет higher (1ms vs 0.5ms) — acceptable для 20% reads; (2) space amplification 1.8x vs 1.2x = +50% disk usage — нужно extra space; (3) compaction spikes — нужен ParallelismController на client side для smooth backpressure. Tuning: state.backend.rocksdb.compaction.style: UNIVERSAL, universal.size-amplification-percent: 100, universal.max-merge-width: -1, увеличить thread.num до 8 для absorb spikes. Validation: monitor rocksdb_bytes_written / user_bytes_written (target &lt;15x), watch для write stalls. Алтернатива если read latency critical — stay leveled, увеличить write_buffer_size до 256MB (меньше flushes), уменьшить multiplier до 5 (меньше levels) — reduces WA до ~30x частично."
 />

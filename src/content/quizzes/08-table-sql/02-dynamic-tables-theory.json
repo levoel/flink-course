@@ -57,7 +57,7 @@
       "question": "PROCTIME() и event-time watermarked column дают одинаковый детерминированный результат при replay (например, после restart).",
       "correctAnswer": false,
       "explanation": "False. **PROCTIME() — НЕ deterministic при replay**. PROCTIME returns current TaskManager wall clock time. После restart pipeline reads same records, but processing time different (now vs original). Windowed aggregations с PROCTIME будут разные на replay — different window assignments, different counts. Это by design — PROCTIME для use cases где latency и simplicity matter, не correctness. **Event-time WATERMARK — deterministic при replay**. Event_time extracted from record payload (e.g., `event_time TIMESTAMP(3)`, ingested from Kafka message). Same record → same event_time → same window assignment, regardless of when processed. Watermark progression deterministic (advance based on event_time progression, not wall clock). Replay produces identical results. **Implications**: (1) Production EOS pipelines should use event_time для correctness — same input always produces same output. (2) PROCTIME OK для approximations, dashboards, latency-critical use cases где deterministic replay не required. (3) Mixed usage — sometimes event_time для logic, PROCTIME для cache invalidation (`lookup_join FOR SYSTEM_TIME AS OF proc_time`). (4) Production tests should run replay scenarios — assert event_time-based queries produce identical output across runs.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

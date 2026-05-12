@@ -119,7 +119,7 @@ state.checkpoints.file-merging.pool-blocking-files-threshold: 5
 state.checkpoints.file-merging.max-space-amplification: 2.0
 ```
 
-- Files < 32MB merged together
+- Files &lt; 32MB merged together
 - Files >= 32MB stored как отдельные
 - max-merged-file-size capped для avoid huge files (default 1GB)
 - space-amplification — допустимый overhead (например, при cleanup partial deletes)
@@ -258,7 +258,7 @@ File merging (FLIP-306) — must-have для installations с 1000+ subtasks и�
 </Callout>
 
 ### Maybe skip if:
-- Small parallelism (< 50)
+- Small parallelism (&lt; 50)
 - Large state per subtask already (files naturally > 32MB)
 - HDFS storage (different limits, не S3)
 - Simple ops, debugging clarity preferred

@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Defense-in-depth philosophy: один layer fails — другие catch. Detailed layers: (1) **Config**: `pipeline.generic-types: false` в production config.yaml — Flink fails job submission на Kryo, не starts с silent degradation. (2) **Programmatic**: `env.getConfig().disableGenericTypes()` в main() Java code — works even если config.yaml не loaded или overridden. (3) **CI integration test**: `LocalEnvironment.createLocalEnvironment(); env.getConfig().disableGenericTypes(); buildPipeline(env); env.getStreamGraph();` — getStreamGraph() forces TypeInformation resolution для всех operators → throws IllegalArgumentException с конкретным class name если Kryo. (4) **Static analysis**: grep `.map(.*->.*)` без следующего `.returns(` — catches lambda без type hints как style violation. (5) **Code review**: PR template checklist с пунктами 'все new types — POJO/Avro', 'Lombok @NoArgsConstructor + @AllArgsConstructor', 'lambda с tuple/POJO имеет .returns()'. (6) **Production monitoring**: alert на JobManager log pattern `Falling back to GenericType` — backstop если все layers миновали. Production team experience: после этой strategy zero Kryo regressions за 6 months.",
       "studyHint": "Повторите урок 07 — секцию 'Production checklist для preventing Kryo regression'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m11-07-q4",
@@ -57,7 +57,7 @@
       "question": "State, written с KryoSerializer, не имеет schema evolution capability — изменение class FQN (rename, package move), добавление field, удаление field могут сделать существующий savepoint unreadable, тогда как PojoSerializer/AvroSerializer handle такие изменения через TypeSerializerSnapshot.",
       "correctAnswer": true,
       "explanation": "KryoSerializer хранит state как opaque byte sequences с class FQN. На recovery: (1) Если class FQN изменился (rename, package move) — Kryo не находит class, ClassNotFoundException, recovery fails. (2) New field added — Kryo пытается prочитать bytes под новый field, видит EOF (старые bytes короче), fails или corrupts. (3) Field removed — Kryo читает bytes, ожидает field того типа, не находит, fails. KryoSerializer НЕ имеет TypeSerializerSnapshot с rich schema info — only class reference. В contrast: **PojoSerializerSnapshot** имеет field-by-field schema + supports add nullable field, remove field, reorder через `resolveSchemaCompatibility()`. **AvroSerializerSnapshot** uses Avro's native reader/writer schema resolution — full Avro evolution (defaults, aliases, type widening). **Kryo + state = upgrade trap**: первый рефакторинг или Flink version upgrade ломает savepoint. Production rule: НИКОГДА Kryo для state-bearing types. Migration path: State Processor API batch job converts Kryo state → POJO state перед deploying new code.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

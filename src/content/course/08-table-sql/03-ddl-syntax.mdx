@@ -262,7 +262,7 @@ CREATE TABLE orders (
 **WATERMARK FOR `event_time` AS `event_time - INTERVAL '5' SECOND`**:
 - `event_time` becomes time attribute (timestamps used для windowing).
 - Watermark = max(event_time) - 5 seconds. Out-of-orderness up to 5s tolerated.
-- Records с event_time < current watermark — late.
+- Records с event_time &lt; current watermark — late.
 
 Use:
 ```sql

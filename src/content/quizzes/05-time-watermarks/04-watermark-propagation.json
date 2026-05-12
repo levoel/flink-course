@@ -34,7 +34,7 @@
       "correctAnswer": "c",
       "explanation": "Classic case: один source имеет idle partitions без withIdleness. KafkaSource WM = MIN(per-partition WM) = MIN(active, Long.MIN_VALUE) = Long.MIN_VALUE. Downstream Join: MIN(orders, inventory) = Long.MIN_VALUE → all event-time timers frozen. Fix: withIdleness в WatermarkStrategy inventory source. Сопутствующие fixes: (1) orders тоже должна иметь withIdleness — тот же баг переедет в slack hours; (2) для long-term resurrection (idle partition просыпается через час) — добавить allowedLateness + sideOutputLateData; (3) если drift между источниками известен — watermark alignment (FLIP-217).",
       "studyHint": "Повторите урок — раздел 'Idle source pitfall'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m05-04-q3",

@@ -280,7 +280,7 @@ state.backend.rocksdb.metrics.block-cache-miss: true
 ### Decision tree
 
 1. **L0 files > 20**? → Compaction starved. Increase `thread.num` или `max_background_jobs`.
-2. **Block cache hit rate < 90%**? → Working set > cache. Increase `block.cache-size` или `memory.managed.fraction`.
+2. **Block cache hit rate &lt; 90%**? → Working set > cache. Increase `block.cache-size` или `memory.managed.fraction`.
 3. **Write stall events > 0**? → Эскалация: bigger `writebuffer.size`, more `writebuffer.count`, faster compaction.
 4. **Read P99 > 10ms**? → Check L0 file count, bloom filter enabled, block cache hit rate.
 5. **Compaction lag (bytes-pending-compaction) growing**? → More threads or universal compaction.

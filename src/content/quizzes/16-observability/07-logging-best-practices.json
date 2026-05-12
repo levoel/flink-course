@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Classic per-record logging incident. Immediate fix focuses на stopping bleeding и cluster recovery. Long-term focus на prevention через discipline и tooling. Critical insights: (1) In streaming с millions events/sec basic logging principles от batch systems don't transfer. (2) Code review должен caught — make it explicit checklist item. (3) Disk-based safeguards — aggressive rotation, async appender. (4) Real-time shipping — TM disk doesn't need long retention. (5) Observability strategy clarity: metrics для high-volume aggregate, traces для sampled per-record, logs для rare events. Treat logs as scarce resource.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-07-q4",

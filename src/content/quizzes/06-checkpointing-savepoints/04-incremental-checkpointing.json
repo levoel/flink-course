@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Inherent limitation incremental + rescale combination. При changing parallelism (100 → 200): Flink redistributes key groups между subtasks. Each subtask теперь contains different subset of keys → RocksDB на каждом subtask completely different SSTs from previous checkpoint. SharedStateRegistry diff = ~100% — все SSTs new. Plus после rescale RocksDB compaction reorganizes state по new key distribution → еще more new SSTs. Mitigations: (1) Increase execution.checkpointing.timeout temporary (30-60min); (2) Wait 5-10 checkpoints для stabilization; (3) ENABLE GIC — DSTL log не зависит от SST layout, checkpoint = log flush (constant time independent of compaction); (4) ENABLE ForSt — state на S3 уже, нет re-upload, just remapping metadata. Production: для jobs с frequent rescale (autoscaling) — ENABLE GIC + ForSt mandatorily.",
       "studyHint": "Повторите урок — раздел 'Production gotchas'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-04-q4",

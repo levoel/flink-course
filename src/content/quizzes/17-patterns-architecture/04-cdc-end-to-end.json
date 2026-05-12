@@ -57,7 +57,7 @@
       "question": "В Flink CDC 3.x source phase 'initial' parallel snapshot создаёт нагрузку на production Postgres — это normal и не требует mitigations.",
       "correctAnswer": false,
       "explanation": "Production OLTP databases чувствительны к heavy reads. Parallel splits для snapshot phase загружают Postgres — SELECT * FROM table parallel. На production это бьёт по latency приложения. Mitigations обязательны: (1) запустить initial snapshot ночью; (2) использовать read replica для snapshot; (3) снизить `scan.snapshot.fetch.size`; (4) меньший parallelism source во время snapshot; (5) `scan.incremental.snapshot.enabled: true` — lock-free algorithm. Never assume snapshot 'не повредит' production.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

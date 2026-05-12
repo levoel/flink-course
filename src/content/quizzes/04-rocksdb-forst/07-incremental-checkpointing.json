@@ -57,7 +57,7 @@
       "question": "Incremental checkpoint enables recovery time independent of state size.",
       "correctAnswer": false,
       "explanation": "False. Incremental saves UPLOAD bandwidth/storage, не download/recovery time. При recovery от incremental checkpoint Flink download FULL set of SST files (shared + private) — same total bytes as full checkpoint. 1TB state = 1TB download. Recovery time ~ linear с state size. Для recovery time INDEPENDENT of state size нужен ForSt (disaggregated state на S3 — primary storage, recovery = metadata only ~5 секунд для TB state). Incremental — bandwidth optimization, ForSt — recovery optimization. Together они addressing different dimensions same problem.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

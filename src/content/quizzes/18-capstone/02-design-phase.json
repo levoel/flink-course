@@ -19,7 +19,7 @@
       "correctAnswer": "b",
       "explanation": "Conscious architectural trade-off. Direct Flink CDC plusses: one less hop, no Kafka retention cost (для 1B events/day × 30 days = 30TB savings ~$3-5k/month), Flink CDC schema evolution propagation auto, simpler debugging. Trade-off: no Kafka buffer means slot pressure if Flink down. Mitigations: monitoring slot lag, max_slot_wal_keep_size guard, recovery procedures. Если scenarios evolve (multiple consumers, longer DR window), Kafka layer can be ADDED later without architectural rewrite. Это explicit trade-off с guardrails, not unconscious choice.",
       "studyHint": "Повторите урок 02 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m18-02-q2",
@@ -57,7 +57,7 @@
       "question": "Single Flink job для всего pipeline (CDC + stateful + sinks) — это automatic anti-pattern, должно быть несколько jobs для isolation.",
       "correctAnswer": false,
       "explanation": "Это conscious design choice с trade-offs. Single job pros: easier ops (one deployment, one savepoint), simpler observability, shared resources, atomic state semantics. Cons: bug в one operator может kill entire job, single failure domain. Multiple jobs pros: isolation, independent scaling, fault domains. Cons: more deployments, savepoint coordination, cost of multiple JobManagers. For capstone (single team, manageable complexity) — single job with extensive testing + savepoint backup + blue/green strategy works. For multi-team scenarios или massive parallelism — multiple jobs lучше. Не automatic anti-pattern.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

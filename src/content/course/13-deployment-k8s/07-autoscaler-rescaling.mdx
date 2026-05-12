@@ -1,5 +1,6 @@
 ---
 title: "Autoscaler (FLIP-271) + In-place rescaling (FLIP-291)"
+description: "Autoscaler (FLIP-271) и in-place rescaling (FLIP-291) — elastic scaling по backpressure metrics"
 order: 7
 difficulty: "advanced"
 estimatedTime: 32
@@ -328,7 +329,7 @@ Autoscaler видит per-vertex busy times, делает per-vertex decisions. 
 - **In-place rescale require FLIP-291 support** — Flink 1.18+ только. Pre-1.18 fallback на savepoint-restart (медленный). Check version.
 - **State backend matters** — ForSt с disaggregated state делает in-place rescale **очень быстрым** (state pointers reuse, не download). RocksDB local — нужно копировать SST files между TM pods.
 - **Backpressure ratio false positive** — если downstream Kafka sink slow (broker bottleneck), backpressure пропагируется upstream. Autoscaler пытается scale upstream — не поможет. Fix: scale downstream OR fix Kafka.
-- **Scale flapping без stabilization** — если traffic очень spiky (< stabilization interval), autoscaler не сможет адаптироваться. Используйте longer windows или manual override для spiky patterns.
+- **Scale flapping без stabilization** — если traffic очень spiky (&lt; stabilization interval), autoscaler не сможет адаптироваться. Используйте longer windows или manual override для spiky patterns.
 - **Kafka partition limit** — Kafka source parallelism = min(configured, number of partitions). Autoscaler знает это, но если вы set max-parallelism > partitions, autoscaler не пойдёт выше partitions.
 - **Scale to 0 не работает в Adaptive Scheduler** — min parallelism >= 1. Для full suspend используйте FlinkDeployment `spec.job.state: suspended`.
 - **Memory tuning + autoscaler conflict** — оба меняют resources. Можно увидеть взаимодействие. Лучше enable memory tuning только после parallelism autoscaling settled.

@@ -57,7 +57,7 @@
       "question": "Если state grows unbounded и TTL не fix-ит проблему, всегда есть technical solution в Flink для preservation correctness.",
       "correctAnswer": false,
       "explanation": "Sometimes the design is wrong. Если TTL не fix (например, retention business requirement), accuracy approximate NOT OK, external state scary — pre-вышенный решение может быть changing the requirement. Re-evaluate на higher level: изменить granularity (per-user-per-day buckets), агрегировать pre-dedup, или принять что pipeline должен иметь large state (TBs disk, hours recovery) plus invest в proper sizing + DR plan. Иногда anti-pattern это symptom — task wrong, не solution wrong.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

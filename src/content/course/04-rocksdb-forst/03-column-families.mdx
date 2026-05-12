@@ -320,7 +320,7 @@ Flink shapes around RocksDB через FRocksDB fork. CF format может ме�
 
 ## Performance: separate CF vs flat key
 
-Question: 10 different counters per user в одном operator — separate ValueState<Long> или MapState<String, Long>?
+Question: 10 different counters per user в одном operator — separate ValueState&lt;Long&gt; или MapState&lt;String, Long&gt;?
 
 ```java
 // Option A: 10 ValueState (10 CF):

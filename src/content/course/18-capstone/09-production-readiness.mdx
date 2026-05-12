@@ -55,7 +55,7 @@ Production readiness — не one-time milestone. Это continuous responsibili
       </DataBox>
       <DataBox
         label="6. Performance"
-        tooltip="Latency SLO: P99 < X ms documented. Throughput SLO: events/sec sustained. Stress-tested 2x expected peak load в staging. Backpressure rare under normal load. GC time < 5% CPU sustained. Checkpoint duration < 50% interval."
+        tooltip="Latency SLO: P99 &lt; X ms documented. Throughput SLO: events/sec sustained. Stress-tested 2x expected peak load в staging. Backpressure rare under normal load. GC time &lt; 5% CPU sustained. Checkpoint duration &lt; 50% interval."
       >
         Latency / throughput SLO
       </DataBox>
@@ -124,7 +124,7 @@ Production readiness — не one-time milestone. Это continuous responsibili
 
 - [ ] **State TTL configured для all keyed state** — без TTL — anti-pattern. Even «infinite» retention should be explicit.
 - [ ] **Cleanup strategies appropriate**: `cleanupInRocksdbCompactFilter(1000)` для RocksDB; `cleanupIncrementally(1000, true)` для heap; `cleanupFullSnapshot()` для snapshot-time cleanup.
-- [ ] **State backend choice justified**: ForSt для disaggregated (TBs state, fast recovery); RocksDB для smaller (< 100 GB); HashMap для truly tiny state.
+- [ ] **State backend choice justified**: ForSt для disaggregated (TBs state, fast recovery); RocksDB для smaller (&lt; 100 GB); HashMap для truly tiny state.
 - [ ] **State size estimated и monitored** — calculate worst-case from cardinality × per-key overhead.
 - [ ] **maxParallelism set explicitly** — minimum 256 для future scaling.
 - [ ] **Changelog state backend (GIC) enabled** — для predictable checkpoint latency. `state.backend.changelog.enabled: true`.
@@ -181,10 +181,10 @@ Production readiness — не one-time milestone. Это continuous responsibili
 ## 6. Performance
 
 - [ ] **Load test in staging** matching production scale × 1.5.
-- [ ] **Latency P99 measured under load** — meets SLO (e.g. < 5s end-to-end для capstone).
+- [ ] **Latency P99 measured under load** — meets SLO (e.g. &lt; 5s end-to-end для capstone).
 - [ ] **Throughput measured** — matches expected peak × 1.2 headroom.
 - [ ] **Backpressure investigations** — no sustained bp > 80% on any operator under normal load.
-- [ ] **Checkpoint duration < interval** — 60s checkpoint should complete in < 30s.
+- [ ] **Checkpoint duration &lt; interval** — 60s checkpoint should complete in &lt; 30s.
 - [ ] **Recovery time tested** — kill TM, measure recovery, document.
 - [ ] **State size projection** — extrapolate growth, plan storage capacity.
 

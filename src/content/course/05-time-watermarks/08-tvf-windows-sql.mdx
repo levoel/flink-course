@@ -110,7 +110,7 @@ GROUP BY window_start, window_end;
 
 ### State implications same as DataStream sliding
 
-Каждое событие в `size/slide` окон. Avoid `slide << size` patterns — state explodes.
+Каждое событие в `size/slide` окон. Avoid `slide &lt;&lt; size` patterns — state explodes.
 
 ---
 

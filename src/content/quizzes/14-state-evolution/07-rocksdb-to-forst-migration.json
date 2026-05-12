@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Carefully staged. Staging — clone job + sample savepoint (~100GB), test ForSt config 1-2 weeks: checkpoint success, throughput vs baseline, cache hit rate, async I/O metrics. Pre-migration — downtime window low traffic, on-call ready, S3 IAM/NetworkPolicy validated, rollback procedure documented. Canonical savepoint в production — 30-45 min для 1.5TB (mostly S3 write throughput). Apply config — Operator handles restart с initialSavepointPath. Validation — first hour critical (rapid restarts? checkpoint failures? throughput drop?). Week monitoring — daily checks. Rollback insurance — keep canonical savepoint 30 days, same canonical works на both backends — symmetric rollback. Skipping staging = russian roulette.",
       "studyHint": "Повторите урок — Полный migration workflow + Production checklist + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m14-07-q4",

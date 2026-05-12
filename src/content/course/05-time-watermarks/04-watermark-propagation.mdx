@@ -43,7 +43,7 @@ Watermark — не просто метка времени, это распред
     <FlowRow>
       <DataBox
         label="currentInputWatermark = MIN(100, 80, 120) = 80"
-        tooltip="Это безопасная нижняя граница. Если оператор объявит WM=120, события с ts=85 с input 2 будут late. WM=80 гарантирует корректность: события с ts < 80 ещё могут прийти только с input 2, но WM(in2)=80 значит — не могут."
+        tooltip="Это безопасная нижняя граница. Если оператор объявит WM=120, события с ts=85 с input 2 будут late. WM=80 гарантирует корректность: события с ts &lt; 80 ещё могут прийти только с input 2, но WM(in2)=80 значит — не могут."
       >
         Min input WM
       </DataBox>
@@ -323,7 +323,7 @@ public class MyCoProcessor extends CoProcessFunction<A, B, C> {
 
 ### 3. Watermark скачет назад
 
-Watermark должен монотонно расти. Если custom WatermarkGenerator emit-ит WM < lastEmittedWM — Flink игнорирует (но logs warning). Если игнорирует много — это bug в generator. Audit logic.
+Watermark должен монотонно расти. Если custom WatermarkGenerator emit-ит WM &lt; lastEmittedWM — Flink игнорирует (но logs warning). Если игнорирует много — это bug в generator. Audit logic.
 
 ### 4. Slot sharing и WM ordering
 

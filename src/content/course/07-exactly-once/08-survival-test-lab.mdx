@@ -405,11 +405,11 @@ Steps:
 
 | Metric | Norm | Alert |
 |---|---|---|
-| `lastCheckpointDuration` | < 5s | > checkpointTimeout |
+| `lastCheckpointDuration` | &lt; 5s | > checkpointTimeout |
 | `lastCheckpointSize` | stable | growing |
 | `numRestarts` | 0-1 за час | > 5 за час |
 | `kafka.producer.transaction-coordinator.PendingTransactions` | low | > 100 |
-| `kafka.broker.LastStableOffsetLag` | < 1000 | > 100000 |
+| `kafka.broker.LastStableOffsetLag` | &lt; 1000 | > 100000 |
 | `lastCheckpointFailureTimestamp` | none | recent |
 
 Backpressure metrics после chaos kill часто spike — это normal recovery, должно вернуться в норму за минуты.

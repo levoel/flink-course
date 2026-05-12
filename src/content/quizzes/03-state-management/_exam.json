@@ -33,7 +33,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Classic maxParallelism trap. Default считается на запуск (parallelism=4 → 128). После запуска IMMUTABLE — потому что keyGroupId = hash(key) % maxParallelism, изменение mp = всех ключей в разные key groups = state lost. State Processor API offline batch может перепаковать state в новый mp, но для multi-TB savepoint часы работы. Solution до запуска: setMaxParallelism(1024) или 4096 — free insurance.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-exam-q3",
@@ -61,7 +61,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Sliding TTL = OnReadAndWrite. + RocksDB cleanup через compact filter. + full snapshot. CRITICAL CAVEAT: OnReadAndWrite на RocksDB = каждый read становится PUT (refresh ttl_timestamp). На read-heavy workload (10 reads per event @ 100k events/sec = 1M PUT/sec) — катастрофа: MemTable постоянно flushing, write amplification 50-100x, CPU на compaction. Для real session timeout часто лучше explicit event-time timer + state.clear(). cleanupIncrementally не работает на RocksDB!",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m03-exam-q5",
@@ -83,7 +83,7 @@
       "question": "Schema evolution через POJO Serializer поддерживает добавление nullable Integer field (compatible after migration), но не поддерживает type change (int→long). Для type changes нужен State Processor API или переход на Avro Serializer.",
       "correctAnswer": true,
       "explanation": "True. POJO Serializer schema evolution rules: ✅ Add nullable field (COMPATIBLE_AFTER_MIGRATION, default null), ✅ Remove field (data discarded), ❌ Change type even widening (INCOMPATIBLE), ❌ Rename (INCOMPATIBLE). Для type changes есть два пути: (1) State Processor API offline rebootstrap — read savepoint, transform, write new savepoint; (2) Use Avro instead of POJO — Avro поддерживает type promotion int→long→float→double через built-in evolution rules. Production recommendation: для state, evolving regularly, prefer Avro Serializer от старта.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

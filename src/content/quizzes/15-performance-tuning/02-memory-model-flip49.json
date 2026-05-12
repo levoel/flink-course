@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Classic K8s vs JVM memory mismatch. JVM не видит OS-level overhead: cgroup accounting, page cache для mmap'нутых RocksDB SST файлов, socket buffers, /tmp tmpfs. Pod limit считает RSS — растёт пока cgroup не превышен. Симптом: JVM heap/direct OK, но pod kill — exit 137 (SIGKILL от kernel). Fix rule: pod.limit = process.size × 1.15 минимум. Также verify state.backend.rocksdb.localdir НЕ на tmpfs (default K8s emptyDir может быть memory-backed). Без headroom — гарантированный OOMKill через несколько часов под steady-state.",
       "studyHint": "Повторите урок — Critical configuration mistakes",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-02-q4",

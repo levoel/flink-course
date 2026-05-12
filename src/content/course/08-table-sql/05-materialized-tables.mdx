@@ -147,7 +147,7 @@ AS SELECT ...;
 ```
 
 Flink выбирает best strategy:
-- **Streaming mode** — continuous incremental updates. Used для freshness < minutes.
+- **Streaming mode** — continuous incremental updates. Used для freshness &lt; minutes.
 - **Batch mode** — periodic full refresh. Used для freshness > hours, simple aggregations.
 
 Default mode для most use cases. Flink decides based on freshness and query complexity.

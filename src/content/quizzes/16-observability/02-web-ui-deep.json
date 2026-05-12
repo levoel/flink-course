@@ -57,7 +57,7 @@
       "question": "Web UI и Grafana — взаимозаменяемы, нужен один из них.",
       "correctAnswer": false,
       "explanation": "False. Они дополняют друг друга. Web UI: live ad-hoc diagnostic, DAG visualization, drill into specific operator, flame graph, watermarks per subtask. Не показывает historical trends, не для alerting. Grafana: historical trends, capacity planning, alerting, multi-job aggregate view. Не показывает live DAG, не позволяет ad-hoc subtask inspection. Production needs оба: Grafana для proactive (alerts + trends), Web UI для reactive (когда alert fires — open Web UI для live debug). FLIP-570 Runtime Data Sampling добавляет ещё один layer — sample реальные records в Web UI.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

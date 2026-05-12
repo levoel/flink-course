@@ -384,7 +384,7 @@ Grafana panel: watermark lag vs wall clock. Should be ≤ 30 секунд в hea
 - **Operator chaining + UID** — если chain нескольких операторов, UID применяется к chained operator. Verify через web UI что UID applied correctly.
 - **Side output для fraud alerts**: separate Kafka topic, не main output. Иначе main consumers получают fraud events как normal.
 - **OnTimer firing storms** — если регистрируете timer per record, при recovery все timers fire одновременно. Solution: round timer time (например, ceiling до nearest minute) для batching.
-- **State backend choice** — ForSt для production scale; RocksDB для smaller state (< 100 GB); никогда heap для production stateful jobs.
+- **State backend choice** — ForSt для production scale; RocksDB для smaller state (&lt; 100 GB); никогда heap для production stateful jobs.
 
 <Callout type="warning">
 **FraudScore calculation в primary processElement — risky**. Если fraud detection становится complex и slow (ML inference), оно блокирует main pipeline. Production pattern: keep main path simple (basic rules), emit raw events на отдельный fraud pipeline (Flink job на ML_PREDICT), который returns decisions через separate Kafka topic.

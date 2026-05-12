@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Classic write stall. Symptoms: L0 SST accumulate потому что compaction can't keep up. level0_slowdown_writes_trigger (default 20) — RocksDB artificially throttles writes. level0_stop_writes_trigger (default 36) — STOPS writes пока compaction catches up. Read perf degrades потому что 30 overlapping L0 SST = check all 30 per GET (bloom helps но not eliminate). Fix эскалация: (1) state.backend.rocksdb.thread.num: 8 — больше parallel compactions; (2) increase max_bytes_for_level_base — fewer L1 cascades; (3) verify SSD I/O not saturated; (4) consider universal compaction для write-heavy; (5) PredefinedOptions.FLASH_SSD_OPTIMIZED для sane SSD defaults.",
       "studyHint": "Повторите урок — Production gotchas",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-02-q4",

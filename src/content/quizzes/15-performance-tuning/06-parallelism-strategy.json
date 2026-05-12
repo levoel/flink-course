@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Severe data skew. Один hot key (или несколько mapped в один key group) overwhelms subtask 12. Diagnose: numRecordsInPerSecond per subtask — coefficient of variation > 0.5 = severe skew. Identify hot key через temporary metric или sample logs. Hot users patterns: single 'whale' (большой account), bot/synthetic traffic. Solutions: (1) Salting — biggest fix. cost: extra shuffle stage. (2) Hot key separation — split stream на 'hot' (round-robin) и 'cold' (normal keyBy). (3) Business logic review — bot detection, special handling. Critical insight: parallelism 32→64 НЕ решает skew — hot key всё равно concentrated в одном subtask из 64. Только salting/custom partitioning fix-ит underlying problem.",
       "studyHint": "Повторите урок — Skew mitigation + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-06-q4",

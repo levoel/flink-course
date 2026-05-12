@@ -68,7 +68,7 @@ async def llm_call(text: str) -> str:
 ## Когда НЕ использовать PyFlink
 
 - Stateful keyed jobs с complex state primitives — лучше Java
-- Latency-critical (< 50ms) — IPC overhead dominates
+- Latency-critical (&lt; 50ms) — IPC overhead dominates
 - High throughput (> 100k rec/s per slot) — Java native parsing
 - Custom serializer / format work — Java API богаче
 

@@ -372,7 +372,7 @@ env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka")
     <FlowRow>
       <DataBox
         label="SourceReader (TaskManager)"
-        tooltip="Один SourceReader на subtask. Может owners одну или несколько partition (если parallelism < partitions). Per-partition WatermarkGenerator state."
+        tooltip="Один SourceReader на subtask. Может owners одну или несколько partition (если parallelism &lt; partitions). Per-partition WatermarkGenerator state."
       >
         Reads p0, p2
       </DataBox>
@@ -411,7 +411,7 @@ Watermark двигается **дискретно** каждые 200ms. Если
 
 ### 2. Out-of-orderness > checkpoint interval = late events на recovery
 
-После restart Flink восстанавливает watermark из checkpoint. Если outOfOrderness = 10 мин, а events после checkpoint восстановления приходят с timestamp до WM — late events. Производственное правило: `outOfOrderness < checkpoint_interval`.
+После restart Flink восстанавливает watermark из checkpoint. Если outOfOrderness = 10 мин, а events после checkpoint восстановления приходят с timestamp до WM — late events. Производственное правило: `outOfOrderness &lt; checkpoint_interval`.
 
 ### 3. withIdleness без markIdle propagation
 
@@ -462,5 +462,5 @@ WatermarkStrategy
 
 <KnowledgeCheck
   question="Production scenario: Flink job читает Kafka topic с 24 partitions, parallelism source-а = 6 (каждый subtask читает 4 partition). 18 партиций активные, 6 — idle (часть бизнес-логики ушла). WatermarkStrategy = forBoundedOutOfOrderness(20s) без withIdleness. Result: windows не fire, currentOutputWatermark застрял. Что произошло и как fix?"
-  answer="Проблема: per-partition watermarks. Каждая partition имеет свой WatermarkGenerator state. Idle partition не получает events → её onEvent() не вызывается → maxTimestamp = Long.MIN_VALUE + outOfOrderness + 1 → emit watermark = Long.MIN_VALUE. На subtask level MIN(per-partition WM) = Long.MIN_VALUE. На downstream MIN(per-subtask WM) = Long.MIN_VALUE. Окна никогда не закрываются. Fix: добавить .withIdleness(Duration.ofMinutes(1)) — после 60 секунд без events на partition она помечается idle через output.markIdle(), и MIN propagation исключает её. После этого активные 18 partitions определяют watermark. Side effect: если idle partition 'просыпается' через 2 часа с событием timestamp = T_old, это событие будет late (WM уже двигается на основе других partitions, T_old < currentWM). Нужен .allowedLateness() + .sideOutputLateData() для capture. Alternative подходы: (1) уменьшить parallelism source до 4, чтобы idle partitions распределились по более активным subtasks (но всё равно нужен withIdleness, тк partition-level state); (2) использовать FLIP-217 watermark alignment между partitions того же source (если drift известен); (3) на бизнес-стороне — закрыть idle partitions через Kafka topic redesign. На production setup .withIdleness — must-have, не optional."
+  answer="Проблема: per-partition watermarks. Каждая partition имеет свой WatermarkGenerator state. Idle partition не получает events → её onEvent() не вызывается → maxTimestamp = Long.MIN_VALUE + outOfOrderness + 1 → emit watermark = Long.MIN_VALUE. На subtask level MIN(per-partition WM) = Long.MIN_VALUE. На downstream MIN(per-subtask WM) = Long.MIN_VALUE. Окна никогда не закрываются. Fix: добавить .withIdleness(Duration.ofMinutes(1)) — после 60 секунд без events на partition она помечается idle через output.markIdle(), и MIN propagation исключает её. После этого активные 18 partitions определяют watermark. Side effect: если idle partition 'просыпается' через 2 часа с событием timestamp = T_old, это событие будет late (WM уже двигается на основе других partitions, T_old &lt; currentWM). Нужен .allowedLateness() + .sideOutputLateData() для capture. Alternative подходы: (1) уменьшить parallelism source до 4, чтобы idle partitions распределились по более активным subtasks (но всё равно нужен withIdleness, тк partition-level state); (2) использовать FLIP-217 watermark alignment между partitions того же source (если drift известен); (3) на бизнес-стороне — закрыть idle partitions через Kafka topic redesign. На production setup .withIdleness — must-have, не optional."
 />

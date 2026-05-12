@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Срочный rollback workflow: (1) Найти savepoint path triggered перед upgrade: kubectl get flinkdeployment -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}'. (2) kubectl patch с прежним image tag + initialSavepointPath=path. (3) Operator делает rollback. Pre-deploy checks которые помогли бы: staging environment с production savepoint, schema evolution validation tests, UID stability checks, canary deployment, quarterly rollback drill. Critical: savepoint retention должен быть >= rollback window (минимум 24-48 часов).",
       "studyHint": "Повторите урок — Production gotchas + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-08-q4",

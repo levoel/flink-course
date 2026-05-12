@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Read-heavy с low cache hit ratio — classic memory allocation mismatch. Default write-buffer-ratio 0.5 неоптимален для read-heavy: вы тратите 50% managed на MemTables (для writes), когда reads dominant. Solution: shift balance в сторону Block Cache. Trade-off: меньше WBM budget (8GB → 4GB) → MemTables меньше → больше L0 files, но writes только 30% так это acceptable. Если writes начнут backlog (write stalls появятся) — revert к balanced 0.4. Iterative tuning: apply changes one at a time, measure impact. Validation: cache hit ratio > 90%, P99 < 30ms.",
       "studyHint": "Повторите урок — Production tuning: read-heavy + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-05-q4",
@@ -57,7 +57,7 @@
       "question": "Custom RocksDBOptionsFactory обязательно должна extends DefaultConfigurableOptionsFactory и вызывать super.createDBOptions()/super.createColumnOptions() первым — иначе WBM и Block Cache не injected, что вызывает OOM через несколько часов.",
       "correctAnswer": true,
       "explanation": "True. Это самая частая причина production OOM с RocksDB. Антипаттерн: return new DBOptions().setMaxBackgroundJobs(8) — fresh options, WBM потерян. Симптом: TaskManager растёт линейно по memory, K8s OOMKill через 2-6 часов после deploy. Status.JVM.Memory.Direct.MemoryUsed растёт линейно (не plateau). Math: 10 CF × 4 slots × 64MB MemTable + 8MB BC per CF = 2.88GB native (vs 1.6GB managed budget). Right way: opts = super.createDBOptions(opts, handles) → preserves WBM injection. Then opts.setMaxBackgroundJobs(8) — твои overrides on top. Аналогично для createColumnOptions (Block Cache injection). Без super() WBM/BC потеряны — even если ты ничего критичного больше не trogал.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

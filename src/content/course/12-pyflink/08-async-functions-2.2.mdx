@@ -27,7 +27,7 @@ import requests
 def llm_classify(text):
     """SYNCHRONOUS — blocks Python interpreter."""
     response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
+        "https://api.openai.com/v1/chat/completions"
         json={"model": "gpt-4", "messages": [...]},
         timeout=30
     )
@@ -55,7 +55,7 @@ async def llm_classify_async(text):
     """NON-BLOCKING — uses asyncio."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/chat/completions"
             json={"model": "gpt-4", "messages": [...]},
             timeout=aiohttp.ClientTimeout(total=30)
         ) as response:
@@ -211,7 +211,7 @@ class LLMFraudClassifier:
 
         try:
             async with self.session.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.anthropic.com/v1/messages"
                 headers={
                     "x-api-key": self.api_key,
                     "content-type": "application/json",
@@ -295,7 +295,7 @@ async def get_embedding(text: str) -> list:
     """Get embedding vector from OpenAI."""
     global _session
     async with _session.post(
-        "https://api.openai.com/v1/embeddings",
+        "https://api.openai.com/v1/embeddings"
         json={"input": text, "model": "text-embedding-3-small"}
     ) as response:
         data = await response.json()
@@ -333,7 +333,7 @@ async def fraud_score_remote(*features):
     """Call internal ML inference service."""
     global _session
     async with _session.post(
-        "http://ml-inference-svc.production:8080/score",
+        "http://ml-inference-svc.production:8080/score"
         json={"features": list(features)}
     ) as response:
         result = await response.json()
@@ -386,7 +386,7 @@ Async UDF — sweet spot когда external service IS your inference path, и 
 - **DNS lookup overhead** — каждое HTTPS connection — DNS lookup. Use `TCPConnector(ttl_dns_cache=300)` to cache.
 - **HTTP/2 keep-alive** — long-lived connections reduce overhead. aiohttp supports automatically.
 - **External rate limits** — OpenAI имеет TPM (tokens per minute) limits. Backpressure через `aiohttp.ClientResponseError` 429 → exponential backoff. Without backoff — request cascade failure.
-- **Timeout cascade** — если timeout < server side timeout, client closes connection but server continues processing → wasted compute. Sync timeouts to server contract.
+- **Timeout cascade** — если timeout &lt; server side timeout, client closes connection but server continues processing → wasted compute. Sync timeouts to server contract.
 - **Error handling — fail vs fallback** — `resultFuture.completeExceptionally` (Java analog) → record fails → operator restarts depending strategy. Better: catch exceptions, emit fallback value (e.g., "uncertain"), preserve pipeline continuity.
 - **Watermark progress** — async UDFs block watermark до in-flight requests complete (within watermark boundary). Long timeouts → watermark stalls. Monitor watermark gap.
 - **Cost control** — каждый LLM call $$. Async UDF easy чтобы fire millions of calls. Always pre-filter в SQL `WHERE` clause + monitor spend.

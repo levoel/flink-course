@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Используйте V1 в production. V2 production-ready timeline 2.3-2.4 (2027). Preparation для будущего migration: (1) ВСЕГДА .uid() на stateful operators — critical для savepoint compatibility между V1/V2; (2) FLIP-27 fromSource (legacy SourceFunction removed в 2.0) и FLIP-191 sinkTo (legacy SinkFunction removed); (3) POJO discipline (public class, no-arg ctor, public fields/getters, pipeline.generic-types: false для fail-fast); (4) Explicit state descriptors с named identifiers через constants; (5) Avoid deprecated/removed patterns: split/select, Queryable State, Reactive Mode, flink-conf.yaml old format. With эти preparation migration к V2 будет smooth.",
       "studyHint": "Повторите урок 07 — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m02-07-q3",
@@ -57,7 +57,7 @@
       "question": "В Flink 2.x DataSet API REMOVED, Scala API REMOVED, SourceFunction/SinkFunction REMOVED. DataStream API V2 — experimental preview, не для production до 2.3-2.4. Stateful Functions sunsetted в 2026.",
       "correctAnswer": true,
       "explanation": "Major API cleanup в Flink 2.0. DataSet API removed (заменён unified DataStream с Boundedness — boundedness объединяет batch и streaming). Scala API removed (Java-first философия — менее maintenance, less confusion). SourceFunction / RichSourceFunction / SinkFunction removed (FLIP-27 + FLIP-191). DataStream V2 (FLIP-409) — experimental preview в 2.0-2.2, production timeline 2.3-2.4 (~2027). Stateful Functions (StateFun) sunsetted из-за неактивности проекта. Также removed: split/select API, Queryable State, Reactive Mode, flink-conf.yaml format (заменён standard YAML config.yaml).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

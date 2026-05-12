@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Sawtooth size 5-50GB → bursty compaction effect. EOS downstream latency = checkpoint visibility (transactional commits в notifyCheckpointComplete). Variability transmitted к users. Changelog backend specifically designed для этого scenario — sub-second predictable checkpoints. Trade-offs Changelog: DFS write throughput выше (но S3 handles это), recovery slower (10min log replay max), storage 2-3× (raw mutations). Acceptable trade для consistent low-latency. Alternative if Changelog не подходит: increase RocksDB compaction parallelism (thread.num: 8), но не решает fundamental issue. Increase checkpoint interval to 5min — fewer checkpoints но visibility latency больше. Verify post-fix: duration <5s consistent, downstream latency <15s consistent.",
       "studyHint": "Повторите урок — KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-09-q4",
@@ -57,7 +57,7 @@
       "question": "max-concurrent-checkpoints: 2+ безопасно для RocksDB, увеличивает throughput за счёт parallel checkpoint progress.",
       "correctAnswer": false,
       "explanation": "False. С 2+ parallel checkpoints RocksDB не может evict immutable MemTables (referenced both active checkpoints). MemTable accumulation → write stall trigger. RocksDB designed для один active checkpoint at a time. Production rule: max-concurrent: 1 для RocksDB. 2+ только для HashMap state (нет concurrent reference issue). Если нужно faster effective checkpoint: incremental checkpoints (delta-based) или Changelog backend (sub-second consistent). Concurrent checkpoints — anti-pattern для RocksDB jobs.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

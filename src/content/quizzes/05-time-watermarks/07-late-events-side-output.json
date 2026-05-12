@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Re-fire emit'ит second result для того же window. Downstream должен handle: (1) Compacted Kafka topic с key=(window_start, user_id) — Kafka log compaction keeps только latest message per key, re-fire overrides initial; (2) ClickHouse ReplacingMergeTree(inserted_at) ORDER BY (key) — keeps last by inserted_at on merge; (3) Postgres ON CONFLICT (pk) DO UPDATE — explicit upsert per row; (4) Append-only с fireVersion field — downstream filters MAX(fireVersion). Choice based on store: Kafka → compaction, ClickHouse → ReplacingMergeTree, OLTP → ON CONFLICT. ANTI-pattern: simply append без deduplication → duplicates в analytics.",
       "studyHint": "Повторите урок — раздел 'Late event downstream consistency'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m05-07-q3",

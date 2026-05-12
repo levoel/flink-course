@@ -18,7 +18,7 @@ Chaos engineering — это не «break stuff for fun». Это **structured t
     <FlowRow>
       <DataBox
         label="Compute failures (Flink-side)"
-        tooltip="Kill TaskManager (subtask failure, recovery from checkpoint). Kill JobManager leader (HA failover via ZooKeeper/K8s lease, RTO < 30s). OOM kill TaskManager (memory budget violation, restart loop check)."
+        tooltip="Kill TaskManager (subtask failure, recovery from checkpoint). Kill JobManager leader (HA failover via ZooKeeper/K8s lease, RTO &lt; 30s). OOM kill TaskManager (memory budget violation, restart loop check)."
       >
         Kill TM / Kill JM / OOM kill
       </DataBox>
@@ -45,7 +45,7 @@ Chaos engineering — это не «break stuff for fun». Это **structured t
       </DataBox>
       <DataBox
         label="2. RTO (recovery time)"
-        tooltip="Time from failure injection to job RUNNING + processing at baseline throughput. SLO: TM kill < 2min, JM failover < 30s, broker down < 60s reconnect. Measure with Prometheus job_uptime + numRestarts increase."
+        tooltip="Time from failure injection to job RUNNING + processing at baseline throughput. SLO: TM kill &lt; 2min, JM failover &lt; 30s, broker down &lt; 60s reconnect. Measure with Prometheus job_uptime + numRestarts increase."
       >
         Measured RTO vs SLO
       </DataBox>

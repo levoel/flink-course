@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Heavy heap allocation + G1 Young Gen занимает 13% времени. HashMapStateBackend = state живёт в JVM heap → large young+old gen pressure. ZGC switch — biggest win. Generational ZGC eliminates GC stop-the-world. Heap sizing: 24GB process - 2GB JVM overhead - 256MB metaspace - 128MB framework heap = ~21GB available; -Xmx20g leaves headroom. AlwaysPreTouch obligatory. Allocation reduction: primitive collections (Long2LongHashMap fastutil), String deduplication (+UseStringDeduplication), object reuse в RichFunction. Long-term: HashMap → RocksDB state — fundamentally lower GC pressure. Critical insight: GC tuning маскирует symptoms, root cause architectural (HashMap для heavy state).",
       "studyHint": "Повторите урок — Production tuning patterns + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m15-07-q4",
@@ -57,7 +57,7 @@
       "question": "ZGC overhead ~3% memory и 5-10% throughput — поэтому для small heap (<4GB) ZGC не worth, лучше G1.",
       "correctAnswer": true,
       "explanation": "True. ZGC требует metadata для colored pointers (3% memory overhead). Throughput cost 5-15% vs G1. На large heap (>8GB) это compensated латencу выигрышем — pauses < 1ms vs десятки мс. На small heap (<4GB): (1) Pauses G1 уже acceptable (~50ms typical); (2) ZGC overhead значителен в proportion; (3) Generational gains меньше (small young gen). Decision tree: <4GB → G1, 4-32GB latency-critical → ZGC, >32GB → ZGC obligatory. Shenandoah — backup plan для Java 17 (где generational ZGC недоступен).",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

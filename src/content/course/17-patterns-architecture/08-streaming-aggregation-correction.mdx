@@ -121,7 +121,7 @@ windowedStream
 Каждое re-emission window (initial + late updates) — это UPSERT по `(window_start, user_id)`. Downstream queries видят latest value. Это **eventual consistency model** — initial value может быть wrong, но через `allowedLateness` корректируется.
 
 Это работает для финансовых aggregates если:
-- Downstream queries говорят «values as of <when>» concept.
+- Downstream queries говорят «values as of &lt;when&gt;» concept.
 - Reconciliation reports запускаются после `allowedLateness` past — т.е. читают «settled» windows.
 
 ---
@@ -365,7 +365,7 @@ public class OrdersAggregationJob {
 - **Multi-stage pipelines compound drift** — aggregate of aggregates. Stage 1 drift 0.5%, Stage 2 на этом же → 1%, Stage 3 → 1.5%. Hard to debug. Минимизируйте stages, и иногда — recompute from raw events каждый stage.
 
 <Callout type="warning">
-**Streaming aggregations никогда не совпадут byte-by-byte с batch для same data** в общем случае. Из-за late events, time-based windows boundary detection, ordering guarantees, watermark approximations — есть fundamental fuzz. Goal — bound drift на acceptable level (например, < 0.1% для analytics, 0% для billing после reconciliation), не достичь strict equality.
+**Streaming aggregations никогда не совпадут byte-by-byte с batch для same data** в общем случае. Из-за late events, time-based windows boundary detection, ordering guarantees, watermark approximations — есть fundamental fuzz. Goal — bound drift на acceptable level (например, &lt; 0.1% для analytics, 0% для billing после reconciliation), не достичь strict equality.
 </Callout>
 
 ---

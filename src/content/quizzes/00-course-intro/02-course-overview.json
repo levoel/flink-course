@@ -57,7 +57,7 @@
       "question": "Курс предполагает базовое знание Kafka, опыт работы с Apache Spark, Java или Scala на production-уровне и знание основ распределённых систем.",
       "correctAnswer": true,
       "explanation": "Курс — продвинутый. Без понимания Kafka (partitions, consumer groups, offsets) трудно следить за source/sink архитектурой Flink. Опыт Spark Structured Streaming помогает сравнивать философию micro-batch vs true streaming. Java на production-уровне нужен для всех labs кроме PyFlink модуля. Распределённые системы (CAP, consensus, partitioning) — для понимания HA, JobManager failover, checkpointing семантики. Рекомендуется сначала пройти kafka-course и spark-course с этой же платформы.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

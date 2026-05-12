@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Cardinality — главная проблема Prometheus + Flink в large clusters. Per-userId/sessionId labels могут привести к miллионам unique time series → Prometheus dies. Pattern fix: aggregate metrics (counter per category, sum by tags), top-N detail tracking (HyperLogLog для approximation, or explicit top-K data structure), histogram для percentile distributions (без per-entity). Production rule: cardinality labels должны быть bounded и known (e.g., status, category, severity — 5-20 values acceptable). Unbounded labels — анти-паттерн.",
       "studyHint": "Повторите урок — Production gotchas + KnowledgeCheck",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m16-03-q4",

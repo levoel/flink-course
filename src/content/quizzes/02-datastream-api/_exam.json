@@ -75,7 +75,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "Production AsyncFunction stack: (1) **Async client** — R2DBC для PG, Lettuce для Redis, AsyncHttpClient. Sync JDBC внутри asyncInvoke блокирует mailbox — defeats purpose. (2) **Capacity** = target_throughput_per_subtask × p99_latency. Round up для headroom. Слишком низкое → backpressure, слишком высокое → external system OOM. (3) **Timeout** = 3-5× p99. Absorbs tail latency. (4) **Retry strategy** ExponentialBackoff с ifException(t -> t instanceof SocketTimeoutException || t instanceof IOException) — только network errors, не data errors. (5) **unorderedWait** для no head-of-line blocking. (6) **Cache layer** (Redis перед PG) — hit rate ~80%+ сильно reduces external load. (7) **Metrics**: cache hit rate, latency histogram, error rate — observability critical.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m02-exam-q6",
@@ -103,7 +103,7 @@
       ],
       "correctAnswer": "b",
       "explanation": "V2 status в Flink 2.2: experimental preview, breaking changes между minor versions, less mature tooling/documentation, minimal community resources. Production readiness timeline: 2.3-2.4 (~2027). Strategy для new projects в 2026: используйте V1 (production-grade, mature ecosystem). Preparation для будущей migration: (1) .uid() на каждом stateful operator — критично для savepoint compatibility; (2) FLIP-27 sources / FLIP-191 sinks вместо legacy; (3) POJO discipline для type safety; (4) explicit state descriptors с named ids; (5) avoid removed APIs (split/select, Queryable State, Reactive Mode). Migration через 1-2 года будет smooth.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m02-exam-q8",
@@ -111,7 +111,7 @@
       "question": "В production Flink 2.x всегда нужны: .uid() на каждом stateful operator (savepoint compatibility), pipeline.generic-types: false (fail-fast на Kryo fallback), .sideOutputLateData(tag) на windowed operations (no silent data loss), Async I/O для external lookups (no mailbox blocking).",
       "correctAnswer": true,
       "explanation": "Этот четыре правила — fundament production-grade Flink. (1) .uid('descriptive-id') на каждом stateful operator — без UID Flink генерирует hash от topology, любое изменение pipeline ломает savepoint restoration. (2) pipeline.generic-types: false — fail-fast при Kryo fallback (50% perf hit). Force POJO discipline. (3) .sideOutputLateData(lateTag) — без этого late events silently dropped, самый частый source data loss. (4) Async I/O для external calls — без него sync calls блокируют mailbox, catastrophic backpressure (12-60x slowdown), checkpoints fail. Это checklist для каждого new production job.",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     }
   ]
 }

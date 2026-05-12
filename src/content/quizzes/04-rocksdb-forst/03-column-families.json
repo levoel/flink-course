@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Самый частый production баг с RocksDB. Custom factory без WBM injection: каждая CF gets own fixed MemTable allocation (default 64MB или more), без shared budget. На state-heavy operator с 10 state primitives, 4 slots per TaskManager: 10 × 64MB × 4 = 2.5GB pure MemTable, plus Block Cache (10 × 8MB × 4 = 320MB), plus immutable MemTables awaiting flush. Total native memory exceeds managed budget → OS OOM-Killer. Fix: ALWAYS extend DefaultConfigurableOptionsFactory ИЛИ explicitly call super.createDBOptions() ИЛИ inject WriteBufferManager from Flink shared resource. Best alternative: use flink-conf properties для tuning (state.backend.rocksdb.*) instead of custom factory — preserves memory management automatically.",
       "studyHint": "Повторите урок — Production gotchas",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m04-03-q4",

@@ -125,7 +125,7 @@ curl -X POST -H "Content-Type: application/json" \
 # Response: {"jobid":"a1b2c3..."}
 ```
 
-**Тайминг**: <1 сек.
+**Тайминг**: &lt;1 сек.
 
 ---
 
@@ -170,7 +170,7 @@ SlotPool → ResourceManager: дай свободный slot
 ResourceManager → JM: вот slot S5 на TaskManager TM3
 ```
 
-**Тайминг**: <1 сек, если slots уже available.
+**Тайминг**: &lt;1 сек, если slots уже available.
 
 ### Locality preferences
 
@@ -262,7 +262,7 @@ CheckpointCoordinator триггерит первый checkpoint через `exe
 | 1. Client compile | — | — | 1-5s | 1-5s |
 | 2. JM start | 30-90s (pod startup) | 10-20s | 0 (running) | 0 |
 | 3. JobMaster init | 2-10s | 2-10s | 2-10s | 2-10s |
-| 4. Slot allocation | 30-90s (TM pods) | 5-15s (warm) | <1s | 20-90s |
+| 4. Slot allocation | 30-90s (TM pods) | 5-15s (warm) | &lt;1s | 20-90s |
 | 5. Task deployment | 2-5s | 2-5s | 2-5s | 2-5s |
 | 6. State restore | 5s-30min | 5s-30min | 5s-30min | 5s-30min |
 | 7. RUNNING | — | — | — | — |
@@ -351,6 +351,6 @@ Primary state на S3. Recovery — открытие LSM на S3, без downloa
 ---
 
 <KnowledgeCheck
-  question="Production Flink job в application mode на K8s падает каждые 4 часа из-за RocksDB compaction issue. State 200 GB. Recovery занимает 8 минут — нарушает SLA <2 минуты. Какие optimizations применить в order приоритета, и почему просто увеличить TM-ы не поможет?"
+  question="Production Flink job в application mode на K8s падает каждые 4 часа из-за RocksDB compaction issue. State 200 GB. Recovery занимает 8 минут — нарушает SLA &lt;2 минуты. Какие optimizations применить в order приоритета, и почему просто увеличить TM-ы не поможет?"
   answer="Главный bottleneck — state restore (download 200 GB из S3). Приоритет optimizations: (1) **Local recovery**: `state.backend.local-recovery: true` + `process.taskmanager.working-dir: /var/flink-recovery` с persistent volume. При сбое JM/Task в **same TM** — read state из local disk, не из S3. Recovery ~30 сек вместо 8 минут. Но не помогает, если node умер. (2) **Incremental checkpoints** уже default в 2.x — verify enabled. Снижает per-checkpoint upload, но recovery всё равно download full state from baseline. (3) **Generic Log-Based Incremental Checkpoints (GIC)**: `state.backend.changelog.enabled: true`. Async upload changelog → checkpoint становится metadata-only. Recovery: replay changelog, который small. Reduces recovery до 2-3 минут. (4) **ForSt + disaggregated state**: state primary на S3, local — только cache. Recovery — открытие LSM на S3 (metadata-only operation, ~30 сек), data загружается на demand. Эта option для serious move к cloud-native. (5) **Решить root cause RocksDB compaction**: использовать `PredefinedOptions.FLASH_SSD_OPTIMIZED`, увеличить managed memory fraction, монитор stall_micros. (6) **Pre-warm TM pods**: уменьшит 30-60s pod startup. Почему просто **увеличить TM-ы не поможет**: state restore time зависит от **per-task state size + DFS bandwidth per task**, не от количества TM-ов. 200 GB state distributed по 8 TM = 25 GB per TM. Если у вас S3 throughput 100 MB/s per TM, это 250 сек = 4 мин просто на download. Увеличение до 16 TM даст по 12.5 GB per TM, восстановление в 125 сек. Линейно scale-ится только частично — но это требует full restart всех tasks вместо localized region failover. Real fix — реже скачивать (local recovery), или architecture change (GIC / ForSt). Просто scale up TMs — money waste без significant gain."
 />

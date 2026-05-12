@@ -305,7 +305,7 @@ public interface TwoPhaseCommittingSink<InputT, CommT> extends Sink<InputT> {
 
 ## Production gotchas
 
-### 1. `transaction.timeout.ms` < checkpoint interval → data loss
+### 1. `transaction.timeout.ms` &lt; checkpoint interval → data loss
 
 Если checkpoint takes longer than transaction timeout — Kafka aborts transaction, but Flink думает it's still alive → records lost.
 

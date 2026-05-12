@@ -78,7 +78,7 @@ PatternStream<Event> ps = CEP.pattern(input.keyBy(...), pattern)
     <FlowRow>
       <DataBox
         label="Watermark generation"
-        tooltip="W = max(event time) - bound = max(15) - 20 = -5. Реалистично watermark отстаёт на 20s от наибольшего seen event time. Это значит что NFA знает: больше events с time < W не придут."
+        tooltip="W = max(event time) - bound = max(15) - 20 = -5. Реалистично watermark отстаёт на 20s от наибольшего seen event time. Это значит что NFA знает: больше events с time &lt; W не придут."
       >
         Watermark W = max_seen_ts - 20s
       </DataBox>
@@ -179,7 +179,7 @@ DataStream<Event> lateEvents = mainAndLate.getSideOutput(lateTag);
 
 ### Реальный case: late event delivers match
 
-Sequence: LOGIN_FAIL × 2 already matched, ждём 3rd FAIL для `times(3)`. Третий FAIL приходит late (ts < watermark). NFA не applies его → match not emitted → false negative.
+Sequence: LOGIN_FAIL × 2 already matched, ждём 3rd FAIL для `times(3)`. Третий FAIL приходит late (ts &lt; watermark). NFA не applies его → match not emitted → false negative.
 
 **Mitigation:** для CEP с пограничной latency используйте relaxed `forBoundedOutOfOrderness` (2-5 min). Cost — increased emission latency. Trade-off explicit.
 
@@ -311,5 +311,5 @@ Late event для already-expired partial match не reactivates его. Есл�
 
 <KnowledgeCheck
   question="У вас CEP pattern 'Пользователь добавил товар в корзину, не сделал checkout within 30 минут' для cart abandonment. Какой select function и какая watermark strategy?"
-  answer="Используйте PatternProcessFunction с processTimedOutMatch (НЕ просто .select() — оно discard-ит timeouts). PatternStream.process(new PatternProcessFunction<>() { processMatch — для completed (рарно если checkout произошёл), processTimedOutMatch — для cart abandonment (это собственно target event). Watermark strategy: forBoundedOutOfOrderness с разумным bound (1-2 минуты для consumer events с network jitter) + withIdleness(1 min) для idle user sessions + withTimestampAssigner на event time. Pattern: begin('add').where(type==ADD_TO_CART).followedBy('checkout').where(type==CHECKOUT).within(Duration.ofMinutes(30)). Цель — processTimedOutMatch вызовется через 30min + watermark bound после ADD_TO_CART если CHECKOUT не пришёл."
+  answer="Используйте PatternProcessFunction с processTimedOutMatch (НЕ просто .select() — оно discard-ит timeouts). PatternStream.process(new PatternProcessFunction&lt;>() { processMatch — для completed (рарно если checkout произошёл), processTimedOutMatch — для cart abandonment (это собственно target event). Watermark strategy: forBoundedOutOfOrderness с разумным bound (1-2 минуты для consumer events с network jitter) + withIdleness(1 min) для idle user sessions + withTimestampAssigner на event time. Pattern: begin('add').where(type==ADD_TO_CART).followedBy('checkout').where(type==CHECKOUT).within(Duration.ofMinutes(30)). Цель — processTimedOutMatch вызовется через 30min + watermark bound после ADD_TO_CART если CHECKOUT не пришёл."
 />

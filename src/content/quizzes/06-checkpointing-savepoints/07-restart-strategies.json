@@ -49,7 +49,7 @@
       "correctAnswer": "b",
       "explanation": "Local recovery — major optimization для recovery time. Configuration: state.backend.local-recovery: true. Mechanics: после каждого successful checkpoint Flink keeps local copy SST files (не just upload then delete). На restart, если TaskManager process restarted на same physical node (или K8s pod rescheduled to same node) — Flink uses local SST files instead of downloading from DFS. Recovery time для 1TB state: without local recovery = state_size / DFS_bandwidth = 10-30 min S3 download; with local recovery = local NVMe read = 30-120 seconds. 20-30x speedup. Constraints: (a) Only same-node restarts — different node still requires DFS download; (b) Disk usage doubles (live + local recovery copies); (c) Most effective combined с Adaptive Scheduler sticky allocation (FLIP-291) — maximizes same-node likelihood. K8s pod affinity also helps.",
       "studyHint": "Повторите урок — раздел 'Local recovery'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m06-07-q4",

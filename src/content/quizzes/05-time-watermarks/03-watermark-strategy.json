@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Per-partition watermarks: каждая Kafka partition имеет свой WatermarkGenerator state. Idle partition без events → onEvent() не вызывается → maxTimestamp = Long.MIN_VALUE + outOfOrderness + 1 → emit watermark = Long.MIN_VALUE. На subtask level MIN(per-partition WM) = Long.MIN_VALUE. На downstream MIN(per-subtask WM) = Long.MIN_VALUE. Окна freeze. Fix: .withIdleness(Duration.ofMinutes(1)) → output.markIdle() через 60s → MIN propagation skips idle channels. Production rule: всегда withIdleness на multi-partition sources.",
       "studyHint": "Повторите урок — раздел 'withIdleness'",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m05-03-q3",

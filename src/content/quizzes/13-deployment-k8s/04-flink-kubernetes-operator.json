@@ -34,7 +34,7 @@
       "correctAnswer": "b",
       "explanation": "Operator делает атомарную reconciliation, но execution sequential. Шаги: trigger savepoint (canonical если cross-backend, иначе native) → wait DONE → cancel job → update JM Deployment с image=v1.43 → wait JM pod ready → submit job с parallelism=16 → restore from savepoint. Savepoint canonical format → parallelism rescale работает (state перераспределяется по новым key groups). Critical: проверьте maxParallelism (см. урок 14.5) — если default 128, scale до 200+ fail. Best practice: разделять concerns на два PR.",
       "studyHint": "Повторите урок — Lifecycle: что operator делает при изменении CR",
-      "bloomLevel": "evaluative"
+      "bloomLevel": "analytical"
     },
     {
       "id": "flink-m13-04-q3",
