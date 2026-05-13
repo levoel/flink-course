@@ -1,6 +1,6 @@
 {
   "id": "flink-course",
-  "title": "Apache Flink 2 Ultimate",
+  "title": "Apache Flink 2",
   "description": "Ультимативный курс по Apache Flink 2.x — true streaming до железа: state internals, RocksDB+ForSt disaggregated state, Chandy-Lamport snapshots, Two-Phase Commit sinks, Materialized Tables, AI integration через ML_PREDICT и VECTOR_SEARCH.",
   "author": "Lev Neganov",
   "difficulty": "advanced",
