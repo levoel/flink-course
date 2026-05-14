@@ -1,3 +1,4 @@
+/** @jsxImportSource solid-js */
 /**
  * TwoPhaseCommit
  *
@@ -10,7 +11,7 @@
  *   - crash after commit → no-op idempotent
  */
 
-import { useState } from 'react';
+import { createSignal } from 'solid-js';
 import { DiagramContainer } from '@primitives/DiagramContainer';
 import { DiagramTooltip } from '@primitives/Tooltip';
 
@@ -194,8 +195,8 @@ const WHO_LABEL: Record<Step['who'], string> = {
 };
 
 export function TwoPhaseCommit() {
-  const [scenario, setScenario] = useState<Scenario>('happy');
-  const { title, steps } = SCENARIOS[scenario];
+  const [scenario, setScenario] = createSignal<Scenario>('happy');
+  const steps = () => SCENARIOS[scenario()].steps;
 
   return (
     <DiagramContainer
@@ -203,16 +204,15 @@ export function TwoPhaseCommit() {
       color="emerald"
       description="barrier → preCommit → notifyCheckpointComplete → commit. Failure recovery строится на хранении pending txn id в Flink state."
     >
-      <div className="flex flex-col gap-3">
+      <div class="flex flex-col gap-3">
         {/* Scenario tabs */}
-        <div className="flex flex-wrap gap-1">
+        <div class="flex flex-wrap gap-1">
           {(Object.keys(SCENARIOS) as Scenario[]).map((s) => (
             <button
-              key={s}
               type="button"
               onClick={() => setScenario(s)}
-              className={`text-[11px] font-mono px-2 py-1 rounded border transition-colors ${
-                scenario === s
+              class={`text-[11px] font-mono px-2 py-1 rounded border transition-colors ${
+                scenario() === s
                   ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-800'
                   : 'bg-[var(--bg-surface)] border-[var(--line-thin)] text-[var(--ink-muted)] hover:text-[var(--ink-default)]'
               }`}
@@ -223,45 +223,43 @@ export function TwoPhaseCommit() {
         </div>
 
         {/* Lane headers */}
-        <div className="grid grid-cols-4 gap-2 text-[10px] font-mono uppercase tracking-wide text-[var(--ink-subtle)]">
+        <div class="grid grid-cols-4 gap-2 text-[10px] font-mono uppercase tracking-wide text-[var(--ink-subtle)]">
           {(Object.keys(WHO_LABEL) as Step['who'][]).map((w) => (
-            <span key={w} className="text-center">
+            <span class="text-center">
               {WHO_LABEL[w]}
             </span>
           ))}
         </div>
 
         {/* Sequence steps */}
-        <div className="flex flex-col gap-1.5">
-          {steps.map((s, i) => {
+        <div class="flex flex-col gap-1.5">
+          {steps().map((s, i) => {
             const col = (Object.keys(WHO_LABEL) as Step['who'][]).indexOf(s.who);
             return (
               <div
-                key={i}
-                className="grid grid-cols-4 gap-2 items-center"
+                class="grid grid-cols-4 gap-2 items-center"
               >
                 {Array.from({ length: 4 }, (_, c) => {
                   if (c !== col) {
                     return (
                       <div
-                        key={c}
-                        className="border-l border-dashed border-[var(--line-thin)] h-full min-h-[36px]"
+                        class="border-l border-dashed border-[var(--line-thin)] h-full min-h-[36px]"
                       />
                     );
                   }
                   return (
-                    <DiagramTooltip key={c} content={s.tooltip || s.label}>
+                    <DiagramTooltip content={s.tooltip || s.label}>
                       <div
-                        className={`rounded border px-2 py-1.5 text-[11px] font-mono ${WHO_STYLE[s.who]} ${
+                        class={`rounded border px-2 py-1.5 text-[11px] font-mono ${WHO_STYLE[s.who]} ${
                           s.variant === 'fail'
                             ? 'ring-1 ring-rose-400/60 bg-rose-500/10 border-rose-400/50 text-rose-800'
                             : s.variant === 'commit'
                               ? 'ring-1 ring-emerald-400/60'
                               : ''
                         }`}
-                        tabIndex={0}
+                        tabindex={0}
                       >
-                        <span className="opacity-60">{i + 1}. </span>
+                        <span class="opacity-60">{i + 1}. </span>
                         {s.label}
                       </div>
                     </DiagramTooltip>
@@ -272,8 +270,8 @@ export function TwoPhaseCommit() {
           })}
         </div>
 
-        <div className="text-[11px] text-[var(--ink-muted)] mt-1">
-          <span className="font-semibold text-[var(--ink-strong)]">
+        <div class="text-[11px] text-[var(--ink-muted)] mt-1">
+          <span class="font-semibold text-[var(--ink-strong)]">
             Ключевая инвариантa:
           </span>{' '}
           commit может произойти только после того, как CheckpointCoordinator

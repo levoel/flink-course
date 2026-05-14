@@ -1,3 +1,4 @@
+/** @jsxImportSource solid-js */
 /**
  * KeyGroupsDistribution
  *
@@ -7,7 +8,7 @@
  * никакого remapping per-key, только per-range.
  */
 
-import { useState } from 'react';
+import { createSignal } from 'solid-js';
 import { DiagramContainer } from '@primitives/DiagramContainer';
 import { DiagramTooltip } from '@primitives/Tooltip';
 
@@ -33,41 +34,37 @@ const PALETTE = [
   'bg-lime-500/30 border-lime-400/60',
 ];
 
-function KeyGroupRow({
-  label,
-  parallelism,
-}: {
+function KeyGroupRow(props: {
   label: string;
   parallelism: number;
 }) {
-  const ranges = rangesFor(parallelism);
+  const ranges = () => rangesFor(props.parallelism);
   // mapping key group → subtask
   const ownerOfKg = (kg: number) =>
-    ranges.findIndex((r) => kg >= r.start && kg <= r.end);
+    ranges().findIndex((r) => kg >= r.start && kg <= r.end);
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <div className="text-xs font-mono text-[var(--ink-strong)]">
-          {label}
+    <div class="flex flex-col gap-2">
+      <div class="flex items-center justify-between">
+        <div class="text-xs font-mono text-[var(--ink-strong)]">
+          {props.label}
         </div>
-        <div className="text-[10px] font-mono text-[var(--ink-subtle)]">
-          parallelism = {parallelism}
+        <div class="text-[10px] font-mono text-[var(--ink-subtle)]">
+          parallelism = {props.parallelism}
         </div>
       </div>
 
       {/* Subtask legend */}
-      <div className="flex flex-wrap gap-1">
-        {ranges.map((r) => (
+      <div class="flex flex-wrap gap-1">
+        {ranges().map((r) => (
           <DiagramTooltip
-            key={r.subtask}
             content={`Subtask ${r.subtask}: key groups [${r.start}..${r.end}] (${r.size} групп). При rescaling этот subtask унаследует state именно из этого диапазона.`}
           >
             <span
-              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+              class={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
                 PALETTE[r.subtask % PALETTE.length]
               } text-[var(--ink-strong)]`}
-              tabIndex={0}
+              tabindex={0}
             >
               s{r.subtask}: [{r.start}..{r.end}]
             </span>
@@ -76,13 +73,12 @@ function KeyGroupRow({
       </div>
 
       {/* 128 key group strip */}
-      <div className="flex flex-wrap gap-[2px]">
+      <div class="flex flex-wrap gap-[2px]">
         {Array.from({ length: MAX_PARALLELISM }, (_, kg) => {
           const owner = ownerOfKg(kg);
           return (
             <div
-              key={kg}
-              className={`w-[10px] h-[14px] rounded-[2px] border ${PALETTE[owner % PALETTE.length]}`}
+              class={`w-[10px] h-[14px] rounded-[2px] border ${PALETTE[owner % PALETTE.length]}`}
               title={`kg=${kg} → subtask ${owner}`}
             />
           );
@@ -93,7 +89,7 @@ function KeyGroupRow({
 }
 
 export function KeyGroupsDistribution() {
-  const [parallelism, setParallelism] = useState<number>(4);
+  const [parallelism, setParallelism] = createSignal<number>(4);
 
   return (
     <DiagramContainer
@@ -101,24 +97,23 @@ export function KeyGroupsDistribution() {
       color="purple"
       description="Один &quot;квадратик&quot; = один key group из 128. Цвет = subtask-владелец. Rescaling — это перерезка соседних range, а не хеш-перешафл."
     >
-      <div className="flex flex-col gap-5">
+      <div class="flex flex-col gap-5">
         <KeyGroupRow label="Before (parallelism = 4)" parallelism={4} />
         <KeyGroupRow
-          label={`After (parallelism = ${parallelism})`}
-          parallelism={parallelism}
+          label={`After (parallelism = ${parallelism()})`}
+          parallelism={parallelism()}
         />
 
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-[11px] font-mono text-[var(--ink-muted)]">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-[11px] font-mono text-[var(--ink-muted)]">
             Try rescaling:
           </span>
           {[2, 4, 8, 16, 32].map((p) => (
             <button
-              key={p}
               type="button"
               onClick={() => setParallelism(p)}
-              className={`text-[11px] font-mono px-2 py-1 rounded border transition-colors ${
-                parallelism === p
+              class={`text-[11px] font-mono px-2 py-1 rounded border transition-colors ${
+                parallelism() === p
                   ? 'bg-purple-500/30 border-purple-400/60 text-purple-800'
                   : 'bg-[var(--bg-surface)] border-[var(--line-thin)] text-[var(--ink-muted)] hover:text-[var(--ink-default)]'
               }`}
@@ -128,23 +123,23 @@ export function KeyGroupsDistribution() {
           ))}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] text-[var(--ink-muted)]">
-          <div className="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
-            <span className="block font-semibold text-[var(--ink-strong)]">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] text-[var(--ink-muted)]">
+          <div class="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
+            <span class="block font-semibold text-[var(--ink-strong)]">
               key → key group
             </span>
             <code>kg = murmurhash(key) % maxParallelism</code>
           </div>
-          <div className="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
-            <span className="block font-semibold text-[var(--ink-strong)]">
+          <div class="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
+            <span class="block font-semibold text-[var(--ink-strong)]">
               key group → subtask
             </span>
             <code>
               subtask = kg * parallelism / maxParallelism
             </code>
           </div>
-          <div className="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
-            <span className="block font-semibold text-[var(--ink-strong)]">
+          <div class="p-2 rounded bg-[var(--bg-surface)] border border-[var(--line-thin)]">
+            <span class="block font-semibold text-[var(--ink-strong)]">
               Почему 128 default
             </span>
             128 = верхняя граница parallelism при restore. Выше 128 без resnapshot

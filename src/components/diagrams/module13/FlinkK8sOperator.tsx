@@ -1,3 +1,4 @@
+/** @jsxImportSource solid-js */
 /**
  * FlinkK8sOperator
  *
@@ -7,7 +8,7 @@
  * trigger savepoint, restart cluster и т.д.).
  */
 
-import { useState } from 'react';
+import { createSignal } from 'solid-js';
 import { DiagramContainer } from '@primitives/DiagramContainer';
 import { DiagramTooltip } from '@primitives/Tooltip';
 
@@ -69,7 +70,7 @@ const ACTIONS = [
 ];
 
 export function FlinkK8sOperator() {
-  const [phase, setPhase] = useState<Phase>('observe');
+  const [phase, setPhase] = createSignal<Phase>('observe');
 
   return (
     <DiagramContainer
@@ -77,16 +78,16 @@ export function FlinkK8sOperator() {
       color="blue"
       description="Operator pattern из k8s. CRD FlinkDeployment / FlinkSessionJob. Loop работает event-driven (watch CRD) + periodic resync."
     >
-      <div className="flex flex-col gap-4">
+      <div class="flex flex-col gap-4">
         {/* Top: CRD + operator */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
           <DiagramTooltip content="CRD FlinkDeployment. Spec описывает желаемый кластер: image, replicas, jobManager.resource.memory, flinkConfiguration, job.upgradeMode (stateless / savepoint / last-state).">
             <div
-              className="rounded-md border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-[11px] font-mono text-amber-800"
-              tabIndex={0}
+              class="rounded-md border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-[11px] font-mono text-amber-800"
+              tabindex={0}
             >
-              <div className="font-semibold">FlinkDeployment CRD</div>
-              <div className="text-[10px] opacity-70 mt-1">
+              <div class="font-semibold">FlinkDeployment CRD</div>
+              <div class="text-[10px] opacity-70 mt-1">
                 .spec · .status<br />
                 + FlinkSessionJob CRD
               </div>
@@ -95,11 +96,11 @@ export function FlinkK8sOperator() {
 
           <DiagramTooltip content="Operator pod в namespace. Watch endpoints на FlinkDeployment, FlinkSessionJob, Deployment, ConfigMap. Каждое событие → enqueue в workqueue → reconcile.">
             <div
-              className="rounded-md border border-blue-400/40 bg-blue-500/10 px-3 py-2 text-[11px] font-mono text-blue-800"
-              tabIndex={0}
+              class="rounded-md border border-blue-400/40 bg-blue-500/10 px-3 py-2 text-[11px] font-mono text-blue-800"
+              tabindex={0}
             >
-              <div className="font-semibold">flink-kubernetes-operator</div>
-              <div className="text-[10px] opacity-70 mt-1">
+              <div class="font-semibold">flink-kubernetes-operator</div>
+              <div class="text-[10px] opacity-70 mt-1">
                 · informer<br />
                 · workqueue<br />
                 · reconciler
@@ -109,11 +110,11 @@ export function FlinkK8sOperator() {
 
           <DiagramTooltip content="Управляемые ресурсы: JobManager Deployment, TaskManager Deployment, ConfigMap, Service, опционально Ingress. Owner reference указывает на FlinkDeployment, поэтому GC чистит всё при удалении CR.">
             <div
-              className="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-[11px] font-mono text-emerald-800"
-              tabIndex={0}
+              class="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-[11px] font-mono text-emerald-800"
+              tabindex={0}
             >
-              <div className="font-semibold">managed resources</div>
-              <div className="text-[10px] opacity-70 mt-1">
+              <div class="font-semibold">managed resources</div>
+              <div class="text-[10px] opacity-70 mt-1">
                 JM Deployment · TM Deployment<br />
                 ConfigMap · Service
               </div>
@@ -122,61 +123,60 @@ export function FlinkK8sOperator() {
         </div>
 
         {/* Reconcile loop */}
-        <div className="rounded-lg border border-[var(--line-thin)] bg-[var(--bg-surface)] p-3">
-          <div className="text-xs font-mono text-[var(--ink-strong)] mb-2">
+        <div class="rounded-lg border border-[var(--line-thin)] bg-[var(--bg-surface)] p-3">
+          <div class="text-xs font-mono text-[var(--ink-strong)] mb-2">
             reconcile() loop
           </div>
-          <div className="grid grid-cols-3 gap-2">
+          <div class="grid grid-cols-3 gap-2">
             {PHASES.map((p) => (
-              <DiagramTooltip key={p.id} content={p.description}>
+              <DiagramTooltip content={p.description}>
                 <button
                   type="button"
                   onClick={() => setPhase(p.id)}
-                  className={`rounded-md border px-3 py-2 text-[11px] font-mono w-full text-left transition-colors ${
-                    phase === p.id
+                  class={`rounded-md border px-3 py-2 text-[11px] font-mono w-full text-left transition-colors ${
+                    phase() === p.id
                       ? 'bg-blue-500/30 border-blue-400/60 text-blue-800'
                       : 'bg-[var(--bg-surface)] border-[var(--line-thin)] text-[var(--ink-default)] hover:bg-[var(--bg-deep)]'
                   }`}
                 >
-                  <div className="font-semibold">{p.label}</div>
+                  <div class="font-semibold">{p.label}</div>
                 </button>
               </DiagramTooltip>
             ))}
           </div>
 
           {/* Phase detail */}
-          <div className="mt-3 text-[11px] text-[var(--ink-default)] leading-relaxed">
-            {PHASES.find((p) => p.id === phase)!.description}
+          <div class="mt-3 text-[11px] text-[var(--ink-default)] leading-relaxed">
+            {PHASES.find((p) => p.id === phase())!.description}
           </div>
         </div>
 
         {/* Action examples */}
-        <div className="rounded-lg border border-[var(--line-thin)] bg-[var(--bg-surface)] p-3">
-          <div className="text-xs font-mono text-[var(--ink-strong)] mb-2">
+        <div class="rounded-lg border border-[var(--line-thin)] bg-[var(--bg-surface)] p-3">
+          <div class="text-xs font-mono text-[var(--ink-strong)] mb-2">
             Common spec changes → reconcile actions
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            {ACTIONS.map((a, i) => (
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {ACTIONS.map((a) => (
               <DiagramTooltip
-                key={i}
                 content={`Plan: ${a.plan}. Steps:\n${a.flow.join('\n')}`}
               >
                 <div
-                  className="rounded-md border border-[var(--line-thin)] bg-[var(--bg-deep)] p-2 text-[10px] font-mono text-[var(--ink-default)]"
-                  tabIndex={0}
+                  class="rounded-md border border-[var(--line-thin)] bg-[var(--bg-deep)] p-2 text-[10px] font-mono text-[var(--ink-default)]"
+                  tabindex={0}
                 >
-                  <div className="font-semibold text-[var(--ink-strong)] mb-1">
+                  <div class="font-semibold text-[var(--ink-strong)] mb-1">
                     {a.spec}
                   </div>
-                  <div className="opacity-70">→ {a.plan}</div>
+                  <div class="opacity-70">→ {a.plan}</div>
                 </div>
               </DiagramTooltip>
             ))}
           </div>
         </div>
 
-        <div className="text-[11px] text-[var(--ink-muted)] leading-relaxed">
-          <span className="font-semibold text-[var(--ink-strong)]">
+        <div class="text-[11px] text-[var(--ink-muted)] leading-relaxed">
+          <span class="font-semibold text-[var(--ink-strong)]">
             Idempotency:
           </span>{' '}
           reconcile вызывается много раз с тем же спеком -- каждый раз приводит

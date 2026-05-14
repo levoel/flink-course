@@ -1,3 +1,4 @@
+/** @jsxImportSource solid-js */
 /**
  * LsmCompaction
  *
@@ -81,48 +82,47 @@ export function LsmCompaction() {
       color="emerald"
       description="Write path: memtable → immutable memtable → L0 SSTable → background compaction. Read path: memtable + bloom filter per SSTable + level scan."
     >
-      <div className="flex flex-col gap-3">
+      <div class="flex flex-col gap-3">
         {/* Write entry point */}
         <DiagramTooltip content="Активный memtable в JVM-heap (writeBufferSize). Записи идут как insert/delete-tombstone. При заполнении → switch на immutable + новый активный.">
           <div
-            className="rounded-md border border-purple-400/40 bg-purple-500/10 px-3 py-2 text-xs font-mono text-purple-800 self-start"
-            tabIndex={0}
+            class="rounded-md border border-purple-400/40 bg-purple-500/10 px-3 py-2 text-xs font-mono text-purple-800 self-start"
+            tabindex={0}
           >
             memtable (active, in-memory)
-            <span className="ml-2 text-[10px] opacity-70">→ flush on full</span>
+            <span class="ml-2 text-[10px] opacity-70">→ flush on full</span>
           </div>
         </DiagramTooltip>
 
-        <div className="text-[var(--ink-muted)] text-center text-lg leading-none">
+        <div class="text-[var(--ink-muted)] text-center text-lg leading-none">
           ↓ flush
         </div>
 
         {/* Levels */}
-        <div className="flex flex-col gap-2">
+        <div class="flex flex-col gap-2">
           {LEVELS.map((lvl) => (
-            <div key={lvl.name} className="flex flex-col gap-1">
-              <div className="flex items-center justify-between">
+            <div class="flex flex-col gap-1">
+              <div class="flex items-center justify-between">
                 <DiagramTooltip content={lvl.description}>
                   <span
-                    className={`text-[11px] font-mono px-2 py-0.5 rounded border ${lvl.color}`}
-                    tabIndex={0}
+                    class={`text-[11px] font-mono px-2 py-0.5 rounded border ${lvl.color}`}
+                    tabindex={0}
                   >
                     {lvl.name}
                   </span>
                 </DiagramTooltip>
-                <span className="text-[10px] font-mono text-[var(--ink-subtle)]">
+                <span class="text-[10px] font-mono text-[var(--ink-subtle)]">
                   {lvl.capacity}
                 </span>
               </div>
-              <div className="flex flex-wrap gap-1">
+              <div class="flex flex-wrap gap-1">
                 {lvl.sstables.map((s) => (
                   <DiagramTooltip
-                    key={s.id}
                     content={`SSTable ${s.id} · ${s.size}. Immutable, sorted by key. Содержит block index, bloom filter, optional compression.`}
                   >
                     <div
-                      className={`px-1.5 py-1 rounded border text-[10px] font-mono ${lvl.color}`}
-                      tabIndex={0}
+                      class={`px-1.5 py-1 rounded border text-[10px] font-mono ${lvl.color}`}
+                      tabindex={0}
                     >
                       {s.id}
                     </div>
@@ -134,15 +134,15 @@ export function LsmCompaction() {
         </div>
 
         {/* Compaction arrows */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
-          <div className="p-2 rounded bg-rose-500/10 border border-rose-400/30 text-[11px] text-rose-800 leading-relaxed">
-            <span className="font-semibold">Write amplification</span>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+          <div class="p-2 rounded bg-rose-500/10 border border-rose-400/30 text-[11px] text-rose-800 leading-relaxed">
+            <span class="font-semibold">Write amplification</span>
             <br />
             Один логический write в memtable рекомпактируется через все уровни.
             Total bytes written ≈ N × original size (N = глубина дерева).
           </div>
-          <div className="p-2 rounded bg-emerald-500/10 border border-emerald-400/30 text-[11px] text-emerald-800 leading-relaxed">
-            <span className="font-semibold">Read amplification</span>
+          <div class="p-2 rounded bg-emerald-500/10 border border-emerald-400/30 text-[11px] text-emerald-800 leading-relaxed">
+            <span class="font-semibold">Read amplification</span>
             <br />
             Worst case = memtable + 1 SSTable per level. Bloom filter режет
             большинство false-positive lookups → реально читаем 1-2 уровня.
